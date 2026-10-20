@@ -1,0 +1,5 @@
+[{"mac":"9C:3D:CF:11:22:33","packets":900,"beacon":[{"ssid":"HomeNet","channel":6,"hidden":0,"freq":2437,"signal":-50,"time":1700000020,"count":80}],"response":[]},
+ {"mac":"B0:A7:B9:00:00:01","packets":200,"beacon":[{"ssid":"Camden Hotel","channel":11,"hidden":0,"freq":2462,"signal":-71,"time":1700000020,"count":20}],"response":[]},
+ {"mac":"C0:56:E3:AA:BB:01","packets":300,"beacon":[{"ssid":"EZVIZ_ABCDEF123","channel":1,"hidden":0,"freq":2412,"signal":-58,"time":1700000020,"count":30}],"response":[]},
+ {"mac":"EC:71:DB:00:00:10","packets":4000,"beacon":[{"ssid":"ReoKit","channel":36,"hidden":0,"freq":5180,"signal":-61,"time":1700000020,"count":30}],"response":[]},
+ {"mac":"02:11:22:33:44:55","packets":80,"beacon":[{"ssid":"","channel":6,"hidden":1,"freq":2437,"signal":-66,"time":1700000020,"count":30}],"response":[]}]

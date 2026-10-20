@@ -1,0 +1,2 @@
+#!/bin/bash
+printf 'PINEAPPLE_EXAMINE_CHANNEL %s\n' "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; echo "$1" > /tmp/cs_harness_chan; exit 0

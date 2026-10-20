@@ -1,0 +1,8 @@
+#!/bin/bash
+title="$1"; shift; n=$(( $# - 1 )); a=$(_rule "$title")
+printf 'PICKER[%s] items=%s -> %s\n' "$title" "$(printf '%s;' "${@:1:$n}")" "$a" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"
+case "$a" in
+  B|"") exit 1 ;;
+  [0-9]*) i=$a; (( i >= 1 && i <= n )) || exit 1; printf '%s' "${!i}"; exit 0 ;;
+  *) printf '%s' "$a"; exit 0 ;;
+esac

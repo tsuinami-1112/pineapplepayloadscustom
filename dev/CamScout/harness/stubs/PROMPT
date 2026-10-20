@@ -1,0 +1,2 @@
+#!/bin/bash
+printf 'PROMPT %s\n' "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; echo 2 > /tmp/cs_harness_pps; exit 0
