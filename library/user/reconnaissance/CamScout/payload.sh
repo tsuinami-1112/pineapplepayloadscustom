@@ -78,6 +78,10 @@ GPS=0                   # closest-approach GPS stamping (0 = off)
 KEEP_PCAP=0; KEEP_RAW=0 # Watch artefacts copied to loot
 ROW_W=22                # list row budget (spike 19; expected 36-40 on the default theme)
 RECON_IF="wlan1mon"     # PineAP monitor radio (tri-band)
+# response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
+RESPONSE=0              # * master switch for the response rung (0 = recon only)
+RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
+SCAN_IF="wlan0"         # posture cross-check iface: the enabled dummy sta on radio0 (2.4 GHz only)
 LOOT_DIR="/root/loot/CamScout"
 OUI_FILE="/lib/hak5/oui.txt"; OUI_FILE_ALT="/rom/lib/hak5/oui.txt"
 # identity weights (constants, not table columns)
@@ -157,6 +161,8 @@ load_overrides() {
   RSSI_MIN=$(cfg RSSI_MIN "$RSSI_MIN" -100)
   SOUND=$(cfg SOUND "$SOUND" 0)
   THR_STREAM_UP=$(cfg THR_STREAM_UP "$THR_STREAM_UP" 1)
+  RESPONSE=$(cfg RESPONSE "$RESPONSE" 0)
+  RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
 }
 
 # install dir: the UI runs a copy from /tmp, so look for the data file where it can live
@@ -280,6 +286,66 @@ band_of() {
   local f="$1"
   if (( f >= 5925 )); then printf 6; elif (( f >= 4900 )); then printf 5; elif (( f >= 2400 )); then printf 2; else printf '?'; fi
 }
+
+# --- response posture begin ---
+# Which disconnect primitive can work against a target, read from its own beacon.
+#   RSN element (ID 48): RSN Capabilities, 2 octets little-endian, low octet first on the wire.
+#     MFPC (capable)  = bit 7 -> 0x80 of the low octet
+#     MFPR (required) = bit 6 -> 0x40 of the low octet
+#   Extended Capabilities (ID 127): Beacon Protection = bit 84 -> octet 10 (0-based), mask 0x10.
+#     Beacon protection is NOT in the RSNXE (ID 244) -- that element has no such bit.
+# Badges: D+C both work | D?+C deauth is per-client, CSA works | C CSA only
+#         NONE both blocked | NOINJ radio may not transmit here | ? posture unread
+declare -A POSTURE POSTURE_TS
+
+hex_octet() {   # hex_octet <hexstring> <index0> -> decimal octet, nonzero rc if short
+  local b="${1:$(( $2 * 2 )):2}"
+  [ ${#b} -eq 2 ] || return 1
+  [[ $b =~ ^[0-9a-fA-F]{2}$ ]] || return 1
+  printf '%d' "$(( 16#$b ))"
+}
+
+csa_injectable() {   # csa_injectable <band> <channel> -> 0 when the radio may legally transmit
+  local b="$1" c="$2"
+  [[ $c =~ ^[0-9]+$ ]] || return 1
+  case "$b" in
+    2) return 0 ;;
+    5) (( c >= 36 && c <= 48 )) && return 0
+       (( c >= 149 && c <= 165 )) && return 0
+       return 1 ;;          # 52-144 is DFS: cfg80211 marks it NO_IR, injection is dropped
+    *) return 1 ;;          # 6 GHz is NO_IR for injection, and always WPA3 anyway
+  esac
+}
+
+posture_from_caps() {   # posture_from_caps <rsncaps_hex|-> <extcap_hex|-> <band> <channel> -> badge
+  local rsn="$1" ext="$2" band="$3" ch="$4" lo o mfpc=0 mfpr=0 bp=0
+  csa_injectable "$band" "$ch" || { printf 'NOINJ'; return 0; }
+  if [ -z "$rsn" ] || [ "$rsn" = - ]; then printf '?'; return 0; fi
+  lo=$(hex_octet "$rsn" 0) || { printf '?'; return 0; }
+  (( lo & 0x80 )) && mfpc=1
+  (( lo & 0x40 )) && mfpr=1
+  if [ -n "$ext" ] && [ "$ext" != - ]; then
+    if o=$(hex_octet "$ext" 10); then (( o & 0x10 )) && bp=1; fi
+  fi
+  if   (( mfpr && bp )); then printf 'NONE'
+  elif (( mfpr ));       then printf 'C'
+  elif (( mfpc ));       then printf 'D?+C'
+  else                        printf 'D+C'
+  fi
+}
+
+# posture_primitive <badge> -> the DuckyScript command to use, or empty when nothing will work
+#   PINEAPPLE_DEAUTH_CLIENT     [bssid] [target] [channel]   deauth + disassoc
+#   PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]            channel-switch announcements
+#   PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]   all three
+posture_primitive() {
+  case "$1" in
+    'D+C'|'D?+C') printf 'PINEAPPLE_DEAUTH_CLIENT_ALL' ;;   # quoted: ? is a case-glob wildcard
+    'C')          printf 'PINEAPPLE_DEAUTH_CLIENT_CSA' ;;
+    *)            printf '' ;;
+  esac
+}
+# --- response posture end ---
 
 cleanup() {
   [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$$" ] || return 0
@@ -1473,6 +1539,31 @@ selftest() {
   st "pcap bucket line" "$(pcap_buckets "$tmp/t.pcap" | head -1)" "1700000000 2400 2 2"
   pcap_buckets "$tmp/t.pcap" >"$tmp/t.b"; st "bucket stats" "$(bucket_stats "$tmp/t.b" | cut -d' ' -f1-4)" "10 20 24000 20"
   printf 'garbage' >"$tmp/bad.pcap"; pcap_buckets "$tmp/bad.pcap" >/dev/null 2>&1; st "bad magic rejected" "$?" 1
+  # 7b response posture (byte vectors; no radio needed)
+  # RSN caps low octet: 0xcc = MFPR+MFPC, 0x8c = MFPC only, 0x0c = neither
+  local XBP='0000000000000000000010'   # 11 octets, octet 10 bit 4 set -> beacon protection on
+  local XNO='0000000000000000000000'   # same length, bit clear
+  st "posture no PMF"               "$(posture_from_caps 0c00 - 2 6)"      "D+C"
+  st "posture PMF capable only"     "$(posture_from_caps 8c00 - 2 6)"      "D?+C"
+  st "posture PMF required"         "$(posture_from_caps cc00 - 2 6)"      "C"
+  st "posture PMF req + beacon prot" "$(posture_from_caps cc00 "$XBP" 2 6)" "NONE"
+  st "posture beacon prot bit clear" "$(posture_from_caps cc00 "$XNO" 2 6)" "C"
+  st "posture short extcap ignored"  "$(posture_from_caps cc00 0000000000 2 6)" "C"
+  st "posture unread rsn"           "$(posture_from_caps - - 2 6)"         "?"
+  st "posture garbage rsn"          "$(posture_from_caps zz00 - 2 6)"      "?"
+  st "posture 6 GHz never injects"  "$(posture_from_caps 0c00 - 6 37)"     "NOINJ"
+  st "posture 5 GHz DFS ch52"       "$(posture_from_caps 0c00 - 5 52)"     "NOINJ"
+  st "posture 5 GHz DFS ch144"      "$(posture_from_caps cc00 - 5 144)"    "NOINJ"
+  st "posture 5 GHz UNII-1 ch36"    "$(posture_from_caps cc00 - 5 36)"     "C"
+  st "posture 5 GHz UNII-3 ch149"   "$(posture_from_caps 0c00 - 5 149)"    "D+C"
+  st "posture unknown band"         "$(posture_from_caps 0c00 - '?' 6)"    "NOINJ"
+  st "posture non-numeric channel"  "$(posture_from_caps 0c00 - 2 x)"      "NOINJ"
+  st "primitive for D+C"            "$(posture_primitive 'D+C')"           "PINEAPPLE_DEAUTH_CLIENT_ALL"
+  st "primitive for D?+C"           "$(posture_primitive 'D?+C')"          "PINEAPPLE_DEAUTH_CLIENT_ALL"
+  st "primitive for C"              "$(posture_primitive C)"               "PINEAPPLE_DEAUTH_CLIENT_CSA"
+  st "primitive for NONE is empty"  "$(posture_primitive NONE)"            ""
+  st "primitive for NOINJ is empty" "$(posture_primitive NOINJ)"           ""
+  st "primitive for unread is empty" "$(posture_primitive '?')"            ""
   # 8 marked blocks
   if command -v md5sum >/dev/null 2>&1 && [ -f "${BASH_SOURCE[0]}" ]; then
     printf 'lib block md5   %s\n' "$(sed -n '/^# --- camscout lib begin ---/,/^# --- camscout lib end ---/p' "${BASH_SOURCE[0]}" | md5sum | cut -c1-32)"
