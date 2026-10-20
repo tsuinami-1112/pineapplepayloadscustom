@@ -1,0 +1,10 @@
+[{"mac":"3C:6A:2C:00:00:01","ap_mac":"9C:3D:CF:11:22:33","packets":9000,"signal":-54,"probes":[]},
+ {"mac":"24:A1:60:00:00:01","ap_mac":"9C:3D:CF:11:22:33","packets":60,"signal":-61,"probes":[]},
+ {"mac":"A4:DA:22:20:00:01","ap_mac":"9C:3D:CF:11:22:33","packets":3000,"signal":-57,"probes":["HomeNet"]},
+ {"mac":"EC:71:DB:00:00:11","ap_mac":"EC:71:DB:00:00:10","packets":2000,"signal":-63,"probes":[]},
+ {"mac":"EC:71:DB:00:00:12","ap_mac":"EC:71:DB:00:00:10","packets":2100,"signal":-64,"probes":[]},
+ {"mac":"00:E0:4C:00:00:01","ap_mac":"02:11:22:33:44:55","packets":100,"signal":-62,"probes":[]},
+ {"mac":"00:E0:4C:00:00:02","ap_mac":"02:11:22:33:44:55","packets":100,"signal":-63,"probes":[]},
+ {"mac":"00:E0:4C:00:00:03","ap_mac":"02:11:22:33:44:55","packets":100,"signal":-64,"probes":[]},
+ {"mac":"02:AB:CD:00:00:01","ap_mac":"-","packets":10,"signal":-70,"probes":["BLINK-AB12"]},
+ {"mac":"00:FC:8B:00:00:01","ap_mac":"9C:3D:CF:11:22:33","packets":400,"signal":-59,"probes":[]}]

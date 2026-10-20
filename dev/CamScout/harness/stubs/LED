@@ -1,0 +1,2 @@
+#!/bin/bash
+printf '%s %s\n' "LED" "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; exit 0

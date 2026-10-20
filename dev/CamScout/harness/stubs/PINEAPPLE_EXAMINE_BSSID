@@ -1,0 +1,4 @@
+#!/bin/bash
+printf 'PINEAPPLE_EXAMINE_BSSID %s\n' "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"
+ch=$(jq -r --arg m "${1^^}" '.[] | select(.mac == $m) | .beacon[0].channel' "${HARNESS_FIX}/aps.json" 2>/dev/null | head -1)
+[ -n "$ch" ] && echo "$ch" > /tmp/cs_harness_chan; exit 0

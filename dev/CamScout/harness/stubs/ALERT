@@ -1,0 +1,2 @@
+#!/bin/bash
+printf 'ALERT %s\n' "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; case "$1" in "Now move"*) echo 16 > /tmp/cs_harness_pps ;; esac; exit 0

@@ -1,0 +1,2 @@
+[{"mac":"9C:3D:CF:11:22:33","packets":500,"beacon":[{"ssid":"HomeNet","channel":6,"hidden":0,"freq":2437,"signal":-52,"time":1700000000,"count":40}],"response":[]},
+ {"mac":"B0:A7:B9:00:00:01","packets":120,"beacon":[{"ssid":"Camden Hotel","channel":11,"hidden":0,"freq":2462,"signal":-70,"time":1700000000,"count":10}],"response":[]}]

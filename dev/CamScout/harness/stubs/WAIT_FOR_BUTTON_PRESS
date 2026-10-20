@@ -1,0 +1,3 @@
+#!/bin/bash
+a=$(_pop); printf 'WAIT[%s] -> %s\n' "$*" "$a" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"
+case "$a" in B|A) exit 0 ;; *) exec sleep 1000 ;; esac

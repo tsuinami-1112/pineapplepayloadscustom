@@ -1,0 +1,2 @@
+#!/bin/bash
+ch=$(cat /tmp/cs_harness_chan 2>/dev/null); echo "wlan1mon  ESSID: unknown"; echo "          Channel: ${ch:-6} (2.437 GHz)"

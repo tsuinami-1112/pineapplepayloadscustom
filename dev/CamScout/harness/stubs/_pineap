@@ -1,0 +1,7 @@
+#!/bin/bash
+case "$1 $2" in
+  "RECON APS") n=$(cat /tmp/cs_harness_cycle 2>/dev/null || echo 0); f="${HARNESS_FIX}/aps_$n.json"; [ -f "$f" ] || f="${HARNESS_FIX}/aps.json"; cat "$f"; echo $((n+1)) > /tmp/cs_harness_cycle ;;
+  "RECON CLIENTS") n=$(cat /tmp/cs_harness_cycle 2>/dev/null || echo 1); f="${HARNESS_FIX}/cli_$((n-1)).json"; [ -f "$f" ] || f="${HARNESS_FIX}/cli.json"; cat "$f" ;;
+  "MONITOR "*) printf 'MONITOR %s\n' "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; i=0; while :; do echo $(( -70 + (i % 10) )); i=$((i+1)); sleep 0.2; done ;;
+  "EXAMINE CANCEL") printf 'EXAMINE CANCEL\n' >> "${HARNESS_LOG:-/tmp/cs_harness.log}" ;;
+esac

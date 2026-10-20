@@ -40,6 +40,7 @@
 #          Tunnel_Rat (EXAMINE lock from a user payload). Design notes in README.md.
 
 PAYLOAD_REL="user/reconnaissance/CamScout"
+PAYLOAD_REL_ALT="recon/client/CamScout recon/access_point/CamScout"   # the v1.1 hooks live here
 PAYLOAD_NAME="camscout"
 VERSION="1.0"
 
@@ -183,10 +184,14 @@ load_overrides() {
 
 # install dir: the UI runs a copy from /tmp, so look for the data file where it can live
 find_install_dir() {
-  local d
-  for d in "${_PAYLOAD_HOME:-${PAYLOAD_HOME:-}}" "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" \
-           "/root/payloads/$PAYLOAD_REL" "/sd/payloads/$PAYLOAD_REL" "/mmc/root/payloads/$PAYLOAD_REL"; do
+  local d r rel
+  for d in "${_PAYLOAD_HOME:-${PAYLOAD_HOME:-}}" "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; do
     [ -n "$d" ] && [ -f "$d/cam_signatures.txt" ] && { printf '%s' "$d"; return 0; }
+  done
+  for r in /root/payloads /sd/payloads /mmc/root/payloads; do
+    for rel in $PAYLOAD_REL $PAYLOAD_REL_ALT; do
+      [ -f "$r/$rel/cam_signatures.txt" ] && { printf '%s' "$r/$rel"; return 0; }
+    done
   done
   return 1
 }
@@ -510,7 +515,6 @@ kill_children() {   # by stored PID only, never by pattern
 }
 child_add() { printf '%s\n' "$1" >>"$CHILD_FILE"; }
 child_del() { [ -f "$CHILD_FILE" ] && grep -v -x "$1" "$CHILD_FILE" >"$CHILD_FILE.n" 2>/dev/null && mv "$CHILD_FILE.n" "$CHILD_FILE"; }
-# --- camscout lib end ---
 
 # ============================================================================ scan state ===
 declare -A ROLE SSID_CLEAN AP_OF CH FREQ BAND HIDDEN PROBES PREV_PKT PREV_T RATE BUSY_N BUSY
@@ -743,6 +747,95 @@ rate_update() {
   PREV_PKT[$mac]=$pk; PREV_T[$mac]=$now
 }
 
+# ---- shared helpers (also used by the recon hooks) ----
+confirm() {   # confirm "question" -> 0 only when the operator confirmed
+  local resp rc
+  resp=$(CONFIRMATION_DIALOG "$1" 2>/dev/null); rc=$?
+  (( rc != 0 )) && return 1
+  if [ -n "${DUCKYSCRIPT_USER_CONFIRMED:-}" ]; then [ "$resp" = "$DUCKYSCRIPT_USER_CONFIRMED" ]; else [[ ${resp,,} =~ ^(1|yes|y|true|confirmed)$ ]]; fi
+}
+count_band() { local m n=0; for m in "${!BANDNAME[@]}"; do [ "${BANDNAME[$m]}" = "$1" ] && n=$((n + 1)); done; printf '%s' "$n"; }
+watchable() {
+  local mac="$1"
+  [ "$HAVE_TCPDUMP" = 1 ] || return 1
+  if [ "${ROLE[$mac]}" = cli ]; then [ -n "${AP_OF[$mac]}" ] && [ "${AP_OF[$mac]}" != "-" ] || return 1; fi
+  return 0
+}
+is_setup_ap() { local s="${SSID_CLEAN[$1]}"; [ "${ROLE[$1]}" != cli ] && [ -n "$s" ] && [ "${SSIDSIG[$s]##*|}" = SSID ]; }
+auto_offer_ok() { watchable "$1" && ! is_setup_ap "$1"; }
+INV_HDR='#first_seen|last_seen|run_id|mac|role|cat|vendor|label|conf|id_score|beh_score|beh_verdict|band|ssid|ap_bssid|ch|freq|rssi_best|rssi_best_ts|rssi_last|prox|n_seen|pkt_rate|signals|lan_tag|lat|lon'
+inv_row() {   # inv_row mac -> stdout one row
+  local m="$1"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "${FIRST_SEEN[$m]}" "${LAST_SEEN[$m]}" "$RUN_ID" "$m" "${ROLE[$m]}" "${CAT[$m]:-UNKNOWN}" "${VENDOR[$m]:--}" "${ID_LABEL[$m]:--}" \
+    "${CONF[$m]:-0}" "${ID_PTS[$m]:-0}" "${BEH[$m]:-0}" "${BEH_VERDICT[$m]:--}" "${BAND[$m]:-?}" "${SSID_CLEAN[$m]:--}" "${AP_OF[$m]:--}" \
+    "${CH[$m]:--}" "${FREQ[$m]:--}" "${RSSI_BEST[$m]:--}" "${RSSI_BEST_TS[$m]:--}" "${RSSI_LAST[$m]:--}" "${PROX[$m]:-?}" "${N_SEEN[$m]:-0}" \
+    "${RATE[$m]:--}" "${TAGS[$m]:--}" "-" "${LAT[$m]:--}" "${LON[$m]:--}"
+}
+upsert_inventory() { (( ${#SCORED[@]} )) || return 0; upsert_rows "${!SCORED[@]}"; }
+upsert_rows() {   # upsert_rows mac... -> merge these rows into inventory.tsv
+  local m f="$LOOT_DIR/inventory.tsv"
+  { for m in "$@"; do [ -n "${ROLE[$m]}" ] && inv_row "$m"; done; } >/tmp/cs_rows.tmp
+  [ -s /tmp/cs_rows.tmp ] || return 0
+  [ -s "$f" ] || printf '%s\n' "$INV_HDR" >"$f"
+  awk -F'|' 'NR==FNR { new[$4]=$0; next } /^#/ { print; next } { if ($4 in new) { print new[$4]; delete new[$4] } else print } END { for (k in new) print new[k] }' /tmp/cs_rows.tmp "$f" >/tmp/cs_inv.new 2>/dev/null && mv /tmp/cs_inv.new "$f"
+  (( CYCLE % 5 == 0 )) && sync
+  return 0
+}
+pick_list() {
+  local title="$1" def="$2"; shift 2
+  local -a items=("$@") page
+  local start=0 n=${#items[@]} resp rc
+  while :; do
+    page=("${items[@]:$start:9}")
+    (( start + 9 < n )) && page+=("More...")
+    (( start > 0 )) && page+=("<- Prev")
+    (( ${#page[@]} == 0 )) && { PICK=""; return 1; }
+    resp=$(LIST_PICKER "$title" "${page[@]}" "${def:-${page[0]}}" 2>/dev/null); rc=$?
+    (( rc != 0 )) && { PICK=""; return 1; }
+    case "$resp" in
+      "More...") start=$((start + 9)); def="" ;;
+      "<- Prev") start=$((start - 9)); (( start < 0 )) && start=0; def="" ;;
+      "") PICK=""; return 1 ;;
+      *) PICK="$resp"; return 0 ;;
+    esac
+  done
+}
+PICK=""
+preflight() {
+  local i a
+  mkdir -p "$LOOT_DIR" 2>/dev/null
+  printf -v RUN_ID '%(%Y%m%d_%H%M%S)T' -1; RUN_T0=$EPOCHSECONDS
+  if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamScout: _pineap not found" 2>/dev/null; exit 0; fi
+  command -v jq >/dev/null 2>&1 && HAVE_JQ=1
+  command -v tcpdump >/dev/null 2>&1 && command -v hexdump >/dev/null 2>&1 && HAVE_TCPDUMP=1
+  [ -r "$OUI_FILE" ] || OUI_FILE="$OUI_FILE_ALT"
+  [ -r "$OUI_FILE" ] || LOG yellow "no oui.txt: vendor rows disabled, OUI rows only"
+  for i in wlan0 wlan1 wlan1mon wlan0cli wlan0mon; do a=$(cat "/sys/class/net/$i/address" 2>/dev/null); [ -n "$a" ] && OWN_MACS+="${a,,} "; done
+  a=$(uci -q get pineapd.wlan1mon.bands 2>/dev/null || uci -q get pineapd.wlan1.bands 2>/dev/null); a=${a//[![:alnum:],]/}
+  [ -n "$a" ] && { BANDS_LINE="$a"; [[ $a != *6* ]] && BANDS_LINE+=" (6 GHz not scanned)"; }
+  if [ -f "$INSTALL_DIR/cam_signatures.txt" ]; then load_signatures "$INSTALL_DIR/cam_signatures.txt"; SIG_SOURCE="file"; fi
+  if (( SIG_COUNT < 10 )); then load_signatures <(builtin_signatures); SIG_SOURCE="built-in"; fi
+  (( SIG_COUNT == 0 )) && { set_state FAIL; ERROR_DIALOG "CamScout: no signatures" 2>/dev/null; exit 0; }
+}
+BANDS_LINE=""; INSTALL_DIR=""
+run_lock() {
+  local pid
+  pid=$(cat "$LOCK_FILE" 2>/dev/null)
+  if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && grep -qa payload "/proc/$pid/cmdline" 2>/dev/null; then
+    LOG red "CamScout already running (pid $pid)"; exit 0
+  fi
+  kill_children; pkill -f "^_pineap MONITOR" 2>/dev/null   # anchored: only a real MONITOR process
+  printf '%s' "$$" >"$LOCK_FILE"; : >"$CHILD_FILE"
+  trap cleanup EXIT INT TERM
+  # watchdog: if the UI kills this process (SIGKILL), release children and the EXAMINE lock
+  ( while kill -0 "$MAIN_PID" 2>/dev/null; do sleep 3; done
+    while read -r p; do [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done <"$CHILD_FILE" 2>/dev/null
+    _pineap EXAMINE CANCEL; PINEAPPLE_EXAMINE_RESET
+    [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ] && rm -f "$LOCK_FILE" "$CHILD_FILE" ) >/dev/null 2>&1 &
+}
+# --- camscout lib end ---
+
 # ================================================================================== cycle ===
 declare -A SCORED HINTED NOALERT PENDING_OFFER
 declare -a AP_LINES CLI_LINES
@@ -936,23 +1029,8 @@ offer_dialogs() {
     fi
   done
 }
-count_band() { local m n=0; for m in "${!BANDNAME[@]}"; do [ "${BANDNAME[$m]}" = "$1" ] && n=$((n + 1)); done; printf '%s' "$n"; }
-confirm() {   # confirm "question" -> 0 only when the operator confirmed
-  local resp rc
-  resp=$(CONFIRMATION_DIALOG "$1" 2>/dev/null); rc=$?
-  (( rc != 0 )) && return 1
-  if [ -n "${DUCKYSCRIPT_USER_CONFIRMED:-}" ]; then [ "$resp" = "$DUCKYSCRIPT_USER_CONFIRMED" ]; else [[ ${resp,,} =~ ^(1|yes|y|true|confirmed)$ ]]; fi
-}
 # watchable mac -> has a BSSID to lock on and tcpdump is present (the operator may Watch any such row)
-watchable() {
-  local mac="$1"
-  [ "$HAVE_TCPDUMP" = 1 ] || return 1
-  if [ "${ROLE[$mac]}" = cli ]; then [ -n "${AP_OF[$mac]}" ] && [ "${AP_OF[$mac]}" != "-" ] || return 1; fi
-  return 0
-}
 # is_setup_ap mac -> AP whose SSID matched a strong (setup / direct-mode) SSID row: never auto-offered Watch
-is_setup_ap() { local s="${SSID_CLEAN[$1]}"; [ "${ROLE[$1]}" != cli ] && [ -n "$s" ] && [ "${SSIDSIG[$s]##*|}" = SSID ]; }
-auto_offer_ok() { watchable "$1" && ! is_setup_ap "$1"; }
 
 gps_tick() {
   local fix lat lon mac
@@ -976,50 +1054,11 @@ battery_tick() {
 BATT_WARNED=""
 
 # inventory.tsv upsert: pending rows -> awk merge -> atomic mv (one fork per cycle)
-INV_HDR='#first_seen|last_seen|run_id|mac|role|cat|vendor|label|conf|id_score|beh_score|beh_verdict|band|ssid|ap_bssid|ch|freq|rssi_best|rssi_best_ts|rssi_last|prox|n_seen|pkt_rate|signals|lan_tag|lat|lon'
-inv_row() {   # inv_row mac -> stdout one row
-  local m="$1"
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-    "${FIRST_SEEN[$m]}" "${LAST_SEEN[$m]}" "$RUN_ID" "$m" "${ROLE[$m]}" "${CAT[$m]:-UNKNOWN}" "${VENDOR[$m]:--}" "${ID_LABEL[$m]:--}" \
-    "${CONF[$m]:-0}" "${ID_PTS[$m]:-0}" "${BEH[$m]:-0}" "${BEH_VERDICT[$m]:--}" "${BAND[$m]:-?}" "${SSID_CLEAN[$m]:--}" "${AP_OF[$m]:--}" \
-    "${CH[$m]:--}" "${FREQ[$m]:--}" "${RSSI_BEST[$m]:--}" "${RSSI_BEST_TS[$m]:--}" "${RSSI_LAST[$m]:--}" "${PROX[$m]:-?}" "${N_SEEN[$m]:-0}" \
-    "${RATE[$m]:--}" "${TAGS[$m]:--}" "-" "${LAT[$m]:--}" "${LON[$m]:--}"
-}
-upsert_inventory() { (( ${#SCORED[@]} )) || return 0; upsert_rows "${!SCORED[@]}"; }
-upsert_rows() {   # upsert_rows mac... -> merge these rows into inventory.tsv
-  local m f="$LOOT_DIR/inventory.tsv"
-  { for m in "$@"; do [ -n "${ROLE[$m]}" ] && inv_row "$m"; done; } >/tmp/cs_rows.tmp
-  [ -s /tmp/cs_rows.tmp ] || return 0
-  [ -s "$f" ] || printf '%s\n' "$INV_HDR" >"$f"
-  awk -F'|' 'NR==FNR { new[$4]=$0; next } /^#/ { print; next } { if ($4 in new) { print new[$4]; delete new[$4] } else print } END { for (k in new) print new[k] }' /tmp/cs_rows.tmp "$f" >/tmp/cs_inv.new 2>/dev/null && mv /tmp/cs_inv.new "$f"
-  (( CYCLE % 5 == 0 )) && sync
-  return 0
-}
 
 # ===================================================================================== UI ===
 declare -a ROW_TEXT ROW_MAC
-PICK=""
 
 # pick_list "title" "default" items...  -> PICK (empty on B / cancel); items paginated by 10 with More...
-pick_list() {
-  local title="$1" def="$2"; shift 2
-  local -a items=("$@") page
-  local start=0 n=${#items[@]} resp rc
-  while :; do
-    page=("${items[@]:$start:9}")
-    (( start + 9 < n )) && page+=("More...")
-    (( start > 0 )) && page+=("<- Prev")
-    (( ${#page[@]} == 0 )) && { PICK=""; return 1; }
-    resp=$(LIST_PICKER "$title" "${page[@]}" "${def:-${page[0]}}" 2>/dev/null); rc=$?
-    (( rc != 0 )) && { PICK=""; return 1; }
-    case "$resp" in
-      "More...") start=$((start + 9)); def="" ;;
-      "<- Prev") start=$((start - 9)); (( start < 0 )) && start=0; def="" ;;
-      "") PICK=""; return 1 ;;
-      *) PICK="$resp"; return 0 ;;
-    esac
-  done
-}
 
 # row_for mac -> ROW (conf tags prox glyph rssi, cut to ROW_W, never a partial tag)
 ROW=""
@@ -1631,10 +1670,8 @@ watch_menu() {
   esac
   return 0
 }
-# --- watch core end ---
 
-# ================================================================================= locate ===
-# locate_target mac -> MONITOR RSSI loop, 5-sample median, hysteresis, staleness; A stops
+# ---- locate (MONITOR RSSI loop) ----
 locate_target() {
   local mac="$1" pid tier=0 last_tier=0 med raw n size0 size1 quiet=0 silent_cap rc t0 i
   local -a ring=() lines=()
@@ -1684,6 +1721,9 @@ locate_target() {
   set_state SCAN; BASELINE_NEXT=1; PREV_PKT=(); PREV_T=()
   return 0
 }
+# --- watch core end ---
+
+# locate_target mac -> MONITOR RSSI loop, 5-sample median, hysteresis, staleness; A stops
 
 # ================================================================================= report ===
 REPORT_DONE_AT_EXIT=0
@@ -1966,39 +2006,7 @@ replay() {   # --replay <pcap or bucket file>
 }
 
 # ============================================================================== preflight ===
-preflight() {
-  local i a
-  mkdir -p "$LOOT_DIR" 2>/dev/null
-  printf -v RUN_ID '%(%Y%m%d_%H%M%S)T' -1; RUN_T0=$EPOCHSECONDS
-  if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamScout: _pineap not found" 2>/dev/null; exit 0; fi
-  command -v jq >/dev/null 2>&1 && HAVE_JQ=1
-  command -v tcpdump >/dev/null 2>&1 && command -v hexdump >/dev/null 2>&1 && HAVE_TCPDUMP=1
-  [ -r "$OUI_FILE" ] || OUI_FILE="$OUI_FILE_ALT"
-  [ -r "$OUI_FILE" ] || LOG yellow "no oui.txt: vendor rows disabled, OUI rows only"
-  for i in wlan0 wlan1 wlan1mon wlan0cli wlan0mon; do a=$(cat "/sys/class/net/$i/address" 2>/dev/null); [ -n "$a" ] && OWN_MACS+="${a,,} "; done
-  a=$(uci -q get pineapd.wlan1mon.bands 2>/dev/null || uci -q get pineapd.wlan1.bands 2>/dev/null); a=${a//[![:alnum:],]/}
-  [ -n "$a" ] && { BANDS_LINE="$a"; [[ $a != *6* ]] && BANDS_LINE+=" (6 GHz not scanned)"; }
-  if [ -f "$INSTALL_DIR/cam_signatures.txt" ]; then load_signatures "$INSTALL_DIR/cam_signatures.txt"; SIG_SOURCE="file"; fi
-  if (( SIG_COUNT < 10 )); then load_signatures <(builtin_signatures); SIG_SOURCE="built-in"; fi
-  (( SIG_COUNT == 0 )) && { set_state FAIL; ERROR_DIALOG "CamScout: no signatures" 2>/dev/null; exit 0; }
-}
-BANDS_LINE=""; INSTALL_DIR=""
 
-run_lock() {
-  local pid
-  pid=$(cat "$LOCK_FILE" 2>/dev/null)
-  if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && grep -qa payload "/proc/$pid/cmdline" 2>/dev/null; then
-    LOG red "CamScout already running (pid $pid)"; exit 0
-  fi
-  kill_children; pkill -f "^_pineap MONITOR" 2>/dev/null   # anchored: only a real MONITOR process
-  printf '%s' "$$" >"$LOCK_FILE"; : >"$CHILD_FILE"
-  trap cleanup EXIT INT TERM
-  # watchdog: if the UI kills this process (SIGKILL), release children and the EXAMINE lock
-  ( while kill -0 "$MAIN_PID" 2>/dev/null; do sleep 3; done
-    while read -r p; do [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done <"$CHILD_FILE" 2>/dev/null
-    _pineap EXAMINE CANCEL; PINEAPPLE_EXAMINE_RESET
-    [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ] && rm -f "$LOCK_FILE" "$CHILD_FILE" ) >/dev/null 2>&1 &
-}
 
 # =================================================================================== main ===
 case "${1:-}" in

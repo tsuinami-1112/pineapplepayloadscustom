@@ -1,0 +1,16 @@
+#!/bin/bash
+out=""; filt=""
+while [ $# -gt 0 ]; do case "$1" in -w) out="$2"; shift ;; -i|-s) shift ;; -nn) ;; *) filt="$filt $1" ;; esac; shift; done
+printf 'TCPDUMP %s [%s]\n' "$out" "$filt" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"
+t0=$(date +%s)
+le32() { printf "\\x$(printf %02x $(( $1 & 255 )))\\x$(printf %02x $(( ($1 >> 8) & 255 )))\\x$(printf %02x $(( ($1 >> 16) & 255 )))\\x$(printf %02x $(( ($1 >> 24) & 255 )))"; }
+write_pcap() {
+  secs=$(( $(date +%s) - t0 )); (( secs < 1 )) && secs=1
+  case "$filt" in *addr2*) per=$(cat /tmp/cs_harness_pps 2>/dev/null || echo ${HARNESS_UP_PPS:-14}); ol=1400 ;; *"not wlan addr2"*) per=1; ol=1400 ;; *) per=${HARNESS_DN_PPS:-2}; ol=200 ;; esac
+  { le32 2712847316; printf '\x02\x00\x04\x00'; le32 0; le32 0; le32 32; le32 127
+    for ((s = 0; s < secs; s++)); do for ((i = 0; i < per; i++)); do le32 $((t0 + s)); le32 $((i * 1000)); le32 32; le32 "$ol"; printf '%032d' 0 | tr 0 '\0'; done; done; } > "$out"
+  echo "0 packets dropped by kernel" >&2
+  exit 0
+}
+trap write_pcap TERM INT
+while :; do sleep 0.2; done

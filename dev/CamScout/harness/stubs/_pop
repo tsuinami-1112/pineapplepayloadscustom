@@ -1,0 +1,6 @@
+#!/bin/bash
+# pops the first line of the answers file; prints it; empty if none
+f="${HARNESS_ANSWERS:-/tmp/cs_harness_answers}"
+exec 9>>"$f.lock"; flock 9
+a=$(head -n1 "$f" 2>/dev/null); tail -n +2 "$f" > "$f.n" 2>/dev/null; mv "$f.n" "$f"
+printf '%s' "$a"

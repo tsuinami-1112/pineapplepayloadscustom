@@ -1,0 +1,12 @@
+C056E3	Hangzhou Hikvision Digital Technology Co.,Ltd.
+EC71DB	Reolink Innovation Limited
+A4DA22	Wyze Labs Inc
+50C7BF	TP-Link Systems Inc
+3C6A2C	Intel Corporate
+24A160	Espressif Inc.
+00FC8B	Amazon Technologies Inc.
+9C3DCF	Netgear
+E8DB84	Espressif Inc.
+44D9E7	Ubiquiti Inc
+B0A7B9	TP-Link Systems Inc
+00E04C	Realtek Semiconductor Corp.
