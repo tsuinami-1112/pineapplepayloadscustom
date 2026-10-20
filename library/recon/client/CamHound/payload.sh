@@ -1,12 +1,12 @@
 #!/bin/bash
 # shellcheck disable=SC2034   # config and scan-state declarations are copied verbatim; the hook uses a subset
-# Title: CamScout (Recon hook)
-# Description: Run CamScout's Watch (live view), Stimulus test or Locate on the AP or client that is
-#              selected in the Recon menu. The same file is installed as recon/client/CamScout and
-#              recon/access_point/CamScout; it branches at run time on the selected-client variable.
-#              GENERATED FILE: dev/CamScout/gen_hooks.sh copies the config block, the lib block and
-#              the watch-core block verbatim from library/user/reconnaissance/CamScout/payload.sh.
-#              Edit the user payload and regenerate; dev/CamScout/check_sync.sh verifies the copies.
+# Title: CamHound (Recon hook)
+# Description: Run CamHound's Watch (live view), Stimulus test or Locate on the AP or client that is
+#              selected in the Recon menu. The same file is installed as recon/client/CamHound and
+#              recon/access_point/CamHound; it branches at run time on the selected-client variable.
+#              GENERATED FILE: dev/CamHound/gen_hooks.sh copies the config block, the lib block and
+#              the watch-core block verbatim from library/user/reconnaissance/CamHound/payload.sh.
+#              Edit the user payload and regenerate; dev/CamHound/check_sync.sh verifies the copies.
 # Author: tsuinami-1112
 # Version: 1.0
 # Category: reconnaissance
@@ -21,13 +21,13 @@
 # B/C/Y/R SOLID  - Locate tiers cold/warm/strong/hot (click per sample, vibe at hot)
 # FINISH, OFF    - clean exit
 
-PAYLOAD_REL="user/reconnaissance/CamScout"
-PAYLOAD_REL_ALT="recon/client/CamScout recon/access_point/CamScout"   # the v1.1 hooks live here
-PAYLOAD_NAME="camscout"
+PAYLOAD_REL="user/reconnaissance/CamHound"
+PAYLOAD_REL_ALT="recon/client/CamHound recon/access_point/CamHound"   # the v1.1 hooks live here
+PAYLOAD_NAME="camhound"
 VERSION="1.0"
 
 # ----------------------------------------------------------------------------- config block ---
-# Starred keys may be overridden without editing: PAYLOAD_SET_CONFIG camscout <KEY> <value>
+# Starred keys may be overridden without editing: PAYLOAD_SET_CONFIG camhound <KEY> <value>
 # All weights and thresholds are lab starting points; see README "Test matrix" (Measured column).
 MODE="ROOM"             # ROOM or SITE (menu toggle; changes alerting/proximity/sort, never the list)
 CYCLE_SECS=20           # * scan period (floor 5)
@@ -78,7 +78,7 @@ BCN_CAP_COUNT=5         # beacons to capture per posture read (first usable one 
 POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
 RESP_LOCK_SECS=20       # EXAMINE lock duration held across a response
 RESP_SETTLE_SECS=6      # * wait after transmitting before re-reading the target to judge the effect
-LOOT_DIR="/root/loot/CamScout"
+LOOT_DIR="/root/loot/CamHound"
 OUI_FILE="/lib/hak5/oui.txt"; OUI_FILE_ALT="/rom/lib/hak5/oui.txt"
 # identity weights (constants, not table columns)
 W_OUI=45; W_WEAK=20; W_MODULE=0; W_ENDPOINT=-25; W_SSID=45; W_SSID_WEAK=15
@@ -87,7 +87,7 @@ W_HIDDEN=10; W_KIT=35; W_KIT_WEAK=10; W_PROBE=5; W_RAND=-40
 W_STREAM_RATE=30; W_STREAM_FAST=35; W_SUSTAIN=10; W_ASYM=15; W_EVENT=60; W_EVENT_WEAK=40; W_BUSY=10; W_DOWN=-20
 # ------------------------------------------------------------------------- end config block ---
 
-# --- camscout lib begin ---
+# --- camhound lib begin ---
 shopt -s extglob nocasematch 2>/dev/null; shopt -u nocasematch
 declare -A SIG_VENDOR_PAT SIG_VENDOR_CAT SIG_VENDOR_TYPE   # keyed by label
 declare -A SIG_OUI_LABEL SIG_OUI_CAT                                        # keyed by hex prefix
@@ -377,7 +377,7 @@ posture_expect() {
 # ---- beacon posture read -------------------------------------------------------------------
 # Walks a captured beacon's tagged parameters for element 48 (RSN) and 127 (Extended Capabilities).
 # No managed interface on this device can scan 5/6 GHz (radio0 is 2g, radio1 is monitor-only), so
-# the beacon on RECON_IF is the only posture source that covers every band CamScout reports on.
+# the beacon on RECON_IF is the only posture source that covers every band CamHound reports on.
 POSTURE_RSN=-; POSTURE_EXT=-; BCN_HEX=""; BCN_IES=0
 
 hex_u16le() {   # hex_u16le <hexstring> <index0> -> decimal, nonzero rc if short
@@ -790,7 +790,7 @@ preflight() {
   local i a
   mkdir -p "$LOOT_DIR" 2>/dev/null
   printf -v RUN_ID '%(%Y%m%d_%H%M%S)T' -1; RUN_T0=$EPOCHSECONDS
-  if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamScout: _pineap not found" 2>/dev/null; exit 0; fi
+  if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamHound: _pineap not found" 2>/dev/null; exit 0; fi
   command -v jq >/dev/null 2>&1 && HAVE_JQ=1
   command -v tcpdump >/dev/null 2>&1 && command -v hexdump >/dev/null 2>&1 && HAVE_TCPDUMP=1
   [ -r "$OUI_FILE" ] || OUI_FILE="$OUI_FILE_ALT"
@@ -800,14 +800,14 @@ preflight() {
   [ -n "$a" ] && { BANDS_LINE="$a"; [[ $a != *6* ]] && BANDS_LINE+=" (6 GHz not scanned)"; }
   if [ -f "$INSTALL_DIR/cam_signatures.txt" ]; then load_signatures "$INSTALL_DIR/cam_signatures.txt"; SIG_SOURCE="file"; fi
   if (( SIG_COUNT < 10 )); then load_signatures <(builtin_signatures); SIG_SOURCE="built-in"; fi
-  (( SIG_COUNT == 0 )) && { set_state FAIL; ERROR_DIALOG "CamScout: no signatures" 2>/dev/null; exit 0; }
+  (( SIG_COUNT == 0 )) && { set_state FAIL; ERROR_DIALOG "CamHound: no signatures" 2>/dev/null; exit 0; }
 }
 BANDS_LINE=""; INSTALL_DIR=""
 run_lock() {
   local pid
   pid=$(cat "$LOCK_FILE" 2>/dev/null)
   if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && grep -qa payload "/proc/$pid/cmdline" 2>/dev/null; then
-    LOG red "CamScout already running (pid $pid)"; exit 0
+    LOG red "CamHound already running (pid $pid)"; exit 0
   fi
   kill_children; pkill -f "^_pineap MONITOR" 2>/dev/null   # anchored: only a real MONITOR process
   printf '%s' "$$" >"$LOCK_FILE"; : >"$CHILD_FILE"
@@ -818,7 +818,7 @@ run_lock() {
     _pineap EXAMINE CANCEL; PINEAPPLE_EXAMINE_RESET
     [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ] && rm -f "$LOCK_FILE" "$CHILD_FILE" ) >/dev/null 2>&1 &
 }
-# --- camscout lib end ---
+# --- camhound lib end ---
 # --- watch core begin ---
 # pcap parser: hexdump words -> per-second buckets "ts bytes frames big" (all four magics; -s 32 records)
 PCAP_AWK='
@@ -1045,7 +1045,7 @@ summary_card() {
   case "$V_WORD" in STREAM|EVENT) col=red; set_state WATCH_HIT ;; EVENT?) col=yellow; set_state LANE ;; DOWN) col=cyan; set_state SCAN ;; *) col=""; set_state SCAN ;; esac
   LOG $col "$V_WORD$weak $( [ "$mode" = stim ] && printf 'best of %s' "${RUNS_N[$mac]}" ) -> ${CONF[$mac]} ${BANDNAME[$mac]}"
   LOG "up $(fmt10 "$up10")/s dn $(fmt10 "$dn10")/s as $( (( as10 >= 0 )) && fmt10 "$as10" || printf -- -) cv $cv"$'\n'"~$(rate_band "$up10") Mbps band"$'\n'"${V_TEXT}"
-  # A STREAM/EVENT verdict is the strongest evidence CamScout can produce that this is a live
+  # A STREAM/EVENT verdict is the strongest evidence CamHound can produce that this is a live
   # camera, so it is where the response funnel belongs: detect -> Watch -> confirmed -> Disrupt.
   if [ "$V_WORD" = STREAM ] || [ "$V_WORD" = EVENT ]; then
     if auto_respond_ok "$mac" && confirm "Streaming confirmed. Disrupt ${ID_LABEL[$mac]:-${mac:9}}?"; then
@@ -1278,7 +1278,7 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
 }
 
 # auto_respond_ok <mac> -> 0 when the funnel may offer Disrupt without being asked.
-# Two keys, not one: RESPONSE opens the manual rung, AUTO_RESPOND additionally lets CamScout
+# Two keys, not one: RESPONSE opens the manual rung, AUTO_RESPOND additionally lets CamHound
 # raise it on its own. Note this resolves the target as a side effect, leaving R_* set.
 auto_respond_ok() {
   [ "$RESPONSE" = 1 ] || return 1
@@ -1343,9 +1343,9 @@ posture_why() {   # one line of plain English for a badge
 
 # ============================================================================== hook main ===
 # Entered from the Recon menu with a selected AP or client. Everything above this line is copied
-# from the user payload by dev/CamScout/gen_hooks.sh.
+# from the user payload by dev/CamHound/gen_hooks.sh.
 case "${1:-}" in
-  -h|--help|--selftest|--replay) printf 'CamScout Recon hook: launch it from the Recon AP or client menu. Laptop checks live in the user payload (payload.sh --selftest).\n'; exit 0 ;;
+  -h|--help|--selftest|--replay) printf 'CamHound Recon hook: launch it from the Recon AP or client menu. Laptop checks live in the user payload (payload.sh --selftest).\n'; exit 0 ;;
 esac
 write_report() { :; }          # the hook keeps no report; cleanup() may call it
 HOOK_MAC=""

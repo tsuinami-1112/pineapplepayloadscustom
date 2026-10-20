@@ -1,9 +1,9 @@
 
 # ============================================================================== hook main ===
 # Entered from the Recon menu with a selected AP or client. Everything above this line is copied
-# from the user payload by dev/CamScout/gen_hooks.sh.
+# from the user payload by dev/CamHound/gen_hooks.sh.
 case "${1:-}" in
-  -h|--help|--selftest|--replay) printf 'CamScout Recon hook: launch it from the Recon AP or client menu. Laptop checks live in the user payload (payload.sh --selftest).\n'; exit 0 ;;
+  -h|--help|--selftest|--replay) printf 'CamHound Recon hook: launch it from the Recon AP or client menu. Laptop checks live in the user payload (payload.sh --selftest).\n'; exit 0 ;;
 esac
 write_report() { :; }          # the hook keeps no report; cleanup() may call it
 HOOK_MAC=""

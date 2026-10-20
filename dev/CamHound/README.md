@@ -1,6 +1,6 @@
-# CamScout development notes
+# CamHound development notes
 
-Developer material for `library/user/reconnaissance/CamScout` and its Recon-menu hooks. Nothing in
+Developer material for `library/user/reconnaissance/CamHound` and its Recon-menu hooks. Nothing in
 this folder runs on the Pager; it is for whoever builds the next phases.
 
 ## Files
@@ -8,13 +8,13 @@ this folder runs on the Pager; it is for whoever builds the next phases.
 | File | Purpose |
 |---|---|
 | `PLAN_v2.md` | the full design: user answers, adopted ideas, confidence model, feature list, phases, the Phase 0 spike table (section 7.1) |
-| `gen_hooks.sh` | regenerates `library/recon/{client,access_point}/CamScout/` from the user payload (header + config + lib block + watch-core block + `hook_main.sh`) |
+| `gen_hooks.sh` | regenerates `library/recon/{client,access_point}/CamHound/` from the user payload (header + config + lib block + watch-core block + `hook_main.sh`) |
 | `check_sync.sh` | fails when the shared blocks differ between the user payload and the hooks |
 | `hook_header.sh`, `hook_main.sh` | the hook-only parts |
 | `harness/run_harness.sh` | laptop harness: stub DuckyScript commands, fake `_pineap`/`tcpdump`/`iwinfo`, RECON fixtures; scenarios live, stimulus, lock, nojq, locate |
 
 Rule: edit the user payload, then `gen_hooks.sh`, then `check_sync.sh`, then `payload.sh --selftest`
-and `harness/run_harness.sh`. The lib block (`# --- camscout lib begin/end ---`) and the watch-core
+and `harness/run_harness.sh`. The lib block (`# --- camhound lib begin/end ---`) and the watch-core
 block (`# --- watch core begin/end ---`) must stay self-contained: everything Watch and Locate need
 lives inside them.
 
@@ -59,7 +59,7 @@ clean). The v1.1 Recon hooks are generated and checked the same way. No Pager ha
    RECON row cap is proven; BLE co-hit; real pocket mode (DISABLE_DISPLAY); external capture radio;
    MODE persistence.
 
-Out of CamScout's scope by design: DEVICE_FILTER response hooks, WiGLE upload, generated OUI
+Out of CamHound's scope by design: DEVICE_FILTER response hooks, WiGLE upload, generated OUI
 tables, per-row weights, BLE-only lists, `iw set channel` while PineAP hops, recon.db reads per
-cycle, SSDP/active mDNS/nmap auto-install, `exec "$0"`. Deauthentication is not part of CamScout;
+cycle, SSDP/active mDNS/nmap auto-install, `exec "$0"`. Deauthentication is not part of CamHound;
 the project owner writes that as a separate component.

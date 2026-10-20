@@ -1,51 +1,33 @@
 #!/bin/bash
-# Title: CamScout
-# Description: Passive Wi-Fi camera census for the Pager. Lists every camera-vendor and
-#              camera-capable 802.11 device PineAP Recon can hear, categorises it, grades it on
-#              a 0-100 confidence scale, and (on request) locks on one suspect to test whether it
-#              is streaming (Watch), whether it reacts to movement (Stimulus test) or where it is
-#              (Locate). Identity scan is passive and free; Watch/Locate pause Recon hopping for
-#              the duration of the lock. No LAN join. With RESPONSE=1 a fourth rung appears on the
-#              device card: read the target's PMF/beacon-protection posture from its own beacon,
-#              then disconnect it with deauth+disassoc, channel-switch announcements, or all three,
-#              and judge from Recon whether it actually went quiet. RESPONSE defaults to 0, in
-#              which case nothing is transmitted and the device card is unchanged.
+# shellcheck disable=SC2034   # config and scan-state declarations are copied verbatim; the hook uses a subset
+# Title: CamHound (Recon hook)
+# Description: Run CamHound's Watch (live view), Stimulus test or Locate on the AP or client that is
+#              selected in the Recon menu. The same file is installed as recon/client/CamHound and
+#              recon/access_point/CamHound; it branches at run time on the selected-client variable.
+#              GENERATED FILE: dev/CamHound/gen_hooks.sh copies the config block, the lib block and
+#              the watch-core block verbatim from library/user/reconnaissance/CamHound/payload.sh.
+#              Edit the user payload and regenerate; dev/CamHound/check_sync.sh verifies the copies.
 # Author: tsuinami-1112
 # Version: 1.0
 # Category: reconnaissance
-# Dependencies: _pineap (PineAP engine, Recon running in the GUI), jq (fallback: built-in parser),
-#               tcpdump (Watch only; without it Watch is greyed), hexdump, awk, iwinfo, timeout,
-#               /lib/hak5/oui.txt (fallback /rom/lib/hak5/oui.txt; fallback built-in OUI rows).
-# Data file:    cam_signatures.txt next to payload.sh (built-in copy used when missing).
-# Loot:         /root/loot/CamScout/{inventory.tsv,events.log,report_<run>.txt,watch_<ts>_<mac>.tsv}
+# Dependencies: _pineap, tcpdump + hexdump (Watch), iwinfo, /lib/hak5/oui.txt; cam_signatures.txt next
+#               to this file or in the user payload directory (both are probed).
 #
 # LED State Descriptions
-# SETUP              - loading signatures and preflight
-# CYAN SLOW          - scanning (identity cycle every CYCLE_SECS)
-# AMBER              - new LIKELY device this cycle (+ one short vibe)
-# RED SLOW           - new CONFIRMED device this cycle (+ triple vibe, + ringtone if SOUND=1)
-# YELLOW             - new STREAM-lane row (behaviour without identity), or Watch INCONCLUSIVE
-# CYAN VERYFAST      - Watch running (Recon hopping paused by the EXAMINE lock)
-# R SOLID            - Watch reached STREAM or EVENT (+ one long vibe)
-# B/C/Y/R SOLID      - Locate tiers cold/warm/strong/hot (click per sample, vibe at hot)
-# MAGENTA            - response transmitting (channel locked for the burst)
-# GREEN              - response MOVED: the target stopped transmitting (+ one long vibe)
-# YELLOW             - response NO_EFFECT or INCONCLUSIVE
-# FAIL               - preflight failure (no _pineap or no vendor table) then exit
-# FINISH, then OFF   - clean exit
-# States persist until the next cycle restores CYAN SLOW; set_state() never sleeps.
-#
-# Credits: device_hunter (MONITOR loop), SkimmerScanner (signature file + install-dir probe),
-#          SignalFence/live_probe (wlan1mon capture), find_hackers (RECON JSON shape),
-#          Tunnel_Rat (EXAMINE lock from a user payload). Design notes in README.md.
+# SETUP          - loading signatures and preflight
+# CYAN VERYFAST  - Watch running (Recon hopping paused by the EXAMINE lock)
+# R SOLID        - Watch reached STREAM or EVENT (+ one long vibe)
+# YELLOW         - Watch INCONCLUSIVE (+ one short vibe)
+# B/C/Y/R SOLID  - Locate tiers cold/warm/strong/hot (click per sample, vibe at hot)
+# FINISH, OFF    - clean exit
 
-PAYLOAD_REL="user/reconnaissance/CamScout"
-PAYLOAD_REL_ALT="recon/client/CamScout recon/access_point/CamScout"   # the v1.1 hooks live here
-PAYLOAD_NAME="camscout"
+PAYLOAD_REL="user/reconnaissance/CamHound"
+PAYLOAD_REL_ALT="recon/client/CamHound recon/access_point/CamHound"   # the v1.1 hooks live here
+PAYLOAD_NAME="camhound"
 VERSION="1.0"
 
 # ----------------------------------------------------------------------------- config block ---
-# Starred keys may be overridden without editing: PAYLOAD_SET_CONFIG camscout <KEY> <value>
+# Starred keys may be overridden without editing: PAYLOAD_SET_CONFIG camhound <KEY> <value>
 # All weights and thresholds are lab starting points; see README "Test matrix" (Measured column).
 MODE="ROOM"             # ROOM or SITE (menu toggle; changes alerting/proximity/sort, never the list)
 CYCLE_SECS=20           # * scan period (floor 5)
@@ -96,7 +78,7 @@ BCN_CAP_COUNT=5         # beacons to capture per posture read (first usable one 
 POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
 RESP_LOCK_SECS=20       # EXAMINE lock duration held across a response
 RESP_SETTLE_SECS=6      # * wait after transmitting before re-reading the target to judge the effect
-LOOT_DIR="/root/loot/CamScout"
+LOOT_DIR="/root/loot/CamHound"
 OUI_FILE="/lib/hak5/oui.txt"; OUI_FILE_ALT="/rom/lib/hak5/oui.txt"
 # identity weights (constants, not table columns)
 W_OUI=45; W_WEAK=20; W_MODULE=0; W_ENDPOINT=-25; W_SSID=45; W_SSID_WEAK=15
@@ -105,7 +87,7 @@ W_HIDDEN=10; W_KIT=35; W_KIT_WEAK=10; W_PROBE=5; W_RAND=-40
 W_STREAM_RATE=30; W_STREAM_FAST=35; W_SUSTAIN=10; W_ASYM=15; W_EVENT=60; W_EVENT_WEAK=40; W_BUSY=10; W_DOWN=-20
 # ------------------------------------------------------------------------- end config block ---
 
-# --- camscout lib begin ---
+# --- camhound lib begin ---
 shopt -s extglob nocasematch 2>/dev/null; shopt -u nocasematch
 declare -A SIG_VENDOR_PAT SIG_VENDOR_CAT SIG_VENDOR_TYPE   # keyed by label
 declare -A SIG_OUI_LABEL SIG_OUI_CAT                                        # keyed by hex prefix
@@ -395,7 +377,7 @@ posture_expect() {
 # ---- beacon posture read -------------------------------------------------------------------
 # Walks a captured beacon's tagged parameters for element 48 (RSN) and 127 (Extended Capabilities).
 # No managed interface on this device can scan 5/6 GHz (radio0 is 2g, radio1 is monitor-only), so
-# the beacon on RECON_IF is the only posture source that covers every band CamScout reports on.
+# the beacon on RECON_IF is the only posture source that covers every band CamHound reports on.
 POSTURE_RSN=-; POSTURE_EXT=-; BCN_HEX=""; BCN_IES=0
 
 hex_u16le() {   # hex_u16le <hexstring> <index0> -> decimal, nonzero rc if short
@@ -808,7 +790,7 @@ preflight() {
   local i a
   mkdir -p "$LOOT_DIR" 2>/dev/null
   printf -v RUN_ID '%(%Y%m%d_%H%M%S)T' -1; RUN_T0=$EPOCHSECONDS
-  if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamScout: _pineap not found" 2>/dev/null; exit 0; fi
+  if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamHound: _pineap not found" 2>/dev/null; exit 0; fi
   command -v jq >/dev/null 2>&1 && HAVE_JQ=1
   command -v tcpdump >/dev/null 2>&1 && command -v hexdump >/dev/null 2>&1 && HAVE_TCPDUMP=1
   [ -r "$OUI_FILE" ] || OUI_FILE="$OUI_FILE_ALT"
@@ -818,14 +800,14 @@ preflight() {
   [ -n "$a" ] && { BANDS_LINE="$a"; [[ $a != *6* ]] && BANDS_LINE+=" (6 GHz not scanned)"; }
   if [ -f "$INSTALL_DIR/cam_signatures.txt" ]; then load_signatures "$INSTALL_DIR/cam_signatures.txt"; SIG_SOURCE="file"; fi
   if (( SIG_COUNT < 10 )); then load_signatures <(builtin_signatures); SIG_SOURCE="built-in"; fi
-  (( SIG_COUNT == 0 )) && { set_state FAIL; ERROR_DIALOG "CamScout: no signatures" 2>/dev/null; exit 0; }
+  (( SIG_COUNT == 0 )) && { set_state FAIL; ERROR_DIALOG "CamHound: no signatures" 2>/dev/null; exit 0; }
 }
 BANDS_LINE=""; INSTALL_DIR=""
 run_lock() {
   local pid
   pid=$(cat "$LOCK_FILE" 2>/dev/null)
   if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && grep -qa payload "/proc/$pid/cmdline" 2>/dev/null; then
-    LOG red "CamScout already running (pid $pid)"; exit 0
+    LOG red "CamHound already running (pid $pid)"; exit 0
   fi
   kill_children; pkill -f "^_pineap MONITOR" 2>/dev/null   # anchored: only a real MONITOR process
   printf '%s' "$$" >"$LOCK_FILE"; : >"$CHILD_FILE"
@@ -836,397 +818,7 @@ run_lock() {
     _pineap EXAMINE CANCEL; PINEAPPLE_EXAMINE_RESET
     [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ] && rm -f "$LOCK_FILE" "$CHILD_FILE" ) >/dev/null 2>&1 &
 }
-# --- camscout lib end ---
-
-# ================================================================================== cycle ===
-declare -A SCORED HINTED NOALERT PENDING_OFFER
-declare -a AP_LINES CLI_LINES
-BASELINE_NEXT=1; TOP_OFFER_DONE=0
-
-# kit_eval: AP + client label consensus (resolved labels, not raw prefixes)
-kit_eval() {
-  local ap c vt vl n cons ok mod weak ssid
-  for ap in "${!CLIENTS_OF[@]}"; do
-    [ -n "${ROLE[$ap]}" ] || continue
-    KITAP[$ap]=""; n=0; cons=""; ok=1; mod=1; weak=1
-    for c in ${CLIENTS_OF[$ap]}; do
-      is_rand "$c" && continue
-      vendor_sig "$c"; vt="${VEND_TYPE[$c]}"; vl="${VEND_LABEL[$c]}"; n=$((n + 1))
-      case "$vt" in
-        OUI|VENDOR)    mod=0; weak=0; if [ -z "$cons" ]; then cons="$vl"; elif [ "$cons" != "$vl" ]; then ok=0; fi ;;
-        VENDOR_WEAK)   mod=0; ok=0; if [ -z "$cons" ]; then cons="$vl"; elif [ "$cons" != "$vl" ]; then weak=0; fi ;;
-        VENDOR_MODULE) ok=0; weak=0 ;;
-        *)             ok=0; mod=0; weak=0 ;;
-      esac
-    done
-    (( n < KIT_MIN_CLIENTS )) && continue
-    vendor_sig "$ap"; ssid="${SSID_CLEAN[$ap]}"
-    if (( ok )) && [ -n "$cons" ]; then
-      if [ "${VEND_LABEL[$ap]}" = "$cons" ] || { [ "${VEND_TYPE[$ap]}" = NONE ] && { [ "${HIDDEN[$ap]}" = 1 ] || is_rand "$ap"; }; }; then
-        KITAP[$ap]=1; for c in ${CLIENTS_OF[$ap]}; do is_rand "$c" || KITCL[$c]=1; done; continue
-      fi
-    fi
-    if (( mod )) && { [ "${HIDDEN[$ap]}" = 1 ] || [ -z "$ssid" ] || [[ $ssid =~ [0-9A-Fa-f]{4}$ ]]; }; then KITAP[$ap]="?"; continue; fi
-    if (( weak )) && [ -n "$cons" ] && [ "${VEND_LABEL[$ap]}" = "$cons" ]; then KITAP[$ap]="?"; fi
-  done
-}
-
-# busy_eval: RATE >= BUSY_PPS for BUSY_CYCLES cycles AND top-3 by RATE among clients on the same band
-busy_eval() {
-  local mac b r; local -A t1 t2 t3
-  for mac in "${SEEN_THIS_CYCLE[@]}"; do
-    [ "${ROLE[$mac]}" = ap ] && continue; r="${RATE[$mac]}"; [ -z "$r" ] && continue; b="${BAND[$mac]:-?}"
-    if (( r > ${t1[$b]:--1} )); then t3[$b]=${t2[$b]:--1}; t2[$b]=${t1[$b]:--1}; t1[$b]=$r
-    elif (( r > ${t2[$b]:--1} )); then t3[$b]=${t2[$b]:--1}; t2[$b]=$r
-    elif (( r > ${t3[$b]:--1} )); then t3[$b]=$r; fi
-  done
-  for mac in "${SEEN_THIS_CYCLE[@]}"; do
-    [ "${ROLE[$mac]}" = ap ] && continue; r="${RATE[$mac]}"; b="${BAND[$mac]:-?}"
-    if [ -n "$r" ] && (( r >= BUSY_PPS * 10 )) && (( r >= ${t3[$b]:-0} )); then BUSY_N[$mac]=$(( ${BUSY_N[$mac]:-0} + 1 )); else BUSY_N[$mac]=0; fi
-    if (( ${BUSY_N[$mac]} >= BUSY_CYCLES )); then BUSY[$mac]=1; else BUSY[$mac]=""; fi
-  done
-}
-
-band_rank() { case "$1" in CONFIRMED) printf 3 ;; LIKELY) printf 2 ;; STREAM|POSSIBLE) printf 1 ;; *) printf 0 ;; esac; }
-
-run_cycle() {
-  local line mac pk ssid ch fr sig hid t ap probes k=0 top=0 u=0 bz=0 r prev now_rank
-  SEEN_THIS_CYCLE=(); NEW_LIKELY=(); NEW_CONFIRMED=(); NEW_LANE=(); CLIENTS_OF=(); SCORED=(); KITCL=(); KITAP=(); NOALERT=(); RSSI_IMPROVED=()
-  CYCLE=$((CYCLE + 1))
-  mapfile -t AP_LINES < <(recon_lines APS)
-  mapfile -t CLI_LINES < <(recon_lines CLIENTS)
-  if (( ${#AP_LINES[@]} == 0 && ${#CLI_LINES[@]} == 0 )); then RECON_EMPTY=$((RECON_EMPTY + 1)); else RECON_EMPTY=0; fi
-  for line in "${AP_LINES[@]}"; do
-    IFS='|' read -r mac pk ssid ch fr sig hid t <<<"$line"
-    mac=${mac,,}; [[ $mac =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || continue
-    [[ $OWN_MACS == *" $mac "* ]] && continue
-    record_seen "$mac" ap "$ssid" "$ch" "$fr" "$sig"
-    HIDDEN[$mac]=0; { [ "$hid" = 1 ] || [ -z "${SSID_CLEAN[$mac]}" ]; } && HIDDEN[$mac]=1
-  done
-  for line in "${CLI_LINES[@]}"; do
-    IFS='|' read -r mac ap pk sig probes fr t ch <<<"$line"
-    mac=${mac,,}; [[ $mac =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || continue
-    [[ $OWN_MACS == *" $mac "* ]] && continue
-    ap=${ap,,}; case "$ap" in ""|-|00:00:00:00:00:00|ff:ff:ff:ff:ff:ff) ap="-" ;; esac
-    [[ $ap =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || ap="-"
-    [ "$fr" = 0 ] && [ "$ap" != "-" ] && fr=${FREQ[$ap]:-0}
-    [ "$ch" = 0 ] && [ "$ap" != "-" ] && ch=${CH[$ap]:-0}
-    record_seen "$mac" cli "${SSID_CLEAN[$ap]}" "$ch" "$fr" "$sig"
-    AP_OF[$mac]="$ap"; PROBES[$mac]="$probes"
-    [[ $pk =~ ^[0-9]+$ ]] && rate_update "$mac" "$pk"
-    [ "$ap" != "-" ] && CLIENTS_OF[$ap]+=" $mac"
-  done
-  kit_eval; busy_eval
-  for mac in "${SEEN_THIS_CYCLE[@]}"; do
-    [ -n "${SCORED[$mac]}" ] && continue; SCORED[$mac]=1
-    score_device "$mac"; prox_of "$mac"
-  done
-  # kit clients inherit the AP band silently
-  for mac in "${!KITCL[@]}"; do
-    ap="${AP_OF[$mac]}"; [ -n "$ap" ] && [ "$ap" != "-" ] || continue
-    if (( ${CONF[$ap]:-0} > ${CONF[$mac]:-0} )); then CONF[$mac]=${CONF[$ap]}; BANDNAME[$mac]=${BANDNAME[$ap]}; fi
-    NOALERT[$mac]=1
-  done
-  # alert collection
-  for mac in "${!SCORED[@]}"; do
-    [ -n "${IGNORED[$mac]}" ] && continue
-    now_rank=$(band_rank "${BANDNAME[$mac]}"); prev=${ALERTED_BAND[$mac]:-0}
-    if (( now_rank >= 1 )) && [[ ${TAGS[$mac]} != *RAND* ]] && [ "${LANE[$mac]}" != STREAM ] && [ "${BANDNAME[$mac]}" != MODULE ] && (( ${N_SEEN[$mac]} == 1 )); then
-      k=$((k + 1)); (( ${CONF[$mac]} > top )) && top=${CONF[$mac]}
-    fi
-    [ "${BANDNAME[$mac]}" = MODULE ] && [ "${ROLE[$mac]}" != ap ] && [[ ${TAGS[$mac]} != *RAND* ]] && u=$((u + 1))
-    [ "${BUSY[$mac]}" = 1 ] && bz=$((bz + 1))
-    if (( BASELINE_NEXT )); then (( now_rank > prev )) && ALERTED_BAND[$mac]=$now_rank; continue; fi
-    [ -n "${NOALERT[$mac]}" ] && { (( now_rank > prev )) && ALERTED_BAND[$mac]=$now_rank; continue; }
-    if (( now_rank > prev )); then
-      ALERTED_BAND[$mac]=$now_rank; ALERT_TS[$mac]=$EPOCHSECONDS
-      case "${BANDNAME[$mac]}" in
-        CONFIRMED) NEW_CONFIRMED+=("$mac") ;;
-        LIKELY)    NEW_LIKELY+=("$mac") ;;
-        STREAM)    NEW_LANE+=("$mac") ;;
-      esac
-    elif (( now_rank >= 2 )) && (( EPOCHSECONDS - ${ALERT_TS[$mac]:-0} >= COOLDOWN_SECS )) && [[ ${PROX[$mac]} == [NM] ]] && [ "${PROX_ALERTED[$mac]}" != "${PROX[$mac]}" ] && [[ ${PROX_ALERTED[$mac]:-F} == [F?] ]]; then
-      ALERT_TS[$mac]=$EPOCHSECONDS
-      [ "${BANDNAME[$mac]}" = CONFIRMED ] && NEW_CONFIRMED+=("$mac") || NEW_LIKELY+=("$mac")
-    fi
-    (( now_rank >= 2 )) && PROX_ALERTED[$mac]="${PROX[$mac]}"
-    # one-time hints
-    if [ -z "${HINTED[$mac]}" ] && [ "${BUSY[$mac]}" = 1 ]; then
-      if [ "${BANDNAME[$mac]}" = LIKELY ]; then HINTED[$mac]=1; ui_ok && LOG yellow "busy + ${ID_LABEL[$mac]} ${mac:9}: Watch?"
-      elif [ "${BANDNAME[$mac]}" = MODULE ] && [[ ${RSSI_LAST[$mac]:--99} =~ ^-?[0-9]+$ ]] && (( ${RSSI_LAST[$mac]:--99} >= MODULE_HINT_RSSI )); then
-        HINTED[$mac]=1; ui_ok && LOG yellow "module ${mac//:/} strong+busy: Watch?"; fi
-    fi
-  done
-  STAT_K=$k; STAT_TOP=$top; STAT_U=$u; STAT_B=$bz
-  gps_tick; battery_tick
-  upsert_inventory
-  (( CYCLE % REPORT_EVERY == 0 )) && write_report quiet
-  log cycle "c=$CYCLE aps=${#AP_LINES[@]} clients=${#CLI_LINES[@]} new=$k top=$top modules=$u busy=$bz"
-}
-declare -A PROX_ALERTED
-STAT_K=0; STAT_TOP=0; STAT_U=0; STAT_B=0
-
-# status + alert output for the cycle just computed (LOG blocks: one fork per colour)
-emit_cycle() {
-  local hhmm n=0 mac blk="" top_state=""
-  printf -v hhmm '%(%H:%M)T' -1
-  n=${#ROLE[@]}
-  if (( STAT_K > 0 )); then LOG "$hhmm $n+$STAT_K T$STAT_TOP U$STAT_U B$STAT_B [$MODE]"; else LOG "$hhmm $n U$STAT_U B$STAT_B [$MODE]"; fi
-  if (( BASELINE_NEXT )); then BASELINE_NEXT=0; LOG "baseline: $n devices, bands ${BANDS_LINE:-?}"; return 0; fi
-  if (( ${#NEW_LIKELY[@]} )); then
-    blk=""; for mac in "${NEW_LIKELY[@]}"; do blk+="${CONF[$mac]} ${ID_LABEL[$mac]:-${TAGS[$mac]%% *}} ${mac:9} ${PROX[$mac]}${RSSI_LAST[$mac]:-}"$'\n'; done
-    LOG yellow "LIKELY:"$'\n'"${blk%$'\n'}"
-    top_state=LIKELY_QUIET
-    for mac in "${NEW_LIKELY[@]}"; do
-      if [[ ${PROX[$mac]} != F ]] || [ "$ALERT_FAR" = 1 ]; then top_state=LIKELY; fi
-      log alert "LIKELY $mac ${CONF[$mac]} ${TAGS[$mac]} prox=${PROX[$mac]}"
-    done
-  fi
-  if (( ${#NEW_LANE[@]} )); then
-    blk=""; for mac in "${NEW_LANE[@]}"; do blk+="${CONF[$mac]} ${BEH_VERDICT[$mac]:-STREAM} ${mac:9} ${PROX[$mac]}${RSSI_LAST[$mac]:-}"$'\n'; log alert "LANE $mac ${CONF[$mac]}"; done
-    LOG yellow "no identity, streaming-like:"$'\n'"${blk%$'\n'}"
-    [ -z "$top_state" ] && top_state=LANE
-  fi
-  if (( ${#NEW_CONFIRMED[@]} )); then
-    blk=""; for mac in "${NEW_CONFIRMED[@]}"; do blk+="${CONF[$mac]} ${ID_LABEL[$mac]:-${TAGS[$mac]%% *}} ${mac:9} ${PROX[$mac]}${RSSI_LAST[$mac]:-}"$'\n'; log alert "CONFIRMED $mac ${CONF[$mac]} ${TAGS[$mac]} prox=${PROX[$mac]}"; done
-    LOG red "CONFIRMED:"$'\n'"${blk%$'\n'}"
-    top_state=CONFIRMED
-  fi
-  [ -n "$top_state" ] && set_state "$top_state"
-  # queue dialogs for the scan loop (issued between cycles)
-  for mac in "${NEW_CONFIRMED[@]}" "${NEW_LIKELY[@]}"; do [ -z "${OFFERED[$mac]}" ] && PENDING_OFFER[$mac]=1; done
-  return 0
-}
-
-# offer_dialogs: AUTO_WATCH funnel, at most one dialog per cycle, once per MAC
-offer_dialogs() {
-  local mac best="" bconf=0 brssi=-200 txt
-  if (( TOP_OFFER_DONE == 0 )) && (( CYCLE >= 1 )) && [ "$AUTO_WATCH" = 1 ]; then
-    TOP_OFFER_DONE=1
-    for mac in "${!CONF[@]}"; do
-      [ -n "${IGNORED[$mac]}" ] && continue
-      (( ${ID_PTS[$mac]:-0} >= 45 )) || continue
-      [[ ${RSSI_LAST[$mac]:--200} =~ ^-?[0-9]+$ ]] && (( ${RSSI_LAST[$mac]} >= AUTO_WATCH_RSSI )) || continue
-      auto_offer_ok "$mac" || continue
-      if (( ${CONF[$mac]} > bconf )) || { (( ${CONF[$mac]} == bconf )) && (( ${RSSI_LAST[$mac]} > brssi )); }; then best=$mac; bconf=${CONF[$mac]}; brssi=${RSSI_LAST[$mac]}; fi
-    done
-    if [ -n "$best" ]; then
-      txt="$(count_band CONFIRMED) CONFIRMED, $(count_band LIKELY) LIKELY. Watch top: ${ID_LABEL[$best]} ${best:9} ${RSSI_LAST[$best]}?"
-      OFFERED[$best]=1
-      if confirm "$txt"; then watch_menu "$best"; return 0; fi
-    fi
-  fi
-  for mac in "${!PENDING_OFFER[@]}"; do
-    unset "PENDING_OFFER[$mac]"
-    [ -n "${OFFERED[$mac]}" ] && continue
-    OFFERED[$mac]=1
-    if [ "$AUTO_WATCH" = 1 ] && auto_offer_ok "$mac"; then
-      if confirm "${BANDNAME[$mac]} ${ID_LABEL[$mac]} ${mac:9}: Watch now?"; then watch_menu "$mac"; fi
-      return 0
-    elif [ "$AUTO_LOCATE" = 1 ] && is_setup_ap "$mac" && (( ${CONF[$mac]} >= 45 )); then
-      if confirm "${BANDNAME[$mac]} ${ID_LABEL[$mac]} ${mac:9} (setup AP): Locate?"; then locate_target "$mac"; fi
-      return 0
-    elif [ "${BANDNAME[$mac]}" = CONFIRMED ] && auto_respond_ok "$mac"; then
-      # secondary path: a CONFIRMED device that cannot be Watched at all (no tcpdump, not associated)
-      if confirm "${BANDNAME[$mac]} ${ID_LABEL[$mac]} ${mac:9}: Disrupt?"; then disrupt_menu "$mac"; fi
-      return 0
-    elif [ "${BANDNAME[$mac]}" = CONFIRMED ] && [ "$ALERT_DIALOG" = 1 ]; then
-      ALERT "CONFIRMED ${ID_LABEL[$mac]}" "${mac} ${CONF[$mac]} ${TAGS[$mac]}" 2>/dev/null; return 0
-    fi
-  done
-}
-# watchable mac -> has a BSSID to lock on and tcpdump is present (the operator may Watch any such row)
-# is_setup_ap mac -> AP whose SSID matched a strong (setup / direct-mode) SSID row: never auto-offered Watch
-
-gps_tick() {
-  local fix lat lon mac
-  [ "$GPS" = 1 ] || return 0
-  (( GPS_BAD >= 2 && CYCLE % 5 != 0 )) && return 0
-  fix=$(timeout 3 GPS_GET 2>/dev/null); read -r lat lon _ <<<"$fix"
-  if [[ $lat =~ ^-?[0-9]+\.[0-9]+$ && $lon =~ ^-?[0-9]+\.[0-9]+$ && $lat != 0.000000 && $lon != 0.000000 && $lat != 0 ]]; then
-    GPS_BAD=0; GPS_LAST="$lat $lon"; [ -z "$GPS_FIRST" ] && GPS_FIRST="$lat $lon"
-    for mac in "${!RSSI_IMPROVED[@]}"; do LAT[$mac]=$lat; LON[$mac]=$lon; done
-  else GPS_BAD=$((GPS_BAD + 1)); fi
-}
-GPS_FIRST=""
-battery_tick() {
-  local b
-  (( EPOCHSECONDS - BATT_TS < 60 )) && return 0
-  BATT_TS=$EPOCHSECONDS
-  command -v BATTERY_PERCENT >/dev/null 2>&1 || return 0
-  b=$(timeout 3 BATTERY_PERCENT 2>/dev/null)
-  if [[ $b =~ ^[0-9]+$ ]]; then BATT=$b; (( b < 15 )) && [ -z "$BATT_WARNED" ] && { BATT_WARNED=1; LOG yellow "battery ${b}%"; }; else BATT="?"; fi
-}
-BATT_WARNED=""
-
-# inventory.tsv upsert: pending rows -> awk merge -> atomic mv (one fork per cycle)
-
-# ===================================================================================== UI ===
-declare -a ROW_TEXT ROW_MAC
-
-# pick_list "title" "default" items...  -> PICK (empty on B / cancel); items paginated by 10 with More...
-
-# row_for mac -> ROW (conf tags prox glyph rssi, cut to ROW_W, never a partial tag)
-ROW=""
-row_for() {
-  local mac="$1" t tags="" budget glyph="A" r
-  [ "${ROLE[$mac]}" = cli ] && glyph="c"
-  r="${RSSI_LAST[$mac]:-}"; [ -n "$r" ] && r=$(printf '%d' "$r" 2>/dev/null)
-  budget=$((ROW_W - 3 - 1 - 1 - 1 - ${#r} - 1))   # "NN " + " " + prox + glyph + rssi
-  for t in ${TAGS[$mac]}; do
-    [ "$t" = BUSY ] && continue
-    if (( ${#tags} + ${#t} + (${#tags} > 0 ? 1 : 0) <= budget )); then tags+="${tags:+ }$t"; fi
-  done
-  [ -z "$tags" ] && tags="${TAGS[$mac]%% *}"
-  ROW=$(printf '%2d %s %s%s%s' "$(( ${CONF[$mac]} > 99 ? 99 : ${CONF[$mac]} ))" "$tags" "${PROX[$mac]:-?}" "$glyph" "$r")
-  [ "${BUSY[$mac]}" = 1 ] && ROW+=" busy"
-  ROW=${ROW:0:$ROW_W}
-}
-
-# sort_macs KIND -> SORTED (bash insertion into buckets; zero fork)
-declare -a SORTED
-sort_macs() {   # by band rank desc, then prox N>M>F>?, then conf desc
-  local kind="$1" mac key; local -a keyed=()
-  for mac in "${!CONF[@]}"; do
-    [ -n "${IGNORED[$mac]}" ] && continue
-    case "$kind" in
-      hits)    (( ${CONF[$mac]} >= 20 )) || continue; [ "${BANDNAME[$mac]}" = MODULE ] && continue ;;
-      modules) { [[ ${TAGS[$mac]} =~ (^| )MODULE( |$) ]] && (( ${CONF[$mac]} < 45 )); } || continue; [ "${ROLE[$mac]}" = ap ] && continue ;;
-    esac
-    local p=3; case "${PROX[$mac]}" in N) p=0 ;; M) p=1 ;; F) p=2 ;; esac
-    local kit=0; [ "${KITAP[$mac]}" = "?" ] && kit=1
-    local bz=0; [ "${BUSY[$mac]}" = 1 ] && bz=1
-    local rs=${RSSI_LAST[$mac]:--200}; [[ $rs =~ ^-?[0-9]+$ ]] || rs=-200
-    if [ "$kind" = modules ]; then printf -v key '%d%d%04d%03d' $((1 - kit)) $((1 - bz)) $((200 + rs > 0 ? 400 - (200 + rs) : 400)) $((999 - ${CONF[$mac]}))
-    else printf -v key '%d%d%03d' $((3 - $(band_rank "${BANDNAME[$mac]}"))) "$p" $((999 - ${CONF[$mac]})); fi
-    keyed+=("$key $mac")
-  done
-  SORTED=()
-  local -a tmp; local i j item
-  tmp=("${keyed[@]}")
-  for ((i = 1; i < ${#tmp[@]}; i++)); do item="${tmp[i]}"; j=$((i - 1)); while (( j >= 0 )) && [[ "${tmp[j]}" > "$item" ]]; do tmp[j + 1]="${tmp[j]}"; j=$((j - 1)); done; tmp[j + 1]="$item"; done
-  for item in "${tmp[@]}"; do SORTED+=("${item#* }"); done
-}
-
-review_list() {
-  local mac last_band="" i
-  while :; do
-    sort_macs hits
-    ROW_TEXT=("Resume scan"); ROW_MAC=("")
-    last_band=""
-    for mac in "${SORTED[@]}"; do
-      if [ "${BANDNAME[$mac]}" != "$last_band" ]; then last_band="${BANDNAME[$mac]}"; ROW_TEXT+=("-- $last_band --"); ROW_MAC+=(""); fi
-      row_for "$mac"
-      for i in "${ROW_TEXT[@]}"; do [ "$i" = "$ROW" ] && { ROW="${ROW:0:$((ROW_W - 5))} ${mac:13}"; break; }; done
-      ROW_TEXT+=("$ROW"); ROW_MAC+=("$mac")
-    done
-    ROW_TEXT+=("Exit"); ROW_MAC+=("")
-    pick_list "[$MODE] Review hits (${#SORTED[@]})" "" "${ROW_TEXT[@]}" || return 0
-    case "$PICK" in
-      "Resume scan") return 0 ;;
-      "Exit") return 1 ;;
-      "-- "*) continue ;;
-    esac
-    for ((i = 0; i < ${#ROW_TEXT[@]}; i++)); do [ "${ROW_TEXT[i]}" = "$PICK" ] && { detail_card "${ROW_MAC[i]}"; break; }; done
-  done
-}
-
-modules_list() {
-  local mac i rows=0
-  sort_macs modules
-  ROW_TEXT=("not cameras until Watched"); ROW_MAC=("")
-  for mac in "${SORTED[@]}"; do
-    ROW=$(printf '%s %s %s%s' "${mac//:/}" "${VENDOR[$mac]:0:8}" "${PROX[$mac]:-?}" "${BUSY[$mac]:+ busy}")
-    [ "${KITAP[${AP_OF[$mac]:--}]}" = "?" ] && ROW+=" KIT?"
-    ROW_TEXT+=("${ROW:0:$ROW_W}"); ROW_MAC+=("$mac"); rows=$((rows + 1))
-  done
-  ROW_TEXT+=("Back"); ROW_MAC+=("")
-  pick_list "[$MODE] Unidentified modules ($rows)" "" "${ROW_TEXT[@]}" || return 0
-  case "$PICK" in "Back"|"not cameras until Watched") return 0 ;; esac
-  for ((i = 0; i < ${#ROW_TEXT[@]}; i++)); do [ "${ROW_TEXT[i]}" = "$PICK" ] && { detail_card "${ROW_MAC[i]}" watch; break; }; done
-}
-
-tag_lines() {   # tag_lines mac -> TAGTXT (one meaning per tag, max 3)
-  local t n=0; TAGTXT=""
-  for t in ${TAGS[$1]}; do
-    (( n >= 3 )) && break
-    if [ -n "${TAG_MEANING[$t]}" ]; then TAGTXT+="$t: ${TAG_MEANING[$t]}"$'\n'
-    elif [ -n "${SIG_VENDOR_CAT[$t]}" ]; then TAGTXT+="$t: vendor block (${SIG_VENDOR_CAT[$t]})"$'\n'
-    elif [ -n "${SIG_SSID_CAT[$t]}" ]; then TAGTXT+="$t: SSID pattern (${SIG_SSID_CAT[$t]})"$'\n'
-    else TAGTXT+="$t"$'\n'; fi
-    n=$((n + 1))
-  done
-}
-TAGTXT=""
-
-detail_card() {
-  local mac="$1" def="${2:-}" age wrow drow
-  [ -n "$mac" ] || return 0
-  while :; do
-    age=$(( EPOCHSECONDS - ${LAST_SEEN[$mac]:-$EPOCHSECONDS} ))
-    tag_lines "$mac"
-    LOG "[$MODE] ${CONF[$mac]} ${BANDNAME[$mac]} ${ROLE[$mac]} $mac"$'\n'"cat: ${CAT[$mac]} ${VENDOR[$mac]:--}"$'\n'"ssid: ${SSID_CLEAN[$mac]:--} ch${CH[$mac]:-?} ${BAND[$mac]:-?}GHz"$'\n'"rssi ${RSSI_LAST[$mac]:--} best ${RSSI_BEST[$mac]:--} ${PROX[$mac]:-?} ${age}s ago"$'\n'"${TAGTXT%$'\n'}"
-    if watchable "$mac"; then wrow="Watch"; elif [ "$HAVE_TCPDUMP" != 1 ]; then wrow="Watch (no tcpdump)"; else wrow="Watch n/a (not associated)"; fi
-    [ "$def" = watch ] && def="$wrow" || def="Back"
-    drow=""; [ "$RESPONSE" = 1 ] && drow=$(disrupt_row "$mac")
-    pick_list "${CONF[$mac]} ${ID_LABEL[$mac]:-${TAGS[$mac]%% *}} ${mac:9}" "$def" "$wrow" ${drow:+"$drow"} "Locate" "Ignore for session" "Back" || return 0
-    case "$PICK" in
-      "Disrupt"*) disrupt_menu "$mac" ;;
-      "Watch") watch_menu "$mac" ;;
-      "Watch n/a"*) LOG "probe-only: identity + Locate only; Locate updates on probe bursts (15-60 s) and the MAC may rotate" ;;
-      "Watch (no tcpdump)") LOG "tcpdump missing: opkg update; opkg install tcpdump" ;;
-      "Locate") if [ "${ROLE[$mac]}" = cli ] && is_rand "$mac" && [ "${AP_OF[$mac]:--}" = "-" ]; then LOG "randomised probe-only MAC: Locate not offered"; else locate_target "$mac"; fi ;;
-      "Ignore for session") IGNORED[$mac]=1; log ui "ignore $mac"; return 0 ;;
-      *) return 0 ;;
-    esac
-    def="Back"
-  done
-}
-
-mode_menu() {
-  pick_list "Mode (now $MODE)" "$MODE" "ROOM" "SITE" "Back" || return 0
-  case "$PICK" in ROOM|SITE) MODE="$PICK"; apply_mode; LOG "mode -> $MODE" ;; esac
-}
-
-# scan_loop: cycles until B opens Review and the operator picks Exit
-scan_loop() {
-  local rc
-  set_state SCAN
-  LOG "[$MODE] scanning. B = review/pause"
-  while :; do
-    run_cycle; emit_cycle
-    if (( RECON_EMPTY >= 3 )); then
-      RECON_EMPTY=0
-      if confirm "Recon list empty. Start a 60 s Recon scan?"; then PINEAPPLE_RECON_NEW 60 >/dev/null 2>&1; LOG "Recon started (60 s)"; fi
-    fi
-    offer_dialogs
-    set_state SCAN
-    timeout "$CYCLE_SECS" WAIT_FOR_BUTTON_PRESS B >/dev/null 2>&1; rc=$?
-    if (( rc == 0 )); then
-      local t0=$EPOCHSECONDS
-      review_list || return 0
-      PAUSED_SECS=$((PAUSED_SECS + EPOCHSECONDS - t0))
-      set_state SCAN
-    elif (( rc != 124 )); then sleep 1; fi
-  done
-}
-
-main_menu() {
-  local def="Scan"
-  while :; do
-    local -a menu=("Scan" "Review hits"); [ "$SHOW_MODULES" = 1 ] && menu+=("Unidentified modules"); menu+=("Mode" "Write report" "Exit")
-    pick_list "CamScout $VERSION [$MODE] sigs:$SIG_COUNT" "$def" "${menu[@]}" || { def="Exit"; continue; }
-    case "$PICK" in
-      "Scan") scan_loop || def="Exit" ;;
-      "Review hits") review_list || def="Exit" ;;
-      "Unidentified modules") modules_list ;;
-      "Mode") mode_menu ;;
-      "Write report") write_report; LOG "report: $LOOT_DIR/report_$RUN_ID.txt" ;;
-      "Exit") if confirm "Exit CamScout?"; then return 0; fi; def="Scan" ;;
-    esac
-  done
-}
-
+# --- camhound lib end ---
 # --- watch core begin ---
 # pcap parser: hexdump words -> per-second buckets "ts bytes frames big" (all four magics; -s 32 records)
 PCAP_AWK='
@@ -1453,7 +1045,7 @@ summary_card() {
   case "$V_WORD" in STREAM|EVENT) col=red; set_state WATCH_HIT ;; EVENT?) col=yellow; set_state LANE ;; DOWN) col=cyan; set_state SCAN ;; *) col=""; set_state SCAN ;; esac
   LOG $col "$V_WORD$weak $( [ "$mode" = stim ] && printf 'best of %s' "${RUNS_N[$mac]}" ) -> ${CONF[$mac]} ${BANDNAME[$mac]}"
   LOG "up $(fmt10 "$up10")/s dn $(fmt10 "$dn10")/s as $( (( as10 >= 0 )) && fmt10 "$as10" || printf -- -) cv $cv"$'\n'"~$(rate_band "$up10") Mbps band"$'\n'"${V_TEXT}"
-  # A STREAM/EVENT verdict is the strongest evidence CamScout can produce that this is a live
+  # A STREAM/EVENT verdict is the strongest evidence CamHound can produce that this is a live
   # camera, so it is where the response funnel belongs: detect -> Watch -> confirmed -> Disrupt.
   if [ "$V_WORD" = STREAM ] || [ "$V_WORD" = EVENT ]; then
     if auto_respond_ok "$mac" && confirm "Streaming confirmed. Disrupt ${ID_LABEL[$mac]:-${mac:9}}?"; then
@@ -1686,7 +1278,7 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
 }
 
 # auto_respond_ok <mac> -> 0 when the funnel may offer Disrupt without being asked.
-# Two keys, not one: RESPONSE opens the manual rung, AUTO_RESPOND additionally lets CamScout
+# Two keys, not one: RESPONSE opens the manual rung, AUTO_RESPOND additionally lets CamHound
 # raise it on its own. Note this resolves the target as a side effect, leaving R_* set.
 auto_respond_ok() {
   [ "$RESPONSE" = 1 ] || return 1
@@ -1749,318 +1341,66 @@ posture_why() {   # one line of plain English for a badge
 
 # --- watch core end ---
 
-# locate_target mac -> MONITOR RSSI loop, 5-sample median, hysteresis, staleness; A stops
-
-# ================================================================================= report ===
-REPORT_DONE_AT_EXIT=0
-write_report() {
-  local quiet="$1" f="$LOOT_DIR/report_$RUN_ID.txt" mac n2=0 n5=0 n6=0 nu=0 c l p ap line six=0 nc=0 nl=0 npo=0 nlane=0 nmod=0
-  local -A census tree
-  [ -n "$RUN_ID" ] || return 0
-  [ "$quiet" = quiet ] && [ "$CYCLE" = 0 ] && return 0
-  {
-    printf 'CamScout %s report  run %s  %s\n' "$VERSION" "$RUN_ID" "$(printf '%(%Y-%m-%d %H:%M)T' -1)"
-    printf 'mode %s  cycles %s  duration %ss  recon paused %ss  bands %s  sigs %s (%s)\n' "$MODE" "$CYCLE" "$((EPOCHSECONDS - RUN_T0))" "$PAUSED_SECS" "${BANDS_LINE:-?}" "$SIG_COUNT" "$SIG_SOURCE"
-    for mac in "${!ROLE[@]}"; do
-      case "${BANDNAME[$mac]}" in CONFIRMED) nc=$((nc + 1)) ;; LIKELY) nl=$((nl + 1)) ;; POSSIBLE) npo=$((npo + 1)) ;; STREAM) nlane=$((nlane + 1)) ;; MODULE) nmod=$((nmod + 1)) ;; esac
-      [ "${ROLE[$mac]}" = cli ] && continue
-      case "${BAND[$mac]}" in 2) n2=$((n2 + 1)) ;; 5) n5=$((n5 + 1)) ;; 6) n6=$((n6 + 1)); six=1 ;; *) nu=$((nu + 1)) ;; esac
-    done
-    printf '\n== headline ==\nCONFIRMED %s  LIKELY %s  POSSIBLE %s  stream-lane %s  modules %s  devices %s\n' "$nc" "$nl" "$npo" "$nlane" "$nmod" "${#ROLE[@]}"
-    printf 'APs by band: 2.4 GHz %s, 5 GHz %s, 6 GHz %s, unknown %s; clients inherit their AP band\n' "$n2" "$n5" "$n6" "$nu"
-    (( six == 0 )) && printf '6 GHz: not scanned or nothing heard (enable in Recon settings)\n'
-    printf '\n== suspects (conf band mac vendor tags classes cat ssid ch rssi_best n_seen first-last [lat,lon]) ==\n'
-    for mac in "${!CONF[@]}"; do
-      (( ${CONF[$mac]:-0} >= 20 )) || continue
-      printf '%03d|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s-%s|%s\n' "${CONF[$mac]}" "${BANDNAME[$mac]}" "$mac" "${VENDOR[$mac]:--}" "${TAGS[$mac]:--}" "${ID_CLASSES[$mac]:--}" "${CAT[$mac]}" "${SSID_CLEAN[$mac]:--}" "${CH[$mac]:--}" "${RSSI_BEST[$mac]:--}" "${N_SEEN[$mac]}" "${FIRST_SEEN[$mac]}" "${LAST_SEEN[$mac]}" "${LAT[$mac]:+${LAT[$mac]},${LON[$mac]}}"
-    done | sort -t'|' -k1,1nr 2>/dev/null
-    printf '\n== vendor census (type: vendor count) ==\n'
-    for mac in "${!ROLE[@]}"; do c="${VEND_TYPE[$mac]:-NONE}: ${VENDOR[$mac]:--}"; census[$c]=$(( ${census[$c]:-0} + 1 )); done
-    for c in "${!census[@]}"; do printf '%s %s\n' "${census[$c]}" "$c"; done | sort -rn 2>/dev/null | head -60
-    printf '\n== AP -> clients (top 20 per AP; module clients marked *; BASE? = hidden AP with 1-4 clients on a module/mixed OUI) ==\n'
-    for mac in "${!AP_OF[@]}"; do ap="${AP_OF[$mac]}"; [ "$ap" != "-" ] && tree[$ap]+=" $mac"; done
-    for ap in "${!tree[@]}"; do
-      n2=0; line=""; local nonrand=0 base=""
-      for mac in ${tree[$ap]}; do
-        is_rand "$mac" || nonrand=$((nonrand + 1))
-        (( n2 >= 20 )) && continue; n2=$((n2 + 1))
-        l="${mac:9}"; [ "${VEND_TYPE[$mac]}" = VENDOR_MODULE ] && l="*$l"; line+=" $l(${VENDOR[$mac]:0:6})"
-      done
-      if [ "${HIDDEN[$ap]}" = 1 ] && (( nonrand >= 1 && nonrand <= 4 )) && { [ "${VEND_TYPE[$ap]}" = VENDOR_MODULE ] || [ "${VEND_TYPE[$ap]}" = VENDOR_WEAK ]; }; then base=" BASE?"; fi
-      printf '%s %s %s [%s]%s:%s\n' "$ap" "${SSID_CLEAN[$ap]:-<hidden>}" "${VENDOR[$ap]:--}" "${BANDNAME[$ap]:-none}" "$base" "$line"
-    done | sort 2>/dev/null
-    printf '\n== modules (check these) ==\n'
-    for mac in "${!ROLE[@]}"; do [ "${BANDNAME[$mac]}" = MODULE ] && printf '%s %s %s %s%s\n' "$mac" "${VENDOR[$mac]:--}" "${PROX[$mac]:-?}" "${RSSI_LAST[$mac]:--}" "${BUSY[$mac]:+ busy}"; done | sort 2>/dev/null
-    printf '\n== gps ==\nfirst %s  last %s\n' "${GPS_FIRST:-no fix}" "$GPS_LAST"
-    printf '\n== footer ==\ncycles %s  duration %ss  recon paused %ss  battery %s%%  cfg overrides %s%s\n' "$CYCLE" "$((EPOCHSECONDS - RUN_T0))" "$PAUSED_SECS" "$BATT" "$CFG_OVERRIDES" "$CFG_NOTE"
-  } >"$f.new" 2>/dev/null && mv "$f.new" "$f"
-  [ "$quiet" = quiet ] || log report "written $f"
-  return 0
-}
-
-# =============================================================================== selftest ===
-ST_FAIL=0; ST_N=0
-st() { ST_N=$((ST_N + 1)); if [ "$2" = "$3" ]; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s: got [%s] want [%s]\n' "$1" "$2" "$3"; ST_FAIL=$((ST_FAIL + 1)); fi; }
-st_stub_ui() {   # laptop run: DuckyScript commands absent
-  for c in LOG LED VIBRATE RINGTONE ALERT PROMPT ERROR_DIALOG PINEAPPLE_EXAMINE_BSSID PINEAPPLE_EXAMINE_CHANNEL PINEAPPLE_EXAMINE_RESET _pineap; do
-    command -v "$c" >/dev/null 2>&1 || eval "$c() { :; }"
-  done
-}
-st_device() {   # st_device mac role "vendor text" "ssid" hidden ap_of
-  local m="$1"
-  ROLE[$m]="$2"; VLOW[$m]="${3,,}"; VENDOR[$m]="${3:0:14}"; unset "VEND_TYPE[$m]"; SSID_CLEAN[$m]="$4"; HIDDEN[$m]="$5"; AP_OF[$m]="${6:--}"
-  LAST_SEEN[$m]=$EPOCHSECONDS; N_SEEN[$m]=1; FIRST_SEEN[$m]=$EPOCHSECONDS; KITAP[$m]=""; unset "KITCL[$m]" "BEH[$m]" "BEH_GATE[$m]" "BEH_VERDICT[$m]" "EVENT_FLAG[$m]" "BUSY[$m]" "PROBES[$m]"
-}
-st_pcap() {   # synthetic LE pcap: st_pcap file orig_len count ts
-  local f="$1" ol="$2" n="$3" ts="$4" i
-  le32() { printf "\\x$(printf %02x $(( $1 & 255 )))\\x$(printf %02x $(( ($1 >> 8) & 255 )))\\x$(printf %02x $(( ($1 >> 16) & 255 )))\\x$(printf %02x $(( ($1 >> 24) & 255 )))"; }
-  { le32 2712847316; printf '\x02\x00\x04\x00'; le32 0; le32 0; le32 32; le32 127
-    for ((i = 0; i < n; i++)); do le32 $((ts + i / 2)); le32 $((i * 1000)); le32 32; le32 "$ol"; printf '%032d' 0 | tr 0 '\0'; done; } >"$f"
-}
-st_le32h() { printf '%02x%02x%02x%02x' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 )); }
-st_hex2bin() { local h="$1" i; for ((i = 0; i < ${#h}; i += 2)); do printf "\\x${h:$i:2}"; done; }
-st_beacon_pcap() {   # st_beacon_pcap file bssid12hex [rsn payload hex] [extcap payload hex]
-  local f="$1" bss="$2" rsn="$3" ext="$4" ies frame flen gh rec
-  ies="000463616d31"                                              # SSID "cam1"
-  [ -n "$rsn" ] && ies+="30$(printf %02x $(( ${#rsn} / 2 )))$rsn" # 0x30 = 48  RSN
-  [ -n "$ext" ] && ies+="7f$(printf %02x $(( ${#ext} / 2 )))$ext" # 0x7f = 127 Extended Capabilities
-  frame="0000080000000000"                                        # radiotap, it_len 8
-  frame+="80000000"                                               # FC beacon + duration
-  frame+="ffffffffffff${bss}${bss}0000"                           # addr1/2/3 + seq  -> 24 B header
-  frame+="000000000000000064001104"                               # timestamp 8 + interval 2 + caps 2
-  frame+="$ies"
-  flen=$(( ${#frame} / 2 ))
-  gh="d4c3b2a1020004000000000000000000$(st_le32h 65535)$(st_le32h 127)"
-  rec="$(st_le32h 0)$(st_le32h 0)$(st_le32h "$flen")$(st_le32h "$flen")"
-  st_hex2bin "$gh$rec$frame" >"$f"
-}
-selftest() {
-  local tmp="${TMPDIR:-/tmp}/cs_st.$$" f lbl n ssid
-  st_stub_ui; mkdir -p "$tmp"; LOOT_DIR="$tmp"; RUN_ID="selftest"
-  printf '== CamScout %s selftest ==\n' "$VERSION"
-  # 1 signatures
-  if f=$(find_install_dir); then load_signatures "$f/cam_signatures.txt"; SIG_SOURCE="file"; else load_signatures <(builtin_signatures); fi
-  st "signatures loaded ($SIG_SOURCE, $SIG_COUNT rows)" "$(( SIG_COUNT > 20 ))" 1
-  st "no rejected signature rows" "$SIG_BAD" 0
-  n=$SIG_BAD; add_sig OUI SECURITY "bad label" "AA:BB:CC" 0 >/dev/null; st "bad label rejected loudly" "$SIG_BAD" "$((n + 1))"
-  n=$SIG_BAD; add_sig VENDOR SECURITY "HIK-OUI" "x" 0 >/dev/null; st "duplicate label same TYPE accepted (update)" "$SIG_BAD" "$n"
-  n=$SIG_BAD; add_sig SSID SECURITY "HIK-OUI" "x" 0 >/dev/null; st "label reuse across TYPEs rejected" "$SIG_BAD" "$((n + 1))"
-  SIG_BAD=0; load_signatures <(builtin_signatures)   # restore clean built-ins after the lint probes
-  # 2 oui.txt layouts
-  printf 'EC71DB\tReolink Innovation Limited\n' >"$tmp/oui2.txt"; printf 'EC:71:DB\t(hex)\tReolink Innovation Limited\n' >"$tmp/oui3.txt"
-  OUI_FILE="$tmp/oui2.txt"; vendor_of "ec:71:db:00:00:01"; st "oui.txt 2-column lookup" "${VLOW[ec:71:db:00:00:01]}" "reolink innovation limited"
-  OUI_FILE="$tmp/oui3.txt"; vendor_of "ec:71:db:00:00:02"; st "oui.txt 3-column lookup" "${VLOW[ec:71:db:00:00:02]}" "reolink innovation limited"
-  # 3 delimiters
-  st "clean_text strips | ; and non-printables" "$(clean_text $'Cam|1;2\x01x')" "Cam_1_2x"
-  # 4 scoring worked examples (section 5.1 of the plan)
-  st_device aa:00:00:00:00:01 ap "Hangzhou Hikvision Digital Technology" "EZVIZ_ABCDEF123" 0; score_device aa:00:00:00:00:01
-  st "Hikvision AP + EZVIZ SSID = 90 CONFIRMED" "${CONF[aa:00:00:00:00:01]} ${BANDNAME[aa:00:00:00:00:01]} ${CAT[aa:00:00:00:00:01]}" "90 CONFIRMED SECURITY"
-  st_device a4:da:22:20:00:01 cli "Wyze Labs Inc" "" 0 aa:00:00:00:00:99; score_device a4:da:22:20:00:01
-  st "Wyze client alone = 45 LIKELY" "${CONF[a4:da:22:20:00:01]} ${BANDNAME[a4:da:22:20:00:01]}" "45 LIKELY"
-  BEH[a4:da:22:20:00:01]=55; BEH_GATE[a4:da:22:20:00:01]=55; BEH_VERDICT[a4:da:22:20:00:01]=STREAM; score_device a4:da:22:20:00:01
-  st "Wyze + STREAM = 100 CONFIRMED" "${CONF[a4:da:22:20:00:01]} ${BANDNAME[a4:da:22:20:00:01]}" "100 CONFIRMED"
-  BEH[a4:da:22:20:00:01]=-20; BEH_GATE[a4:da:22:20:00:01]=0; BEH_VERDICT[a4:da:22:20:00:01]=DOWN; score_device a4:da:22:20:00:01
-  st "Wyze + DOWN = 45 LIKELY (floored)" "${CONF[a4:da:22:20:00:01]} ${BANDNAME[a4:da:22:20:00:01]}" "45 LIKELY"
-  st_device bb:00:00:00:00:01 ap "TP-Link Systems Inc" "Tapo_Cam_1234" 0; st_device bb:00:00:00:00:02 cli "TP-Link Systems Inc" "Tapo_Cam_1234" 0 bb:00:00:00:00:01
-  score_device bb:00:00:00:00:02; st "TP-Link client on Tapo_Cam AP = 65 LIKELY" "${CONF[bb:00:00:00:00:02]} ${BANDNAME[bb:00:00:00:00:02]}" "65 LIKELY"
-  BEH[bb:00:00:00:00:02]=55; BEH_GATE[bb:00:00:00:00:02]=55; BEH_VERDICT[bb:00:00:00:00:02]=STREAM; score_device bb:00:00:00:00:02
-  st "TP-Link + Tapo SSID + STREAM = 100 CONFIRMED (SSID class >= 45 + gate behaviour)" "${CONF[bb:00:00:00:00:02]} ${BANDNAME[bb:00:00:00:00:02]}" "100 CONFIRMED"
-  st_device bb:00:00:00:00:04 cli "TP-Link Systems Inc" "" 0 aa:00:00:00:00:99; BEH[bb:00:00:00:00:04]=55; BEH_GATE[bb:00:00:00:00:04]=55; BEH_VERDICT[bb:00:00:00:00:04]=STREAM; score_device bb:00:00:00:00:04
-  st "TP-Link client + STREAM = 75 LIKELY" "${CONF[bb:00:00:00:00:04]} ${BANDNAME[bb:00:00:00:00:04]}" "75 LIKELY"
-  st_device cc:00:00:00:00:01 cli "Amazon Technologies Inc." "" 0 aa:00:00:00:00:99; BEH[cc:00:00:00:00:01]=75; BEH_GATE[cc:00:00:00:00:01]=75; EVENT_FLAG[cc:00:00:00:00:01]=1; BEH_VERDICT[cc:00:00:00:00:01]=EVENT; BUSY[cc:00:00:00:00:01]=1
-  score_device cc:00:00:00:00:01; st "mixed vendor + EVENT + asym + BUSY = 79 LIKELY" "${CONF[cc:00:00:00:00:01]} ${BANDNAME[cc:00:00:00:00:01]}" "79 LIKELY"
-  st_device cc:00:00:00:00:02 cli "Amazon Technologies Inc." "" 0 aa:00:00:00:00:99; score_device cc:00:00:00:00:02
-  st "idle Blink on Amazon OUI = 20 POSSIBLE MIXED" "${CONF[cc:00:00:00:00:02]} ${BANDNAME[cc:00:00:00:00:02]} ${CAT[cc:00:00:00:00:02]}" "20 POSSIBLE MIXED"
-  st_device dd:00:00:00:00:01 cli "Espressif Inc." "" 0 aa:00:00:00:00:99; score_device dd:00:00:00:00:01
-  st "Espressif alone = 0 MODULE" "${CONF[dd:00:00:00:00:01]} ${BANDNAME[dd:00:00:00:00:01]} ${CAT[dd:00:00:00:00:01]}" "0 MODULE IOTMOD"
-  st_device dd:00:00:00:00:02 cli "Espressif Inc." "IPC_1234" 0 aa:00:00:00:00:98; score_device dd:00:00:00:00:02
-  st "Espressif on IPC_1234 AP = 15, module list, SSID tag" "${CONF[dd:00:00:00:00:02]} ${BANDNAME[dd:00:00:00:00:02]} ${TAGS[dd:00:00:00:00:02]}" "15 MODULE CAMWORD MODULE"
-  st_device dd:00:00:00:00:03 cli "Espressif Inc." "" 0 aa:00:00:00:00:99; BEH[dd:00:00:00:00:03]=55; BEH_GATE[dd:00:00:00:00:03]=55; BEH_VERDICT[dd:00:00:00:00:03]=STREAM; score_device dd:00:00:00:00:03
-  st "Espressif + STREAM = 55 STREAM lane" "${CONF[dd:00:00:00:00:03]} ${BANDNAME[dd:00:00:00:00:03]}" "55 STREAM"
-  st_device dd:00:00:00:00:04 cli "Espressif Inc." "" 0 aa:00:00:00:00:99; BEH[dd:00:00:00:00:04]=75; BEH_GATE[dd:00:00:00:00:04]=75; EVENT_FLAG[dd:00:00:00:00:04]=1; BEH_VERDICT[dd:00:00:00:00:04]=EVENT; score_device dd:00:00:00:00:04
-  st "Espressif + EVENT + asym = 75 LIKELY" "${CONF[dd:00:00:00:00:04]} ${BANDNAME[dd:00:00:00:00:04]}" "75 LIKELY"
-  st_device e4:00:00:00:00:01 cli "Intel Corporate" "" 0 aa:00:00:00:00:99; BEH[e4:00:00:00:00:01]=55; BEH_GATE[e4:00:00:00:00:01]=55; BEH_VERDICT[e4:00:00:00:00:01]=STREAM; score_device e4:00:00:00:00:01
-  st "Intel laptop streaming = 30 STREAM lane" "${CONF[e4:00:00:00:00:01]} ${BANDNAME[e4:00:00:00:00:01]}" "30 STREAM"
-  st_device ee:00:00:00:00:01 cli "Intel Corporate" "" 0 aa:00:00:00:00:99; BEH[ee:00:00:00:00:01]=55; BEH_GATE[ee:00:00:00:00:01]=55; BEH_VERDICT[ee:00:00:00:00:01]=STREAM; score_device ee:00:00:00:00:01
-  st "randomised MAC + STREAM = 0 (RAND -40 on top of ENDPOINT)" "${CONF[ee:00:00:00:00:01]} ${TAGS[ee:00:00:00:00:01]}" "0 RAND STREAM"
-  st_device 02:00:00:00:00:01 cli "Amazon Technologies Inc." "" 0; PROBES[02:00:00:00:00:01]="BLINK-AB12"; score_device 02:00:00:00:00:01
-  st "randomised Amazon client probing BLINK- = 0 (report only)" "${CONF[02:00:00:00:00:01]} ${BANDNAME[02:00:00:00:00:01]}" "0 none"
-  st_device ff:00:00:00:00:01 cli "Liteon Technology Corporation" "" 0 aa:00:00:00:00:99; score_device ff:00:00:00:00:01
-  st "Liteon-module laptop = MODULE" "${BANDNAME[ff:00:00:00:00:01]} ${CAT[ff:00:00:00:00:01]}" "MODULE IOTMOD"
-  st_device bb:00:00:00:00:03 ap "TP-Link Systems Inc" "Camden Hotel" 0; score_device bb:00:00:00:00:03
-  st "TP-Link AP Camden Hotel = 20 POSSIBLE (no CAMWORD)" "${CONF[bb:00:00:00:00:03]} ${BANDNAME[bb:00:00:00:00:03]} ${TAGS[bb:00:00:00:00:03]}" "20 POSSIBLE TPL-MIX"
-  st_device 11:00:00:00:00:01 ap "Reolink Innovation Limited" "ReoKit" 0; st_device 11:00:00:00:00:02 cli "Reolink Innovation Limited" "ReoKit" 0 11:00:00:00:00:01; st_device 11:00:00:00:00:03 cli "Reolink Innovation Limited" "ReoKit" 0 11:00:00:00:00:01
-  CLIENTS_OF=(); CLIENTS_OF[11:00:00:00:00:01]=" 11:00:00:00:00:02 11:00:00:00:00:03"; kit_eval; score_device 11:00:00:00:00:01
-  st "Reolink AP + 2 Reolink clients = 80 CONFIRMED kit" "${CONF[11:00:00:00:00:01]} ${BANDNAME[11:00:00:00:00:01]} ${CAT[11:00:00:00:00:01]}" "80 CONFIRMED NVRKIT"
-  st_device 02:11:22:00:00:01 ap "" "" 1; for n in 2 3 4; do st_device "a0:00:00:00:00:0$n" cli "Realtek Semiconductor Corp." "" 0 02:11:22:00:00:01; done
-  CLIENTS_OF=(); CLIENTS_OF[02:11:22:00:00:01]=" a0:00:00:00:00:02 a0:00:00:00:00:03 a0:00:00:00:00:04"; kit_eval; score_device 02:11:22:00:00:01
-  st "hidden LAA AP + 3 Realtek clients = KIT?" "${KITAP[02:11:22:00:00:01]} ${TAGS[02:11:22:00:00:01]}" "? KIT?"
-  st_device aa:00:00:00:00:05 ap "Hangzhou Hikvision Digital Technology" "" 1; score_device aa:00:00:00:00:05
-  st "hidden Hikvision AP = 55 LIKELY HIDDEN" "${CONF[aa:00:00:00:00:05]} ${BANDNAME[aa:00:00:00:00:05]} ${TAGS[aa:00:00:00:00:05]}" "55 LIKELY HIK-OUI HIDDEN"
-  # 5 proximity
-  RSSI_HIST[aa:00:00:00:00:01]="-70 -58 -65"; BAND[aa:00:00:00:00:01]=2; MODE=ROOM; apply_mode; prox_of aa:00:00:00:00:01; st "prox ROOM -58 best = N" "${PROX[aa:00:00:00:00:01]}" N
-  RSSI_HIST[aa:00:00:00:00:01]="-79"; prox_of aa:00:00:00:00:01; st "prox ROOM -79 = F" "${PROX[aa:00:00:00:00:01]}" F
-  MODE=SITE; apply_mode; prox_of aa:00:00:00:00:01; st "prox SITE -79 = M" "${PROX[aa:00:00:00:00:01]}" M; MODE=ROOM; apply_mode
-  # 6 rows / status / inventory
-  RSSI_LAST[aa:00:00:00:00:01]=-58; PROX[aa:00:00:00:00:01]=N; row_for aa:00:00:00:00:01; st "row fits ROW_W" "$(( ${#ROW} <= ROW_W ))" 1
-  st "row text" "$ROW" "90 HIK-OUI NA-58"
-  n=$(inv_row aa:00:00:00:00:01 | awk -F'|' '{print NF}'); st "inventory row field count = header" "$n" "$(printf '%s\n' "$INV_HDR" | awk -F'|' '{print NF}')"
-  # 7 pcap parser
-  st_pcap "$tmp/t.pcap" 1200 20 1700000000; st "pcap buckets (10 s x 2 big frames)" "$(pcap_buckets "$tmp/t.pcap" | wc -l | tr -d ' ')" 10
-  st "pcap bucket line" "$(pcap_buckets "$tmp/t.pcap" | head -1)" "1700000000 2400 2 2"
-  pcap_buckets "$tmp/t.pcap" >"$tmp/t.b"; st "bucket stats" "$(bucket_stats "$tmp/t.b" | cut -d' ' -f1-4)" "10 20 24000 20"
-  printf 'garbage' >"$tmp/bad.pcap"; pcap_buckets "$tmp/bad.pcap" >/dev/null 2>&1; st "bad magic rejected" "$?" 1
-  # 7b response posture (byte vectors; no radio needed)
-  # RSN caps low octet: 0xcc = MFPR+MFPC, 0x8c = MFPC only, 0x0c = neither
-  local XBP='0000000000000000000010'   # 11 octets, octet 10 bit 4 set -> beacon protection on
-  local XNO='0000000000000000000000'   # same length, bit clear
-  st "posture no PMF"               "$(posture_from_caps 0c00 - 2 6)"      "D+C"
-  st "posture PMF capable only"     "$(posture_from_caps 8c00 - 2 6)"      "D?+C"
-  st "posture PMF required"         "$(posture_from_caps cc00 - 2 6)"      "C"
-  st "posture PMF req + beacon prot" "$(posture_from_caps cc00 "$XBP" 2 6)" "NONE"
-  st "posture beacon prot bit clear" "$(posture_from_caps cc00 "$XNO" 2 6)" "C"
-  st "posture short extcap ignored"  "$(posture_from_caps cc00 0000000000 2 6)" "C"
-  st "posture unread rsn"           "$(posture_from_caps - - 2 6)"         "?"
-  st "posture garbage rsn"          "$(posture_from_caps zz00 - 2 6)"      "?"
-  st "posture 6 GHz never injects"  "$(posture_from_caps 0c00 - 6 37)"     "NOINJ"
-  st "posture 5 GHz DFS ch52"       "$(posture_from_caps 0c00 - 5 52)"     "NOINJ"
-  st "posture 5 GHz DFS ch144"      "$(posture_from_caps cc00 - 5 144)"    "NOINJ"
-  st "posture 5 GHz UNII-1 ch36"    "$(posture_from_caps cc00 - 5 36)"     "C"
-  st "posture 5 GHz UNII-3 ch149"   "$(posture_from_caps 0c00 - 5 149)"    "D+C"
-  st "posture unknown band"         "$(posture_from_caps 0c00 - '?' 6)"    "NOINJ"
-  st "posture non-numeric channel"  "$(posture_from_caps 0c00 - 2 x)"      "NOINJ"
-  # three operator-selectable attacks: command mapping, viability, honest per-option labels
-  st "cmd DEAUTH"  "$(response_cmd DEAUTH)" "PINEAPPLE_DEAUTH_CLIENT"
-  st "cmd CSA"     "$(response_cmd CSA)"    "PINEAPPLE_DEAUTH_CLIENT_CSA"
-  st "cmd BOTH"    "$(response_cmd BOTH)"   "PINEAPPLE_DEAUTH_CLIENT_ALL"
-  st "cmd unknown is empty" "$(response_cmd WAT)" ""
-  st "opts no PMF prefers BOTH"   "$(posture_opts 'D+C')"  "BOTH DEAUTH CSA"
-  st "opts PMF required leads CSA" "$(posture_opts C)"     "CSA BOTH DEAUTH"
-  st "opts beacon prot offers none" "$(posture_opts NONE)" ""
-  st "opts no-inject offers none"  "$(posture_opts NOINJ)" ""
-  st "opts unread offers all"      "$(posture_opts '?')"   "BOTH DEAUTH CSA"
-  st "expect deauth vs no PMF"     "$(posture_expect 'D+C' DEAUTH)"  "works"
-  st "expect deauth vs optional PMF" "$(posture_expect 'D?+C' DEAUTH)" "partial"
-  st "expect deauth vs required PMF" "$(posture_expect C DEAUTH)"    "blocked"
-  st "expect csa vs required PMF"  "$(posture_expect C CSA)"         "works"
-  st "expect csa vs beacon prot"   "$(posture_expect NONE CSA)"      "blocked"
-  st "expect both vs beacon prot"  "$(posture_expect NONE BOTH)"     "blocked"
-  st "expect anything on NOINJ"    "$(posture_expect NOINJ CSA)"     "blocked"
-  st "expect anything when unread" "$(posture_expect '?' DEAUTH)"    "unknown"
-  # 7c beacon element parsing (synthetic frames; no radio needed)
-  local RSN_PMF='0100000fac040100000fac040100000fac08cc00'   # 1 pairwise, 1 AKM, caps 0x00cc
-  local RSN_NOP='0100000fac040100000fac040100000fac020c00'   # same shape, caps 0x000c
-  st "ie_find first element"    "$(ie_find 0003616263 0 0)"              "616263"
-  st "ie_find later element"    "$(ie_find 0003616263dd0411223344 0 221)" "11223344"
-  ie_find 0003616263 0 48 >/dev/null 2>&1; st "ie_find absent element rc" "$?" 1
-  ie_find 000a6162 0 0 >/dev/null 2>&1;    st "ie_find truncated chain rc" "$?" 1
-  st "rsn_caps walks suite lists" "$(rsn_caps "$RSN_PMF")" "cc00"
-  rsn_caps 0100000f >/dev/null 2>&1; st "rsn_caps short element rc" "$?" 1
-  st_beacon_pcap "$tmp/b_open.pcap" aabbccddeeff "" ""
-  st "beacon: open network"       "$(posture_read_pcap "$tmp/b_open.pcap" 2 6)" "D+C"
-  st_beacon_pcap "$tmp/b_np.pcap" aabbccddeeff "$RSN_NOP" "$XNO"
-  st "beacon: WPA2 without PMF"   "$(posture_read_pcap "$tmp/b_np.pcap" 2 6)"   "D+C"
-  st_beacon_pcap "$tmp/b_pmf.pcap" aabbccddeeff "$RSN_PMF" ""
-  st "beacon: PMF required"       "$(posture_read_pcap "$tmp/b_pmf.pcap" 2 6)"  "C"
-  # POSTURE_RSN/POSTURE_EXT only reach the caller when not run in a subshell, so re-run in-shell
-  posture_read_pcap "$tmp/b_pmf.pcap" 2 6 >/dev/null
-  st "beacon: rsn caps extracted" "$POSTURE_RSN"                                "cc00"
-  st "beacon: absent extcap stays -" "$POSTURE_EXT"                             "-"
-  st_beacon_pcap "$tmp/b_bp.pcap" aabbccddeeff "$RSN_PMF" "$XBP"
-  st "beacon: PMF + beacon prot"  "$(posture_read_pcap "$tmp/b_bp.pcap" 2 6)"   "NONE"
-  st "beacon: DFS beats posture"  "$(posture_read_pcap "$tmp/b_pmf.pcap" 5 52)" "NOINJ"
-  st "beacon: UNII-1 reads normally" "$(posture_read_pcap "$tmp/b_pmf.pcap" 5 36)" "C"
-  printf 'garbage' >"$tmp/b_bad.pcap"; beacon_find "$tmp/b_bad.pcap" >/dev/null 2>&1
-  st "beacon: bad magic rejected" "$?" 1
-  st_pcap "$tmp/b_data.pcap" 1200 4 1700000000; beacon_find "$tmp/b_data.pcap" >/dev/null 2>&1
-  st "beacon: no beacon in file rc" "$?" 1
-  # 7d response rung: target resolution, effect verdicts, loot row
-  st_device aa:00:00:00:00:10 ap "Reolink" "cam-ap" 0 -
-  CH[aa:00:00:00:00:10]=6; BAND[aa:00:00:00:00:10]=2
-  resp_target aa:00:00:00:00:10
-  st "resp_target ap targets broadcast" "$R_TARGET" "ff:ff:ff:ff:ff:ff"
-  st "resp_target ap is its own bssid"  "$R_BSSID"  "aa:00:00:00:00:10"
-  st "resp_target ap channel"           "$R_CH"     "6"
-  st_device aa:00:00:00:00:11 cli "Wyze" "" 0 aa:00:00:00:00:10
-  CH[aa:00:00:00:00:11]=0
-  resp_target aa:00:00:00:00:11
-  st "resp_target cli uses ap bssid"    "$R_BSSID"  "aa:00:00:00:00:10"
-  st "resp_target cli targets itself"   "$R_TARGET" "aa:00:00:00:00:11"
-  st "resp_target cli rides ap channel" "$R_CH"     "6"
-  st_device aa:00:00:00:00:12 cli "Espressif" "" 0 -
-  resp_target aa:00:00:00:00:12 >/dev/null 2>&1; st "resp_target unassociated rc" "$?" 1
-  st_device aa:00:00:00:00:13 ap "Hikvision" "x" 0 -
-  CH[aa:00:00:00:00:13]=0
-  resp_target aa:00:00:00:00:13 >/dev/null 2>&1; st "resp_target no channel rc" "$?" 1
-  st "verdict target vanished"  "$(resp_verdict 100 50 - - 0)"     "MOVED"
-  st "verdict counter advanced" "$(resp_verdict 100 50 140 60 1)"  "NO_EFFECT"
-  st "verdict counter stalled"  "$(resp_verdict 100 50 100 50 1)"  "MOVED"
-  st "verdict stalled but seen" "$(resp_verdict 100 50 100 60 1)"  "INCONCLUSIVE"
-  st "verdict no baseline"      "$(resp_verdict - - 140 60 1)"     "INCONCLUSIVE"
-  st "verdict no follow-up"     "$(resp_verdict 100 50 - - 1)"     "INCONCLUSIVE"
-  st "verdict non-numeric"      "$(resp_verdict x 50 y 60 1)"      "INCONCLUSIVE"
-  POSTURE[aa:00:00:00:00:10]=C; POSTURE_TS[aa:00:00:00:00:10]=$EPOCHSECONDS
-  st "disrupt row shows cached badge" "$(disrupt_row aa:00:00:00:00:10)" "Disrupt [C]"
-  st "disrupt row bare when uncached" "$(disrupt_row aa:00:00:00:00:13)" "Disrupt"
-  R_BSSID=aa:00:00:00:00:10; R_TARGET=ff:ff:ff:ff:ff:ff; R_CH=6; R_BAND=2
-  POSTURE_RSN=cc00; POSTURE_EXT=-; rm -f "$tmp/responses.tsv"
-  resp_write aa:00:00:00:00:10 C CSA PINEAPPLE_DEAUTH_CLIENT_CSA ok 10 10 MOVED
-  st "response header written"           "$(head -1 "$tmp/responses.tsv")" "$RESP_HDR"
-  st "response row field count = header" "$(sed -n 2p "$tmp/responses.tsv" | awk -F'|' '{print NF}')" \
-                                         "$(printf '%s\n' "$RESP_HDR" | awk -F'|' '{print NF}')"
-  st "posture_why covers NOINJ" "$(posture_why NOINJ | grep -c 'may not transmit')" "1"
-  RESPONSE=0; AUTO_RESPOND=0
-  auto_respond_ok aa:00:00:00:00:10 2>/dev/null; st "auto_respond off by default"     "$?" 1
-  RESPONSE=1
-  auto_respond_ok aa:00:00:00:00:10 2>/dev/null; st "auto_respond needs its own key"  "$?" 1
-  AUTO_RESPOND=1
-  auto_respond_ok aa:00:00:00:00:10 2>/dev/null; st "auto_respond with both keys"     "$?" 0
-  IGNORED[aa:00:00:00:00:10]=1
-  auto_respond_ok aa:00:00:00:00:10 2>/dev/null; st "auto_respond skips ignored"      "$?" 1
-  unset "IGNORED[aa:00:00:00:00:10]"
-  auto_respond_ok aa:00:00:00:00:12 2>/dev/null; st "auto_respond skips unattackable" "$?" 1
-  RESPONSE=0; AUTO_RESPOND=0
-  # 8 marked blocks
-  if command -v md5sum >/dev/null 2>&1 && [ -f "${BASH_SOURCE[0]}" ]; then
-    printf 'lib block md5   %s\n' "$(sed -n '/^# --- camscout lib begin ---/,/^# --- camscout lib end ---/p' "${BASH_SOURCE[0]}" | md5sum | cut -c1-32)"
-    printf 'watch block md5 %s\n' "$(sed -n '/^# --- watch core begin ---/,/^# --- watch core end ---/p' "${BASH_SOURCE[0]}" | md5sum | cut -c1-32)"
-  fi
-  rm -rf "$tmp"
-  printf '== %s checks, %s failed ==\n' "$ST_N" "$ST_FAIL"
-  return $(( ST_FAIL > 0 ))
-}
-replay() {   # --replay <pcap or bucket file>
-  local f="$1" m; st_stub_ui
-  [ -r "$f" ] || { printf 'replay: cannot read %s\n' "$f"; return 1; }
-  m=$(pcap_words "$f" | head -1)
-  case "$m" in 2712847316|2712812077|3569595041|1295823521) pcap_buckets "$f" >/tmp/cs_replay.b || { printf 'parse error\n'; return 1; } ;; *) cp "$f" /tmp/cs_replay.b ;; esac
-  read -r WM_USEC WM_UF WM_UB WM_UG _ WM_UCV <<<"$(bucket_stats /tmp/cs_replay.b)"
-  local r10=0; (( WM_USEC > 0 )) && r10=$(( WM_UG * 10 / WM_USEC ))
-  printf 'secs %s frames %s bytes %s big %s big/s %s cv %s\n' "$WM_USEC" "$WM_UF" "$WM_UB" "$WM_UG" "$(fmt10 "$r10")" "$( (( WM_UCV >= 0 )) && fmt10 "$WM_UCV" || printf -)"
-  if (( r10 >= THR_STREAM_UP * 10 )) && { (( WM_UCV < 0 )) || (( WM_UCV <= THR_CV10 )); }; then printf 'badge: STREAM-rate (asym unknown from one file)\n'
-  elif (( r10 < 20 )); then printf 'badge: IDLE-rate\n'; else printf 'badge: NONE\n'; fi
-  rm -f /tmp/cs_replay.b
-}
-
-# ============================================================================== preflight ===
-
-
-# =================================================================================== main ===
+# ============================================================================== hook main ===
+# Entered from the Recon menu with a selected AP or client. Everything above this line is copied
+# from the user payload by dev/CamHound/gen_hooks.sh.
 case "${1:-}" in
-  --selftest) selftest; exit $? ;;
-  --replay)   replay "${2:-}"; exit $? ;;
-  -h|--help)  printf 'CamScout %s: run from the Pager UI. Laptop: --selftest | --replay <pcap|bucket file>\n' "$VERSION"; exit 0 ;;
+  -h|--help|--selftest|--replay) printf 'CamHound Recon hook: launch it from the Recon AP or client menu. Laptop checks live in the user payload (payload.sh --selftest).\n'; exit 0 ;;
 esac
+write_report() { :; }          # the hook keeps no report; cleanup() may call it
+HOOK_MAC=""
 set_state SETUP
 INSTALL_DIR=$(find_install_dir) || INSTALL_DIR=""
 run_lock
 preflight
 apply_mode
 load_overrides
-(( CFG_OVERRIDES > 0 )) && { LOG yellow "cfg: $CFG_OVERRIDES overrides"; log cfg "$CFG_NOTE"; }
-log run "start v$VERSION run=$RUN_ID sigs=$SIG_COUNT($SIG_SOURCE) jq=$HAVE_JQ tcpdump=$HAVE_TCPDUMP bands=${BANDS_LINE:-?} mode=$MODE"
-LOG "CamScout $VERSION [$MODE]"$'\n'"sigs: $SIG_COUNT ($SIG_SOURCE)$( [ "$HAVE_JQ" = 1 ] || printf ' no-jq')$( [ "$HAVE_TCPDUMP" = 1 ] || printf ' no-tcpdump')"$'\n'"bands: ${BANDS_LINE:-?}"$'\n'"prox: uncal"
-[ "$HAVE_TCPDUMP" = 1 ] || LOG yellow "tcpdump missing: Watch disabled"
-main_menu
-REPORT_DONE_AT_EXIT=1; write_report quiet
+
+# hook_target: build one inventory record from the _RECON_SELECTED_* variables (MAC_PICKER fallback)
+hook_target() {
+  local mac bssid ssid freq ch rssi role probes
+  mac=${_RECON_SELECTED_CLIENT_MAC_ADDRESS:-${_RECON_SELECTED_CLIENT_MAC:-}}; mac=${mac,,}
+  bssid=${_RECON_SELECTED_AP_BSSID:-${_RECON_SELECTED_AP_MAC_ADDRESS:-}}; bssid=${bssid,,}
+  [[ $bssid =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || bssid=""
+  if [[ $mac =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then role=cli; HOOK_MAC=$mac
+  elif [ -n "$bssid" ]; then role=ap; HOOK_MAC=$bssid
+  else
+    mac=$(MAC_PICKER "Target MAC?" "DE:AD:BE:EF:CA:FE" 2>/dev/null) || { LOG "no target selected"; exit 0; }
+    mac=${mac,,}; [[ $mac =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || { LOG "not a MAC: $mac"; exit 0; }
+    role=ap; HOOK_MAC=$mac; bssid=$mac
+    LOG "manual target: treated as an AP (BSSID = MAC)"
+  fi
+  ssid=$(clean_text "${_RECON_SELECTED_AP_SSID:-${_RECON_SELECTED_AP_BEACONED_SSID:-}}" 32)
+  freq=${_RECON_SELECTED_AP_FREQ:-0}; freq=${freq//[!0-9]/}
+  ch=${_RECON_SELECTED_AP_CHANNEL:-0}; [ "$role" = cli ] && [ -n "${_RECON_SELECTED_CLIENT_CHANNEL:-}" ] && ch=$_RECON_SELECTED_CLIENT_CHANNEL; ch=${ch//[!0-9]/}
+  rssi=${_RECON_SELECTED_CLIENT_RSSI:-${_RECON_SELECTED_AP_RSSI:-}}; rssi=${rssi//[!0-9-]/}
+  record_seen "$HOOK_MAC" "$role" "$ssid" "${ch:-0}" "${freq:-0}" "${rssi:--}"
+  if [ "$role" = cli ]; then AP_OF[$HOOK_MAC]="${bssid:--}"
+  else HIDDEN[$HOOK_MAC]=0; [ -z "$ssid" ] && HIDDEN[$HOOK_MAC]=1; fi
+  probes=${_RECON_SELECTED_CLIENT_PROBED_SSID:-}
+  [ -n "$probes" ] && PROBES[$HOOK_MAC]=$(clean_text "$probes" 64)
+  score_device "$HOOK_MAC"; prox_of "$HOOK_MAC"
+  log run "hook v$VERSION target=$HOOK_MAC role=$role conf=${CONF[$HOOK_MAC]} tags=${TAGS[$HOOK_MAC]:--}"
+}
+
+hook_menu() {
+  local m="$HOOK_MAC" wrow drow
+  while :; do
+    LOG "[$MODE] ${CONF[$m]} ${BANDNAME[$m]} ${ROLE[$m]} $m"$'\n'"cat: ${CAT[$m]} ${VENDOR[$m]:--}"$'\n'"ssid: ${SSID_CLEAN[$m]:--} ch${CH[$m]:-?} ${BAND[$m]:-?}GHz"$'\n'"rssi ${RSSI_LAST[$m]:--} ${PROX[$m]:-?}"$'\n'"tags: ${TAGS[$m]:--}"
+    if watchable "$m"; then wrow="Watch"; elif [ "$HAVE_TCPDUMP" != 1 ]; then wrow="Watch (no tcpdump)"; else wrow="Watch n/a (not associated)"; fi
+    drow=""; [ "$RESPONSE" = 1 ] && drow=$(disrupt_row "$m")
+    pick_list "${CONF[$m]} ${ID_LABEL[$m]:-${TAGS[$m]%% *}} ${m:9}" "$wrow" "$wrow" ${drow:+"$drow"} "Locate" "Exit" || return 0
+    case "$PICK" in
+      "Disrupt"*) disrupt_menu "$m" ;;
+      "Watch") watch_menu "$m" ;;
+      "Watch (no tcpdump)") LOG "tcpdump missing: opkg update; opkg install tcpdump" ;;
+      "Watch n/a"*) LOG "probe-only client: identity and Locate only" ;;
+      "Locate") locate_target "$m" ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+hook_target
+hook_menu
 exit 0

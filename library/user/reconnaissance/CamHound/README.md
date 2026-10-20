@@ -1,16 +1,22 @@
-# CamScout
+# CamHound
 
-Passive Wi-Fi camera census for the WiFi Pineapple Pager. CamScout reads the PineAP Recon lists
+Wi-Fi camera census and response for the WiFi Pineapple Pager — the recon+response successor to
+CamScout, which it replaces. Detection is unchanged and still passive; what is new is that a
+detection can now be acted on from the same screen that found it.
+
+CamHound reads the PineAP Recon lists
 every 20 s, lists every camera-vendor and camera-capable 802.11 device it can hear, categorises it,
 grades it on a 0-100 confidence scale with reason tags, and, on request, locks the radio on one
 suspect to test whether it is streaming (**Watch**), whether it reacts to movement (**Stimulus
 test**) or where it is (**Locate**). Identity scanning is passive and free. Watch and Locate pause
-Recon channel hopping for the length of the lock (30-120 s). CamScout never joins a network.
+Recon channel hopping for the length of the lock (30-120 s). CamHound never joins a network.
 
 With `RESPONSE=1` a fourth rung appears on the device card — **Disrupt** — which reads the target's
-protection posture from its own beacon and then disconnects it. See [Response](#response).
-**`RESPONSE` defaults to 0**, and with it off CamScout transmits nothing and the device card is
-exactly as it was.
+protection posture from its own beacon and then disconnects it with deauthentication and
+disassociation, channel-switch announcements, or all three. See [Response](#response).
+**`RESPONSE` defaults to 0**, and with it off CamHound transmits nothing and behaves exactly as
+CamScout did. `AUTO_RESPOND=1` additionally lets the funnel raise Disrupt by itself once a Watch
+confirms a device is streaming; it is a second key precisely because that rung transmits.
 
 ## What it cannot see
 
@@ -41,12 +47,12 @@ exactly as it was.
 
 ## Install
 
-1. Copy the `CamScout` folder to `/root/payloads/user/reconnaissance/CamScout/` (or the same path on
+1. Copy the `CamHound` folder to `/root/payloads/user/reconnaissance/CamHound/` (or the same path on
    `/sd` or `/mmc/root`). Keep `cam_signatures.txt` next to `payload.sh`; without it a built-in copy
    of the rows is used and the status line says `(built-in)`.
 2. If the files came through Windows: `sed -i 's/\r$//' payload.sh cam_signatures.txt; chmod +x payload.sh`.
-3. Start **Recon in continuous mode** in the Pager GUI. CamScout only reads what Recon hears.
-4. Launch CamScout from the payload menu. Needs `_pineap`, `jq` (falls back to a built-in parser),
+3. Start **Recon in continuous mode** in the Pager GUI. CamHound only reads what Recon hears.
+4. Launch CamHound from the payload menu. Needs `_pineap`, `jq` (falls back to a built-in parser),
    `tcpdump` + `hexdump` for Watch (without them Watch is greyed), `/lib/hak5/oui.txt`.
 
 ## Quick start, the two-button flow
@@ -64,7 +70,7 @@ exactly as it was.
   They are not cameras until Watched.
 - **Mode**: `ROOM` (default: vibrate on everything LIKELY, proximity -60/-75 dBm) or `SITE` (floor
   walk: FAR rows do not vibrate, -70/-85 dBm). Mode never changes what is listed.
-- **Write report** renders `/root/loot/CamScout/report_<run>.txt` now; it is also written every 15
+- **Write report** renders `/root/loot/CamHound/report_<run>.txt` now; it is also written every 15
   cycles and at exit.
 
 Buttons: A = select / stop (Watch, Locate), B = back / pause, UP and DOWN scroll lists only.
@@ -140,7 +146,7 @@ street survey keep a steady pace and set `GPS=1`; `inventory.tsv` keeps the stro
 ## Configuration
 
 Edit the config block at the top of `payload.sh`. Starred keys can also be set without editing and
-survive updates: `PAYLOAD_SET_CONFIG camscout CYCLE_SECS 10` (`PAYLOAD_DEL_CONFIG camscout CYCLE_SECS`
+survive updates: `PAYLOAD_SET_CONFIG camhound CYCLE_SECS 10` (`PAYLOAD_DEL_CONFIG camhound CYCLE_SECS`
 removes it). Overrides are counted on the start screen and listed in `events.log`.
 
 | Key | Default | Persist | Meaning |
@@ -179,11 +185,11 @@ removes it). Overrides are counted on the start screen and listed in `events.log
 
 ## Response
 
-Off by default. `PAYLOAD_SET_CONFIG camscout RESPONSE 1` adds **Disrupt** to the device card.
+Off by default. `PAYLOAD_SET_CONFIG camhound RESPONSE 1` adds **Disrupt** to the device card.
 
 **1 · Posture.** The badge comes from the target's own beacon, captured on `RECON_IF` — the only
 source that covers every band, since `radio0` is 2.4 GHz-only and `radio1` carries no managed
-interface, so no `iw scan` on this device can read 5/6 GHz RSN. CamScout reads MFPC (bit 7) and
+interface, so no `iw scan` on this device can read 5/6 GHz RSN. CamHound reads MFPC (bit 7) and
 MFPR (bit 6) from the RSN Capabilities field of element 48, and Beacon Protection from bit 84 of
 the Extended Capabilities element (127). Badges cache per BSSID for `POSTURE_TTL`.
 
@@ -231,7 +237,7 @@ Beacon protection (WPA3, Dec-2020 onward, mandatory for AP support in Wi-Fi 7) d
 path outright, and CSA bursts are detectable — Kismet alerts on CSA floods and on announcements
 that reuse a captured beacon's timestamp.
 
-## Loot (`/root/loot/CamScout/`, flat)
+## Loot (`/root/loot/CamHound/`, flat)
 
 - `inventory.tsv`: one `|`-separated row per MAC, rewritten atomically each cycle. Header:
   `#first_seen|last_seen|run_id|mac|role|cat|vendor|label|conf|id_score|beh_score|beh_verdict|band|ssid|ap_bssid|ch|freq|rssi_best|rssi_best_ts|rssi_last|prox|n_seen|pkt_rate|signals|lan_tag|lat|lon`
@@ -288,6 +294,6 @@ weights: they are fixed per TYPE. Ship unverified rows commented out.
 
 ## Roadmap
 
-v1.1: Recon-menu hooks (`library/recon/client|access_point/CamScout`), inventory persistence across
+v1.1: Recon-menu hooks (`library/recon/client|access_point/CamHound`), inventory persistence across
 runs, settings menu, band write (`PINEAPPLE_SET_BANDS`), WPS/IE peek, LAN confirm (opt-in RTSP
 DESCRIBE). v2: multi-channel passive behaviour sweep, BLE co-hit, pocket mode, external capture radio.
