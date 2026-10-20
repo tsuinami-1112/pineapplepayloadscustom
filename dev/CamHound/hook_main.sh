@@ -1,9 +1,9 @@
 
 # ============================================================================== hook main ===
 # Entered from the Recon menu with a selected AP or client. Everything above this line is copied
-# from the user payload by dev/CamScout/gen_hooks.sh.
+# from the user payload by dev/CamHound/gen_hooks.sh.
 case "${1:-}" in
-  -h|--help|--selftest|--replay) printf 'CamScout Recon hook: launch it from the Recon AP or client menu. Laptop checks live in the user payload (payload.sh --selftest).\n'; exit 0 ;;
+  -h|--help|--selftest|--replay) printf 'CamHound Recon hook: launch it from the Recon AP or client menu. Laptop checks live in the user payload (payload.sh --selftest).\n'; exit 0 ;;
 esac
 write_report() { :; }          # the hook keeps no report; cleanup() may call it
 HOOK_MAC=""
@@ -42,12 +42,14 @@ hook_target() {
 }
 
 hook_menu() {
-  local m="$HOOK_MAC" wrow
+  local m="$HOOK_MAC" wrow drow
   while :; do
     LOG "[$MODE] ${CONF[$m]} ${BANDNAME[$m]} ${ROLE[$m]} $m"$'\n'"cat: ${CAT[$m]} ${VENDOR[$m]:--}"$'\n'"ssid: ${SSID_CLEAN[$m]:--} ch${CH[$m]:-?} ${BAND[$m]:-?}GHz"$'\n'"rssi ${RSSI_LAST[$m]:--} ${PROX[$m]:-?}"$'\n'"tags: ${TAGS[$m]:--}"
     if watchable "$m"; then wrow="Watch"; elif [ "$HAVE_TCPDUMP" != 1 ]; then wrow="Watch (no tcpdump)"; else wrow="Watch n/a (not associated)"; fi
-    pick_list "${CONF[$m]} ${ID_LABEL[$m]:-${TAGS[$m]%% *}} ${m:9}" "$wrow" "$wrow" "Locate" "Exit" || return 0
+    drow=""; [ "$RESPONSE" = 1 ] && drow=$(disrupt_row "$m")
+    pick_list "${CONF[$m]} ${ID_LABEL[$m]:-${TAGS[$m]%% *}} ${m:9}" "$wrow" "$wrow" ${drow:+"$drow"} "Locate" "Exit" || return 0
     case "$PICK" in
+      "Disrupt"*) disrupt_menu "$m" ;;
       "Watch") watch_menu "$m" ;;
       "Watch (no tcpdump)") LOG "tcpdump missing: opkg update; opkg install tcpdump" ;;
       "Watch n/a"*) LOG "probe-only client: identity and Locate only" ;;

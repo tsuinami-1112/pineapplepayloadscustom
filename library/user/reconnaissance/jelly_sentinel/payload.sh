@@ -524,15 +524,63 @@ phase_wifi_audit() {
         fi
     fi
 
-    local scan_out
-    scan_out=$(iw dev "$IFACE" scan 2>/dev/null | head -200)
-    local has_wpa2 has_pmf
-    has_wpa2=$(echo "$scan_out" | grep -c "WPA2\|RSN" 2>/dev/null)
-    has_pmf=$(echo "$scan_out" | grep -c "MFP\|MFPC\|MFPR" 2>/dev/null)
-    [ "${has_wpa2:-0}" -gt 0 ] && [ "${has_pmf:-0}" -eq 0 ] && \
-        add_finding "MEDIUM" "PMF Not Enabled" \
-            "Protected Management Frames disabled — deauth attacks possible" \
-            "5.3" "CVE-2019-16275" "Enable 802.11w in router WiFi settings"
+    # Per-BSS PMF posture. The whole-airspace grep this replaces was wrong three ways: a single
+    # PMF-capable AP in range silenced the finding for every PMF-less AP, an SSID merely
+    # containing "MFP" silenced it too, and head -200 cut the scan to the first few BSSes.
+    # MFP-capable/MFP-required are read only from the RSN block's own Capabilities line, and
+    # beacon protection from Extended Capabilities bit 84, which iw prints as a bare "* 84".
+    local pmf_rows pmf_off=0 pmf_opt=0 pmf_req=0 pmf_prot=0 pmf_total=0 pmf_names=""
+    pmf_rows=$(iw dev "$IFACE" scan 2>/dev/null | awk '
+        function flush() { if (bssid != "" && rsn) printf "%s|%s|%d|%d|%d\n", bssid, ssid, mfpc, mfpr, bp }
+        /^BSS /         { flush(); bssid=$2; sub(/\(.*/, "", bssid); ssid=""; sec=""; rsn=0; mfpc=0; mfpr=0; bp=0; next }
+        /^[\t ]+SSID: / { ssid=$0; sub(/^[\t ]+SSID: /, "", ssid); next }
+        /^[\t ]+[A-Za-z][A-Za-z0-9 ()._\/-]*:/ && !/\*/ { sec="other" }
+        /^[\t ]+RSN:/   { sec="rsn"; rsn=1 }
+        /^[\t ]+WPA:/   { sec="wpa" }
+        /Extended capabilities:/ { sec="ext" }
+        sec == "rsn" && /\* Capabilities:/ {
+            if ($0 ~ /MFP-capable/)  mfpc=1
+            if ($0 ~ /MFP-required/) mfpr=1
+        }
+        sec == "ext" && /^[\t ]+\* 84[\t ]*$/ { bp=1 }
+        END { flush() }')
+
+    if [ -z "$pmf_rows" ]; then
+        LOG yellow "PMF check skipped: no RSN networks seen on $IFACE"
+        echo "PMF check  : no scan results on $IFACE" >> "$WIFI_FILE"
+    else
+        local b s c r p
+        while IFS='|' read -r b s c r p; do
+            [ -n "$b" ] || continue
+            pmf_total=$((pmf_total + 1))
+            if [ "$c" = 0 ]; then
+                pmf_off=$((pmf_off + 1))
+                [ ${#pmf_names} -lt 72 ] && pmf_names="$pmf_names ${s:-$b}"
+            elif [ "$r" = 0 ]; then
+                pmf_opt=$((pmf_opt + 1))
+            else
+                pmf_req=$((pmf_req + 1)); [ "$p" = 1 ] && pmf_prot=$((pmf_prot + 1))
+            fi
+        done <<< "$pmf_rows"
+
+        {
+            echo "--- PMF POSTURE ($pmf_total RSN networks) ---"
+            echo "no PMF        : $pmf_off"
+            echo "PMF optional  : $pmf_opt"
+            echo "PMF required  : $pmf_req (beacon protection: $pmf_prot)"
+            echo ""
+        } >> "$WIFI_FILE"
+        LOG blue "PMF: $pmf_off off, $pmf_opt optional, $pmf_req required of $pmf_total"
+
+        [ "$pmf_off" -gt 0 ] && add_finding "MEDIUM" "PMF Not Enabled ($pmf_off of $pmf_total)" \
+            "Protected Management Frames absent on:$pmf_names — deauth disconnects clients" \
+            "5.3" "N/A" "Enable 802.11w (PMF) on these networks"
+        [ "$pmf_opt" -gt 0 ] && add_finding "LOW" "PMF Optional ($pmf_opt of $pmf_total)" \
+            "WPA3 transition mode: clients that do not negotiate PMF are still deauthable" \
+            "3.1" "N/A" "Set PMF to required once all clients support it"
+    fi
+    # $IFACE is on radio0, which is 2.4 GHz only, so this posture covers 2.4 GHz networks alone.
+    echo "PMF scope  : 2.4 GHz only ($IFACE is on the 2.4 GHz radio)" >> "$WIFI_FILE"
 
     local cur_gw
     cur_gw=$(ip route | grep default | grep "$IFACE" | awk '{print $3}' | head -1)

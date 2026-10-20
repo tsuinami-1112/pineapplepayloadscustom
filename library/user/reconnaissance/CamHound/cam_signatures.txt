@@ -1,4 +1,4 @@
-# CamScout signature file.  One rule per line:  TYPE|CAT|LABEL|PATTERN      # note
+# CamHound signature file.  One rule per line:  TYPE|CAT|LABEL|PATTERN      # note
 #   TYPE    OUI VENDOR VENDOR_WEAK VENDOR_MODULE VENDOR_ENDPOINT SSID SSID_WEAK
 #   CAT     SECURITY DOORBELL BABY ACTION DASH DRONE BODYCAM ALPR NVRKIT MIXED IOTMOD ENDPOINT
 #   LABEL   on-screen tag, ^[A-Z0-9][A-Z0-9-]{1,9}$, unique (a label may not be reused by another TYPE)
