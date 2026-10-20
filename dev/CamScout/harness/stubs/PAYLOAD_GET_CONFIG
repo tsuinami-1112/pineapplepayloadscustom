@@ -1,0 +1,2 @@
+#!/bin/bash
+v=$(grep "^$2=" "${HARNESS_CFG:-/tmp/cs_harness.cfg}" 2>/dev/null | head -1 | cut -d= -f2-); [ -n "$v" ] || exit 1; printf '%s' "$v"

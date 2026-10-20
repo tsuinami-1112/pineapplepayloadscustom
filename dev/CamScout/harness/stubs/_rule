@@ -1,0 +1,13 @@
+#!/bin/bash
+# _rule "title" -> prints the next answer for the first rule whose regex matches the title
+f="${HARNESS_RULES:-/tmp/cs_harness.rules}"; t="$1"
+exec 9>>"$f.lock"; flock 9
+n=0
+while IFS=$'\t' read -r re answers; do
+  n=$((n+1)); [ -z "$re" ] && continue
+  if printf '%s' "$t" | grep -Eq -- "$re"; then
+    c=$(cat "$f.c$n" 2>/dev/null || echo 0); IFS=',' read -ra arr <<<"$answers"
+    i=$c; (( i >= ${#arr[@]} )) && i=$(( ${#arr[@]} - 1 )); echo $((c+1)) > "$f.c$n"; printf '%s' "${arr[$i]}"; exit 0
+  fi
+done < "$f"
+printf ''

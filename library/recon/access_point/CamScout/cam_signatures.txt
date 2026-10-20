@@ -1,0 +1,71 @@
+# CamScout signature file.  One rule per line:  TYPE|CAT|LABEL|PATTERN      # note
+#   TYPE    OUI VENDOR VENDOR_WEAK VENDOR_MODULE VENDOR_ENDPOINT SSID SSID_WEAK
+#   CAT     SECURITY DOORBELL BABY ACTION DASH DRONE BODYCAM ALPR NVRKIT MIXED IOTMOD ENDPOINT
+#   LABEL   on-screen tag, ^[A-Z0-9][A-Z0-9-]{1,9}$, unique (a label may not be reused by another TYPE)
+#   PATTERN last field so a regex | is safe. OUI = AA:BB:CC (24-bit) or AA:BB:CC:D (28-bit) or AA:BB:CC:DE:F (36-bit).
+#           Every other TYPE is a case-insensitive POSIX ERE matched against the vendor text from
+#           /lib/hak5/oui.txt (VENDOR*) or against the beaconed SSID (SSID*).
+# Weights are fixed by TYPE in payload.sh (OUI/VENDOR 45, VENDOR_WEAK 20, VENDOR_MODULE 0, VENDOR_ENDPOINT -25,
+# SSID 45, SSID_WEAK 15); contributors add rows, not numbers.  Lines starting with # are ignored; a bad TYPE,
+# CAT or LABEL is reported on screen at start ("sig line N skipped") and the rest of the file still loads.
+# Verified = checked against the IEEE MA-L/MA-M registry or a published setup guide, Oct 2026.
+# Unverified rows ship commented out; uncomment after you have seen the device yourself.
+
+# --- camera-only vendors (identity 45, one class) ---------------------------------------------
+OUI|SECURITY|REO-OUI|EC:71:DB                       # Reolink Innovation, single IEEE block
+OUI|SECURITY|WYZE-OUI|A4:DA:22:2                    # Wyze Labs MA-M block (28-bit)
+VENDOR|SECURITY|HIK-OUI|hikvision|hangzhou ezviz    # all Hikvision blocks; also NVR/intercom/bridge hardware
+VENDOR|SECURITY|DAHUA-OUI|zhejiang dahua            # not "shanghai dahua scale"
+VENDOR|SECURITY|ARLO-OUI|arlo technolog
+VENDOR|SECURITY|AXIS-OUI|axis communications ab
+VENDOR|SECURITY|HANW-OUI|hanwha (techwin|vision)
+VENDOR|SECURITY|WYZE-V|wyze labs                    # remaining Wyze blocks by vendor text
+VENDOR|SECURITY|REO-V|reolink
+VENDOR|DOORBELL|RING-OUI|^ring llc                  # cameras, doorbells, Chime, Alarm hub: card says "Ring device"
+VENDOR|SECURITY|BLINK-OUI|blink by amazon|immedia   # Blink cameras and Sync Module
+VENDOR|SECURITY|DROP-OUI|dropcam
+VENDOR|SECURITY|CCTV-OUI|vivotek|verkada|avigilon|mobotix|arecont|amcrest|swann communications|lorex technology|zhejiang uniview
+VENDOR|DASH|DASH-OUI|pittasoft|thinkware           # BlackVue, Thinkware dash cameras
+VENDOR|BODYCAM|AXON-OUI|taser international|axon enterprise   # Wi-Fi blocks; BLE OUIs live in nosey-neighbor
+VENDOR|ACTION|GOPRO-OUI|gopro|arashi vision         # GoPro, Insta360
+#VENDOR|SECURITY|FOSCAM-OUI|foscam                  # Foscam has no IEEE block of its own (modules): unverified
+#VENDOR|SECURITY|ANNKE-OUI|annke                    # Annke has no IEEE block of its own: unverified
+
+# --- mixed vendors (identity 20; cameras among many other products) ---------------------------
+VENDOR_WEAK|MIXED|AMZN-MIX|amazon technologies      # Ring/Blink hardware, Echo, Fire TV, Kindle
+VENDOR_WEAK|MIXED|GOOG-MIX|^google                  # Nest Cam, Nest Hub, Chromecast, Pixel
+VENDOR_WEAK|MIXED|NEST-MIX|nest labs                # Nest Cam, Protect, thermostat share blocks
+VENDOR_WEAK|MIXED|TPL-MIX|tp-link                   # Tapo/Kasa cameras, routers, plugs
+VENDOR_WEAK|MIXED|TUYA-MIX|tuya smart               # white-label camera platform, plugs, bulbs
+VENDOR_WEAK|MIXED|XIAOMI-MIX|xiaomi
+VENDOR_WEAK|MIXED|ANKER-MIX|fantasia trading|smart innovation llc   # eufy (Anker) blocks; "Anker" never appears as a name
+VENDOR_WEAK|MIXED|NET-MIX|netgear|ubiquiti|logitech # older Arlo, UniFi Protect, Circle; mostly network gear
+VENDOR_WEAK|DRONE|DJI-MIX|sz dji                    # aircraft, RC and goggles share the blocks
+
+# --- radio modules (identity 0; "Unidentified modules: check these" list) ----------------------
+VENDOR_MODULE|IOTMOD|ESP-MOD|espressif
+VENDOR_MODULE|IOTMOD|RTK-MOD|realtek
+VENDOR_MODULE|IOTMOD|AZW-MOD|azurewave|murata|ampak|fn-link|bilian|ai-thinker|hi-?link|ai-link|mediatek|texas instruments|ingenic|quectel
+VENDOR_MODULE|IOTMOD|USI-MOD|lite-?on|universal scientific   # Ring Pro, eufy and white-label cameras ride these blocks; so do laptops
+VENDOR_MODULE|IOTMOD|OEM-MOD|sercomm|wistron neweb  # contract OEMs: ISP/alarm-company cameras, gateways, plugs
+
+# --- endpoint makers (identity -25; laptops/phones: never red without a stimulus EVENT) --------
+VENDOR_ENDPOINT|ENDPOINT|INTEL-END|intel corporate
+VENDOR_ENDPOINT|ENDPOINT|OEM-END|apple, inc|samsung electronics|microsoft|dell inc|hewlett packard|^hp inc|lenovo|qualcomm
+
+# --- setup / direct-mode SSIDs (identity 45, SSID class) -------------------------------------
+SSID|SECURITY|EZVIZ-AP|^EZVIZ_[0-9A-Z]{9}$
+SSID|SECURITY|HAP-AP|^HAP_                          # Hikvision / HiLook setup AP
+SSID|SECURITY|TAPO-AP|^Tapo_Cam_
+SSID|SECURITY|BLINK-AP|^BLINK-[0-9A-Za-z]{4}$
+SSID|DOORBELL|RING-AP|^Ring-[0-9A-Fa-f]{6}$|^Ring Setup [0-9A-Fa-f]{2}$
+SSID|SECURITY|IPC-AP|^IPC_AP_|^GW_AP_|^HICAM_|^CAM_[0-9A-F]{6}$|^MCCamera|^MV[0-9]{8}$|^Swann-SWIFI-|^DAP-AMC
+SSID|ACTION|GOPRO-AP|^GP[0-9]{8}$|\.OSC$
+#SSID|NVRKIT|REO-HUB|^REOLINK                       # Reolink Home Hub permanent AP: string length unverified
+#SSID|BABY|NANIT-AP|^Nanit|^Owlet                   # unverified
+#SSID|DASH|BLACKVUE-AP|^BlackVue|^DR[0-9]{3}       # unverified
+#SSID|DRONE|DJI-AP|^DJI-|^Mavic|^TELLO-            # unverified
+#SSID|SECURITY|DIRECT-CAM|^DIRECT-.*(cam|gopro)    # Wi-Fi Direct names: unverified
+
+# --- weak SSID word (identity 15, SSID class; word boundaries so "Camden" does not match) -----
+SSID_WEAK|SECURITY|CAMWORD|(^|[^[:alnum:]])(cam|camera|ipc|nvr|dvr|doorbell)([^[:alnum:]]|$)
