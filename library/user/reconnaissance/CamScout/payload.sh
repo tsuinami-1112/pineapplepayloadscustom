@@ -82,6 +82,9 @@ RECON_IF="wlan1mon"     # PineAP monitor radio (tri-band)
 RESPONSE=0              # * master switch for the response rung (0 = recon only)
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
 SCAN_IF="wlan0"         # posture cross-check iface: the enabled dummy sta on radio0 (2.4 GHz only)
+BCN_CAP_SECS=4          # seconds to wait for a beacon when reading a target's posture
+BCN_CAP_COUNT=5         # beacons to capture per posture read (first usable one is parsed)
+POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
 LOOT_DIR="/root/loot/CamScout"
 OUI_FILE="/lib/hak5/oui.txt"; OUI_FILE_ALT="/rom/lib/hak5/oui.txt"
 # identity weights (constants, not table columns)
@@ -163,6 +166,7 @@ load_overrides() {
   THR_STREAM_UP=$(cfg THR_STREAM_UP "$THR_STREAM_UP" 1)
   RESPONSE=$(cfg RESPONSE "$RESPONSE" 0)
   RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
+  POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
 }
 
 # install dir: the UI runs a copy from /tmp, so look for the data file where it can live
@@ -334,16 +338,143 @@ posture_from_caps() {   # posture_from_caps <rsncaps_hex|-> <extcap_hex|-> <band
   fi
 }
 
-# posture_primitive <badge> -> the DuckyScript command to use, or empty when nothing will work
-#   PINEAPPLE_DEAUTH_CLIENT     [bssid] [target] [channel]   deauth + disassoc
-#   PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]            channel-switch announcements
-#   PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]   all three
-posture_primitive() {
+# The three operator-selectable attacks. The badge advises; it never decides.
+#   DEAUTH  PINEAPPLE_DEAUTH_CLIENT     [bssid] [target] [channel]  deauth + disassoc
+#   CSA     PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]           channel-switch announcements
+#   BOTH    PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]  all three frame types
+response_cmd() {
   case "$1" in
-    'D+C'|'D?+C') printf 'PINEAPPLE_DEAUTH_CLIENT_ALL' ;;   # quoted: ? is a case-glob wildcard
-    'C')          printf 'PINEAPPLE_DEAUTH_CLIENT_CSA' ;;
-    *)            printf '' ;;
+    DEAUTH) printf 'PINEAPPLE_DEAUTH_CLIENT' ;;
+    CSA)    printf 'PINEAPPLE_DEAUTH_CLIENT_CSA' ;;
+    BOTH)   printf 'PINEAPPLE_DEAUTH_CLIENT_ALL' ;;
+    *)      printf '' ;;
   esac
+}
+
+# posture_opts <badge> -> viable attack keys, best first; empty when nothing can reach the air
+posture_opts() {
+  case "$1" in
+    'NOINJ'|'NONE') printf '' ;;                 # regulatory wall, or beacon protection: nothing works
+    'C')            printf 'CSA BOTH DEAUTH' ;;  # PMF required: deauth is ignored but stays offered
+    *)              printf 'BOTH DEAUTH CSA' ;;
+  esac
+}
+
+# posture_expect <badge> <attack key> -> works | partial | blocked | unknown
+# Labels each option honestly in the picker so a deliberate no-hope attempt is still the operator's call.
+posture_expect() {
+  local b="$1" k="$2"
+  [ "$b" = NOINJ ] && { printf 'blocked'; return 0; }
+  [ "$b" = '?' ]   && { printf 'unknown'; return 0; }
+  case "$k" in
+    DEAUTH)      case "$b" in 'D+C') printf 'works' ;; 'D?+C') printf 'partial' ;; *) printf 'blocked' ;; esac ;;
+    CSA|BOTH)    case "$b" in 'NONE') printf 'blocked' ;; *) printf 'works' ;; esac ;;
+    *)           printf 'unknown' ;;
+  esac
+}
+
+# ---- beacon posture read -------------------------------------------------------------------
+# Walks a captured beacon's tagged parameters for element 48 (RSN) and 127 (Extended Capabilities).
+# No managed interface on this device can scan 5/6 GHz (radio0 is 2g, radio1 is monitor-only), so
+# the beacon on RECON_IF is the only posture source that covers every band CamScout reports on.
+POSTURE_RSN=-; POSTURE_EXT=-; BCN_HEX=""; BCN_IES=0
+
+hex_u16le() {   # hex_u16le <hexstring> <index0> -> decimal, nonzero rc if short
+  local a b
+  a=$(hex_octet "$1" "$2") || return 1
+  b=$(hex_octet "$1" "$(( $2 + 1 ))") || return 1
+  printf '%d' "$(( a + b * 256 ))"
+}
+
+ie_find() {   # ie_find <hexstring> <first element octet> <element id> -> payload hex, rc 1 if absent
+  local h="$1" p="$2" want="$3" id len n
+  n=$(( ${#h} / 2 ))
+  while (( p + 2 <= n )); do
+    id=$(hex_octet "$h" "$p") || return 1
+    len=$(hex_octet "$h" "$(( p + 1 ))") || return 1
+    (( p + 2 + len > n )) && return 1          # truncated element chain: stop, do not guess
+    if (( id == want )); then printf '%s' "${h:$(( (p + 2) * 2 )):$(( len * 2 ))}"; return 0; fi
+    p=$(( p + 2 + len ))
+  done
+  return 1
+}
+
+rsn_caps() {   # rsn_caps <element 48 payload hex> -> 2-octet RSN Capabilities hex, low octet first
+  local h="$1" p=6 n cnt                       # skip version (2) + group cipher suite (4)
+  n=$(( ${#h} / 2 ))
+  (( n >= 8 )) || return 1
+  cnt=$(hex_u16le "$h" "$p") || return 1; p=$(( p + 2 + 4 * cnt ))   # pairwise suite list
+  (( p + 2 <= n )) || return 1
+  cnt=$(hex_u16le "$h" "$p") || return 1; p=$(( p + 2 + 4 * cnt ))   # AKM suite list
+  (( p + 2 <= n )) || return 1
+  printf '%s' "${h:$(( p * 2 )):4}"
+}
+
+pcap_bytes() {   # whole file as one lowercase hex string (od fallback mirrors pcap_words)
+  if command -v hexdump >/dev/null 2>&1; then hexdump -v -e '1/1 "%02x"' "$1" 2>/dev/null
+  else od -An -v -tx1 "$1" 2>/dev/null | tr -d ' \n'; fi
+}
+
+beacon_find() {   # beacon_find <pcap> -> sets BCN_HEX and BCN_IES at the first beacon's elements
+  local f="$1" h p n rec rt fc
+  h=$(pcap_bytes "$f") || return 1
+  [ -n "$h" ] || return 1
+  case "${h:0:8}" in d4c3b2a1|a1b2c3d4|4d3cb2a1|a1b23c4d) ;; *) return 1 ;; esac
+  n=$(( ${#h} / 2 )); p=24                     # pcap global header
+  while (( p + 16 <= n )); do
+    rec=$(hex_u16le "$h" "$(( p + 8 ))") || return 1   # incl_len; low 16 bits suffice for a beacon
+    p=$(( p + 16 ))
+    (( rec > 0 && p + rec <= n )) || return 1
+    rt=$(hex_u16le "$h" "$(( p + 2 ))") || return 1    # radiotap it_len
+    if (( rt >= 8 && rt + 36 <= rec )); then
+      fc=$(hex_octet "$h" "$(( p + rt ))")
+      # 0x80 = protocol version 0, type management, subtype beacon
+      if [ "$fc" = 128 ]; then BCN_HEX="$h"; BCN_IES=$(( p + rt + 36 )); return 0; fi
+    fi
+    p=$(( p + rec ))
+  done
+  return 1
+}
+
+posture_read_pcap() {   # posture_read_pcap <pcap> <band> <channel> -> badge
+  local f="$1" band="$2" ch="$3" rsn ext caps
+  POSTURE_RSN=-; POSTURE_EXT=-
+  if beacon_find "$f"; then
+    if rsn=$(ie_find "$BCN_HEX" "$BCN_IES" 48); then
+      caps=$(rsn_caps "$rsn") && POSTURE_RSN="$caps"
+    else
+      POSTURE_RSN=0000                         # no RSN element at all: open network, no PMF
+    fi
+    ext=$(ie_find "$BCN_HEX" "$BCN_IES" 127) && POSTURE_EXT="$ext"
+  fi
+  posture_from_caps "$POSTURE_RSN" "$POSTURE_EXT" "$band" "$ch"
+}
+
+capture_beacon() {   # capture_beacon <bssid> -> pcap path on stdout, rc 1 on failure
+  local bssid="$1" out="/tmp/cs_bcn_$$.pcap" p w=0
+  [ "$HAVE_TCPDUMP" = 1 ] || return 1
+  rm -f "$out"
+  tcpdump -i "$RECON_IF" -nn -s 0 -c "$BCN_CAP_COUNT" -w "$out" \
+    "type mgt subtype beacon and wlan addr2 $bssid" >/dev/null 2>&1 & p=$!
+  child_add "$p"
+  while (( w < BCN_CAP_SECS )); do kill -0 "$p" 2>/dev/null || break; sleep 1; w=$(( w + 1 )); done
+  kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null; child_del "$p"
+  [ -s "$out" ] || { rm -f "$out"; return 1; }
+  printf '%s' "$out"
+}
+
+posture_of() {   # posture_of <bssid> <band> <channel> -> badge, cached per BSSID for POSTURE_TTL
+  local bssid="$1" band="$2" ch="$3" f b now="$EPOCHSECONDS"
+  if [ -n "${POSTURE[$bssid]}" ] && (( now - ${POSTURE_TS[$bssid]:-0} < POSTURE_TTL )); then
+    printf '%s' "${POSTURE[$bssid]}"; return 0
+  fi
+  # A channel we may not transmit on needs no capture: the answer is NOINJ whatever the beacon says.
+  if [ "$(posture_from_caps - - "$band" "$ch")" = NOINJ ]; then
+    POSTURE[$bssid]=NOINJ; POSTURE_TS[$bssid]=$now; printf 'NOINJ'; return 0
+  fi
+  if f=$(capture_beacon "$bssid"); then b=$(posture_read_pcap "$f" "$band" "$ch"); rm -f "$f"; else b='?'; fi
+  POSTURE[$bssid]="$b"; POSTURE_TS[$bssid]=$now
+  printf '%s' "$b"
 }
 # --- response posture end ---
 
@@ -1463,6 +1594,23 @@ st_pcap() {   # synthetic LE pcap: st_pcap file orig_len count ts
   { le32 2712847316; printf '\x02\x00\x04\x00'; le32 0; le32 0; le32 32; le32 127
     for ((i = 0; i < n; i++)); do le32 $((ts + i / 2)); le32 $((i * 1000)); le32 32; le32 "$ol"; printf '%032d' 0 | tr 0 '\0'; done; } >"$f"
 }
+st_le32h() { printf '%02x%02x%02x%02x' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 )); }
+st_hex2bin() { local h="$1" i; for ((i = 0; i < ${#h}; i += 2)); do printf "\\x${h:$i:2}"; done; }
+st_beacon_pcap() {   # st_beacon_pcap file bssid12hex [rsn payload hex] [extcap payload hex]
+  local f="$1" bss="$2" rsn="$3" ext="$4" ies frame flen gh rec
+  ies="000463616d31"                                              # SSID "cam1"
+  [ -n "$rsn" ] && ies+="30$(printf %02x $(( ${#rsn} / 2 )))$rsn" # 0x30 = 48  RSN
+  [ -n "$ext" ] && ies+="7f$(printf %02x $(( ${#ext} / 2 )))$ext" # 0x7f = 127 Extended Capabilities
+  frame="0000080000000000"                                        # radiotap, it_len 8
+  frame+="80000000"                                               # FC beacon + duration
+  frame+="ffffffffffff${bss}${bss}0000"                           # addr1/2/3 + seq  -> 24 B header
+  frame+="000000000000000064001104"                               # timestamp 8 + interval 2 + caps 2
+  frame+="$ies"
+  flen=$(( ${#frame} / 2 ))
+  gh="d4c3b2a1020004000000000000000000$(st_le32h 65535)$(st_le32h 127)"
+  rec="$(st_le32h 0)$(st_le32h 0)$(st_le32h "$flen")$(st_le32h "$flen")"
+  st_hex2bin "$gh$rec$frame" >"$f"
+}
 selftest() {
   local tmp="${TMPDIR:-/tmp}/cs_st.$$" f lbl n ssid
   st_stub_ui; mkdir -p "$tmp"; LOOT_DIR="$tmp"; RUN_ID="selftest"
@@ -1558,12 +1706,51 @@ selftest() {
   st "posture 5 GHz UNII-3 ch149"   "$(posture_from_caps 0c00 - 5 149)"    "D+C"
   st "posture unknown band"         "$(posture_from_caps 0c00 - '?' 6)"    "NOINJ"
   st "posture non-numeric channel"  "$(posture_from_caps 0c00 - 2 x)"      "NOINJ"
-  st "primitive for D+C"            "$(posture_primitive 'D+C')"           "PINEAPPLE_DEAUTH_CLIENT_ALL"
-  st "primitive for D?+C"           "$(posture_primitive 'D?+C')"          "PINEAPPLE_DEAUTH_CLIENT_ALL"
-  st "primitive for C"              "$(posture_primitive C)"               "PINEAPPLE_DEAUTH_CLIENT_CSA"
-  st "primitive for NONE is empty"  "$(posture_primitive NONE)"            ""
-  st "primitive for NOINJ is empty" "$(posture_primitive NOINJ)"           ""
-  st "primitive for unread is empty" "$(posture_primitive '?')"            ""
+  # three operator-selectable attacks: command mapping, viability, honest per-option labels
+  st "cmd DEAUTH"  "$(response_cmd DEAUTH)" "PINEAPPLE_DEAUTH_CLIENT"
+  st "cmd CSA"     "$(response_cmd CSA)"    "PINEAPPLE_DEAUTH_CLIENT_CSA"
+  st "cmd BOTH"    "$(response_cmd BOTH)"   "PINEAPPLE_DEAUTH_CLIENT_ALL"
+  st "cmd unknown is empty" "$(response_cmd WAT)" ""
+  st "opts no PMF prefers BOTH"   "$(posture_opts 'D+C')"  "BOTH DEAUTH CSA"
+  st "opts PMF required leads CSA" "$(posture_opts C)"     "CSA BOTH DEAUTH"
+  st "opts beacon prot offers none" "$(posture_opts NONE)" ""
+  st "opts no-inject offers none"  "$(posture_opts NOINJ)" ""
+  st "opts unread offers all"      "$(posture_opts '?')"   "BOTH DEAUTH CSA"
+  st "expect deauth vs no PMF"     "$(posture_expect 'D+C' DEAUTH)"  "works"
+  st "expect deauth vs optional PMF" "$(posture_expect 'D?+C' DEAUTH)" "partial"
+  st "expect deauth vs required PMF" "$(posture_expect C DEAUTH)"    "blocked"
+  st "expect csa vs required PMF"  "$(posture_expect C CSA)"         "works"
+  st "expect csa vs beacon prot"   "$(posture_expect NONE CSA)"      "blocked"
+  st "expect both vs beacon prot"  "$(posture_expect NONE BOTH)"     "blocked"
+  st "expect anything on NOINJ"    "$(posture_expect NOINJ CSA)"     "blocked"
+  st "expect anything when unread" "$(posture_expect '?' DEAUTH)"    "unknown"
+  # 7c beacon element parsing (synthetic frames; no radio needed)
+  local RSN_PMF='0100000fac040100000fac040100000fac08cc00'   # 1 pairwise, 1 AKM, caps 0x00cc
+  local RSN_NOP='0100000fac040100000fac040100000fac020c00'   # same shape, caps 0x000c
+  st "ie_find first element"    "$(ie_find 0003616263 0 0)"              "616263"
+  st "ie_find later element"    "$(ie_find 0003616263dd0411223344 0 221)" "11223344"
+  ie_find 0003616263 0 48 >/dev/null 2>&1; st "ie_find absent element rc" "$?" 1
+  ie_find 000a6162 0 0 >/dev/null 2>&1;    st "ie_find truncated chain rc" "$?" 1
+  st "rsn_caps walks suite lists" "$(rsn_caps "$RSN_PMF")" "cc00"
+  rsn_caps 0100000f >/dev/null 2>&1; st "rsn_caps short element rc" "$?" 1
+  st_beacon_pcap "$tmp/b_open.pcap" aabbccddeeff "" ""
+  st "beacon: open network"       "$(posture_read_pcap "$tmp/b_open.pcap" 2 6)" "D+C"
+  st_beacon_pcap "$tmp/b_np.pcap" aabbccddeeff "$RSN_NOP" "$XNO"
+  st "beacon: WPA2 without PMF"   "$(posture_read_pcap "$tmp/b_np.pcap" 2 6)"   "D+C"
+  st_beacon_pcap "$tmp/b_pmf.pcap" aabbccddeeff "$RSN_PMF" ""
+  st "beacon: PMF required"       "$(posture_read_pcap "$tmp/b_pmf.pcap" 2 6)"  "C"
+  # POSTURE_RSN/POSTURE_EXT only reach the caller when not run in a subshell, so re-run in-shell
+  posture_read_pcap "$tmp/b_pmf.pcap" 2 6 >/dev/null
+  st "beacon: rsn caps extracted" "$POSTURE_RSN"                                "cc00"
+  st "beacon: absent extcap stays -" "$POSTURE_EXT"                             "-"
+  st_beacon_pcap "$tmp/b_bp.pcap" aabbccddeeff "$RSN_PMF" "$XBP"
+  st "beacon: PMF + beacon prot"  "$(posture_read_pcap "$tmp/b_bp.pcap" 2 6)"   "NONE"
+  st "beacon: DFS beats posture"  "$(posture_read_pcap "$tmp/b_pmf.pcap" 5 52)" "NOINJ"
+  st "beacon: UNII-1 reads normally" "$(posture_read_pcap "$tmp/b_pmf.pcap" 5 36)" "C"
+  printf 'garbage' >"$tmp/b_bad.pcap"; beacon_find "$tmp/b_bad.pcap" >/dev/null 2>&1
+  st "beacon: bad magic rejected" "$?" 1
+  st_pcap "$tmp/b_data.pcap" 1200 4 1700000000; beacon_find "$tmp/b_data.pcap" >/dev/null 2>&1
+  st "beacon: no beacon in file rc" "$?" 1
   # 8 marked blocks
   if command -v md5sum >/dev/null 2>&1 && [ -f "${BASH_SOURCE[0]}" ]; then
     printf 'lib block md5   %s\n' "$(sed -n '/^# --- camscout lib begin ---/,/^# --- camscout lib end ---/p' "${BASH_SOURCE[0]}" | md5sum | cut -c1-32)"
