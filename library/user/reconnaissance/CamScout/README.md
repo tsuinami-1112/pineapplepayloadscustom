@@ -5,8 +5,12 @@ every 20 s, lists every camera-vendor and camera-capable 802.11 device it can he
 grades it on a 0-100 confidence scale with reason tags, and, on request, locks the radio on one
 suspect to test whether it is streaming (**Watch**), whether it reacts to movement (**Stimulus
 test**) or where it is (**Locate**). Identity scanning is passive and free. Watch and Locate pause
-Recon channel hopping for the length of the lock (30-120 s). CamScout never transmits, never joins
-a network and never deauthenticates anything.
+Recon channel hopping for the length of the lock (30-120 s). CamScout never joins a network.
+
+With `RESPONSE=1` a fourth rung appears on the device card — **Disrupt** — which reads the target's
+protection posture from its own beacon and then disconnects it. See [Response](#response).
+**`RESPONSE` defaults to 0**, and with it off CamScout transmits nothing and the device card is
+exactly as it was.
 
 ## What it cannot see
 
@@ -166,13 +170,77 @@ removes it). Overrides are counted on the start screen and listed in `events.log
 | GPS | 0 | | closest-approach GPS stamping |
 | KEEP_PCAP / KEEP_RAW | 0 / 0 | | keep Watch pcaps / per-second bucket lines in loot |
 | ROW_W | 22 | | list row budget (36-40 expected after Phase 0 item 19) |
+| RESPONSE | 0 | * | master switch for the Disrupt rung; 0 = recon only, nothing transmits |
+| RESPONSE_CONFIRM | 1 | * | blocking confirmation before any transmit |
+| POSTURE_TTL | 300 | * | seconds a posture badge stays cached per BSSID |
+| RESP_SETTLE_SECS | 6 | * | wait after transmitting before re-reading the target to judge the effect |
+| BCN_CAP_SECS / BCN_CAP_COUNT | 4 / 5 | | beacon capture window and frame count for a posture read |
+| RESP_LOCK_SECS | 20 | | EXAMINE lock duration held across a response |
+
+## Response
+
+Off by default. `PAYLOAD_SET_CONFIG camscout RESPONSE 1` adds **Disrupt** to the device card.
+
+**1 · Posture.** The badge comes from the target's own beacon, captured on `RECON_IF` — the only
+source that covers every band, since `radio0` is 2.4 GHz-only and `radio1` carries no managed
+interface, so no `iw scan` on this device can read 5/6 GHz RSN. CamScout reads MFPC (bit 7) and
+MFPR (bit 6) from the RSN Capabilities field of element 48, and Beacon Protection from bit 84 of
+the Extended Capabilities element (127). Badges cache per BSSID for `POSTURE_TTL`.
+
+| Badge | Meaning | deauth+disassoc | CSA |
+|---|---|---|---|
+| `D+C` | no PMF | works | works |
+| `D?+C` | PMF optional (transition mode) | per-client | works |
+| `C` | PMF required (WPA3) | ignored | works |
+| `NONE` | PMF + beacon protection | blocked | blocked |
+| `NOINJ` | DFS 5 GHz or 6 GHz channel | cannot transmit | cannot transmit |
+| `?` | no beacon captured | unknown | unknown |
+
+`D?+C` cannot be resolved from a beacon alone, because PMF is negotiated per client — a transition
+-mode BSS can hold both protected and unprotected clients at once. `NOINJ` is a regulatory wall,
+not a property of the target: cfg80211 marks DFS and 6 GHz channels no-initiate-radiation for a
+monitor interface, so frames are dropped before they reach the air whatever the target's posture.
+
+**2 · Attack.** All three are always offered, ordered by what the beacon says will work and
+labelled `works` / `partial` / `blocked` / `unknown`. The badge advises; you decide. If nothing is
+expected to work you are asked once, then may proceed anyway.
+
+| Option | Command | Frames |
+|---|---|---|
+| `DEAUTH` | `PINEAPPLE_DEAUTH_CLIENT [bssid] [target] [channel]` | deauth + disassociation |
+| `CSA` | `PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]` | channel-switch announcements |
+| `BOTH` | `PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]` | all three |
+
+An AP target is attacked broadcast (`ff:ff:ff:ff:ff:ff`); a client target is attacked through its
+own AP's BSSID on that AP's channel. An unassociated client has no BSS to announce from and is
+refused. CSA takes no target because it rides in a beacon.
+
+**3 · Verdict.** Every kernel-side drop path reports success, so "we sent it" proves nothing. The
+channel is locked with the same `lock_target` Watch uses (verified read-back, falling back to a
+channel lock, aborting if the radio is still hopping), and after `RESP_SETTLE_SECS` the target is
+re-read from Recon:
+
+| Verdict | Means |
+|---|---|
+| `MOVED` | gone from Recon, or its packet counter stalled with nothing newer seen |
+| `NO_EFFECT` | packet counter still advancing — it never left |
+| `INCONCLUSIVE` | no baseline, no follow-up reading, or the counter stalled but it was seen again |
+| `LOCK_FAILED` | the radio would not hold the target channel; nothing was transmitted |
+
+Beacon protection (WPA3, Dec-2020 onward, mandatory for AP support in Wi-Fi 7) defeats the CSA
+path outright, and CSA bursts are detectable — Kismet alerts on CSA floods and on announcements
+that reuse a captured beacon's timestamp.
 
 ## Loot (`/root/loot/CamScout/`, flat)
 
 - `inventory.tsv`: one `|`-separated row per MAC, rewritten atomically each cycle. Header:
   `#first_seen|last_seen|run_id|mac|role|cat|vendor|label|conf|id_score|beh_score|beh_verdict|band|ssid|ap_bssid|ch|freq|rssi_best|rssi_best_ts|rssi_last|prox|n_seen|pkt_rate|signals|lan_tag|lat|lon`
   (`band` = 2/5/6 GHz, `signals` = tags, epoch seconds, `-` for empty). ~160 B per MAC.
-- `events.log`: `epoch level msg` (cycle, alert, mode, watch, locate, cfg, warn, run).
+- `events.log`: `epoch level msg` (cycle, alert, mode, watch, locate, cfg, warn, run, resp).
+- `responses.tsv` (only once a response is fired): one `|`-separated row per attempt. Header:
+  `#epoch|mac|role|bssid|target|ch|band|badge|rsn_caps|beacon_prot|attack|cmd|lock|pk_before|pk_after|verdict`
+  (`rsn_caps` is the raw 2-octet RSN Capabilities field, low octet first; `beacon_prot` is octet 10
+  of the Extended Capabilities element, or `-` when absent).
 - `watch_<run>_<mac>.tsv`: one row per Watch episode:
   `#epoch|mac|role|bssid|ch|freq|mode|run|secs|up|down|asym|cv|delta|rec|drops|verdict|batt_start|batt_end|charging`.
 - `report_<run>.txt`: headline counts, suspects by confidence, vendor census, AP-to-client tree
