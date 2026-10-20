@@ -853,10 +853,10 @@ bucket_stats() {
 WATCH_MAC=""; WATCH_BSSID=""; WATCH_CH=0; WATCH_ROLE=""; CAP_PIDS=""; CUR=A
 declare -a RUNS
 
-# lock_target bssid secs -> 0 locked, 1 locked by channel, 2 lock failed
+# lock_target bssid secs [channel] -> 0 locked, 1 locked by channel, 2 lock failed
 LOCK_TEXT=""
-lock_target() {
-  local bssid="$1" secs="$2" c1 c2 c3 want="${WATCH_CH:-0}"
+lock_target() {   # lock_target <bssid> <secs> [channel]; the channel defaults to the current Watch target's
+  local bssid="$1" secs="$2" c1 c2 c3 want="${3:-${WATCH_CH:-0}}"
   PINEAPPLE_EXAMINE_BSSID "$bssid" "$secs" >/dev/null 2>&1; WATCH_LOCKED=1; LAST_LOCK_TS=$EPOCHSECONDS
   sleep 0.5; c1=$(cur_channel); sleep 0.5; c2=$(cur_channel); sleep 0.5; c3=$(cur_channel)
   LOCK_TEXT="$RECON_IF ch ${c3:-?}, target ch $want"
