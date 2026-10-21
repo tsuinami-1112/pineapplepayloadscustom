@@ -1652,46 +1652,89 @@ resp_verdict() {
   printf 'INCONCLUSIVE'
 }
 
-resp_write() {   # resp_write <mac> <badge> <attack> <cmd> <lock> <pk0> <pk1> <verdict>
-  local f="$LOOT_DIR/responses.tsv" bp=-
+resp_write() {   # resp_write <mac> <badge> <attack> <cmd> <lock> <pk0> <pk1> <verdict> [measured target]
+  local f="$LOOT_DIR/responses.tsv" bp=- tgt="${9:-$R_TARGET}"
   [ "$POSTURE_EXT" = - ] || bp=$(hex_octet "$POSTURE_EXT" 10 2>/dev/null) || bp=-
   [ -s "$f" ] || printf '%s\n' "$RESP_HDR" >"$f" 2>/dev/null
   printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-    "$EPOCHSECONDS" "$1" "${ROLE[$1]:--}" "$R_BSSID" "$R_TARGET" "$R_CH" "$R_BAND" \
+    "$EPOCHSECONDS" "$1" "${ROLE[$1]:--}" "$R_BSSID" "$tgt" "$R_CH" "$R_BAND" \
     "$2" "${POSTURE_RSN:--}" "$bp" "$3" "$4" "$5" "$6" "$7" "$8" >>"$f" 2>/dev/null
 }
 
+# resp_snapshot -> RS_PK/RS_T (packets, last-seen) for the subjects of the attempt, from one Recon read:
+# a client target measures itself; a broadcast (AP) target measures the AP's visible, non-random clients.
+# The AP's own counter is never the subject: it keeps beaconing whatever happens to its clients.
+declare -A RS_PK RS_T
+resp_snapshot() {
+  local m a pk sig pr fr t ch s
+  RS_PK=(); RS_T=()
+  while IFS='|' read -r m a pk sig pr fr t ch; do
+    m=${m,,}; a=${a,,}
+    if [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ]; then [ "$a" = "$R_BSSID" ] || continue; is_rand "$m" && continue
+    else [ "$m" = "$R_TARGET" ] || continue; fi
+    RS_PK[$m]="${pk:-0}"; RS_T[$m]="${t:-0}"
+  done < <(recon_lines CLIENTS)
+  if [ "$R_TARGET" != ff:ff:ff:ff:ff:ff ] && [ -z "${RS_PK[$R_TARGET]+x}" ]; then   # a client row Recon lists as an AP
+    if s=$(recon_stat "$R_TARGET"); then read -r pk t <<<"$s"; RS_PK[$R_TARGET]="$pk"; RS_T[$R_TARGET]="$t"; fi
+  fi
+}
+# resp_aggregate <moved> <no_effect> <inconclusive> -> one word for the whole attempt
+resp_aggregate() {
+  (( $2 > 0 )) && { printf 'NO_EFFECT'; return 0; }           # any subject kept transmitting
+  (( $1 > 0 && $3 == 0 )) && { printf 'MOVED'; return 0; }     # every subject went quiet
+  printf 'INCONCLUSIVE'
+}
+
 resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was reached
-  local mac="$1" k="$2" badge="$3" cmd lock rc s p0=- t0=- p1=- t1=- present=1 verdict
+  local mac="$1" k="$2" badge="$3" cmd lock rc m p0 t0 p1 t1 present verdict nmv=0 nne=0 ninc=0 n
+  local -a subjects=(); local -A P0=() T0=()
   cmd=$(response_cmd "$k")
   [ -n "$cmd" ] || return 1
   if ! command -v "$cmd" >/dev/null 2>&1; then
     LOG red "$cmd not present in this firmware"; log resp "missing $cmd"; return 1
   fi
-  if s=$(recon_stat "$R_TARGET"); then read -r p0 t0 <<<"$s"; fi
+  resp_snapshot
+  for m in "${!RS_PK[@]}"; do subjects+=("$m"); P0[$m]="${RS_PK[$m]}"; T0[$m]="${RS_T[$m]}"; done
+  if [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ]; then
+    if (( ${#subjects[@]} == 0 )); then                        # nothing to disconnect, nothing to measure
+      LOG red "no visible clients on ${R_BSSID:9}: nothing to disconnect"; log resp "refused $R_BSSID no clients"
+      resp_write "$mac" "$badge" "$k" "$cmd" - - - NO_CLIENTS
+      set_state RESPOND_NIL; return 1
+    fi
+  else
+    (( ${#subjects[@]} == 0 )) && { subjects=("$R_TARGET"); P0[$R_TARGET]=-; T0[$R_TARGET]=-; }
+  fi
+  n=${#subjects[@]}
   lock_target "$R_BSSID" "$RESP_LOCK_SECS" "$R_CH"; rc=$?
   case $rc in 0) lock=ok ;; 1) lock=by-channel ;; *) lock=failed ;; esac
   if (( rc == 2 )); then
     unlock_target
     LOG red "lock failed: $LOCK_TEXT"; log resp "lock-failed $R_BSSID $LOCK_TEXT"
-    resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "$p0" - LOCK_FAILED
+    for m in "${subjects[@]}"; do resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "${P0[$m]}" - LOCK_FAILED "$m"; done
     set_state INCONCLUSIVE; return 1
   fi
   set_state RESPOND
-  LOG "$k -> ${R_BSSID:9} ch $R_CH"$'\n'"lock: $lock"
-  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock"
+  LOG "$k -> ${R_BSSID:9} ch $R_CH"$'\n'"lock: $lock, $n subject(s)"
+  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock subjects=$n"
   if [ "$k" = CSA ]; then "$cmd" "$R_BSSID" "$R_CH" >/dev/null 2>&1
   else "$cmd" "$R_BSSID" "$R_TARGET" "$R_CH" >/dev/null 2>&1; fi
   sleep "$RESP_SETTLE_SECS"
-  if s=$(recon_stat "$R_TARGET"); then read -r p1 t1 <<<"$s"; else present=0; fi
+  resp_snapshot
   unlock_target
-  verdict=$(resp_verdict "$p0" "$t0" "$p1" "$t1" "$present")
-  resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "$p0" "$p1" "$verdict"
-  log resp "verdict $verdict $R_TARGET pk $p0 -> $p1 present=$present"
+  for m in "${subjects[@]}"; do
+    p0="${P0[$m]}"; t0="${T0[$m]}"; present=1; p1=-; t1=-
+    if [ -n "${RS_PK[$m]+x}" ]; then p1="${RS_PK[$m]}"; t1="${RS_T[$m]}"; else present=0; fi
+    verdict=$(resp_verdict "$p0" "$t0" "$p1" "$t1" "$present")
+    case "$verdict" in MOVED) nmv=$((nmv + 1)) ;; NO_EFFECT) nne=$((nne + 1)) ;; *) ninc=$((ninc + 1)) ;; esac
+    resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "$p0" "$p1" "$verdict" "$m"
+    log resp "subject $m $verdict pk $p0 -> $p1 present=$present"
+  done
+  verdict=$(resp_aggregate "$nmv" "$nne" "$ninc")
+  log resp "verdict $verdict $R_TARGET moved=$nmv no_effect=$nne inconclusive=$ninc of $n"
   case "$verdict" in
-    MOVED)     set_state RESPOND_HIT; LOG green "$verdict: target went quiet" ;;
-    NO_EFFECT) set_state RESPOND_NIL; LOG yellow "$verdict: still transmitting (pk $p0 -> $p1)" ;;
-    *)         set_state INCONCLUSIVE; LOG yellow "$verdict: recon could not settle it" ;;
+    MOVED)     set_state RESPOND_HIT; LOG green "$verdict: $nmv/$n quiet" ;;
+    NO_EFFECT) set_state RESPOND_NIL; LOG yellow "$verdict: $nne/$n still transmitting" ;;
+    *)         set_state INCONCLUSIVE; LOG yellow "$verdict: $ninc/$n unsettled, $nmv quiet" ;;
   esac
   return 0
 }
@@ -2031,6 +2074,12 @@ selftest() {
   unset "IGNORED[aa:00:00:00:00:10]"
   auto_respond_ok aa:00:00:00:00:12 2>/dev/null; st "auto_respond skips unattackable" "$?" 1
   RESPONSE=0; AUTO_RESPOND=0
+  st "aggregate: all quiet"          "$(resp_aggregate 2 0 0)" "MOVED"
+  st "aggregate: any still active"   "$(resp_aggregate 1 1 0)" "NO_EFFECT"
+  st "aggregate: mixed"              "$(resp_aggregate 1 0 1)" "INCONCLUSIVE"
+  st "aggregate: nothing measured"   "$(resp_aggregate 0 0 0)" "INCONCLUSIVE"
+  rm -f "$tmp/responses.tsv"; resp_write aa:00:00:00:00:10 C CSA PINEAPPLE_DEAUTH_CLIENT_CSA ok 10 10 MOVED aa:00:00:00:00:11
+  st "response row: measured target override" "$(sed -n 2p "$tmp/responses.tsv" | cut -d'|' -f5)" "aa:00:00:00:00:11"
   # 8 marked blocks
   if command -v md5sum >/dev/null 2>&1 && [ -f "${BASH_SOURCE[0]}" ]; then
     printf 'lib block md5   %s\n' "$(sed -n '/^# --- camhound lib begin ---/,/^# --- camhound lib end ---/p' "${BASH_SOURCE[0]}" | md5sum | cut -c1-32)"

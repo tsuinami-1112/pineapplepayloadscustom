@@ -233,6 +233,14 @@ re-read from Recon:
 | `NO_EFFECT` | packet counter still advancing — it never left |
 | `INCONCLUSIVE` | no baseline, no follow-up reading, or the counter stalled but it was seen again |
 | `LOCK_FAILED` | the radio would not hold the target channel; nothing was transmitted |
+| `NO_CLIENTS` | AP target with no visible clients; refused before anything was transmitted |
+
+A broadcast attempt (AP target) is measured on the AP's visible, non-randomised clients, since the AP
+itself keeps beaconing whatever happens: `responses.tsv` gets one row per client with that client as
+`target`, and the verdict shown is the aggregate (`MOVED` only when every client went quiet,
+`NO_EFFECT` when any kept transmitting, `INCONCLUSIVE` otherwise). An AP with no visible clients is
+refused. Recon's packet counter is direction-blind, so a disconnected client that keeps probing still
+reads as transmitting.
 
 Beacon protection (WPA3, Dec-2020 onward, mandatory for AP support in Wi-Fi 7) defeats the CSA
 path outright, and CSA bursts are detectable — Kismet alerts on CSA floods and on announcements
