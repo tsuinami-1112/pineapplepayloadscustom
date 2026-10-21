@@ -286,7 +286,8 @@ rows are the evidence, the aggregate is the summary.
 
 ## 12. What is verified
 
-Laptop only, no radio. Selftest is **117 checks, 0 failures** (was 39 before the response side), and
+Laptop only, no radio. Selftest is **127 checks, 0 failures** (was 39 before the response side; the
+most recent additions are recon-side, for inventory persistence), and
 the harness has a `disrupt` scenario that exercises the whole chain end to end — log-only stubs for
 the three `PINEAPPLE_DEAUTH_CLIENT*` commands that record their arguments and transmit nothing, plus
 a synthetic-beacon branch in the fake `tcpdump`. That scenario checks the posture read happening
