@@ -90,7 +90,8 @@ RECON_IF="wlan1mon"     # PineAP monitor radio (tri-band)
 RESPONSE=0              # * master switch for the response rung (0 = recon only)
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
 AUTO_RESPOND=0          # * let the funnel offer Disrupt by itself (needs RESPONSE=1; 0 = manual only)
-SCAN_IF="wlan0"         # posture cross-check iface: the enabled dummy sta on radio0 (2.4 GHz only)
+# shellcheck disable=SC2034
+SCAN_IF="wlan0"         # reserved: posture cross-check iface, the enabled dummy sta on radio0 (2.4 GHz only)
 BCN_CAP_SECS=4          # seconds to wait for a beacon when reading a target's posture
 BCN_CAP_COUNT=5         # beacons to capture per posture read (first usable one is parsed)
 POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
@@ -482,18 +483,23 @@ capture_beacon() {   # capture_beacon <bssid> -> pcap path on stdout, rc 1 on fa
   printf '%s' "$out"
 }
 
-posture_of() {   # posture_of <bssid> <band> <channel> -> badge, cached per BSSID for POSTURE_TTL
-  local bssid="$1" band="$2" ch="$3" f b now="$EPOCHSECONDS"
+POSTURE_LAST='?'
+posture_of() {   # posture_of <bssid> <band> <channel> -> badge (stdout and POSTURE_LAST), cached per BSSID
+  # Call it directly, not in $(...): the cache, POSTURE_RSN and POSTURE_EXT are set in the caller's shell.
+  local bssid="$1" band="$2" ch="$3" f b now="$EPOCHSECONDS" locked_here=0
   if [ -n "${POSTURE[$bssid]}" ] && (( now - ${POSTURE_TS[$bssid]:-0} < POSTURE_TTL )); then
-    printf '%s' "${POSTURE[$bssid]}"; return 0
+    POSTURE_LAST="${POSTURE[$bssid]}"; printf '%s' "$POSTURE_LAST"; return 0
   fi
   # A channel we may not transmit on needs no capture: the answer is NOINJ whatever the beacon says.
   if [ "$(posture_from_caps - - "$band" "$ch")" = NOINJ ]; then
-    POSTURE[$bssid]=NOINJ; POSTURE_TS[$bssid]=$now; printf 'NOINJ'; return 0
+    POSTURE[$bssid]=NOINJ; POSTURE_TS[$bssid]=$now; POSTURE_LAST=NOINJ; printf 'NOINJ'; return 0
   fi
+  # Recon hops while unlocked, so a 4 s capture on one BSSID mostly misses; hold the channel for it.
+  if [ "$WATCH_LOCKED" != 1 ]; then lock_target "$bssid" $(( BCN_CAP_SECS + 5 )) "$ch" >/dev/null; locked_here=1; fi
   if f=$(capture_beacon "$bssid"); then b=$(posture_read_pcap "$f" "$band" "$ch"); rm -f "$f"; else b='?'; fi
-  POSTURE[$bssid]="$b"; POSTURE_TS[$bssid]=$now
-  printf '%s' "$b"
+  (( locked_here )) && unlock_target
+  if [ "$b" != '?' ]; then POSTURE[$bssid]="$b"; POSTURE_TS[$bssid]=$now; fi   # a failed read is not cached
+  POSTURE_LAST="$b"; printf '%s' "$b"
 }
 # --- response posture end ---
 
@@ -1613,6 +1619,9 @@ resp_target() {   # resp_target <mac> -> sets R_BSSID R_TARGET R_CH R_BAND; rc 1
   fi
   [[ $R_CH =~ ^[0-9]+$ ]] || return 1
   (( R_CH > 0 )) || return 1
+  if [ "$R_BAND" = '?' ]; then    # no frequency seen for the target or its AP: the channel number decides
+    if (( R_CH <= 14 )); then R_BAND=2; elif (( R_CH >= 36 && R_CH <= 177 )); then R_BAND=5; fi
+  fi
   return 0
 }
 
@@ -1658,7 +1667,7 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
     LOG red "$cmd not present in this firmware"; log resp "missing $cmd"; return 1
   fi
   if s=$(recon_stat "$R_TARGET"); then read -r p0 t0 <<<"$s"; fi
-  lock_target "$R_BSSID" "$RESP_LOCK_SECS"; rc=$?
+  lock_target "$R_BSSID" "$RESP_LOCK_SECS" "$R_CH"; rc=$?
   case $rc in 0) lock=ok ;; 1) lock=by-channel ;; *) lock=failed ;; esac
   if (( rc == 2 )); then
     unlock_target
@@ -1712,7 +1721,7 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
     LOG red "nothing to attack: no associated BSS or no channel for $mac"; return 0
   fi
   LOG "reading posture ${R_BSSID:9} ch $R_CH"
-  badge=$(posture_of "$R_BSSID" "$R_BAND" "$R_CH")
+  posture_of "$R_BSSID" "$R_BAND" "$R_CH" >/dev/null; badge="$POSTURE_LAST"
   opts=$(posture_opts "$badge")
   LOG "[$badge] ${R_BSSID:9} ch$R_CH ${R_BAND}GHz"$'\n'"target ${R_TARGET:9}"$'\n'"$(posture_why "$badge")"
   if [ -z "$opts" ]; then

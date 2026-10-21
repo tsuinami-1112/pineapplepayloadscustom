@@ -191,7 +191,8 @@ Off by default. `PAYLOAD_SET_CONFIG camhound RESPONSE 1` adds **Disrupt** to the
 source that covers every band, since `radio0` is 2.4 GHz-only and `radio1` carries no managed
 interface, so no `iw scan` on this device can read 5/6 GHz RSN. CamHound reads MFPC (bit 7) and
 MFPR (bit 6) from the RSN Capabilities field of element 48, and Beacon Protection from bit 84 of
-the Extended Capabilities element (127). Badges cache per BSSID for `POSTURE_TTL`.
+the Extended Capabilities element (127). Badges cache per BSSID for `POSTURE_TTL`; a failed read (`?`) is not cached, and the beacon is
+captured under a short channel lock when no Watch lock is held, since Recon hops while unlocked.
 
 | Badge | Meaning | deauth+disassoc | CSA |
 |---|---|---|---|
