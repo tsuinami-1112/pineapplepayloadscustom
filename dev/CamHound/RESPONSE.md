@@ -167,15 +167,43 @@ Every kernel-side drop path on an injected frame returns `NETDEV_TX_OK` — no c
 interface that is not running: all of them reach userspace as success. So the send call is not
 evidence. Only the target's subsequent behaviour is.
 
-`resp_fire` snapshots the target's packet counter and last-seen time from PineAP Recon, transmits,
-waits `RESP_SETTLE_SECS`, and re-reads:
+**What gets measured: subjects, not the target.** `resp_snapshot()` collects a packet counter and
+last-seen time per *subject* from one Recon read:
 
-| Verdict | Means |
+- **client target** → the client itself.
+- **broadcast target** (an AP) → the AP's **visible, non-randomised clients**. The AP's own counter
+  is deliberately never used: it keeps beaconing whatever happens to its clients, so it carries no
+  signal. Randomised MACs are excluded via `is_rand` because they rotate and would read as `MOVED`
+  for free.
+- A client row that Recon happens to list as an AP falls back to `recon_stat`.
+
+This distinction was a real defect, not a refinement. The first version asked Recon about
+`R_TARGET` directly, and for a broadcast attempt that is `ff:ff:ff:ff:ff:ff`, which never appears in
+Recon. `recon_stat` therefore failed, `present` was 0, and **every broadcast attempt was judged
+`MOVED` regardless of effect**, with no counters in its loot row. The unit tests covered
+`resp_verdict`'s branches in isolation and never the composition that fed it, so they passed while
+the result was wrong.
+
+**A broadcast target with no visible clients is refused** before the lock is taken and before
+anything is transmitted, and records a `NO_CLIENTS` row. There is nothing to disconnect and nothing
+to measure, so sending would be unverifiable noise.
+
+`resp_fire` then snapshots, transmits, waits `RESP_SETTLE_SECS`, re-snapshots, and judges **each
+subject** with `resp_verdict`:
+
+| Per-subject verdict | Means |
 |---|---|
 | `MOVED` | gone from Recon, or its packet counter stalled with nothing newer seen |
 | `NO_EFFECT` | counter still advancing — it never left |
 | `INCONCLUSIVE` | no baseline, no follow-up reading, or the counter stalled but it was seen again |
 | `LOCK_FAILED` | the radio would not hold the channel; nothing was transmitted |
+| `NO_CLIENTS` | broadcast target with no measurable clients; nothing was transmitted |
+
+`resp_aggregate` reduces those to the one verdict shown on screen and written to `events.log`:
+**`MOVED` only when every subject went quiet**, `NO_EFFECT` when any kept transmitting,
+`INCONCLUSIVE` otherwise. The screen also shows the ratio (`3/4 quiet`), because "two of five
+cameras dropped" is a materially different outcome from "all five dropped" and collapsing them
+would hide it.
 
 Worth stating plainly: **nobody has publicly demonstrated the CSA attack moving a real client.** The
 aircrack-ng PR that popularised it (#2724, still unmerged) ships a regression test whose hostapd
@@ -239,19 +267,35 @@ unprompted transmit path.
 
 ## 11. Loot
 
-`responses.tsv`, `|`-separated with a `#` header, one row per attempt:
+`responses.tsv`, `|`-separated with a `#` header, **one row per measured subject** (so a broadcast
+attempt against an AP with four clients writes four rows, one attempt):
 
 ```
 #epoch|mac|role|bssid|target|ch|band|badge|rsn_caps|beacon_prot|attack|cmd|lock|pk_before|pk_after|verdict
 ```
 
-`rsn_caps` is the raw 2-octet RSN Capabilities field, low octet first; `beacon_prot` is octet 10 of
-the Extended Capabilities element, or `-` when absent. Keeping the raw bytes means a disputed badge
-can be re-derived from the loot rather than re-argued.
+`mac` is the enumerated target the operator acted on; **`target` is the subject actually measured**
+— the individual client for a broadcast attempt, not `ff:ff:ff:ff:ff:ff`. `resp_write` takes that as
+an optional 9th argument and defaults to `R_TARGET`. `rsn_caps` is the raw 2-octet RSN Capabilities
+field, low octet first; `beacon_prot` is octet 10 of the Extended Capabilities element, or `-` when
+absent. Keeping the raw bytes means a disputed badge can be re-derived from the loot rather than
+re-argued.
+
+The aggregate verdict is **not** in this file; it is on screen and in `events.log`. The per-subject
+rows are the evidence, the aggregate is the summary.
 
 ## 12. What is verified
 
-Laptop only, no radio. Selftest is **112 checks, 0 failures** (was 39 before the response side):
+Laptop only, no radio. Selftest is **117 checks, 0 failures** (was 39 before the response side), and
+the harness has a `disrupt` scenario that exercises the whole chain end to end — log-only stubs for
+the three `PINEAPPLE_DEAUTH_CLIENT*` commands that record their arguments and transmit nothing, plus
+a synthetic-beacon branch in the fake `tcpdump`. That scenario checks the posture read happening
+under a lock on the target channel, the badge derived from the beacon, the correct command invoked
+with the right BSSID/target/channel, the lock verified as `ok` rather than by-channel, the
+per-subject loot rows with badge and raw caps, the aggregate verdict, the no-clients guard, the
+cached badge appearing on the card afterwards, and EXAMINE being released.
+
+Unit coverage:
 
 - every badge from hand-built RSN and Extended-Capabilities byte vectors, both beacon-protection
   states, absent/short/truncated/garbage elements, each regulatory class
@@ -279,10 +323,17 @@ Needs a Pager:
 - whether Recon's packet counters move the way `resp_verdict` assumes
 - whether the CSA attack moves a real client **at all** — see §7
 
-The laptop harness reports 6 failures in this container, all in the Watch path. They are
-environmental, not regressions: `preflight()` sets `HAVE_TCPDUMP` only when **both** `tcpdump` and
-`hexdump` are present, and this container has no `hexdump`, so Watch is disabled and its verdict
-assertions cannot pass. The same 6 fail on an unmodified upstream checkout.
+**A note on running the harness where `hexdump` is absent.** `preflight()` sets `HAVE_TCPDUMP` only
+when **both** `tcpdump` and `hexdump` are present. On a machine without `hexdump`, `HAVE_TCPDUMP`
+stays 0, `capture_beacon` returns immediately, and every assertion that depends on a capture fails —
+the Watch scenarios and the posture half of `disrupt`. This is environmental and not a code defect:
+re-running with a small `od`-backed `hexdump` shim on `PATH` clears all of them. Worth knowing
+because the failures look alarming and are not.
+
+Mildly interesting: the gate requires `hexdump` even though **both** pcap readers have `od`
+fallbacks (`pcap_words` and `pcap_bytes`). On a Pager `hexdump` is always present via busybox, so
+this never matters in production — it only affects laptop runs. Gating on `hexdump || od` would fix
+it.
 
 ## 14. Known limits
 
