@@ -456,7 +456,8 @@ beacon_find() {   # beacon_find <pcap> -> sets BCN_HEX and BCN_IES at the first 
   return 1
 }
 
-posture_read_pcap() {   # posture_read_pcap <pcap> <band> <channel> -> badge
+POSTURE_BADGE='?'
+posture_read_pcap() {   # posture_read_pcap <pcap> <band> <channel> -> badge (stdout and POSTURE_BADGE)
   local f="$1" band="$2" ch="$3" rsn ext caps
   POSTURE_RSN=-; POSTURE_EXT=-
   if beacon_find "$f"; then
@@ -467,7 +468,8 @@ posture_read_pcap() {   # posture_read_pcap <pcap> <band> <channel> -> badge
     fi
     ext=$(ie_find "$BCN_HEX" "$BCN_IES" 127) && POSTURE_EXT="$ext"
   fi
-  posture_from_caps "$POSTURE_RSN" "$POSTURE_EXT" "$band" "$ch"
+  POSTURE_BADGE=$(posture_from_caps "$POSTURE_RSN" "$POSTURE_EXT" "$band" "$ch")
+  printf '%s' "$POSTURE_BADGE"
 }
 
 capture_beacon() {   # capture_beacon <bssid> -> pcap path on stdout, rc 1 on failure
@@ -496,7 +498,7 @@ posture_of() {   # posture_of <bssid> <band> <channel> -> badge (stdout and POST
   fi
   # Recon hops while unlocked, so a 4 s capture on one BSSID mostly misses; hold the channel for it.
   if [ "$WATCH_LOCKED" != 1 ]; then lock_target "$bssid" $(( BCN_CAP_SECS + 5 )) "$ch" >/dev/null; locked_here=1; fi
-  if f=$(capture_beacon "$bssid"); then b=$(posture_read_pcap "$f" "$band" "$ch"); rm -f "$f"; else b='?'; fi
+  if f=$(capture_beacon "$bssid"); then posture_read_pcap "$f" "$band" "$ch" >/dev/null; b="$POSTURE_BADGE"; rm -f "$f"; else POSTURE_RSN=-; POSTURE_EXT=-; b='?'; fi
   (( locked_here )) && unlock_target
   if [ "$b" != '?' ]; then POSTURE[$bssid]="$b"; POSTURE_TS[$bssid]=$now; fi   # a failed read is not cached
   POSTURE_LAST="$b"; printf '%s' "$b"

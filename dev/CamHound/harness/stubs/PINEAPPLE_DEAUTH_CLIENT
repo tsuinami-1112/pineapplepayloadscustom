@@ -1,0 +1,3 @@
+#!/bin/bash
+# harness stub: records the call, transmits nothing
+printf '%s %s\n' "PINEAPPLE_DEAUTH_CLIENT" "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; exit 0
