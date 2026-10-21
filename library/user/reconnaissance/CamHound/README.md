@@ -175,6 +175,8 @@ removes it). Overrides are counted on the start screen and listed in `events.log
 | REPORT_EVERY | 15 | | cycles between report rewrites |
 | GPS | 0 | | closest-approach GPS stamping |
 | KEEP_PCAP / KEEP_RAW | 0 / 0 | | keep Watch pcaps / per-second bucket lines in loot |
+| DEDUPE_H | 0 | * | hours: a device stored in inventory.tsv within this horizon is not alerted again unless its band rose or it is 10 dB closer; `Scan (fresh)` ignores it for one run |
+| INVENTORY_KEEP_DAYS | 30 | | inventory.tsv rows older than this are pruned at start (0 = never) |
 | ROW_W | 22 | | list row budget (36-40 expected after Phase 0 item 19) |
 | RESPONSE | 0 | * | master switch for the Disrupt rung; 0 = recon only, nothing transmits |
 | RESPONSE_CONFIRM | 1 | * | blocking confirmation before any transmit |
@@ -191,7 +193,8 @@ Off by default. `PAYLOAD_SET_CONFIG camhound RESPONSE 1` adds **Disrupt** to the
 source that covers every band, since `radio0` is 2.4 GHz-only and `radio1` carries no managed
 interface, so no `iw scan` on this device can read 5/6 GHz RSN. CamHound reads MFPC (bit 7) and
 MFPR (bit 6) from the RSN Capabilities field of element 48, and Beacon Protection from bit 84 of
-the Extended Capabilities element (127). Badges cache per BSSID for `POSTURE_TTL`.
+the Extended Capabilities element (127). Badges cache per BSSID for `POSTURE_TTL`; a failed read (`?`) is not cached, and the beacon is
+captured under a short channel lock when no Watch lock is held, since Recon hops while unlocked.
 
 | Badge | Meaning | deauth+disassoc | CSA |
 |---|---|---|---|
@@ -232,6 +235,14 @@ re-read from Recon:
 | `NO_EFFECT` | packet counter still advancing — it never left |
 | `INCONCLUSIVE` | no baseline, no follow-up reading, or the counter stalled but it was seen again |
 | `LOCK_FAILED` | the radio would not hold the target channel; nothing was transmitted |
+| `NO_CLIENTS` | AP target with no visible clients; refused before anything was transmitted |
+
+A broadcast attempt (AP target) is measured on the AP's visible, non-randomised clients, since the AP
+itself keeps beaconing whatever happens: `responses.tsv` gets one row per client with that client as
+`target`, and the verdict shown is the aggregate (`MOVED` only when every client went quiet,
+`NO_EFFECT` when any kept transmitting, `INCONCLUSIVE` otherwise). An AP with no visible clients is
+refused. Recon's packet counter is direction-blind, so a disconnected client that keeps probing still
+reads as transmitting.
 
 Beacon protection (WPA3, Dec-2020 onward, mandatory for AP support in Wi-Fi 7) defeats the CSA
 path outright, and CSA bursts are detectable — Kismet alerts on CSA floods and on announcements
@@ -239,7 +250,10 @@ that reuse a captured beacon's timestamp.
 
 ## Loot (`/root/loot/CamHound/`, flat)
 
-- `inventory.tsv`: one `|`-separated row per MAC, rewritten atomically each cycle. Header:
+- `inventory.tsv`: one `|`-separated row per MAC, rewritten atomically each cycle and kept across runs:
+  `first_seen` and `n_seen` carry over, rows older than `INVENTORY_KEEP_DAYS` are pruned at start, randomised
+  client MACs are never stored, devices known from an earlier run carry the `SEEN` tag, and the report
+  counts them as `returning`. Header:
   `#first_seen|last_seen|run_id|mac|role|cat|vendor|label|conf|id_score|beh_score|beh_verdict|band|ssid|ap_bssid|ch|freq|rssi_best|rssi_best_ts|rssi_last|prox|n_seen|pkt_rate|signals|lan_tag|lat|lon`
   (`band` = 2/5/6 GHz, `signals` = tags, epoch seconds, `-` for empty). ~160 B per MAC.
 - `events.log`: `epoch level msg` (cycle, alert, mode, watch, locate, cfg, warn, run, resp).

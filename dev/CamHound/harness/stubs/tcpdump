@@ -1,6 +1,15 @@
 #!/bin/bash
 out=""; filt=""
-while [ $# -gt 0 ]; do case "$1" in -w) out="$2"; shift ;; -i|-s) shift ;; -nn) ;; *) filt="$filt $1" ;; esac; shift; done
+while [ $# -gt 0 ]; do case "$1" in -w) out="$2"; shift ;; -i|-s|-c) shift ;; -nn) ;; *) filt="$filt $1" ;; esac; shift; done
+case "$filt" in *"subtype beacon"*)
+  bss=$(printf '%s' "$filt" | sed -n 's/.*addr2 \([0-9a-fA-F:]*\).*/\1/p' | tr -d ':' | tr 'A-F' 'a-f')
+  le32h() { printf '%02x%02x%02x%02x' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 )); }
+  rsn="0100000fac040100000fac040100000fac020c00"
+  frame="000008000000000080000000ffffffffffff${bss}${bss}0000000000000000000064001104000463616d3130$(printf %02x $(( ${#rsn} / 2 )))$rsn"
+  flen=$(( ${#frame} / 2 )); hex="d4c3b2a1020004000000000000000000$(le32h 65535)$(le32h 127)$(le32h 0)$(le32h 0)$(le32h $flen)$(le32h $flen)$frame"
+  for ((i = 0; i < ${#hex}; i += 2)); do printf "\\x${hex:$i:2}"; done > "$out"
+  printf 'TCPDUMP beacon %s -> %s\n' "$bss" "$out" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; exit 0 ;;
+esac
 printf 'TCPDUMP %s [%s]\n' "$out" "$filt" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"
 t0=$(date +%s)
 le32() { printf "\\x$(printf %02x $(( $1 & 255 )))\\x$(printf %02x $(( ($1 >> 8) & 255 )))\\x$(printf %02x $(( ($1 >> 16) & 255 )))\\x$(printf %02x $(( ($1 >> 24) & 255 )))"; }

@@ -14,11 +14,12 @@ mkdir -p "$T/bin"; if command -v busybox >/dev/null 2>&1; then for a in hexdump 
 sed -e 's/^WIN_SECS=10 /WIN_SECS=5 /' -e 's/^LIVE_WINDOWS=6 /LIVE_WINDOWS=4 /' \
     -e 's/^WIN_BASE_S=30; WIN_STIM_S=20; WIN_POST_S=20 /WIN_BASE_S=6; WIN_STIM_S=5; WIN_POST_S=5 /' -e 's/^QUIET_SECS=15 /QUIET_SECS=3 /' \
     -e "s|^OUI_FILE=\"/lib/hak5/oui.txt\"; OUI_FILE_ALT=\"/rom/lib/hak5/oui.txt\"|OUI_FILE=\"$HERE/fix/oui.txt\"; OUI_FILE_ALT=\"$HERE/fix/oui.txt\"|" \
+    -e 's/^RESP_SETTLE_SECS=6 /RESP_SETTLE_SECS=1 /' -e 's/^BCN_CAP_SECS=4 /BCN_CAP_SECS=2 /' \
     -e "s|^LOOT_DIR=\"/root/loot/CamHound\"|LOOT_DIR=\"$LOOT\"|" "$SRC" >"$T/payload_fast.sh"
 grep -q "LOOT_DIR=\"$LOOT\"" "$T/payload_fast.sh" || { echo "sed on the config block failed"; exit 1; }
 printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
 PATHX="$HERE/stubs:$T/bin:$PATH"
-reset() { rm -rf "$LOOT" "$T/log" "$T"/rules*.c* /tmp/cs_harness_chan /tmp/cs_harness_pps /tmp/cs_run.pid /tmp/cs_children; mkdir -p "$LOOT"; echo 0 >/tmp/cs_harness_cycle; }
+reset() { [ "${1:-}" = keep ] || rm -rf "$LOOT"; rm -rf "$T/log" "$T"/rules*.c* /tmp/cs_harness_chan /tmp/cs_harness_pps /tmp/cs_run.pid /tmp/cs_children; mkdir -p "$LOOT"; echo 0 >/tmp/cs_harness_cycle; }
 rules() { local f="$T/rules_$1"; shift; printf '%s\t%s\n' "$@" >"$f"; export HARNESS_RULES="$f"; }
 answers() { printf '%s\n' "$@" >"$HARNESS_ANSWERS"; }
 check() { if eval "$2"; then printf 'PASS %s\n' "$1"; else printf 'FAIL %s\n' "$1"; FAIL=$((FAIL + 1)); fi; }
@@ -68,10 +69,39 @@ s_locate() {   # Locate on the Hikvision AP: bars, tiers, clean stop
   check "locate: MONITOR started and bars drawn" "grep -q '^MONITOR MONITOR c0:56:e3' $T/log && grep -q 'dBm \[' $T/log"
   check "locate: stop logged" "grep -q 'locate stop' $LOOT/events.log"
 }
+s_disrupt() {   # RESPONSE=1: Disrupt on the Reolink AP against log-only stubs; posture, lock, loot row
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules disrupt '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '1' ' via ' '1' "${COMMON[@]}"
+  answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "disrupt: posture read under a lock on the target channel" "grep -q 'TCPDUMP beacon ec71db000010' $T/log && grep -q 'PINEAPPLE_EXAMINE_BSSID ec:71:db:00:00:10' $T/log"
+  check "disrupt: badge D+C from the synthetic beacon" "grep -q 'PICKER\[Disrupt \[D+C\]' $T/log"
+  check "disrupt: stub command called with bssid, broadcast target, channel 36" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_ALL ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log"
+  check "disrupt: lock verified ok (not by channel)" "grep -q 'lock: ok' $T/log"
+  check "disrupt: one loot row per client, 16 fields, badge and raw caps" "[ \"\$(grep -c '^[0-9]' $LOOT/responses.tsv)\" = 2 ] && [ \"\$(sed -n 2p $LOOT/responses.tsv | awk -F'|' '{print NF}')\" = 16 ] && grep -q '|ec:71:db:00:00:11|36|5|D+C|0c00|' $LOOT/responses.tsv && grep -q '|ec:71:db:00:00:12|36|5|D+C|0c00|' $LOOT/responses.tsv"
+  check "disrupt: aggregate verdict over both clients" "grep -q 'verdict MOVED ff:ff:ff:ff:ff:ff moved=2 no_effect=0 inconclusive=0 of 2' $LOOT/events.log"
+  # guard: an AP with no visible clients (the Hikvision setup AP) is refused before anything is sent
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules disrupt2 '^CamHound' 'Scan,Exit' 'Review hits' '3,Exit' '^[0-9]+ HIK' 'Disrupt,Back' '^Disrupt \[' '1' ' via ' '1' "${COMMON[@]}"
+  answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "disrupt: AP without clients refused, nothing sent" "grep -q 'no visible clients' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log && grep -q '|NO_CLIENTS$' $LOOT/responses.tsv"
+  check "disrupt: cached badge shown on the card afterwards" "grep -q 'items=.*Disrupt \[D+C\]' $T/log"
+  check "disrupt: EXAMINE released, no lock file" "grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log && [ ! -e /tmp/cs_run.pid ]"
+}
+s_persist() {   # a second run with DEDUPE_H=24 stays silent on known devices; first_seen carries over; RAND rows are not stored
+  reset; rules persist1 '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; run
+  local fs1; fs1=$(grep '|ec:71:db:00:00:10|' "$LOOT/inventory.tsv" | cut -d'|' -f1)
+  check "persist: first run alerted and stored rows" "grep -q 'REO-OUI 00:00:10' $T/log && [ -n \"$fs1\" ]"
+  check "persist: randomised client not stored" "! grep -q '|02:ab:cd:00:00:01|' $LOOT/inventory.tsv"
+  reset keep; printf 'CYCLE_SECS=5\nDEDUPE_H=24\n' >"$HARNESS_CFG"
+  rules persist2 '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "persist: known devices not re-alerted" "! grep -q '^LOG red CONFIRMED' $T/log && ! grep -q '^LOG yellow LIKELY' $T/log && grep -q 'dedupe known ec:71:db:00:00:10' $LOOT/events.log"
+  check "persist: first_seen carried over" "[ \"\$(grep '|ec:71:db:00:00:10|' $LOOT/inventory.tsv | cut -d'|' -f1)\" = \"$fs1\" ]"
+  check "persist: SEEN tag and returning count" "grep -q '|ec:71:db:00:00:10|.*SEEN' $LOOT/inventory.tsv && grep -q 'returning [1-9]' $LOOT/report_*.txt"
+}
 case "${1:-all}" in
-  live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;;
-  all) s_live; s_stimulus; s_lock; s_nojq; s_locate ;;
-  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|all]"; exit 2 ;;
+  live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; persist) s_persist ;;
+  all) s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_persist ;;
+  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|persist|all]"; exit 2 ;;
 esac
 printf '== harness: %s failure(s); temp dir %s ==\n' "$FAIL" "$T"
 exit $(( FAIL > 0 ))

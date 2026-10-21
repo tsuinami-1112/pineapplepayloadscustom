@@ -66,13 +66,16 @@ MEDIAN_N=5              # Locate median ring
 REPORT_EVERY=15         # cycles between report rewrites
 GPS=0                   # closest-approach GPS stamping (0 = off)
 KEEP_PCAP=0; KEEP_RAW=0 # Watch artefacts copied to loot
+DEDUPE_H=0              # * hours: a device already in inventory.tsv within this horizon is not alerted again (0 = off)
+INVENTORY_KEEP_DAYS=30  # inventory.tsv rows older than this are pruned at start (0 = never)
 ROW_W=22                # list row budget (spike 19; expected 36-40 on the default theme)
 RECON_IF="wlan1mon"     # PineAP monitor radio (tri-band)
 # response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
 RESPONSE=0              # * master switch for the response rung (0 = recon only)
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
 AUTO_RESPOND=0          # * let the funnel offer Disrupt by itself (needs RESPONSE=1; 0 = manual only)
-SCAN_IF="wlan0"         # posture cross-check iface: the enabled dummy sta on radio0 (2.4 GHz only)
+# shellcheck disable=SC2034
+SCAN_IF="wlan0"         # reserved: posture cross-check iface, the enabled dummy sta on radio0 (2.4 GHz only)
 BCN_CAP_SECS=4          # seconds to wait for a beacon when reading a target's posture
 BCN_CAP_COUNT=5         # beacons to capture per posture read (first usable one is parsed)
 POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
@@ -104,7 +107,7 @@ TAG_MEANING=([HIDDEN]="hidden SSID + camera-vendor OUI" [RAND]="randomised clien
   [PROBE]="probes for a camera SSID" [BUSY]="high packet rate this cycle"
   [STREAM]="steady big uplink: streaming-consistent" [EVENT]="uplink jumped when you moved"
   [EVENT?]="uplink rose when you moved (weak)" [DOWN]="download-heavy: call/update, not camera-like"
-  [IDLE]="asleep, disarmed or local-record" [NONE]="traffic seen, no camera pattern")
+  [IDLE]="asleep, disarmed or local-record" [NONE]="traffic seen, no camera pattern" [SEEN]="known from an earlier run")
 
 # log LEVEL msg...  -> events.log (debug mirror); never prints to the screen
 log() { local lvl="$1"; shift; printf '%s %s %s\n' "$EPOCHSECONDS" "$lvl" "$*" >>"$LOOT_DIR/events.log" 2>/dev/null; }
@@ -164,6 +167,7 @@ load_overrides() {
   RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
   AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
   POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
+  DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
 }
 
 # install dir: the UI runs a copy from /tmp, so look for the data file where it can live
@@ -437,7 +441,8 @@ beacon_find() {   # beacon_find <pcap> -> sets BCN_HEX and BCN_IES at the first 
   return 1
 }
 
-posture_read_pcap() {   # posture_read_pcap <pcap> <band> <channel> -> badge
+POSTURE_BADGE='?'
+posture_read_pcap() {   # posture_read_pcap <pcap> <band> <channel> -> badge (stdout and POSTURE_BADGE)
   local f="$1" band="$2" ch="$3" rsn ext caps
   POSTURE_RSN=-; POSTURE_EXT=-
   if beacon_find "$f"; then
@@ -448,7 +453,8 @@ posture_read_pcap() {   # posture_read_pcap <pcap> <band> <channel> -> badge
     fi
     ext=$(ie_find "$BCN_HEX" "$BCN_IES" 127) && POSTURE_EXT="$ext"
   fi
-  posture_from_caps "$POSTURE_RSN" "$POSTURE_EXT" "$band" "$ch"
+  POSTURE_BADGE=$(posture_from_caps "$POSTURE_RSN" "$POSTURE_EXT" "$band" "$ch")
+  printf '%s' "$POSTURE_BADGE"
 }
 
 capture_beacon() {   # capture_beacon <bssid> -> pcap path on stdout, rc 1 on failure
@@ -464,18 +470,23 @@ capture_beacon() {   # capture_beacon <bssid> -> pcap path on stdout, rc 1 on fa
   printf '%s' "$out"
 }
 
-posture_of() {   # posture_of <bssid> <band> <channel> -> badge, cached per BSSID for POSTURE_TTL
-  local bssid="$1" band="$2" ch="$3" f b now="$EPOCHSECONDS"
+POSTURE_LAST='?'
+posture_of() {   # posture_of <bssid> <band> <channel> -> badge (stdout and POSTURE_LAST), cached per BSSID
+  # Call it directly, not in $(...): the cache, POSTURE_RSN and POSTURE_EXT are set in the caller's shell.
+  local bssid="$1" band="$2" ch="$3" f b now="$EPOCHSECONDS" locked_here=0
   if [ -n "${POSTURE[$bssid]}" ] && (( now - ${POSTURE_TS[$bssid]:-0} < POSTURE_TTL )); then
-    printf '%s' "${POSTURE[$bssid]}"; return 0
+    POSTURE_LAST="${POSTURE[$bssid]}"; printf '%s' "$POSTURE_LAST"; return 0
   fi
   # A channel we may not transmit on needs no capture: the answer is NOINJ whatever the beacon says.
   if [ "$(posture_from_caps - - "$band" "$ch")" = NOINJ ]; then
-    POSTURE[$bssid]=NOINJ; POSTURE_TS[$bssid]=$now; printf 'NOINJ'; return 0
+    POSTURE[$bssid]=NOINJ; POSTURE_TS[$bssid]=$now; POSTURE_LAST=NOINJ; printf 'NOINJ'; return 0
   fi
-  if f=$(capture_beacon "$bssid"); then b=$(posture_read_pcap "$f" "$band" "$ch"); rm -f "$f"; else b='?'; fi
-  POSTURE[$bssid]="$b"; POSTURE_TS[$bssid]=$now
-  printf '%s' "$b"
+  # Recon hops while unlocked, so a 4 s capture on one BSSID mostly misses; hold the channel for it.
+  if [ "$WATCH_LOCKED" != 1 ]; then lock_target "$bssid" $(( BCN_CAP_SECS + 5 )) "$ch" >/dev/null; locked_here=1; fi
+  if f=$(capture_beacon "$bssid"); then posture_read_pcap "$f" "$band" "$ch" >/dev/null; b="$POSTURE_BADGE"; rm -f "$f"; else POSTURE_RSN=-; POSTURE_EXT=-; b='?'; fi
+  (( locked_here )) && unlock_target
+  if [ "$b" != '?' ]; then POSTURE[$bssid]="$b"; POSTURE_TS[$bssid]=$now; fi   # a failed read is not cached
+  POSTURE_LAST="$b"; printf '%s' "$b"
 }
 # --- response posture end ---
 
@@ -647,6 +658,7 @@ score_device() {
     for p in "${pr[@]}"; do [ -z "$p" ] && continue; ssid_sig "$p"; [ "${SSIDSIG[$p]%%|*}" != 0 ] && { I=$((I + W_PROBE)); tags+=" PROBE"; break; }; done
   fi
   [ "${BUSY[$mac]}" = 1 ] && tags+=" BUSY"
+  [ -n "${SEEN_LAST[$mac]}" ] && tags+=" SEEN"
   # behaviour axis
   Bh=${BEH[$mac]:-0}; gate_beh=${BEH_GATE[$mac]:-0}; ev=${EVENT_FLAG[$mac]:-0}
   [ "${BUSY[$mac]}" = 1 ] && Bh=$((Bh + W_BUSY))
@@ -701,7 +713,8 @@ prox_of() {
 record_seen() {
   local mac="$1" role="$2" ssid="$3" ch="$4" fr="$5" sig="$6" h
   if [ -z "${ROLE[$mac]}" ]; then
-    ROLE[$mac]="$role"; FIRST_SEEN[$mac]=$EPOCHSECONDS; N_SEEN[$mac]=0; RSSI_HIST[$mac]=""
+    ROLE[$mac]="$role"; FIRST_SEEN[$mac]=$EPOCHSECONDS; N_SEEN[$mac]=0; RSSI_HIST[$mac]=""; FIRST_CYCLE[$mac]=$CYCLE
+    if [ -n "${SEEN_FIRST[$mac]}" ]; then FIRST_SEEN[$mac]=${SEEN_FIRST[$mac]}; N_SEEN[$mac]=${SEEN_N[$mac]:-0}; RETURNING=$((RETURNING + 1)); fi
     vendor_sig "$mac"
   elif [ "${ROLE[$mac]}" != "$role" ] && [ "${ROLE[$mac]}" != "ap+cli" ]; then ROLE[$mac]="ap+cli"; fi
   LAST_SEEN[$mac]=$EPOCHSECONDS; N_SEEN[$mac]=$((${N_SEEN[$mac]} + 1)); SEEN_THIS_CYCLE+=("$mac")
@@ -720,7 +733,7 @@ record_seen() {
     RSSI_HIST[$mac]="${RSSI_HIST[$mac]} -"; set -- ${RSSI_HIST[$mac]}; (( $# > 3 )) && shift $(( $# - 3 )); RSSI_HIST[$mac]="$*"
   fi
 }
-declare -A RSSI_IMPROVED
+declare -A RSSI_IMPROVED FIRST_CYCLE
 # packet-rate delta (clients): RATE x10 frames/s between polls
 rate_update() {
   local mac="$1" pk="$2" now=$EPOCHSECONDS dt dp
@@ -757,9 +770,41 @@ inv_row() {   # inv_row mac -> stdout one row
     "${RATE[$m]:--}" "${TAGS[$m]:--}" "-" "${LAT[$m]:--}" "${LON[$m]:--}"
 }
 upsert_inventory() { (( ${#SCORED[@]} )) || return 0; upsert_rows "${!SCORED[@]}"; }
-upsert_rows() {   # upsert_rows mac... -> merge these rows into inventory.tsv
+# ---- persistence across runs: inventory.tsv is the store ----
+declare -A SEEN_LAST SEEN_CONF SEEN_RSSI SEEN_FIRST SEEN_N
+CLOCK_OK=1; RETURNING=0; LOADED_ROWS=0; DEDUPE_RUN=1
+load_inventory() {   # read inventory.tsv once at start into SEEN_*; prune rows older than INVENTORY_KEEP_DAYS; clock guard
+  local f="$LOOT_DIR/inventory.tsv" fs ls mac conf rb n maxls=0 cutoff=0
+  [ -s "$f" ] || return 0
+  (( INVENTORY_KEEP_DAYS > 0 )) && cutoff=$(( EPOCHSECONDS - INVENTORY_KEEP_DAYS * 86400 ))
+  while IFS='|' read -r fs ls _ mac _ _ _ _ conf _ _ _ _ _ _ _ _ rb _ _ _ n _; do
+    [[ $fs =~ ^[0-9]+$ && $ls =~ ^[0-9]+$ ]] || continue
+    (( ls > maxls )) && maxls=$ls
+    SEEN_LAST[$mac]=$ls; SEEN_CONF[$mac]=${conf:-0}; SEEN_RSSI[$mac]=${rb:--}; SEEN_FIRST[$mac]=$fs; SEEN_N[$mac]=${n:-0}
+    LOADED_ROWS=$((LOADED_ROWS + 1))
+  done <"$f"
+  if (( maxls > EPOCHSECONDS )); then
+    CLOCK_OK=0; log warn "clock invalid: inventory newer than now; dedupe and prune disabled"; ui_ok && LOG yellow "clock invalid: dedupe off"; return 0
+  fi
+  if (( cutoff > 0 )); then
+    awk -F'|' -v c="$cutoff" '/^#/ { print; next } $2 ~ /^[0-9]+$/ && $2 >= c { print }' "$f" >/tmp/cs_inv.new 2>/dev/null && mv /tmp/cs_inv.new "$f"
+    for mac in "${!SEEN_LAST[@]}"; do (( ${SEEN_LAST[$mac]} < cutoff )) && unset "SEEN_LAST[$mac]" "SEEN_CONF[$mac]" "SEEN_RSSI[$mac]" "SEEN_FIRST[$mac]" "SEEN_N[$mac]"; done
+  fi
+  return 0
+}
+dedupe_known() {   # dedupe_known mac rank -> 0 when an earlier run (within DEDUPE_H) already had this device at this rank or higher
+  local mac="$1" rank="$2" sr=0 c
+  (( DEDUPE_H > 0 && DEDUPE_RUN == 1 && CLOCK_OK == 1 )) || return 1
+  [ -n "${SEEN_LAST[$mac]}" ] || return 1
+  (( EPOCHSECONDS - ${SEEN_LAST[$mac]} < DEDUPE_H * 3600 )) || return 1
+  c=${SEEN_CONF[$mac]:-0}; if (( c >= 80 )); then sr=3; elif (( c >= 45 )); then sr=2; elif (( c >= 20 )); then sr=1; fi
+  (( sr >= rank )) || return 1
+  if [[ ${SEEN_RSSI[$mac]} =~ ^-?[0-9]+$ && ${RSSI_BEST[$mac]:-x} =~ ^-?[0-9]+$ ]] && (( ${RSSI_BEST[$mac]} - ${SEEN_RSSI[$mac]} >= 10 )); then return 1; fi
+  return 0
+}
+upsert_rows() {   # upsert_rows mac... -> merge these rows into inventory.tsv (randomised client MACs are not stored)
   local m f="$LOOT_DIR/inventory.tsv"
-  { for m in "$@"; do [ -n "${ROLE[$m]}" ] && inv_row "$m"; done; } >/tmp/cs_rows.tmp
+  { for m in "$@"; do [ -n "${ROLE[$m]}" ] || continue; [ "${ROLE[$m]}" = cli ] && is_rand "$m" && continue; inv_row "$m"; done; } >/tmp/cs_rows.tmp
   [ -s /tmp/cs_rows.tmp ] || return 0
   [ -s "$f" ] || printf '%s\n' "$INV_HDR" >"$f"
   awk -F'|' 'NR==FNR { new[$4]=$0; next } /^#/ { print; next } { if ($4 in new) { print new[$4]; delete new[$4] } else print } END { for (k in new) print new[k] }' /tmp/cs_rows.tmp "$f" >/tmp/cs_inv.new 2>/dev/null && mv /tmp/cs_inv.new "$f"
@@ -801,6 +846,7 @@ preflight() {
   if [ -f "$INSTALL_DIR/cam_signatures.txt" ]; then load_signatures "$INSTALL_DIR/cam_signatures.txt"; SIG_SOURCE="file"; fi
   if (( SIG_COUNT < 10 )); then load_signatures <(builtin_signatures); SIG_SOURCE="built-in"; fi
   (( SIG_COUNT == 0 )) && { set_state FAIL; ERROR_DIALOG "CamHound: no signatures" 2>/dev/null; exit 0; }
+  load_inventory
 }
 BANDS_LINE=""; INSTALL_DIR=""
 run_lock() {
@@ -853,10 +899,10 @@ bucket_stats() {
 WATCH_MAC=""; WATCH_BSSID=""; WATCH_CH=0; WATCH_ROLE=""; CAP_PIDS=""; CUR=A
 declare -a RUNS
 
-# lock_target bssid secs -> 0 locked, 1 locked by channel, 2 lock failed
+# lock_target bssid secs [channel] -> 0 locked, 1 locked by channel, 2 lock failed
 LOCK_TEXT=""
-lock_target() {
-  local bssid="$1" secs="$2" c1 c2 c3 want="${WATCH_CH:-0}"
+lock_target() {   # lock_target <bssid> <secs> [channel]; the channel defaults to the current Watch target's
+  local bssid="$1" secs="$2" c1 c2 c3 want="${3:-${WATCH_CH:-0}}"
   PINEAPPLE_EXAMINE_BSSID "$bssid" "$secs" >/dev/null 2>&1; WATCH_LOCKED=1; LAST_LOCK_TS=$EPOCHSECONDS
   sleep 0.5; c1=$(cur_channel); sleep 0.5; c2=$(cur_channel); sleep 0.5; c3=$(cur_channel)
   LOCK_TEXT="$RECON_IF ch ${c3:-?}, target ch $want"
@@ -1205,6 +1251,9 @@ resp_target() {   # resp_target <mac> -> sets R_BSSID R_TARGET R_CH R_BAND; rc 1
   fi
   [[ $R_CH =~ ^[0-9]+$ ]] || return 1
   (( R_CH > 0 )) || return 1
+  if [ "$R_BAND" = '?' ]; then    # no frequency seen for the target or its AP: the channel number decides
+    if (( R_CH <= 14 )); then R_BAND=2; elif (( R_CH >= 36 && R_CH <= 177 )); then R_BAND=5; fi
+  fi
   return 0
 }
 
@@ -1233,46 +1282,89 @@ resp_verdict() {
   printf 'INCONCLUSIVE'
 }
 
-resp_write() {   # resp_write <mac> <badge> <attack> <cmd> <lock> <pk0> <pk1> <verdict>
-  local f="$LOOT_DIR/responses.tsv" bp=-
+resp_write() {   # resp_write <mac> <badge> <attack> <cmd> <lock> <pk0> <pk1> <verdict> [measured target]
+  local f="$LOOT_DIR/responses.tsv" bp=- tgt="${9:-$R_TARGET}"
   [ "$POSTURE_EXT" = - ] || bp=$(hex_octet "$POSTURE_EXT" 10 2>/dev/null) || bp=-
   [ -s "$f" ] || printf '%s\n' "$RESP_HDR" >"$f" 2>/dev/null
   printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-    "$EPOCHSECONDS" "$1" "${ROLE[$1]:--}" "$R_BSSID" "$R_TARGET" "$R_CH" "$R_BAND" \
+    "$EPOCHSECONDS" "$1" "${ROLE[$1]:--}" "$R_BSSID" "$tgt" "$R_CH" "$R_BAND" \
     "$2" "${POSTURE_RSN:--}" "$bp" "$3" "$4" "$5" "$6" "$7" "$8" >>"$f" 2>/dev/null
 }
 
+# resp_snapshot -> RS_PK/RS_T (packets, last-seen) for the subjects of the attempt, from one Recon read:
+# a client target measures itself; a broadcast (AP) target measures the AP's visible, non-random clients.
+# The AP's own counter is never the subject: it keeps beaconing whatever happens to its clients.
+declare -A RS_PK RS_T
+resp_snapshot() {
+  local m a pk sig pr fr t ch s
+  RS_PK=(); RS_T=()
+  while IFS='|' read -r m a pk sig pr fr t ch; do
+    m=${m,,}; a=${a,,}
+    if [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ]; then [ "$a" = "$R_BSSID" ] || continue; is_rand "$m" && continue
+    else [ "$m" = "$R_TARGET" ] || continue; fi
+    RS_PK[$m]="${pk:-0}"; RS_T[$m]="${t:-0}"
+  done < <(recon_lines CLIENTS)
+  if [ "$R_TARGET" != ff:ff:ff:ff:ff:ff ] && [ -z "${RS_PK[$R_TARGET]+x}" ]; then   # a client row Recon lists as an AP
+    if s=$(recon_stat "$R_TARGET"); then read -r pk t <<<"$s"; RS_PK[$R_TARGET]="$pk"; RS_T[$R_TARGET]="$t"; fi
+  fi
+}
+# resp_aggregate <moved> <no_effect> <inconclusive> -> one word for the whole attempt
+resp_aggregate() {
+  (( $2 > 0 )) && { printf 'NO_EFFECT'; return 0; }           # any subject kept transmitting
+  (( $1 > 0 && $3 == 0 )) && { printf 'MOVED'; return 0; }     # every subject went quiet
+  printf 'INCONCLUSIVE'
+}
+
 resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was reached
-  local mac="$1" k="$2" badge="$3" cmd lock rc s p0=- t0=- p1=- t1=- present=1 verdict
+  local mac="$1" k="$2" badge="$3" cmd lock rc m p0 t0 p1 t1 present verdict nmv=0 nne=0 ninc=0 n
+  local -a subjects=(); local -A P0=() T0=()
   cmd=$(response_cmd "$k")
   [ -n "$cmd" ] || return 1
   if ! command -v "$cmd" >/dev/null 2>&1; then
     LOG red "$cmd not present in this firmware"; log resp "missing $cmd"; return 1
   fi
-  if s=$(recon_stat "$R_TARGET"); then read -r p0 t0 <<<"$s"; fi
-  lock_target "$R_BSSID" "$RESP_LOCK_SECS"; rc=$?
+  resp_snapshot
+  for m in "${!RS_PK[@]}"; do subjects+=("$m"); P0[$m]="${RS_PK[$m]}"; T0[$m]="${RS_T[$m]}"; done
+  if [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ]; then
+    if (( ${#subjects[@]} == 0 )); then                        # nothing to disconnect, nothing to measure
+      LOG red "no visible clients on ${R_BSSID:9}: nothing to disconnect"; log resp "refused $R_BSSID no clients"
+      resp_write "$mac" "$badge" "$k" "$cmd" - - - NO_CLIENTS
+      set_state RESPOND_NIL; return 1
+    fi
+  else
+    (( ${#subjects[@]} == 0 )) && { subjects=("$R_TARGET"); P0[$R_TARGET]=-; T0[$R_TARGET]=-; }
+  fi
+  n=${#subjects[@]}
+  lock_target "$R_BSSID" "$RESP_LOCK_SECS" "$R_CH"; rc=$?
   case $rc in 0) lock=ok ;; 1) lock=by-channel ;; *) lock=failed ;; esac
   if (( rc == 2 )); then
     unlock_target
     LOG red "lock failed: $LOCK_TEXT"; log resp "lock-failed $R_BSSID $LOCK_TEXT"
-    resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "$p0" - LOCK_FAILED
+    for m in "${subjects[@]}"; do resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "${P0[$m]}" - LOCK_FAILED "$m"; done
     set_state INCONCLUSIVE; return 1
   fi
   set_state RESPOND
-  LOG "$k -> ${R_BSSID:9} ch $R_CH"$'\n'"lock: $lock"
-  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock"
+  LOG "$k -> ${R_BSSID:9} ch $R_CH"$'\n'"lock: $lock, $n subject(s)"
+  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock subjects=$n"
   if [ "$k" = CSA ]; then "$cmd" "$R_BSSID" "$R_CH" >/dev/null 2>&1
   else "$cmd" "$R_BSSID" "$R_TARGET" "$R_CH" >/dev/null 2>&1; fi
   sleep "$RESP_SETTLE_SECS"
-  if s=$(recon_stat "$R_TARGET"); then read -r p1 t1 <<<"$s"; else present=0; fi
+  resp_snapshot
   unlock_target
-  verdict=$(resp_verdict "$p0" "$t0" "$p1" "$t1" "$present")
-  resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "$p0" "$p1" "$verdict"
-  log resp "verdict $verdict $R_TARGET pk $p0 -> $p1 present=$present"
+  for m in "${subjects[@]}"; do
+    p0="${P0[$m]}"; t0="${T0[$m]}"; present=1; p1=-; t1=-
+    if [ -n "${RS_PK[$m]+x}" ]; then p1="${RS_PK[$m]}"; t1="${RS_T[$m]}"; else present=0; fi
+    verdict=$(resp_verdict "$p0" "$t0" "$p1" "$t1" "$present")
+    case "$verdict" in MOVED) nmv=$((nmv + 1)) ;; NO_EFFECT) nne=$((nne + 1)) ;; *) ninc=$((ninc + 1)) ;; esac
+    resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "$p0" "$p1" "$verdict" "$m"
+    log resp "subject $m $verdict pk $p0 -> $p1 present=$present"
+  done
+  verdict=$(resp_aggregate "$nmv" "$nne" "$ninc")
+  log resp "verdict $verdict $R_TARGET moved=$nmv no_effect=$nne inconclusive=$ninc of $n"
   case "$verdict" in
-    MOVED)     set_state RESPOND_HIT; LOG green "$verdict: target went quiet" ;;
-    NO_EFFECT) set_state RESPOND_NIL; LOG yellow "$verdict: still transmitting (pk $p0 -> $p1)" ;;
-    *)         set_state INCONCLUSIVE; LOG yellow "$verdict: recon could not settle it" ;;
+    MOVED)     set_state RESPOND_HIT; LOG green "$verdict: $nmv/$n quiet" ;;
+    NO_EFFECT) set_state RESPOND_NIL; LOG yellow "$verdict: $nne/$n still transmitting" ;;
+    *)         set_state INCONCLUSIVE; LOG yellow "$verdict: $ninc/$n unsettled, $nmv quiet" ;;
   esac
   return 0
 }
@@ -1304,7 +1396,7 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
     LOG red "nothing to attack: no associated BSS or no channel for $mac"; return 0
   fi
   LOG "reading posture ${R_BSSID:9} ch $R_CH"
-  badge=$(posture_of "$R_BSSID" "$R_BAND" "$R_CH")
+  posture_of "$R_BSSID" "$R_BAND" "$R_CH" >/dev/null; badge="$POSTURE_LAST"
   opts=$(posture_opts "$badge")
   LOG "[$badge] ${R_BSSID:9} ch$R_CH ${R_BAND}GHz"$'\n'"target ${R_TARGET:9}"$'\n'"$(posture_why "$badge")"
   if [ -z "$opts" ]; then
