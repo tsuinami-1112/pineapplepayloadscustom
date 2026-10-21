@@ -19,7 +19,7 @@ sed -e 's/^WIN_SECS=10 /WIN_SECS=5 /' -e 's/^LIVE_WINDOWS=6 /LIVE_WINDOWS=4 /' \
 grep -q "LOOT_DIR=\"$LOOT\"" "$T/payload_fast.sh" || { echo "sed on the config block failed"; exit 1; }
 printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
 PATHX="$HERE/stubs:$T/bin:$PATH"
-reset() { rm -rf "$LOOT" "$T/log" "$T"/rules*.c* /tmp/cs_harness_chan /tmp/cs_harness_pps /tmp/cs_run.pid /tmp/cs_children; mkdir -p "$LOOT"; echo 0 >/tmp/cs_harness_cycle; }
+reset() { [ "${1:-}" = keep ] || rm -rf "$LOOT"; rm -rf "$T/log" "$T"/rules*.c* /tmp/cs_harness_chan /tmp/cs_harness_pps /tmp/cs_run.pid /tmp/cs_children; mkdir -p "$LOOT"; echo 0 >/tmp/cs_harness_cycle; }
 rules() { local f="$T/rules_$1"; shift; printf '%s\t%s\n' "$@" >"$f"; export HARNESS_RULES="$f"; }
 answers() { printf '%s\n' "$@" >"$HARNESS_ANSWERS"; }
 check() { if eval "$2"; then printf 'PASS %s\n' "$1"; else printf 'FAIL %s\n' "$1"; FAIL=$((FAIL + 1)); fi; }
@@ -87,10 +87,21 @@ s_disrupt() {   # RESPONSE=1: Disrupt on the Reolink AP against log-only stubs; 
   check "disrupt: cached badge shown on the card afterwards" "grep -q 'items=.*Disrupt \[D+C\]' $T/log"
   check "disrupt: EXAMINE released, no lock file" "grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log && [ ! -e /tmp/cs_run.pid ]"
 }
+s_persist() {   # a second run with DEDUPE_H=24 stays silent on known devices; first_seen carries over; RAND rows are not stored
+  reset; rules persist1 '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; run
+  local fs1; fs1=$(grep '|ec:71:db:00:00:10|' "$LOOT/inventory.tsv" | cut -d'|' -f1)
+  check "persist: first run alerted and stored rows" "grep -q 'REO-OUI 00:00:10' $T/log && [ -n \"$fs1\" ]"
+  check "persist: randomised client not stored" "! grep -q '|02:ab:cd:00:00:01|' $LOOT/inventory.tsv"
+  reset keep; printf 'CYCLE_SECS=5\nDEDUPE_H=24\n' >"$HARNESS_CFG"
+  rules persist2 '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "persist: known devices not re-alerted" "! grep -q '^LOG red CONFIRMED' $T/log && ! grep -q '^LOG yellow LIKELY' $T/log && grep -q 'dedupe known ec:71:db:00:00:10' $LOOT/events.log"
+  check "persist: first_seen carried over" "[ \"\$(grep '|ec:71:db:00:00:10|' $LOOT/inventory.tsv | cut -d'|' -f1)\" = \"$fs1\" ]"
+  check "persist: SEEN tag and returning count" "grep -q '|ec:71:db:00:00:10|.*SEEN' $LOOT/inventory.tsv && grep -q 'returning [1-9]' $LOOT/report_*.txt"
+}
 case "${1:-all}" in
-  live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;;
-  all) s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt ;;
-  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|all]"; exit 2 ;;
+  live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; persist) s_persist ;;
+  all) s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_persist ;;
+  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|persist|all]"; exit 2 ;;
 esac
 printf '== harness: %s failure(s); temp dir %s ==\n' "$FAIL" "$T"
 exit $(( FAIL > 0 ))
