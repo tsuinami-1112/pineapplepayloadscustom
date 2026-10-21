@@ -7,7 +7,8 @@ this folder runs on the Pager; it is for whoever builds the next phases.
 
 | File | Purpose |
 |---|---|
-| `PLAN_v2.md` | the full design: user answers, adopted ideas, confidence model, feature list, phases, the Phase 0 spike table (section 7.1) |
+| `PLAN_v2.md` | the full recon design: user answers, adopted ideas, confidence model, feature list, phases, the Phase 0 spike table (section 7.1) |
+| `RESPONSE.md` | the response side (the Disrupt rung): why CSA works where deauth cannot, the undocumented firmware primitives, the posture model and its element/bit references, target resolution, the channel lock, the verdict model, block placement, and what is still unverified |
 | `gen_hooks.sh` | regenerates `library/recon/{client,access_point}/CamHound/` from the user payload (header + config + lib block + watch-core block + `hook_main.sh`) |
 | `check_sync.sh` | fails when the shared blocks differ between the user payload and the hooks |
 | `hook_header.sh`, `hook_main.sh` | the hook-only parts |
@@ -61,5 +62,9 @@ clean). The v1.1 Recon hooks are generated and checked the same way. No Pager ha
 
 Out of CamHound's scope by design: DEVICE_FILTER response hooks, WiGLE upload, generated OUI
 tables, per-row weights, BLE-only lists, `iw set channel` while PineAP hops, recon.db reads per
-cycle, SSDP/active mDNS/nmap auto-install, `exec "$0"`. Deauthentication is not part of CamHound;
-the project owner writes that as a separate component.
+cycle, SSDP/active mDNS/nmap auto-install, `exec "$0"`.
+
+Disconnection is now **in** scope: the payload was renamed from CamScout to CamHound when the
+response side landed, and `RESPONSE=1` adds a Disrupt rung offering deauth+disassoc, channel-switch
+announcements, or all three. It is off by default, so with `RESPONSE=0` the payload transmits
+nothing and behaves exactly as the recon-only build did. See `RESPONSE.md`.
