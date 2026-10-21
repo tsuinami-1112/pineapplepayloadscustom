@@ -77,8 +77,13 @@ s_disrupt() {   # RESPONSE=1: Disrupt on the Reolink AP against log-only stubs; 
   check "disrupt: badge D+C from the synthetic beacon" "grep -q 'PICKER\[Disrupt \[D+C\]' $T/log"
   check "disrupt: stub command called with bssid, broadcast target, channel 36" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_ALL ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log"
   check "disrupt: lock verified ok (not by channel)" "grep -q 'lock: ok' $T/log"
-  check "disrupt: responses.tsv row with 16 fields, badge and raw caps" "[ \"\$(sed -n 2p $LOOT/responses.tsv | awk -F'|' '{print NF}')\" = 16 ] && sed -n 2p $LOOT/responses.tsv | grep -q '|D+C|0c00|'"
-  check "disrupt: verdict recorded" "sed -n 2p $LOOT/responses.tsv | grep -Eq '\|(MOVED|NO_EFFECT|INCONCLUSIVE)$'"
+  check "disrupt: one loot row per client, 16 fields, badge and raw caps" "[ \"\$(grep -c '^[0-9]' $LOOT/responses.tsv)\" = 2 ] && [ \"\$(sed -n 2p $LOOT/responses.tsv | awk -F'|' '{print NF}')\" = 16 ] && grep -q '|ec:71:db:00:00:11|36|5|D+C|0c00|' $LOOT/responses.tsv && grep -q '|ec:71:db:00:00:12|36|5|D+C|0c00|' $LOOT/responses.tsv"
+  check "disrupt: aggregate verdict over both clients" "grep -q 'verdict MOVED ff:ff:ff:ff:ff:ff moved=2 no_effect=0 inconclusive=0 of 2' $LOOT/events.log"
+  # guard: an AP with no visible clients (the Hikvision setup AP) is refused before anything is sent
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules disrupt2 '^CamHound' 'Scan,Exit' 'Review hits' '3,Exit' '^[0-9]+ HIK' 'Disrupt,Back' '^Disrupt \[' '1' ' via ' '1' "${COMMON[@]}"
+  answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "disrupt: AP without clients refused, nothing sent" "grep -q 'no visible clients' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log && grep -q '|NO_CLIENTS$' $LOOT/responses.tsv"
   check "disrupt: cached badge shown on the card afterwards" "grep -q 'items=.*Disrupt \[D+C\]' $T/log"
   check "disrupt: EXAMINE released, no lock file" "grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log && [ ! -e /tmp/cs_run.pid ]"
 }
