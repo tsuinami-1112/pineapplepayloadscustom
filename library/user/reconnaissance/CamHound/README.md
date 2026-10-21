@@ -175,6 +175,8 @@ removes it). Overrides are counted on the start screen and listed in `events.log
 | REPORT_EVERY | 15 | | cycles between report rewrites |
 | GPS | 0 | | closest-approach GPS stamping |
 | KEEP_PCAP / KEEP_RAW | 0 / 0 | | keep Watch pcaps / per-second bucket lines in loot |
+| DEDUPE_H | 0 | * | hours: a device stored in inventory.tsv within this horizon is not alerted again unless its band rose or it is 10 dB closer; `Scan (fresh)` ignores it for one run |
+| INVENTORY_KEEP_DAYS | 30 | | inventory.tsv rows older than this are pruned at start (0 = never) |
 | ROW_W | 22 | | list row budget (36-40 expected after Phase 0 item 19) |
 | RESPONSE | 0 | * | master switch for the Disrupt rung; 0 = recon only, nothing transmits |
 | RESPONSE_CONFIRM | 1 | * | blocking confirmation before any transmit |
@@ -248,7 +250,10 @@ that reuse a captured beacon's timestamp.
 
 ## Loot (`/root/loot/CamHound/`, flat)
 
-- `inventory.tsv`: one `|`-separated row per MAC, rewritten atomically each cycle. Header:
+- `inventory.tsv`: one `|`-separated row per MAC, rewritten atomically each cycle and kept across runs:
+  `first_seen` and `n_seen` carry over, rows older than `INVENTORY_KEEP_DAYS` are pruned at start, randomised
+  client MACs are never stored, devices known from an earlier run carry the `SEEN` tag, and the report
+  counts them as `returning`. Header:
   `#first_seen|last_seen|run_id|mac|role|cat|vendor|label|conf|id_score|beh_score|beh_verdict|band|ssid|ap_bssid|ch|freq|rssi_best|rssi_best_ts|rssi_last|prox|n_seen|pkt_rate|signals|lan_tag|lat|lon`
   (`band` = 2/5/6 GHz, `signals` = tags, epoch seconds, `-` for empty). ~160 B per MAC.
 - `events.log`: `epoch level msg` (cycle, alert, mode, watch, locate, cfg, warn, run, resp).

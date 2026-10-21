@@ -66,6 +66,8 @@ MEDIAN_N=5              # Locate median ring
 REPORT_EVERY=15         # cycles between report rewrites
 GPS=0                   # closest-approach GPS stamping (0 = off)
 KEEP_PCAP=0; KEEP_RAW=0 # Watch artefacts copied to loot
+DEDUPE_H=0              # * hours: a device already in inventory.tsv within this horizon is not alerted again (0 = off)
+INVENTORY_KEEP_DAYS=30  # inventory.tsv rows older than this are pruned at start (0 = never)
 ROW_W=22                # list row budget (spike 19; expected 36-40 on the default theme)
 RECON_IF="wlan1mon"     # PineAP monitor radio (tri-band)
 # response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
@@ -105,7 +107,7 @@ TAG_MEANING=([HIDDEN]="hidden SSID + camera-vendor OUI" [RAND]="randomised clien
   [PROBE]="probes for a camera SSID" [BUSY]="high packet rate this cycle"
   [STREAM]="steady big uplink: streaming-consistent" [EVENT]="uplink jumped when you moved"
   [EVENT?]="uplink rose when you moved (weak)" [DOWN]="download-heavy: call/update, not camera-like"
-  [IDLE]="asleep, disarmed or local-record" [NONE]="traffic seen, no camera pattern")
+  [IDLE]="asleep, disarmed or local-record" [NONE]="traffic seen, no camera pattern" [SEEN]="known from an earlier run")
 
 # log LEVEL msg...  -> events.log (debug mirror); never prints to the screen
 log() { local lvl="$1"; shift; printf '%s %s %s\n' "$EPOCHSECONDS" "$lvl" "$*" >>"$LOOT_DIR/events.log" 2>/dev/null; }
@@ -165,6 +167,7 @@ load_overrides() {
   RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
   AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
   POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
+  DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
 }
 
 # install dir: the UI runs a copy from /tmp, so look for the data file where it can live
@@ -655,6 +658,7 @@ score_device() {
     for p in "${pr[@]}"; do [ -z "$p" ] && continue; ssid_sig "$p"; [ "${SSIDSIG[$p]%%|*}" != 0 ] && { I=$((I + W_PROBE)); tags+=" PROBE"; break; }; done
   fi
   [ "${BUSY[$mac]}" = 1 ] && tags+=" BUSY"
+  [ -n "${SEEN_LAST[$mac]}" ] && tags+=" SEEN"
   # behaviour axis
   Bh=${BEH[$mac]:-0}; gate_beh=${BEH_GATE[$mac]:-0}; ev=${EVENT_FLAG[$mac]:-0}
   [ "${BUSY[$mac]}" = 1 ] && Bh=$((Bh + W_BUSY))
@@ -709,7 +713,8 @@ prox_of() {
 record_seen() {
   local mac="$1" role="$2" ssid="$3" ch="$4" fr="$5" sig="$6" h
   if [ -z "${ROLE[$mac]}" ]; then
-    ROLE[$mac]="$role"; FIRST_SEEN[$mac]=$EPOCHSECONDS; N_SEEN[$mac]=0; RSSI_HIST[$mac]=""
+    ROLE[$mac]="$role"; FIRST_SEEN[$mac]=$EPOCHSECONDS; N_SEEN[$mac]=0; RSSI_HIST[$mac]=""; FIRST_CYCLE[$mac]=$CYCLE
+    if [ -n "${SEEN_FIRST[$mac]}" ]; then FIRST_SEEN[$mac]=${SEEN_FIRST[$mac]}; N_SEEN[$mac]=${SEEN_N[$mac]:-0}; RETURNING=$((RETURNING + 1)); fi
     vendor_sig "$mac"
   elif [ "${ROLE[$mac]}" != "$role" ] && [ "${ROLE[$mac]}" != "ap+cli" ]; then ROLE[$mac]="ap+cli"; fi
   LAST_SEEN[$mac]=$EPOCHSECONDS; N_SEEN[$mac]=$((${N_SEEN[$mac]} + 1)); SEEN_THIS_CYCLE+=("$mac")
@@ -728,7 +733,7 @@ record_seen() {
     RSSI_HIST[$mac]="${RSSI_HIST[$mac]} -"; set -- ${RSSI_HIST[$mac]}; (( $# > 3 )) && shift $(( $# - 3 )); RSSI_HIST[$mac]="$*"
   fi
 }
-declare -A RSSI_IMPROVED
+declare -A RSSI_IMPROVED FIRST_CYCLE
 # packet-rate delta (clients): RATE x10 frames/s between polls
 rate_update() {
   local mac="$1" pk="$2" now=$EPOCHSECONDS dt dp
@@ -765,9 +770,41 @@ inv_row() {   # inv_row mac -> stdout one row
     "${RATE[$m]:--}" "${TAGS[$m]:--}" "-" "${LAT[$m]:--}" "${LON[$m]:--}"
 }
 upsert_inventory() { (( ${#SCORED[@]} )) || return 0; upsert_rows "${!SCORED[@]}"; }
-upsert_rows() {   # upsert_rows mac... -> merge these rows into inventory.tsv
+# ---- persistence across runs: inventory.tsv is the store ----
+declare -A SEEN_LAST SEEN_CONF SEEN_RSSI SEEN_FIRST SEEN_N
+CLOCK_OK=1; RETURNING=0; LOADED_ROWS=0; DEDUPE_RUN=1
+load_inventory() {   # read inventory.tsv once at start into SEEN_*; prune rows older than INVENTORY_KEEP_DAYS; clock guard
+  local f="$LOOT_DIR/inventory.tsv" fs ls mac conf rb n maxls=0 cutoff=0
+  [ -s "$f" ] || return 0
+  (( INVENTORY_KEEP_DAYS > 0 )) && cutoff=$(( EPOCHSECONDS - INVENTORY_KEEP_DAYS * 86400 ))
+  while IFS='|' read -r fs ls _ mac _ _ _ _ conf _ _ _ _ _ _ _ _ rb _ _ _ n _; do
+    [[ $fs =~ ^[0-9]+$ && $ls =~ ^[0-9]+$ ]] || continue
+    (( ls > maxls )) && maxls=$ls
+    SEEN_LAST[$mac]=$ls; SEEN_CONF[$mac]=${conf:-0}; SEEN_RSSI[$mac]=${rb:--}; SEEN_FIRST[$mac]=$fs; SEEN_N[$mac]=${n:-0}
+    LOADED_ROWS=$((LOADED_ROWS + 1))
+  done <"$f"
+  if (( maxls > EPOCHSECONDS )); then
+    CLOCK_OK=0; log warn "clock invalid: inventory newer than now; dedupe and prune disabled"; ui_ok && LOG yellow "clock invalid: dedupe off"; return 0
+  fi
+  if (( cutoff > 0 )); then
+    awk -F'|' -v c="$cutoff" '/^#/ { print; next } $2 ~ /^[0-9]+$/ && $2 >= c { print }' "$f" >/tmp/cs_inv.new 2>/dev/null && mv /tmp/cs_inv.new "$f"
+    for mac in "${!SEEN_LAST[@]}"; do (( ${SEEN_LAST[$mac]} < cutoff )) && unset "SEEN_LAST[$mac]" "SEEN_CONF[$mac]" "SEEN_RSSI[$mac]" "SEEN_FIRST[$mac]" "SEEN_N[$mac]"; done
+  fi
+  return 0
+}
+dedupe_known() {   # dedupe_known mac rank -> 0 when an earlier run (within DEDUPE_H) already had this device at this rank or higher
+  local mac="$1" rank="$2" sr=0 c
+  (( DEDUPE_H > 0 && DEDUPE_RUN == 1 && CLOCK_OK == 1 )) || return 1
+  [ -n "${SEEN_LAST[$mac]}" ] || return 1
+  (( EPOCHSECONDS - ${SEEN_LAST[$mac]} < DEDUPE_H * 3600 )) || return 1
+  c=${SEEN_CONF[$mac]:-0}; if (( c >= 80 )); then sr=3; elif (( c >= 45 )); then sr=2; elif (( c >= 20 )); then sr=1; fi
+  (( sr >= rank )) || return 1
+  if [[ ${SEEN_RSSI[$mac]} =~ ^-?[0-9]+$ && ${RSSI_BEST[$mac]:-x} =~ ^-?[0-9]+$ ]] && (( ${RSSI_BEST[$mac]} - ${SEEN_RSSI[$mac]} >= 10 )); then return 1; fi
+  return 0
+}
+upsert_rows() {   # upsert_rows mac... -> merge these rows into inventory.tsv (randomised client MACs are not stored)
   local m f="$LOOT_DIR/inventory.tsv"
-  { for m in "$@"; do [ -n "${ROLE[$m]}" ] && inv_row "$m"; done; } >/tmp/cs_rows.tmp
+  { for m in "$@"; do [ -n "${ROLE[$m]}" ] || continue; [ "${ROLE[$m]}" = cli ] && is_rand "$m" && continue; inv_row "$m"; done; } >/tmp/cs_rows.tmp
   [ -s /tmp/cs_rows.tmp ] || return 0
   [ -s "$f" ] || printf '%s\n' "$INV_HDR" >"$f"
   awk -F'|' 'NR==FNR { new[$4]=$0; next } /^#/ { print; next } { if ($4 in new) { print new[$4]; delete new[$4] } else print } END { for (k in new) print new[k] }' /tmp/cs_rows.tmp "$f" >/tmp/cs_inv.new 2>/dev/null && mv /tmp/cs_inv.new "$f"
@@ -809,6 +846,7 @@ preflight() {
   if [ -f "$INSTALL_DIR/cam_signatures.txt" ]; then load_signatures "$INSTALL_DIR/cam_signatures.txt"; SIG_SOURCE="file"; fi
   if (( SIG_COUNT < 10 )); then load_signatures <(builtin_signatures); SIG_SOURCE="built-in"; fi
   (( SIG_COUNT == 0 )) && { set_state FAIL; ERROR_DIALOG "CamHound: no signatures" 2>/dev/null; exit 0; }
+  load_inventory
 }
 BANDS_LINE=""; INSTALL_DIR=""
 run_lock() {
