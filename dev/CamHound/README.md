@@ -21,8 +21,13 @@ lives inside them.
 
 ## Status
 
-v1 is coded and verified on a laptop only (selftest 39/39, harness scenarios green, shellcheck
-clean). The v1.1 Recon hooks are generated and checked the same way. No Pager has run any of it.
+Coded and verified on a laptop only (selftest **112/112**, harness scenarios green, shellcheck
+clean). The v1.1 Recon hooks are generated and checked the same way. **No Pager has run any of it.**
+
+The payload is recon **and response**: it was renamed from CamScout when the Disrupt rung landed.
+The recon tiers are unchanged and still passive; the response tier is the only part that transmits
+and is off by default (`RESPONSE=0`). Its design, the firmware primitives it calls and the list of
+what remains unverified are in `RESPONSE.md`.
 
 ## Roadmap
 

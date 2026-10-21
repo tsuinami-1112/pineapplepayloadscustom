@@ -31,7 +31,7 @@ confirms a device is streaming; it is a second key precisely because that rung t
 - A battery/event camera that is asleep looks idle in Watch. Use the Stimulus test.
 - INCONCLUSIVE is about the measurement (lock, band, distance), not about the device.
 
-## How it works: three tiers
+## How it works: four tiers
 
 1. **Identity** (free, every device, every cycle): OUI/vendor rows, setup-mode SSIDs, hidden-SSID
    plus camera vendor, a kit signal (AP and all clients share one camera brand), probed camera SSIDs,
@@ -42,8 +42,12 @@ confirms a device is streaming; it is a second key precisely because that rung t
    hexdump+awk. Live view grades STREAM / DOWN / IDLE / NONE / INCONCLUSIVE; the Stimulus test
    grades EVENT / EVENT? by comparing a 30 s still baseline with 20 s of you moving in front of it
    plus a 20 s settle window.
-3. **Active** (opt-in, not in this version): joining the network to confirm an RTSP/ONVIF feed is
-   planned as `LAN_CONFIRM=1` in v1.1b and is off by default.
+3. **Response** (opt-in, off by default): reads the target's PMF and beacon-protection posture from
+   its own beacon, then disconnects it with deauth+disassoc, channel-switch announcements, or all
+   three, and judges from Recon whether it actually went quiet. This is the only tier that
+   transmits, and it does nothing unless `RESPONSE=1`. See [Response](#response).
+4. **Active LAN** (opt-in, not in this version): joining the network to confirm an RTSP/ONVIF feed
+   is planned as `LAN_CONFIRM=1` in v1.1b and is off by default.
 
 ## Install
 
