@@ -1,6 +1,6 @@
 #!/bin/bash
 # Title: CamHound
-# Description: Passive Wi-Fi camera census for the Pager. Lists every camera-vendor and
+# Description: Wi-Fi camera census and response for the Pager. Lists every camera-vendor and
 #              camera-capable 802.11 device PineAP Recon can hear, categorises it, grades it on
 #              a 0-100 confidence scale, and (on request) locks on one suspect to test whether it
 #              is streaming (Watch), whether it reacts to movement (Stimulus test) or where it is
