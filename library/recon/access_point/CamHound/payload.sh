@@ -721,7 +721,16 @@ record_seen() {
   local mac="$1" role="$2" ssid="$3" ch="$4" fr="$5" sig="$6" h
   if [ -z "${ROLE[$mac]}" ]; then
     ROLE[$mac]="$role"; FIRST_SEEN[$mac]=$EPOCHSECONDS; N_SEEN[$mac]=0; RSSI_HIST[$mac]=""; FIRST_CYCLE[$mac]=$CYCLE
-    if [ -n "${SEEN_FIRST[$mac]}" ]; then FIRST_SEEN[$mac]=${SEEN_FIRST[$mac]}; N_SEEN[$mac]=${SEEN_N[$mac]:-0}; RETURNING=$((RETURNING + 1)); fi
+    if [ -n "${SEEN_FIRST[$mac]}" ]; then   # known from an earlier run: carry the cumulative evidence over
+      FIRST_SEEN[$mac]=${SEEN_FIRST[$mac]}; N_SEEN[$mac]=${SEEN_N[$mac]:-0}; RETURNING=$((RETURNING + 1))
+      if [[ ${SEEN_RSSI[$mac]} =~ ^-?[0-9]+$ ]]; then RSSI_BEST[$mac]=${SEEN_RSSI[$mac]}; RSSI_BEST_TS[$mac]=${SEEN_RSSI_TS[$mac]:-${SEEN_LAST[$mac]}}; fi
+      [ "${SEEN_LAT[$mac]:--}" != - ] && LAT[$mac]=${SEEN_LAT[$mac]} && LON[$mac]=${SEEN_LON[$mac]}
+      if [[ ${SEEN_BEH[$mac]} =~ ^-?[0-9]+$ ]] && (( SEEN_BEH[$mac] != 0 )); then
+        BEH[$mac]=${SEEN_BEH[$mac]}; BEH_VERDICT[$mac]=${SEEN_VERDICT[$mac]}
+        case "${SEEN_VERDICT[$mac]}" in STREAM|EVENT|EVENT?) BEH_GATE[$mac]=${SEEN_BEH[$mac]} ;; esac
+        case "${SEEN_VERDICT[$mac]}" in EVENT|EVENT?) EVENT_FLAG[$mac]=1 ;; esac
+      fi
+    fi
     vendor_sig "$mac"
   elif [ "${ROLE[$mac]}" != "$role" ] && [ "${ROLE[$mac]}" != "ap+cli" ]; then ROLE[$mac]="ap+cli"; fi
   LAST_SEEN[$mac]=$EPOCHSECONDS; N_SEEN[$mac]=$((${N_SEEN[$mac]} + 1)); SEEN_THIS_CYCLE+=("$mac")
@@ -778,16 +787,17 @@ inv_row() {   # inv_row mac -> stdout one row
 }
 upsert_inventory() { (( ${#SCORED[@]} )) || return 0; upsert_rows "${!SCORED[@]}"; }
 # ---- persistence across runs: inventory.tsv is the store ----
-declare -A SEEN_LAST SEEN_CONF SEEN_RSSI SEEN_FIRST SEEN_N
+declare -A SEEN_LAST SEEN_CONF SEEN_RSSI SEEN_RSSI_TS SEEN_FIRST SEEN_N SEEN_LAT SEEN_LON SEEN_BEH SEEN_VERDICT
 CLOCK_OK=1; RETURNING=0; LOADED_ROWS=0; DEDUPE_RUN=1
 load_inventory() {   # read inventory.tsv once at start into SEEN_*; prune rows older than INVENTORY_KEEP_DAYS; clock guard
-  local f="$LOOT_DIR/inventory.tsv" fs ls mac conf rb n maxls=0 cutoff=0
+  local f="$LOOT_DIR/inventory.tsv" fs ls mac conf beh verdict rb rbts n lat lon maxls=0 cutoff=0
   [ -s "$f" ] || return 0
   (( INVENTORY_KEEP_DAYS > 0 )) && cutoff=$(( EPOCHSECONDS - INVENTORY_KEEP_DAYS * 86400 ))
-  while IFS='|' read -r fs ls _ mac _ _ _ _ conf _ _ _ _ _ _ _ _ rb _ _ _ n _; do
+  while IFS='|' read -r fs ls _ mac _ _ _ _ conf _ beh verdict _ _ _ _ _ rb rbts _ _ n _ _ _ lat lon; do
     [[ $fs =~ ^[0-9]+$ && $ls =~ ^[0-9]+$ ]] || continue
     (( ls > maxls )) && maxls=$ls
-    SEEN_LAST[$mac]=$ls; SEEN_CONF[$mac]=${conf:-0}; SEEN_RSSI[$mac]=${rb:--}; SEEN_FIRST[$mac]=$fs; SEEN_N[$mac]=${n:-0}
+    SEEN_LAST[$mac]=$ls; SEEN_CONF[$mac]=${conf:-0}; SEEN_RSSI[$mac]=${rb:--}; SEEN_RSSI_TS[$mac]=${rbts:--}; SEEN_FIRST[$mac]=$fs; SEEN_N[$mac]=${n:-0}
+    SEEN_LAT[$mac]=${lat:--}; SEEN_LON[$mac]=${lon:--}; SEEN_BEH[$mac]=${beh:-0}; SEEN_VERDICT[$mac]=${verdict:--}
     LOADED_ROWS=$((LOADED_ROWS + 1))
   done <"$f"
   if (( maxls > EPOCHSECONDS )); then
@@ -795,7 +805,7 @@ load_inventory() {   # read inventory.tsv once at start into SEEN_*; prune rows 
   fi
   if (( cutoff > 0 )); then
     awk -F'|' -v c="$cutoff" '/^#/ { print; next } $2 ~ /^[0-9]+$/ && $2 >= c { print }' "$f" >/tmp/cs_inv.new 2>/dev/null && mv /tmp/cs_inv.new "$f"
-    for mac in "${!SEEN_LAST[@]}"; do (( ${SEEN_LAST[$mac]} < cutoff )) && unset "SEEN_LAST[$mac]" "SEEN_CONF[$mac]" "SEEN_RSSI[$mac]" "SEEN_FIRST[$mac]" "SEEN_N[$mac]"; done
+    for mac in "${!SEEN_LAST[@]}"; do (( ${SEEN_LAST[$mac]} < cutoff )) && unset "SEEN_LAST[$mac]" "SEEN_CONF[$mac]" "SEEN_RSSI[$mac]" "SEEN_RSSI_TS[$mac]" "SEEN_FIRST[$mac]" "SEEN_N[$mac]" "SEEN_LAT[$mac]" "SEEN_LON[$mac]" "SEEN_BEH[$mac]" "SEEN_VERDICT[$mac]"; done
   fi
   return 0
 }
@@ -806,7 +816,7 @@ dedupe_known() {   # dedupe_known mac rank -> 0 when an earlier run (within DEDU
   (( EPOCHSECONDS - ${SEEN_LAST[$mac]} < DEDUPE_H * 3600 )) || return 1
   c=${SEEN_CONF[$mac]:-0}; if (( c >= 80 )); then sr=3; elif (( c >= 45 )); then sr=2; elif (( c >= 20 )); then sr=1; fi
   (( sr >= rank )) || return 1
-  if [[ ${SEEN_RSSI[$mac]} =~ ^-?[0-9]+$ && ${RSSI_BEST[$mac]:-x} =~ ^-?[0-9]+$ ]] && (( ${RSSI_BEST[$mac]} - ${SEEN_RSSI[$mac]} >= 10 )); then return 1; fi
+  if [[ ${SEEN_RSSI[$mac]} =~ ^-?[0-9]+$ && ${RSSI_LAST[$mac]:-x} =~ ^-?[0-9]+$ ]] && (( ${RSSI_LAST[$mac]} - ${SEEN_RSSI[$mac]} >= 10 )); then return 1; fi
   return 0
 }
 upsert_rows() {   # upsert_rows mac... -> merge these rows into inventory.tsv (randomised client MACs are not stored)
@@ -964,7 +974,9 @@ window_metrics() {
   WM_UPRATE10=$(( WM_UG * 10000 / s )); WM_UPS10=$(( WM_UF * 10000 / s ))        # big uplink fr/s x10, all uplink fr/s x10
   WM_DNRATE10=$(( WM_DG * 10000 / s ))
   if (( WM_UF >= 50 )); then WM_ASYM10=$(( WM_UB * 10 / (WM_DB + 1) )); (( WM_ASYM10 > 9999 )) && WM_ASYM10=9999; else WM_ASYM10=-1; fi
-  if [ "$KEEP_RAW" = 1 ]; then { printf '# %s up %s\n' "$EPOCHSECONDS" "$WATCH_MAC"; cat "/tmp/cs_up_$x.b"; printf '# dn\n'; cat "/tmp/cs_dn_$x.b"; } >>"$LOOT_DIR/raw_$RUN_ID.txt" 2>/dev/null; fi
+  if [ "$KEEP_RAW" = 1 ] && [ "$(stat -c %s "$LOOT_DIR/raw_$RUN_ID.txt" 2>/dev/null || echo 0)" -lt 2000000 ]; then   # ~60,000 bucket lines
+    { printf '# %s up %s\n' "$EPOCHSECONDS" "$WATCH_MAC"; cat "/tmp/cs_up_$x.b"; printf '# dn\n'; cat "/tmp/cs_dn_$x.b"; } >>"$LOOT_DIR/raw_$RUN_ID.txt" 2>/dev/null
+  fi
   if [ "$KEEP_PCAP" = 1 ]; then mkdir -p "$LOOT_DIR/watch_$RUN_ID"; cp "/tmp/cs_up_$x.pcap" "$LOOT_DIR/watch_$RUN_ID/up_$EPOCHSECONDS.pcap" 2>/dev/null; fi
   rm -f "/tmp/cs_up_$x.pcap" "/tmp/cs_dn_$x.pcap" "/tmp/cs_ot_$x.pcap"
 }
@@ -1127,7 +1139,7 @@ stimulus_test() {
   RUNS_N[$mac]=$(( ${RUNS_N[$mac]:-0} + 1 )); n=${RUNS_N[$mac]}
   if (( n > MAX_RUNS )); then RUNS_N[$mac]=$MAX_RUNS; LOG "max runs; move closer or try Live view"; return 0; fi
   secs=$(( WIN_BASE_S + 10 ))
-  watch_prepare "$mac" "$secs" || return 1
+  watch_prepare "$mac" $(( QUIET_SECS * 4 + 10 )) || return 1      # the gate may run four captures before the baseline lock
   BATT_W0="$BATT"; watch_tsv_hdr
   # quiet gate: wait for < 2 big uplink fr/s over 15 s (cap 60 s)
   LOG "waiting for camera to settle"
