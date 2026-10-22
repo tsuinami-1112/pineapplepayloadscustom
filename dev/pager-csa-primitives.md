@@ -163,14 +163,60 @@ A working implementation of all of this already exists in this repo:
 
 ## Hard constraints
 
-- **2.4 GHz and non-DFS 5 GHz only.** `cfg80211_reg_can_beacon()` gates monitor TX, and
-  `cfg80211_chandef_dfs_required()` returns 0 for a monitor interface so the DFS relaxation never
-  applies. Frames on DFS 5 GHz (channels 52–144) or **any** 6 GHz channel are dropped before they
-  reach the air, whatever the target's posture. This matches Hak5's documented deauth limitation.
-- Consequence: the Pager's 6 GHz capability is **reconnaissance surface only**, never attack
-  surface — and every 6 GHz network mandates WPA3 anyway.
-- There is **no crackable handshake** behind this. WPA3-SAE has no offline-crackable 4-way exchange
-  and no PMKID, so CSA buys nothing for handshake capture. Its value is disconnect and forced roam.
+### Bands: 2.4 GHz and non-DFS 5 GHz only
+
+`ieee80211_monitor_start_xmit()` calls `cfg80211_reg_can_beacon(wiphy, chandef, iftype)`, which
+fails on any channel flagged `IEEE80211_CHAN_NO_IR` — "no initiating radiation", meaning you may
+not *start* transmitting there on your own initiative, only respond to a legitimate master you have
+heard. Injecting on a monitor interface is unsolicited initiation by definition, so it is refused.
+
+**The refusal is silent.** The frame is freed and the function returns `NETDEV_TX_OK` — no errno,
+no dropped-frame counter, and `sendto()` reports the full byte count. If you are debugging "the
+command ran and nothing happened on the air", this is the first thing to suspect.
+
+The DFS escape hatch does not help: there is a relaxation permitting `NO_IR` channels once a DFS
+channel has completed its Channel Availability Check and a legitimate AP is operating, but
+`cfg80211_chandef_dfs_required()` returns 0 for `NL80211_IFTYPE_MONITOR` (grouped with
+STATION/AP_VLAN/NAN), so a monitor vif can never qualify.
+
+Both excluded ranges use that same mechanism for different reasons:
+
+- **DFS 5 GHz (52–144)** — shared with weather and military radar, so the rule is "listen for radar
+  first".
+- **All 6 GHz** — 6 GHz has no unconditional transmit mode at all. Every device must fall under
+  LPI (low-power indoor, power-capped), SP (standard power, which requires **AFC** — reporting
+  geolocation to a coordination service and receiving an authorised channel and power list before
+  radiating, because the band is shared with incumbent licensed fixed microwave links), or VLP
+  (very low power, portable). A transmitter must be authorised *before* it radiates, which is
+  exactly what `NO_IR` encodes.
+
+### 6 GHz: do not conflate the two barriers
+
+6 GHz networks also all mandate WPA3/PMF, but that is a **separate** fact and it is *not* what
+stops CSA:
+
+| Barrier | Blocks deauth? | Blocks CSA? |
+|---|---|---|
+| Regulatory `NO_IR` | yes | **yes — this is the real wall** |
+| WPA3/PMF mandate | yes | **no** — beacons are not PMF-protected |
+
+So the Pager's 6 GHz radio is **reconnaissance surface only** because of regulation, not because of
+WPA3. If the regulatory block were ever absent — a VLP-authorised path, or a permissive regdomain —
+**CSA on 6 GHz would become viable while deauth stayed dead.** Do not write off 6 GHz CSA as
+doubly-blocked; it is singly-blocked, by regulation.
+
+Caveat on verification: the per-channel flags live in a binary regdb
+(`/lib/firmware/regulatory.db`, `wireless-regdb 2025.02.20` on 1.1.3) and reading them needs
+`regdbdump`, which is not on the device. The mechanism above is kernel behaviour and is solid; the
+exact flag set depends on regdb version and country code. `radio1` ships `country 'US'` and
+`band '5g'`, so 6 GHz operation depends on PineAP's runtime band selection anyway. Hak5's own
+`DEAUTH_CLIENT` docs state the 6 GHz injection limit independently, which corroborates this as a
+regulatory wall rather than a device limitation.
+
+### No handshake behind it
+
+WPA3-SAE has no offline-crackable 4-way exchange and no PMKID, so CSA buys nothing for handshake
+capture. Its value is disconnect and forced roam, not cracking.
 
 ## Detection — assume you are visible
 
