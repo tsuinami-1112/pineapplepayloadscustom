@@ -16,8 +16,8 @@ Firmware under analysis: **1.1.3-stable**, `pineapd` sha256 `adc9d36d…8493`, `
 
 | Tag | Meaning |
 |---|---|
-| **[V]** | Verified by direct inspection of the shipped binaries / the exact kernel + driver source the device was built from |
-| **[A]** | Assumed or inferred — stated with its basis, not proven |
+| **[V]** | **Provenance, not reliability.** "I read the named artifact — the shipped binaries, or the exact kernel/driver source this device was built from — and it says this." It does **not** mean correct, and it loses to a contradicting reading. A conclusion *drawn from* a [V] reading is **[A]**, not [V]: tag the reading, argue the conclusion. |
+| **[A]** | Assumed or inferred — stated with its basis, so the inference step is the thing to attack |
 | **[RO]** | Read-only step, no device state changed |
 | **[INV]** | Invasive, with risk level and tested rollback |
 

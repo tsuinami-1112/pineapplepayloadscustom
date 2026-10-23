@@ -127,18 +127,50 @@ fire + settle or it expires mid-measurement.
 Each of those cross-references the others; `pager-csa-primitives.md` is the reference the rest defer
 to on mechanism.
 
+## How claims work in this repo
+
+Every factual claim in these docs — **including the ones tagged `[V]`** — is arguable and amendable.
+Nothing here is settled by having survived review. In one day this project's conclusions went
+through three independent adversarial reviews and still carried two material errors; one was caught
+by a later review, the other by a parallel session re-reading a source that was already cited.
+**Review count is not evidence.** Three passes that agree can all be wrong in the same way, and
+twice they were.
+
+**What outranks a claim here is better evidence, and nothing else** — not seniority, not recency,
+not having the hardware. Both overturns came from sessions with no device, re-reading an artifact the
+doc had already named. If you can show the artifact says something different, you are right and the
+doc is wrong, and you do not need permission to say so.
+
+So when you stake a claim, substantiate it well enough that the next session can attack it cheaply:
+
+- **Name the artifact and the location** — `file:line`, an address, a symbol, the exact command.
+  "The kernel checks this" is not a claim you can argue with; `mac80211_mlme.c:8349` is.
+- **Separate what you read from what you concluded, and write the inference step out.** Both of
+  today's errors were a correct reading followed by a wrong step. The step is the attackable part,
+  so leave it visible instead of folding it into the finding.
+- **State what would falsify it**, in a clause. If you cannot name a falsifier, the claim is vaguer
+  than it looks and probably wants splitting into two.
+- Prefer a claim a reader can re-check in one command over one they have to take on trust.
+
+**`[V]` is a claim about provenance, not reliability.** It means "I read the named artifact and it
+says this". It does not mean correct, and it does not win against a contradicting reading. In
+particular: **a conclusion drawn from a `[V]` reading is not itself `[V]`.** That slip is precisely
+how `[V]` got attached to three wrong claims in one day — the regdb reading was verified while
+"cfg80211 is what blocks DFS" was not, and the function body was read correctly while
+"probe-response CSA does nothing" did not follow from it. Tag the reading; argue the conclusion.
+
+When you do overturn something, change it **everywhere it is stated** — these docs deliberately
+repeat themselves — and say so in the commit, rather than leaving two answers in the repo for the
+session after you to adjudicate. `dev/pager-csa-primitives.md` §"Re-deriving from scratch, if you do
+not trust this file" exists for exactly this; as it says, the point of these files is to save you
+the grep, not to replace verification.
+
 ## Established so far — a snapshot, not a verdict
 
 **Read this to recognise a question that has already had work done on it, not as a reason to stop
 asking it.** Everything below was derived from static analysis of firmware 1.1.3-stable and kernel
 source, as of commit `07916df`, with **no hardware on the bench**. Full working and citations are in
-the docs above.
-
-Over one day these conclusions needed three independent reviews and were materially wrong twice, in
-both directions. So: a session with the device in front of it outranks anything here; so does a
-contradicting primary source. If you overturn something, change it here and say so in the commit
-rather than leaving two answers in the repo. `dev/pager-csa-primitives.md` §"Re-deriving from
-scratch, if you do not trust this file" exists for exactly that.
+the docs above, and each claim carries the thing that would falsify it.
 
 If you are working on **unlocking 6 GHz or DFS injection**, treat the gate claims below as the prior
 state of the investigation, not its conclusion — the determination plan is a plan precisely because
@@ -153,30 +185,45 @@ the question is open.
   refusal is entirely gate 1's. A gate-2 drop is **silent** — the frame is freed and the path
   returns `NETDEV_TX_OK`, so `sendto()` reports success. Nothing on the Pager can tell
   "transmitted" from "dropped"; that is why an independent receiver is mandatory.
+  *Falsified by:* a frame landing on an external receiver from a channel in the gate-1 set, or
+  `pcap_inject` turning out to have a second call site in a build other than 1.1.3-stable.
 - **pineapd's CSA carries Channel Switch Count = 0** (built at `0x4bee8a`), and
   `ieee80211_mgd_csa_present()` discards a count-0 CSA before the auth/assoc refusal check. So CSA
   can kick a client but can never deny it a reconnection. Count 0 is also what makes the move
   immediate. A non-zero count would get both — needs our own injector, no setting exists. This is
   the single most load-bearing firmware fact for the response rung.
+  *Falsified by:* a capture of a pineapd CSA whose count byte is not 0, or a client refusing
+  auth/assoc while only count-0 CSAs are on the air. Either kills it; both are cheap to check with
+  a receiver and a target.
 - **Beacon protection needs both ends.** The AP must enable it (hostapd advertises Ext Cap bit 84
   only with `beacon_prot=1` *and* driver support; it turns itself on once 11be is enabled with PMF)
   **and** the client must be able to install a BIGTK (`nl80211` refuses key idx 6–7 without
   `NL80211_EXT_FEATURE_BEACON_PROTECTION[_CLIENT]`). The AP's bit 84 is policy, not client
   behaviour.
+  *Falsified by:* a client dropping a forged MME-less beacon without having installed a BIGTK, or
+  `nl80211` accepting key index 6–7 on a wiphy that does not set the ext-feature flag.
 - **Hardware, from FCC ID 2A52Y-MK1:** 6 GHz is certified across all four U-NII sub-bands, so the
   block is software. The Pager is a **one-transmitter** device — `WIFI-1`/`WIFI-2` do all TX on
   every band; `2.4G-1`/`2.4G-2` are annotated "Not used for transmitting", so `radio0` is
   receive-only and **`wlan0mon` cannot hear 5 GHz**. Board `Pager V2.2.0`.
+  *Falsified by:* a different FCC ID on the device label, or a board revision other than
+  `Pager V2.2.0` — a filing describes the unit that was submitted, not necessarily the one in your
+  hand. `wlan0mon` returning 5 GHz frames would kill the receive-only half on its own.
 - **Firmware under analysis is 1.1.3-stable** — OpenWrt 24.10.1, `ramips/mt76x8`, `mipsel_24kc`,
   mac80211 from backports-6.12. Every address above is pinned to it. `pineapd` is **MIPS16e** with
   no section headers: disassemble with `-m mips:16`, mask bit 0 off symbol values, and read symbols
   with `nm -D` / `objdump -T` / `readelf --use-dynamic -sW` — plain `readelf -s` and
   `readelf --dyn-syms` return nothing **and exit 0**.
+  *Falsified by:* `/etc/openwrt_release` or the image sha256 not matching. This one is load-bearing
+  for every address above — if the pin is wrong they are not merely suspect, they are void, so check
+  it first (day-one step 3) rather than discovering it through a confusing disassembly.
 - **`libwifi.so.0.0.10` exports 113 functions**, 92 unused by pineapd, including
   `libwifi_create_action`, `_action_no_ack`, `_add_action_detail`, `_create_probe_resp`,
   `_set_probe_resp_channel` and the `libwifi_*_tag` element API. Reach them with `dlopen`/`dlsym` —
   **linking `-lwifi` against the shipped file is refused** (no section headers). No headers or
   static lib ship, so write prototypes and struct layouts by hand against upstream `0.0.10`.
+  *Falsified by:* `nm -D` on the device's own copy returning a different export set, or a
+  `libwifi.so.0.0.10` whose sha256 is not `d3421de2…6ee1`.
 
 **Refuted hypotheses**, so they are not re-proposed — but note which rest on what:
 
