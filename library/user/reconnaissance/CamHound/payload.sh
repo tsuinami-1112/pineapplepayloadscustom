@@ -97,7 +97,7 @@ SCAN_IF="wlan0"         # reserved: posture cross-check iface, the enabled dummy
 BCN_CAP_SECS=4          # seconds to wait for a beacon when reading a target's posture
 BCN_CAP_COUNT=5         # beacons to capture per posture read (first usable one is parsed)
 POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
-RESP_LOCK_SECS=20       # EXAMINE lock duration held across a response
+RESP_LOCK_SECS=20       # * EXAMINE lock duration held across a response (must exceed fire + settle)
 RESP_SETTLE_SECS=6      # * wait after transmitting before re-reading the target to judge the effect
 LOOT_DIR="/root/loot/CamHound"
 OUI_FILE="/lib/hak5/oui.txt"; OUI_FILE_ALT="/rom/lib/hak5/oui.txt"
@@ -183,6 +183,8 @@ load_overrides() {
   THR_STREAM_UP=$(cfg THR_STREAM_UP "$THR_STREAM_UP" 1)
   RESPONSE=$(cfg RESPONSE "$RESPONSE" 0)
   RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
+  RESP_LOCK_SECS=$(cfg RESP_LOCK_SECS "$RESP_LOCK_SECS" 5)
+  RESP_SETTLE_SECS=$(cfg RESP_SETTLE_SECS "$RESP_SETTLE_SECS" 1)
   AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
   POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
   DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
@@ -456,6 +458,7 @@ posture_opts() {
   case "$1" in
     'NOINJ'|'NONE') printf '' ;;                 # regulatory wall, or beacon protection: nothing works
     'C')            printf 'CSA BOTH DEAUTH' ;;  # PMF required: deauth is ignored but stays offered
+    '?')            printf 'CSA BOTH DEAUTH' ;;  # posture unread: CSA lands on every badge but NONE
     *)              printf 'BOTH DEAUTH CSA' ;;
   esac
 }
@@ -578,6 +581,10 @@ POSTURE_LAST='?'
 posture_of() {   # posture_of <bssid> <band> <channel> -> badge (stdout and POSTURE_LAST), cached per BSSID
   # Call it directly, not in $(...): the cache, POSTURE_RSN and POSTURE_EXT are set in the caller's shell.
   local bssid="$1" band="$2" ch="$3" f b now="$EPOCHSECONDS" locked_here=0
+  # Both early returns below answer without reading a beacon, so the caps globals must not keep the
+  # PREVIOUS target's values -- resp_write records them as this response's rsn_caps/beacon_prot and
+  # would otherwise attribute another BSSID's posture to this row. Only the badge itself is cached.
+  POSTURE_RSN=-; POSTURE_EXT=-
   if [ -n "${POSTURE[$bssid]}" ] && (( now - ${POSTURE_TS[$bssid]:-0} < POSTURE_TTL )); then
     POSTURE_LAST="${POSTURE[$bssid]}"; printf '%s' "$POSTURE_LAST"; return 0
   fi
@@ -1916,6 +1923,9 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
     LOG red "$(posture_why "$badge")"
     confirm "Nothing is expected to work ($badge). Try anyway?" || return 0
     opts='BOTH DEAUTH CSA'
+  elif [ "$badge" = '?' ]; then
+    # No beacon was captured, so nothing below is advice -- say so instead of firing on one accept.
+    confirm "Posture unread on ${R_BSSID:9}: no beacon captured. Fire blind?" || return 0
   fi
   for k in $opts; do
     exp=$(posture_expect "$badge" "$k")
@@ -1937,7 +1947,7 @@ posture_why() {   # one line of plain English for a badge
     'D+C')   printf 'no PMF: deauth and CSA both land' ;;
     'D?+C')  printf 'PMF optional: deauth works per-client, CSA lands' ;;
     'C')     printf 'PMF required: deauth is ignored, CSA still lands' ;;
-    'NONE')  printf 'PMF + beacon protection: nothing here works' ;;
+    'NONE')  printf 'PMF + beacon protection: no frame this firmware sends works' ;;
     'NOINJ') printf 'DFS or 6 GHz: the radio may not transmit on this channel' ;;
     *)       printf 'posture unread: no beacon captured' ;;
   esac
@@ -2133,6 +2143,15 @@ selftest() {
   st "posture beacon prot bit clear" "$(posture_from_caps cc00 "$XNO" 2 6)" "C"
   st "posture short extcap ignored"  "$(posture_from_caps cc00 0000000000 2 6)" "C"
   st "posture unread rsn"           "$(posture_from_caps - - 2 6)"         "?"
+  # 4c posture_of must not carry a previous target's caps into this response's loot row
+  POSTURE_RSN=cc00; POSTURE_EXT=0000000000000000000010
+  POSTURE[aa:00:00:00:00:f1]=C; POSTURE_TS[aa:00:00:00:00:f1]=$EPOCHSECONDS
+  posture_of aa:00:00:00:00:f1 2 6 >/dev/null
+  st "posture_of cache hit clears stale caps" "$POSTURE_RSN/$POSTURE_EXT" "-/-"
+  POSTURE_RSN=cc00; POSTURE_EXT=0000000000000000000010
+  posture_of aa:00:00:00:00:f2 6 37 >/dev/null
+  st "posture_of NOINJ exit clears stale caps" "$POSTURE_RSN/$POSTURE_EXT" "-/-"
+  st "posture_of NOINJ exit still answers"     "$POSTURE_LAST"             "NOINJ"
   st "posture garbage rsn"          "$(posture_from_caps zz00 - 2 6)"      "?"
   st "posture unknown band"         "$(posture_from_caps 0c00 - '?' 6)"    "NOINJ"
   st "posture non-numeric channel"  "$(posture_from_caps 0c00 - 2 x)"      "NOINJ"
@@ -2193,7 +2212,7 @@ IWFIX
   st "opts PMF required leads CSA" "$(posture_opts C)"     "CSA BOTH DEAUTH"
   st "opts beacon prot offers none" "$(posture_opts NONE)" ""
   st "opts no-inject offers none"  "$(posture_opts NOINJ)" ""
-  st "opts unread offers all"      "$(posture_opts '?')"   "BOTH DEAUTH CSA"
+  st "opts unread leads CSA"       "$(posture_opts '?')"   "CSA BOTH DEAUTH"
   st "expect deauth vs no PMF"     "$(posture_expect 'D+C' DEAUTH)"  "works"
   st "expect deauth vs optional PMF" "$(posture_expect 'D?+C' DEAUTH)" "partial"
   st "expect deauth vs required PMF" "$(posture_expect C DEAUTH)"    "blocked"

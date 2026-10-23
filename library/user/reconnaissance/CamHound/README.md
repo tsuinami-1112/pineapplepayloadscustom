@@ -188,7 +188,7 @@ removes it). Overrides are counted on the start screen and listed in `events.log
 | POSTURE_TTL | 300 | * | seconds a posture badge stays cached per BSSID |
 | RESP_SETTLE_SECS | 6 | * | wait after transmitting before re-reading the target to judge the effect |
 | BCN_CAP_SECS / BCN_CAP_COUNT | 4 / 5 | | beacon capture window and frame count for a posture read |
-| RESP_LOCK_SECS | 20 | | EXAMINE lock duration held across a response |
+| RESP_LOCK_SECS | 20 | * | EXAMINE lock duration held across a response; must exceed fire + settle |
 
 ## Response
 
@@ -216,8 +216,14 @@ not a property of the target: cfg80211 marks DFS and 6 GHz channels no-initiate-
 monitor interface, so frames are dropped before they reach the air whatever the target's posture.
 
 **2 · Attack.** All three are always offered, ordered by what the beacon says will work and
-labelled `works` / `partial` / `blocked` / `unknown`. The badge advises; you decide. If nothing is
-expected to work you are asked once, then may proceed anyway.
+labelled `works` / `partial` / `blocked` / `unknown`. The first in the list is preselected, so the
+ordering is the recommendation. The badge advises; you decide — there are two gates, and both can be
+overridden:
+
+- **`NONE` or `NOINJ`** — nothing is offered. You are asked once ("Nothing is expected to work"),
+  and may proceed anyway.
+- **`?`** — the beacon could not be read, so none of the labels mean anything. CSA leads, because it
+  works on every badge but `NONE`, and you are asked once ("Fire blind?") before the picker.
 
 | Option | Command | Frames |
 |---|---|---|
