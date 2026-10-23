@@ -368,9 +368,11 @@ inj_probe() {   # inj_probe [force] -> 0 when INJ_OK is usable
 
 # Parsed against the shipped iw's own format strings, not an invented layout: the channel
 # line is "\t* %d MHz [%d] " optionally followed by "(disabled)", then indented attribute
-# lines, of which only "No IR" blocks transmission ("Radar detection" does not -- gate 2
-# prohibits DISABLED and NO_IR, never RADAR).  Matching "MHz [n]" loosely also covers the
-# "phy%d %d MHz [%d]:" variant present in the same binary.
+# lines, of which only the NO_IR one blocks transmission ("Radar detection" does not -- gate 2
+# prohibits DISABLED and NO_IR, never RADAR).  iw spells that attribute three ways: "No IR" when
+# the kernel sets both NO_IR and the separate legacy NO_IBSS slot, otherwise "Passive scan" or
+# "No IBSS" -- all three must block, or an older kernel's NO_IR channel reads as injectable.
+# Matching "MHz [n]" loosely also covers the "phy%d %d MHz [%d]:" variant in the same binary.
 inj_parse_channels() {   # stdin: iw phy <phy> channels -> "freq|channel|blocked" rows
   awk '
       function flush() { if (ch != "") printf "%d|%d|%d\n", freq, ch, bad }
@@ -381,7 +383,7 @@ inj_parse_channels() {   # stdin: iw phy <phy> channels -> "freq|channel|blocked
           bad = ($0 ~ /\(disabled\)/) ? 1 : 0
           next
       }
-      /^[ \t]+No IR[ \t]*$/ { if (ch != "") bad = 1; next }
+      /^[ \t]+(No IR|Passive scan|No IBSS)[ \t]*$/ { if (ch != "") bad = 1; next }
       /^[Bb]and [0-9]+:/    { flush(); ch = ""; next }
       END { flush() }'
 }
