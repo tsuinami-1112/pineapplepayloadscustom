@@ -716,15 +716,15 @@ ssh root@172.16.52.1 'df -h /overlay; sha256sum /root/regulatory.db.new
 | Regdomain change needed? | Yes (B2) | **None** |
 | Custom regulatory.db needed? | No (B2 suffices) | **None** |
 | Kernel change needed? | No | **None** |
-| New hardware needed? | 6E receiver **and** 6E AP | **None** — the Pager's own `wlan0mon` (phy0, mt7603e, a physically different chip) is a free independent receiver in the same enclosure |
+| New hardware needed? | 6E receiver **and** 6E AP | **A 5 GHz receiver** — see the correction in Addendum 2c. An earlier draft claimed `wlan0mon` was a free in-enclosure receiver; it is `band '2g'` and cannot hear ch 52. |
 | Only obstacle | NO-IR + pineapd + PMF | **pineapd's hardcoded channel bitmask alone** |
 | Fix cost | B2 + 4-byte patch group | **12-byte `dfs` patch group, or `opkg install hcxdumptool`** |
 | **Does deauth actually work?** | **No** — PMF mandatory | **Yes** — ordinary WPA2 networks, PMF optional |
 | Coverage won | 59 channels nobody is on yet | **~16 widely-deployed channels** |
 
-**Sequence:** A3 (confirm no NO-IR on 5260/5500) → B0 (rig) → B3 (`hcxdumptool`) → B4 (inject ch 52, confirm on `wlan0mon` — free) → B5 (attribute) → C1 `dfs` group only, if the integrated pineapd workflow is wanted.
+**Sequence:** A3 (confirm no NO-IR on 5260/5500) → B0 (rig) → B3 (`hcxdumptool`) → B4 (inject ch 52, confirm on the **external 5 GHz receiver**, not `wlan0mon`) → B5 (attribute) → C1 `dfs` group only, if the integrated pineapd workflow is wanted.
 
-This needs **no kernel change, no regdb change, and no new hardware**, and it is verifiable on day one.
+This needs **no kernel change and no regdb change**. It does need a 5 GHz-capable receiver (Addendum 2c), which the 6E adapter from §0.1 already satisfies — so it adds no purchase beyond what the 6 GHz branch requires anyway, and it is verifiable on day one.
 
 ---
 
@@ -1017,3 +1017,47 @@ compliance control**, which matches exactly what the binary shows.
 > binary patch took but the radio still refuses, an undisclosed enforcement layer moves from
 > "unlikely" to "the leading suspect" — alongside E4 (closed MT7961 firmware), which Addendum 2
 > already flags.
+
+## Addendum 2c — the antenna map, and a correction to §5
+
+Source: FCC internal photos **TZ0278250701PH03**, Fig.11 (page 6), read at full resolution. **[V]**
+
+Four antenna positions are labelled in the case, and the annotations are unambiguous:
+
+| Label | Annotation in the filing | Meaning |
+|---|---|---|
+| `WIFI-1` | **"Wifi 2.4G/5G/6G Antenna 1"** | MT7921AU chain 1 — transmits, all three bands |
+| `WIFI-2` | **"Wifi 2.4G/5G/6G Antenna 2"** | MT7921AU chain 2 — transmits, all three bands |
+| `2.4G-1` | **"Not used for transmitting"** | radio0 chain 1 — **receive only** |
+| `2.4G-2` | **"Not used for transmitting"** | radio0 chain 2 — **receive only** |
+
+So **every transmission on this device — 2.4, 5 and 6 GHz alike — leaves through the MT7921AU's
+two antennas.** `radio0` (`platform/10300000.wmac`, the SoC's own mt7603e, UCI `band '2g'`) is a
+**receive-only radio**. Corroborated by its own config: every AP-mode interface it defines
+(`wlan0mgmt`, `wlan0open`, `wlan0wpa`) ships `disabled '1'`, and only `wlan0mon` plus a dummy sta
+are live. The antenna gains in the radio report (Ant. 1 = 4.43 dBi, Ant. 2 = 2.93 dBi) are
+therefore `WIFI-1` and `WIFI-2`.
+
+### Correction to §5 — this one would have cost a day on the bench
+
+§5 claimed the DFS branch needed **no new hardware**, because "the Pager's own `wlan0mon` (phy0,
+mt7603e, a physically different chip) is a free independent receiver in the same enclosure".
+
+**That is wrong.** `radio0` is `band '2g'`. It is a fine independent receiver for a 2.4 GHz control
+— and it genuinely is a different chip, so it remains the right instrument for the B0 rig's 2.4 GHz
+sanity check — but **it physically cannot hear 5 GHz channel 52**. The DFS branch needs a 5 GHz-
+capable receiver like any other band.
+
+Practical impact is small, because the 6E adapter §0.1 already requires is tri-band and covers
+5 GHz. But do not plan the DFS test around `wlan0mon`, and do not read its silence on ch 52 as
+"the Pager did not transmit" — it would be silent either way. That is exactly the confounded
+pass/fail signal the plan's own validity rules forbid.
+
+### Note for CamHound's injectability probe
+
+`inj_probe()` merges per-channel flags across every phy, chosen so we need not guess which
+interface pineapd picks as injector. That stays correct here, but for a reason worth writing down:
+**the only transmitting radio (phy1) covers every band the receive-only one does**, so merging
+phy0's flags in can never make the merged answer differ from phy1's. If a future revision ships a
+transmitting radio0, or a radio0 covering a band phy1 does not, that invariant breaks and the merge
+would need to select the transmitting phy instead.
