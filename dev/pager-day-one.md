@@ -74,10 +74,29 @@ fallback — and it is the **first real-world input to `inj_probe()`'s parser**,
 against the shipped `iw`'s format strings but has never seen live output. Diff what `inj_probe`
 produced against the raw text by hand, once.
 
-**9. THE VALUE GATE — run this before spending any effort on 6 GHz.** With the 6E AP and a real
-client in the chamber, establish whether the client enforces beacon protection. If it does, 6 GHz
-CSA is dead and the only survivor is probe-response CSA. Deauth on 6 GHz is already dead by
-standard (PMF mandatory).
+**9. THE VALUE GATE — one beacon capture, before spending any effort on 6 GHz.** Beacon protection
+is an **AP-side** switch, so the chamber AP decides it; no client is needed to find out. Capture one
+beacon from the 6E AP and read two fields:
+
+```sh
+# 1. does the AP advertise beacon protection?  (Ext Cap bit 84)
+tshark -i wlan0 -c 5 -T fields -e wlan.extcap.b84 \
+       -Y 'wlan.fc.type_subtype==8 && wlan.bssid==<AP>'
+
+# 2. are its beacons actually carrying an MMIE?  (element 76) -- no output = not protected
+tshark -i wlan0 -c 5 \
+       -Y 'wlan.fc.type_subtype==8 && wlan.bssid==<AP> && wlan.tag.number==76'
+```
+
+MMIE (element **76**) present **and** `wlan.extcap.b84 == 1` → beacon protection is on, and
+beacon-borne CSA is dead against anything associated to that AP. Neither → beacon-CSA is live.
+**Record which**, because "beacon CSA worked" may mean only "my AP does not enable it".
+
+If it is on, the fallbacks are both poor and both verified from mac80211 source: probe-response CSA
+is **ignored outright** (the probe-resp path never reaches chanswitch), and an unprotected
+Public-Action eCSA only **stalls the client's TX queues** until the next clean beacon. Deauth is
+already dead by standard (PMF mandatory). The real client is still worth having — it confirms a
+switch actually happens, and non-Linux stacks may differ.
 
 > **If the deliverable is client disconnection, stop the 6 GHz branch here.** The answer is
 > "unlockable, and it will not work." Go to the DFS branch, which is unaffected.
@@ -125,6 +144,13 @@ changed. Set `uci set wireless.radio1.country=` too so netifd does not revert it
 
 **17. Inject on 6 GHz, confirm at the receiver.** Tune the receiver *first* — a `NO-IR` channel is
 passive-only, so scanning will never find it.
+
+**17b. If the AP turned out to have beacon protection on, test the one remaining outside path.**
+Unprotected Public-Action eCSA (category 4, action 4) is excluded from PMF's robust set, and the
+builder is already on the device — `dlopen("libwifi.so.0")` gets you `libwifi_create_action` and
+`libwifi_add_action_detail` without vendoring anything. Expect a TX stall on a current Linux client
+rather than a channel move; an older or non-Linux stack may switch properly. Watch the client's
+traffic, not just its association state.
 
 ---
 

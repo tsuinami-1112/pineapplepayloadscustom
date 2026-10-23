@@ -347,8 +347,12 @@ Needs a Pager:
 - whether the three `PINEAPPLE_DEAUTH_CLIENT*` commands behave as `hak5cmd`'s help text claims
 - `PINEAPPLE_DEAUTH_CLIENT_ALL`'s target argument — its help says "all clients on an AP" yet it
   takes a target, which is passed through but whose semantics are unconfirmed
-- whether `DEAUTHCSA` emits a CSA-bearing beacon or a spectrum-management action frame (the symbols
-  and the "Caught beacon for CSA" string strongly imply beacon)
+- ~~whether `DEAUTHCSA` emits a CSA-bearing beacon or a spectrum-management action frame~~ —
+  **settled, beacon.** `pineapd`'s dynamic imports from `libwifi.so.0` are exactly
+  `libwifi_create_beacon`, `_deauth`, `_disassoc`, `_radiotap`; there is no action-frame builder
+  among them, so it cannot emit one. (The shipped `.so` *does* export `libwifi_create_action` and
+  `libwifi_create_probe_resp` — pineapd just never calls them. See
+  `dev/pager-csa-primitives.md`.)
 - whether Recon's packet counters move the way `resp_verdict` assumes
 - whether the CSA attack moves a real client **at all** — see §7
 
@@ -367,7 +371,12 @@ it.
 ## 14. Known limits
 
 - **Beacon protection defeats the CSA path outright** (WPA3, December 2020 update onward; AP support
-  is mandatory in Wi-Fi 7), so this decays over time. The `NONE` badge exists to say so.
+  is mandatory in Wi-Fi 7), so this decays over time. The `NONE` badge exists to say so. Verified in
+  mac80211's receive path: once a client holds a BIGTK, an MME-less beacon is dropped before the CSA
+  element is parsed. There is **no fallback carrier** worth offering — a CSA element in a probe
+  response is never fed to mac80211's chanswitch path, and the one frame outside PMF's robust set
+  (a Public-Action eCSA) only stalls the client's TX queues until the next clean beacon, and pineapd
+  cannot build it anyway. `NONE` meaning "nothing here works" is correct, not conservative.
 - **DFS and 6 GHz cannot be attacked from a monitor interface**, so the 6 GHz radio is recon-only
   surface. 2.4 GHz and non-DFS 5 GHz only.
 - **Detection is improving fast.** Kismet merged a CSA-flood alert (>20 CSA beacons from one BSSID

@@ -109,7 +109,7 @@ certification gap.
 |---|---|
 | **6E-capable monitor receiver** — they ordered an EDUP AX1672 (MT7921AU, USB 3.0, tri-band) | The only way to distinguish "transmitted" from "silently dropped". Load-bearing for **both** branches: it is also the 5 GHz receiver for the DFS tests, since `wlan0mon` cannot hear 5 GHz. |
 | **6 GHz AP** in the chamber | Beacon source for receiver proof, and the CSA target. |
-| **Real 6 GHz client** | The only way to answer whether beacon protection is enforced. |
+| **Real 6 GHz client** | Confirms a CSA actually moves something. *Not* needed to decide whether beacon protection is in play — one beacon capture answers that (§5). |
 | **5 GHz AP on a DFS channel** | The DFS branch's target. |
 
 **Validate the receiver against a source that is not the Pager, before the Pager is powered on.**
@@ -126,18 +126,42 @@ beacons in client mode, so in monitor mode the regdom stays `00` and 6 GHz chann
 It may end the 6 GHz branch before any effort is spent, and the operator should decide with it in
 hand rather than discover it at step 15.
 
-`pineapd`'s entire frame-construction repertoire is `libwifi_create_beacon`, `_deauth`,
-`_disassoc`, `_radiotap`. **There is no action-frame builder**, so its CSA rides a spoofed beacon or
-probe response.
+`pineapd` imports exactly four builders — `libwifi_create_beacon`, `_deauth`, `_disassoc`,
+`_radiotap` — so **pineapd's own** CSA rides a spoofed beacon. But the device's
+`/usr/lib/libwifi.so.0.0.10` also exports `libwifi_create_action`, `libwifi_create_action_no_ack`,
+`libwifi_add_action_detail` and `libwifi_create_probe_resp`; pineapd just never calls them. Any
+non-pineapd injector can `dlopen` the shipped library and get action frames and probe responses
+without vendoring anything.
 
 | Attack on 6 GHz | Viability |
 |---|---|
 | Deauth / disassoc | **Dead by standard.** 6 GHz mandates WPA3 (OWE even for open), so PMF is mandatory. Hak5's own docs say this. |
-| Beacon-borne CSA | **Probably defeated** — beacon protection (BIGTK) is part of WPA3 and 6 GHz clients are the newest silicon. |
-| Probe-response CSA | **The one plausible survivor** — beacon protection does not cover probe responses. |
+| Beacon-borne CSA | **Works unless the target AP enables beacon protection** — and then it is dead, not degraded. mac80211 drops MME-less beacons once the client holds a BIGTK, before the CSA element is read. |
+| Probe-response CSA | **Does nothing.** `ieee80211_rx_mgmt_probe_resp()` never reaches mac80211's chanswitch path, so a CSA in a probe response is ignored whether or not beacon protection is on. |
+| Public-Action eCSA (cat 4, action 4) | **The only outside path past PMF + beacon protection** — Public Action frames are outside PMF's robust set. But current mac80211 will not switch on one: it blocks the client's TX queues while the CSA mode bit is set and unblocks on the next clean beacon. **A self-healing TX stall**, not a channel move. |
 
 > If the deliverable is client disconnection, the honest answer is **"unlockable, and it will not
 > work"**. Say so plainly and move to the DFS branch, which is unaffected.
+
+### Answer the gate from one beacon capture, before touching a client
+
+Beacon protection is an **AP-side** switch — the AP enables it and distributes the BIGTK in message
+3 of the 4-way handshake, and only then can a client reject anything. So capture one beacon from
+the chamber AP and read two fields:
+
+| What | Where | tshark |
+|---|---|---|
+| MMIE present in the beacon | element ID **76** | `wlan.tag.number == 76` |
+| Beacon Protection Enabled | Extended Capabilities (ID 127) **bit 84** — octet 10 zero-based, mask `0x10` | `wlan.extcap.b84 == 1` |
+
+Both present → beacon-CSA is dead against clients associated to that AP. Neither → beacon-CSA is
+live. **Report which it was**, because the chamber AP is operator-controlled: "beacon CSA worked"
+may mean only "my AP does not enable beacon protection". hostapd advertises bit 84 only when
+`beacon_prot=1` *and* the driver sets `WPA_DRIVER_FLAGS_BEACON_PROTECTION`, so with some APs the
+hardened case cannot be staged at all — say so rather than reporting the easy result.
+
+A client that does enforce it reports MME-less beacons back to its AP in a WNM Notification frame,
+so the attack is self-announcing on a protected network. **[A]**
 
 ---
 
@@ -215,10 +239,19 @@ that `pcap_inject` has one call site; the shipped regdb's contents for US / worl
 `disable_clc` as a module parameter; 6 GHz certification and antenna gains; the antenna map; the
 log-string mix-up; that `inject_csa` injects nothing itself.
 
+Also verified by reading the mac80211 receive path this build backports: that a client holding a
+BIGTK drops MME-less beacons before the CSA element is parsed; that CSA in a probe response is never
+fed to the chanswitch path; that an unprotected Public-Action eCSA only blocks TX queues rather than
+switching; and, with `objdump -T`, that the shipped `libwifi.so.0.0.10` exports action-frame and
+probe-response builders pineapd does not use.
+
 **Assumed / inferred, stated as such:** that gate 1's 6 GHz check is unreachable for
 hardware-derived channels (§7); that `inject_csa` emits via the beacon path specifically; the
 motive behind the gate; that no undisclosed hardware enforcement exists — the FCC filing that would
-describe it is withheld, so this is absence of public evidence, not evidence of absence.
+describe it is withheld, so this is absence of public evidence, not evidence of absence; that a
+pre-2024 or non-Linux client might honour an unprotected eCSA by actually switching.
 
-**Not determined:** whether the MT7961's closed firmware independently gates 6 GHz TX; real client
-behaviour on beacon protection; free flash space; the module part number.
+**Not determined:** whether the MT7961's closed firmware independently gates 6 GHz TX; whether
+beacon protection is *required* on 6 GHz (WPA3 and PMF are; this could not be confirmed from a
+primary source); client behaviour on stacks other than mac80211; free flash space; the module part
+number.
