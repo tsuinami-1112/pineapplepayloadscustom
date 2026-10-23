@@ -149,13 +149,37 @@ earlier revision of these notes collapsed them and got the conclusion wrong twic
 |---|---|
 | Deauth / disassoc | **Dead by standard.** 6 GHz mandates WPA3 (OWE even for open), so PMF is mandatory. Hak5's own docs say this. |
 | Beacon CSA, as a **channel move** | **Works unless the AP *and* the client both enforce beacon protection.** mac80211 drops MME-less beacons once the client holds a BIGTK, before the CSA element is read — but the client's driver has to be able to install one. |
-| Beacon CSA, as **connection denial** | **Works anyway — beacon protection does not stop it.** The forged beacon reaches the cfg80211 BSS cache *before* the protection check, and mac80211 then refuses auth and assoc while a cached CSA is present. Needs a sustained flood, which is what pineapd's CSA mode already emits. |
-| Probe-response CSA | **Moves nothing** in station mode. But it **denies association while the client is scanning**, through the same cached-IE check. |
+| Beacon CSA, as **connection denial** | The path is real — the forged beacon reaches the cfg80211 BSS cache *before* the protection check, and mac80211 refuses auth and assoc while a cached CSA is present — but **pineapd cannot reach it.** Its CSA carries Channel Switch Count = 0, and the kernel discards a count-0 CSA before that check. Needs an injector of our own with `count != 0`. See §5a. |
+| Probe-response CSA | **Moves nothing** in station mode, and the same count-0 problem blocks the denial path. |
 | Public-Action eCSA (cat 4, action 4) | Outside PMF's robust set, so it reaches a protected client — but it does not switch anything. With the CSA mode byte set it blocks the client's TX queues, and **the stall persists** (the unblock sits behind a beacon-CRC short-circuit that a stable AP never trips). On a driver advertising `HANDLES_QUIET_CSA`, it does nothing at all. |
 
 > If the deliverable is "the client changes channel", beacon protection may well end it. If the
 > deliverable is "the camera stops working", it does not — the denial path survives. Ask the
 > operator which one they need before declaring the branch dead, and say which effect you measured.
+
+### §5a The one byte that settles it: pineapd's CSA carries Count = 0
+
+Before planning anything around CSA, know this. pineapd builds every CSA element as
+`{37, len 3, mode 1, new_ch = runtime, count 0}` — construction at `0x4bee8a`, inside
+`recon_engine::index_beacon_ns`, which catches a real beacon and clones it. And
+`ieee80211_mgd_csa_present()` (`mac80211_mlme.c:8349`) throws away any CSA whose count is 0 *before*
+the auth/assoc refusal check:
+
+```c
+	if (csa && csa->count == 0)
+		csa = NULL;
+```
+
+So **the connection-denial effect cannot be triggered by anything pineapd sends.** It is not a
+flood-rate problem; the frames are disqualified by their own contents. Count 0 is simultaneously
+what makes the *channel move* immediate, which is why CSA works on every other badge. **[V]** on
+both sides.
+
+Any non-zero count survives that check, so the same frame with `count = 3` would get the move **and**
+the refusal. There is no setting for it — this needs the Stage-B injector, which is wanted for the
+DFS work anyway. That is **day-one step 17a**, and it is the highest-value cheap experiment in the
+runbook. Do not go hunting for a config option, and do not patch pineapd's instruction without
+reading the warning in `dev/pager-csa-primitives.md` §"THE ONE BYTE".
 
 ### The beacon capture answers half the gate — take it, but do not stop there
 

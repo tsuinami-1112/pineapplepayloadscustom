@@ -162,6 +162,23 @@ changed. Set `uci set wireless.radio1.country=` too so netifd does not revert it
 **17. Inject on 6 GHz, confirm at the receiver.** Tune the receiver *first* — a `NO-IR` channel is
 passive-only, so scanning will never find it.
 
+**17a. THE COUNT BYTE — the cheapest high-value experiment on this list.** pineapd builds every CSA
+with **Channel Switch Count = 0** (`0x4bee8a`), and `ieee80211_mgd_csa_present()` discards a count-0
+CSA before the auth/assoc refusal check. So pineapd's CSA can kick a client but can never deny it a
+reconnection. Any non-zero count survives that check.
+
+Build the Stage-B injector (it is needed for the DFS work anyway) and send the **same frame twice,
+differing only in that byte** — `count = 0`, then `count = 3`. Watch whether the client can
+re-associate while each flood runs. Use the jammer (or a power cycle) to force the disconnect, since
+deauth cannot: this is the one target class where PMF makes the usual kick unavailable. Run the
+jam-only control first and confirm the client *does* come back without the flood, or the result
+means nothing.
+
+There is no setting for the count — do not go looking for one. Patching pineapd's instruction is
+possible but global, costs ~200 ms on the working attack, and is not a clean one-byte edit (the zero
+register is reused two instructions earlier to NUL-terminate a string). Prefer the injector. Full
+working: `dev/pager-csa-primitives.md`, section "THE ONE BYTE".
+
 **17b. If beacon protection is being enforced, test the two remaining outside paths.**
 
 *Connection denial* first, because it is free and uses the frame pineapd already builds: flood the

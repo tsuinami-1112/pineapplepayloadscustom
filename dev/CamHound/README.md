@@ -3,6 +3,10 @@
 Developer material for `library/user/reconnaissance/CamHound` and its Recon-menu hooks. Nothing in
 this folder runs on the Pager; it is for whoever builds the next phases.
 
+**Start at `/CLAUDE.md`** for repo-wide orientation: the three-copy edit contract and its validation
+commands, a code map of the payload by rung, which document answers which question, and the firmware
+facts that are settled so they do not get re-derived.
+
 ## Files
 
 | File | Purpose |

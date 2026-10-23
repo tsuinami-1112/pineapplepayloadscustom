@@ -379,18 +379,21 @@ it.
   support is mandatory in Wi-Fi 7, and hostapd enables it by itself once 11be is on with PMF), so
   that decays over time. Verified in mac80211's receive path: where the client holds a BIGTK and MFP
   is in use, an MME-less beacon is dropped before the CSA element is parsed.
-- **But the `NONE` badge overstates the defence, and this is a known inaccuracy.** `NONE` currently
-  means "nothing here works" and `posture_opts` offers no attack. In fact a sustained forged-CSA
-  beacon flood — exactly what `DEAUTHCSA` emits — still **denies auth and association** on a
-  beacon-protected AP: `ieee80211_scan_rx()` updates the cfg80211 BSS cache *before* the
-  protection check, and `ieee80211_mgd_csa_in_process()` then makes both
-  `ieee80211_mgd_auth()` and `ieee80211_mgd_assoc()` bail ("AP is in CSA process, reject
-  auth"/"reject assoc"). A camera that cannot re-associate is off the air. **[V]** by source
-  reading, **not bench-tested** — which is why the badge has not been changed. Changing it means
-  changing what the payload offers an operator, and that wants a real client behind it first.
-  Caveats to test: it needs a flood (real beacons overwrite the cache), it bites at connect/roam
-  time rather than on an already-associated client, and only `posture_expect` would still be
-  honest in calling the channel-move outcome `blocked`.
+- **`NONE` meaning "nothing this firmware sends works" is correct, and here is the proof.** There
+  *is* a path by which a forged CSA beacon denies auth/assoc even on a beacon-protected AP —
+  `ieee80211_scan_rx()` updates the BSS cache before the protection check, and
+  `ieee80211_mgd_csa_in_process()` then makes `ieee80211_mgd_auth()` and `ieee80211_mgd_assoc()`
+  bail. But **pineapd cannot reach it.** Its CSA element is built at `0x4bee8a` as
+  `{37, len 3, mode 1, new_ch=<runtime>, count 0}`, and `ieee80211_mgd_csa_present()`
+  (`mac80211_mlme.c:8349`) discards any CSA with `count == 0` before that check runs. So the refusal
+  never fires. Count 0 is simultaneously what makes the *channel move* immediate
+  (`max_t(int, count, 1) - 1` clamps it to zero delay), which is why CSA works on the other badges.
+  **[V]** both sides — the emitted bytes and the kernel check. Full working in
+  `dev/pager-csa-primitives.md`, section "THE ONE BYTE".
+  *The experiment this implies:* any non-zero count survives `csa_present()`, so the same frame with
+  `count = 3` would get the move **and** the refusal. That needs a non-pineapd injector (Stage B of
+  `dev/pager-6ghz-determination-plan.md`); there is no setting for it. Until that is measured,
+  `posture_opts` offering nothing at `NONE` is right, not conservative.
 - **DFS and 6 GHz cannot be attacked from a monitor interface**, so the 6 GHz radio is recon-only
   surface. 2.4 GHz and non-DFS 5 GHz only.
 - **Detection is improving fast.** Kismet merged a CSA-flood alert (>20 CSA beacons from one BSSID

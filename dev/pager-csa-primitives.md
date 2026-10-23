@@ -287,11 +287,59 @@ replaces `bss->beacon_ies`. `ieee80211_mgd_csa_in_process()` reads those cached 
 `ieee80211_mgd_auth()` and `ieee80211_mgd_assoc()` bail on it: *"AP is in CSA process, reject
 auth"* / *"reject assoc"*. **[V]**
 
-So a sustained forged-CSA beacon flood stops a client (re)connecting to a beacon-protected AP. It
-is not a channel move, but a camera that cannot re-associate is off the air just the same. The real
-AP's beacons overwrite `beacon_ies` again, so it needs a flood rather than a single frame — which is
-what pineapd's CSA mode already emits — and it bites at connect/roam time, not on an
-already-associated client.
+So in principle a sustained forged-CSA beacon flood stops a client (re)connecting to a
+beacon-protected AP — not a channel move, but a camera that cannot re-associate is off the air just
+the same. The real AP's beacons overwrite `beacon_ies` again, so it needs a flood rather than a
+single frame, and it bites at connect/roam time, not on an already-associated client.
+
+**pineapd cannot do it, for a reason that has nothing to do with flood rate.** See the next section;
+this matters more than anything else on this page if you are planning a CSA attack.
+
+### THE ONE BYTE: pineapd writes Channel Switch Count = 0, which disqualifies the denial path
+
+`recon_engine::index_beacon_ns` catches a genuine beacon for the target BSSID and clones it with a
+CSA element appended. The construction is at **`0x4bee8a`** (MIPS16e; `-m mips:16`, first `PT_LOAD`
+maps vaddr `0x400000` to file offset `0`):
+
+```
+4bee8a:  li   v1,37      ; sb v1,0(v0)    element ID 37 = Channel Switch Announcement
+4bee8e:  li   v1,3       ; sb v1,1(v0)    length 3
+4bee92:  li   v1,1       ; sb v1,2(v0)    Channel Switch Mode   = 1   (hardcoded)
+4bee96:  lbu  v1,52(a0)  ; sb v1,3(v0)    New Channel Number    = runtime field, a0+52
+4bee9e:                    sb s1,4(v0)    Channel Switch Count  = 0   (s1 zeroed at 0x4bee6c)
+```
+
+So every CSA pineapd emits is `{37, 3, mode=1, new_ch=<runtime>, count=0}`. Only element 37 — no
+Extended CSA (60), no Operating Class. **[V]**
+
+Now the receiving side, `ieee80211_mgd_csa_present()` (`mac80211_mlme.c:8349`):
+
+```c
+	if (csa && csa->count == 0)
+		csa = NULL;
+```
+
+A count-0 CSA is thrown away *before* the auth/assoc refusal check, so
+`ieee80211_mgd_csa_in_process()` returns false and nothing is refused. **The connection-denial path
+cannot be triggered by pineapd's CSA at all.** Not too few frames, not too slow — the frames are
+disqualified by their own contents. **[V]** on both sides: the emitted bytes and the kernel check.
+
+Meanwhile count 0 is exactly right for the *channel move*: `process_chanswitch` computes the delay
+as `(max_t(int, csa_ie.count, 1) - 1) * beacon_int`, which clamps 0 to a zero delay — switch
+immediately. And `mode = 1` sets `blocked_tx`, so an accepting client also stops transmitting, and
+on the `drop_connection` path deliberately does not send a deauth. pineapd's CSA is tuned for the
+instant kick and is, by construction, invisible to the refusal logic. That is consistent with Hak5
+shipping it as "CSA Deauthentication".
+
+**The experiment this implies.** Any non-zero count (1–255) survives `csa_present()`, so a frame
+identical but for that byte would get the move *and* the refusal. pineapd hardcodes 0 and there is
+no setting for it, so this needs a non-pineapd injector — which is Stage B of
+`dev/pager-6ghz-determination-plan.md` anyway, and which also chooses its own send rate (needed to
+win the ~100 ms cache race against the real AP) and bypasses gate 1. One tool, three jobs. Patching
+pineapd's instruction instead would be global, would slow the working attack by ~200 ms, and is not
+a clean one-byte edit: the register holding the zero is reused two instructions earlier to write a
+string terminator. Prefer the injector. **[A]** that count≠0 produces the refusal in practice —
+derived from the kernel check, not measured.
 
 The probe-response row reaches the same check through `bss->proberesp_ies`, with two differences:
 the probe-response branch of `ieee80211_scan_rx()` **does** require an active scan, and the
