@@ -983,3 +983,37 @@ gate at §0.3 — PMF and beacon protection, which this filing does nothing to c
 `Block Diagram`, `Schematics`, `Operational Description`, `BOM` and
 `FCC Software Security Requirements for UNII devices` are listed **Metadata only** under the
 filing's confidentiality request and cannot be downloaded.
+
+## Addendum 2b — internal photos and the software-control attestation
+
+Source: FCC ID 2A52Y-MK1, internal photos report **TZ0278250701PH03**, and
+`FCC Software Configuration Control Declaration Rev1.0` (signed 2025-09-15). **[V]**
+
+**Hardware, from the photos.** Board silkscreen reads **`Pager V2.2.0`**, dated **`2025/06/03`**.
+Antenna labels moulded into the case half: **`WiFi-1`**, **`WiFi-2`**, **`2.4G-2`** — consistent
+with the MT7921AU's 2T2R pair (matching the radio report's Ant. 1 = 4.43 dBi, Ant. 2 = 2.93 dBi)
+plus a separate 2.4 GHz pair for the SoC's own radio. Two copper RF shield cans; USB-A and USB-C.
+If the unit in hand carries a different board revision, re-check the hardware assumptions here.
+
+**Not determined.** The module part number is under an intact shield can, and the BOM, schematics,
+block diagram and operational description are all *Metadata only* under the filing's
+confidentiality request. The exact MT7921 variant therefore stays unconfirmed — which no longer
+blocks anything, since the radio report already establishes 6 GHz TX capability regardless of
+variant. One annotation in Fig.10 reads **"Not used for transmitting"**, pointing at connectors
+near the one labelled "Bluetooth Antenna"; the published image resolution is too low to tell which
+connectors or to read the adjacent silkscreen. Worth a zoom if a receive-only chain would matter.
+
+**What the attestation tells us about Stage C.** The Software Configuration Control Declaration is
+the standard KDB 594280 attestation — a signed statement that "no third party will have software,
+or configuration control, to program the device out of compliance." It is a legal attestation, not
+a technical description: no secure-boot claim, no hardware RF-parameter lock, no signed radio
+parameters. The implication is that **pineapd's compiled-in gate and the regdb flag _are_ the
+compliance control**, which matches exactly what the binary shows.
+
+> **State this precisely.** The filing that would describe any deeper enforcement —
+> `FCC Software Security Requirements for UNII devices Rev1.0` — is withheld as *Metadata only*.
+> So this is **absence of public evidence for a hardware lock, not evidence that none exists.**
+> It makes Stage C look feasible; it does not prove it. If C1 fails in a way that suggests the
+> binary patch took but the radio still refuses, an undisclosed enforcement layer moves from
+> "unlikely" to "the leading suspect" — alongside E4 (closed MT7961 firmware), which Addendum 2
+> already flags.
