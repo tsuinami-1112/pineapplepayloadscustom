@@ -75,9 +75,11 @@ uci get pineapd.wlan1mon.bands        # does pineapd even scan band 6?
 ```
 
 This settles whether the device runs US or world domain — the open question behind CamHound's
-fallback — and it is the **first real-world input to `inj_probe()`'s parser**, which was written
-against the shipped `iw`'s format strings but has never seen live output. Diff what `inj_probe`
-produced against the raw text by hand, once.
+fallback — and it is the **first live-device input to `inj_probe()`'s parser**. The parser has
+already been validated against a fixture built from the shipped `iw`'s own format strings, which
+found and fixed one over-permissive defect (`dev/pager-prearrival.md` §5), so this is a
+confirmation rather than first contact. Still diff what `inj_probe` produced against the raw text
+by hand, once — a real device can emit attribute lines the fixture did not.
 
 **9. THE VALUE GATE — a beacon capture plus the real client, before spending effort on 6 GHz.**
 Beacon protection takes **both** an AP that enables it and a client that can enforce it, so the

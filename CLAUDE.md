@@ -95,8 +95,11 @@ Line numbers drift; find things by name (`grep -n '^name()' payload.sh`).
 **Injection gates** — `csa_injectable <band> <ch>` models both gates (see below);
 `PINEAPD_DFS_BLOCKED` mirrors the firmware's hardcoded set; `inj_probe` reads live
 `iw phy <phy> channels` into `INJ_OK` and **must run in the parent shell** (`preflight` and
-`disrupt_menu` call it). `inj_parse_channels` is its awk parser — **it has never seen live `iw`
-output**; diffing it by hand against a real run is a day-one job.
+`disrupt_menu` call it). `inj_parse_channels` is its awk parser. It is validated against a fixture
+built byte-for-byte from the shipped `iw` binary's own format strings — which found and fixed one
+over-permissive defect (`iw` spells the NO_IR attribute three ways; see
+`dev/pager-prearrival.md` §5). It has still never parsed output from a *running* Pager, so the
+day-one diff is now a confirmation rather than first contact.
 
 **Response rung** — `resp_target` (sets `R_BSSID`/`R_TARGET`/`R_CH`/`R_BAND`), `disrupt_menu`,
 `resp_fire`, `resp_snapshot`, `resp_verdict` (MOVED / NO_EFFECT / INCONCLUSIVE from recon packet
@@ -117,6 +120,7 @@ fire + settle or it expires mid-measurement.
 | The response rung: primitives, PMF/beacon-protection reasoning, what is unverified | `dev/CamHound/RESPONSE.md` |
 | CSA mechanics, the two injection gates, pineapd internals, MIPS16e disassembly recipe | `dev/pager-csa-primitives.md` |
 | The full 6 GHz/DFS determination plan, staged, with rollbacks and early exits | `dev/pager-6ghz-determination-plan.md` |
+| What has already been closed without hardware, and how | `dev/pager-prearrival.md` |
 | Bench running order once hardware arrives | `dev/pager-day-one.md` |
 | Self-contained brief for the session that will walk the operator through the bench | `dev/pager-bench-handoff.md` |
 
@@ -184,11 +188,12 @@ the question is open.
 
 ## Open, and needs the hardware
 
-Listed in `dev/CamHound/RESPONSE.md` §13 and `dev/pager-day-one.md`. The ones most worth knowing:
-`inj_parse_channels` has never parsed real `iw` output; the three `PINEAPPLE_DEAUTH_CLIENT*`
-commands are documented only by `hak5cmd`'s help text; whether Recon's packet counters move the way
-`resp_verdict` assumes; whether CSA moves a real client at all; and the count-byte experiment
-(day-one step 17a).
+Listed in `dev/CamHound/RESPONSE.md` §13, `dev/pager-day-one.md` and — for what has already been
+closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowing: the three
+`PINEAPPLE_DEAUTH_CLIENT*` commands are documented only by `hak5cmd`'s help text; whether Recon's
+packet counters move the way `resp_verdict` assumes; whether CSA moves a real client at all; and the
+count-byte experiment (day-one step 17a). `inj_parse_channels` is format-validated but has not run
+against a live device.
 
 ## Re-obtaining the firmware
 

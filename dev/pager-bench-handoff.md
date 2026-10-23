@@ -263,9 +263,13 @@ will fire at a target. It models both gates:
 
 Two things to check on-device, both free:
 
-1. **`inj_probe()`'s parser has never seen live `iw` output.** It was written against the format
-   strings inside the shipped `iw` binary, not against a real run. Capture
-   `iw phy <phy> channels` verbatim and diff it against what `inj_probe` produced, once, by hand.
+1. **`inj_probe()`'s parser is format-validated but has never run on a live device.** It has been
+   checked against a fixture built byte-for-byte from the shipped `iw` binary's format strings, and
+   that found one real over-permissive defect — `iw` spells the NO_IR attribute three ways
+   (`No IR`, `Passive scan`, `No IBSS`) and the parser matched only the first, so a NO_IR channel
+   could read as injectable. Fixed. See `dev/pager-prearrival.md` §5 for the per-channel table.
+   Still capture `iw phy <phy> channels` verbatim on the device and diff it against what
+   `inj_probe` produced, once, by hand: a real radio can emit attribute lines the fixture did not.
 2. **Which regulatory domain is actually live** (`iw reg get`). The fallback set when the probe
    fails is deliberately conservative — 2.4 GHz 1–11 and 5 GHz 36–48 only, the set injectable under
    *both* US and world domains. If the device runs US, 149–165 should also come back injectable
