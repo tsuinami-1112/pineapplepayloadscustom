@@ -48,7 +48,7 @@ The six research lenses all declared "does the MT7961 have a 6 GHz PHY" unresolv
 
 - Look up the Pager's **FCC ID** (on the device label / in the FCC OET database). The **grant** lists the exact frequency bands the product was certified to transmit on. No UNII-5/6/7/8 (5925–7125 MHz) entry ⇒ the product was never certified for 6 GHz TX, which strongly predicts the cheaper dual-band module SKU *and* that the antennas and front-end filters were never tuned for 6 GHz.
 - The **internal photos** (also public) show the module part number and antenna count.
-- Status: **not done — the Pager's FCC ID does not appear in Hak5's published documentation, so it must be read off the device label or found by brand search.** **[V]** (grepped `hak5/llms-full.txt`: the string "FCC" appears but no ID).
+- Status: **DONE — superseded by Addendum 2.** The ID is **2A52Y-MK1** and the filing settles 6 GHz certification; do not re-run this lookup. (It did not appear in Hak5's published documentation — grepping `hak5/llms-full.txt` finds the string "FCC" but no ID — so it was found by brand search instead.) **[V]**
 
 This is free, available before arrival, and is the only pre-arrival evidence about the **antenna path** — which no amount of software inspection can reach.
 
@@ -529,7 +529,7 @@ ssh root@172.16.52.1 'df -h /overlay /tmp
   /tmp/usr/bin/hcxdumptool --version 2>/dev/null || hcxdumptool --version'
 ```
 
-`hcxdumptool` is 40 KB download / 143 KB installed; its three dependencies (`libc`, `libpcap1`, `libopenssl3`) are already on the box. **[V]**
+`hcxdumptool` is 40 KB download / 143 KB installed (`hcxdumptool_6.3.4-r1_mipsel_24kc.ipk`, 40034 bytes, sha256 `72508f11…265e`). Its **declared** dependencies (`libc`, `libpcap1`, `libopenssl3`) are already on the box **[V]** — but the declared set is not the linked set. `readelf -d` on the shipped binary gives `NEEDED libpcap.so.1, libgcc_s.so.1, libc.so`: **`libgcc_s.so.1` is in neither the package's `Depends:` nor this list**, so `opkg` will not pull it, and it links no libcrypto at all. Check `ls -l /lib/libgcc_s.so.1` before you need the injector. The binary is `ELF32 MIPS32r2`, interpreter `/lib/ld-musl-mipsel-sf.so.1`, and is itself MIPS16 with no section headers. **[V]** See `dev/pager-prearrival.md`.
 
 **Use `-d ram` (tmpfs), not `-d root`** — flash is small, and a reboot then becomes the rollback.
 

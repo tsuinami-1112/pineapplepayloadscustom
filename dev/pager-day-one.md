@@ -12,6 +12,11 @@ less, and it proves the measurement rig.
 
 ## Before the Pager arrives
 
+> Steps 1–6 have already been taken as far as they go without hardware — firmware pin re-checked,
+> recovery image verified, injector pre-staged so the chamber needs no network, `iw` output format
+> confirmed against the shipped binary, and `inj_probe()`'s parser validated (one defect found and
+> fixed). Read `dev/pager-prearrival.md` before re-doing any of it.
+
 **1. Validate the receiver, alone.** Prove the 6E adapter hears both bands against a source that
 is not the Pager — a 6E phone hotspot or 6E AP, and any 5 GHz AP parked on ch 52.
 
