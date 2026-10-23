@@ -14,7 +14,7 @@
 # Author: tsuinami-1112
 # Version: 1.0
 # Category: reconnaissance
-# Dependencies: _pineap, tcpdump + hexdump (Watch), iwinfo, /lib/hak5/oui.txt; cam_signatures.txt next
+# Dependencies: _pineap, tcpdump + hexdump or od (Watch), iwinfo, /lib/hak5/oui.txt; cam_signatures.txt next
 #               to this file or in the user payload directory (both are probed).
 #
 # LED State Descriptions

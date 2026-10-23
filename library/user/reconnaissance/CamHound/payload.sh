@@ -14,8 +14,8 @@
 # Version: 1.0
 # Category: reconnaissance
 # Dependencies: _pineap (PineAP engine, Recon running in the GUI), jq (fallback: built-in parser),
-#               tcpdump (Watch only; without it Watch is greyed), hexdump, awk, iwinfo, timeout,
-#               /lib/hak5/oui.txt (fallback /rom/lib/hak5/oui.txt; fallback built-in OUI rows).
+#               tcpdump (Watch only; without it Watch is greyed), hexdump or od, awk, iwinfo,
+#               timeout, /lib/hak5/oui.txt (fallback /rom/lib/hak5/oui.txt; fallback built-in rows).
 # Data file:    cam_signatures.txt next to payload.sh (built-in copy used when missing).
 # Loot:         /root/loot/CamHound/{inventory.tsv,events.log,report_<run>.txt,watch_<ts>_<mac>.tsv}
 #
@@ -353,6 +353,7 @@ INJ_PROBE_TS=0
 
 # inj_probe must run in the PARENT shell: it populates INJ_OK, and csa_injectable is
 # reached from posture_from_caps inside $( ), where writes to globals are discarded.
+# shellcheck disable=SC2120   # `force` is deliberate API for a manual re-probe; no call site yet
 inj_probe() {   # inj_probe [force] -> 0 when INJ_OK is usable
   local phy d line freq ch dis rows=""
   [ "$1" = force ] || { (( INJ_PROBED != 0 && EPOCHSECONDS - INJ_PROBE_TS < POSTURE_TTL )) && return $(( INJ_PROBED == 1 ? 0 : 1 )); }
@@ -507,6 +508,15 @@ rsn_caps() {   # rsn_caps <element 48 payload hex> -> 2-octet RSN Capabilities h
   cnt=$(hex_u16le "$h" "$p") || return 1; p=$(( p + 2 + 4 * cnt ))   # AKM suite list
   (( p + 2 <= n )) || return 1
   printf '%s' "${h:$(( p * 2 )):4}"
+}
+
+# Watch needs tcpdump plus a hex dumper. Both pcap readers below fall back to od, so either
+# dumper satisfies it; requiring hexdump specifically disabled Watch on hosts that have only od
+# (most non-busybox Linux) for no reason. A Pager always has busybox hexdump, so this only ever
+# mattered off-device -- but it made laptop and harness runs fail in a way that looked like a bug.
+capture_ready() {   # capture_ready -> 0 when a Watch capture can be taken and parsed
+  command -v tcpdump >/dev/null 2>&1 || return 1
+  command -v hexdump >/dev/null 2>&1 || command -v od >/dev/null 2>&1
 }
 
 pcap_bytes() {   # whole file as one lowercase hex string (od fallback mirrors pcap_words)
@@ -941,7 +951,7 @@ preflight() {
   printf -v RUN_ID '%(%Y%m%d_%H%M%S)T' -1; RUN_T0=$EPOCHSECONDS
   if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamHound: _pineap not found" 2>/dev/null; exit 0; fi
   command -v jq >/dev/null 2>&1 && HAVE_JQ=1
-  command -v tcpdump >/dev/null 2>&1 && command -v hexdump >/dev/null 2>&1 && HAVE_TCPDUMP=1
+  capture_ready && HAVE_TCPDUMP=1
   [ -r "$OUI_FILE" ] || OUI_FILE="$OUI_FILE_ALT"
   [ -r "$OUI_FILE" ] || LOG yellow "no oui.txt: vendor rows disabled, OUI rows only"
   for i in wlan0 wlan1 wlan1mon wlan0cli wlan0mon; do a=$(cat "/sys/class/net/$i/address" 2>/dev/null); [ -n "$a" ] && OWN_MACS+="${a,,} "; done
@@ -2004,6 +2014,11 @@ st_pcap() {   # synthetic LE pcap: st_pcap file orig_len count ts
   { le32 2712847316; printf '\x02\x00\x04\x00'; le32 0; le32 0; le32 32; le32 127
     for ((i = 0; i < n; i++)); do le32 $((ts + i / 2)); le32 $((i * 1000)); le32 32; le32 "$ol"; printf '%032d' 0 | tr 0 '\0'; done; } >"$f"
 }
+st_gate() {   # st_gate <bindir> -> capture_ready's verdict with PATH masked to that dir alone
+  local r                                  # runs in $( ), so the mask never escapes the subshell
+  # shellcheck disable=SC2123   # masking PATH is the point: capture_ready probes what is on it
+  PATH="$1"; capture_ready && r=1 || r=0; printf '%s' "$r"
+}
 st_le32h() { printf '%02x%02x%02x%02x' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 )); }
 st_hex2bin() { local h="$1" i; for ((i = 0; i < ${#h}; i += 2)); do printf "\\x${h:$i:2}"; done; }
 st_beacon_pcap() {   # st_beacon_pcap file bssid12hex [rsn payload hex] [extcap payload hex]
@@ -2097,6 +2112,16 @@ selftest() {
   st "pcap bucket line" "$(pcap_buckets "$tmp/t.pcap" | head -1)" "1700000000 2400 2 2"
   pcap_buckets "$tmp/t.pcap" >"$tmp/t.b"; st "bucket stats" "$(bucket_stats "$tmp/t.b" | cut -d' ' -f1-4)" "10 20 24000 20"
   printf 'garbage' >"$tmp/bad.pcap"; pcap_buckets "$tmp/bad.pcap" >/dev/null 2>&1; st "bad magic rejected" "$?" 1
+  # 4b capture gate: tcpdump plus EITHER hex dumper. Stub dirs, so the verdict does not depend
+  #    on what happens to be installed where the selftest runs.
+  mkdir -p "$tmp/gb_hd" "$tmp/gb_od" "$tmp/gb_no"; printf '#!/bin/sh\n' >"$tmp/stub"; chmod +x "$tmp/stub"
+  cp "$tmp/stub" "$tmp/gb_hd/tcpdump"; cp "$tmp/stub" "$tmp/gb_hd/hexdump"
+  cp "$tmp/stub" "$tmp/gb_od/tcpdump"; cp "$tmp/stub" "$tmp/gb_od/od"
+  cp "$tmp/stub" "$tmp/gb_no/tcpdump"
+  st "capture gate: tcpdump + hexdump"         "$(st_gate "$tmp/gb_hd")"      1
+  st "capture gate: tcpdump + od, no hexdump"  "$(st_gate "$tmp/gb_od")"      1
+  st "capture gate: tcpdump but no hex dumper" "$(st_gate "$tmp/gb_no")"      0
+  st "capture gate: no tcpdump"                "$(st_gate "$tmp/gb_absent")"  0
   # 7b response posture (byte vectors; no radio needed)
   # RSN caps low octet: 0xcc = MFPR+MFPC, 0x8c = MFPC only, 0x0c = neither
   local XBP='0000000000000000000010'   # 11 octets, octet 10 bit 4 set -> beacon protection on
@@ -2324,7 +2349,7 @@ load_overrides
 (( CFG_OVERRIDES > 0 )) && { LOG yellow "cfg: $CFG_OVERRIDES overrides"; log cfg "$CFG_NOTE"; }
 log run "start v$VERSION run=$RUN_ID sigs=$SIG_COUNT($SIG_SOURCE) jq=$HAVE_JQ tcpdump=$HAVE_TCPDUMP bands=${BANDS_LINE:-?} mode=$MODE loaded=$LOADED_ROWS dedupe_h=$DEDUPE_H"
 LOG "CamHound $VERSION [$MODE]"$'\n'"sigs: $SIG_COUNT ($SIG_SOURCE)$( [ "$HAVE_JQ" = 1 ] || printf ' no-jq')$( [ "$HAVE_TCPDUMP" = 1 ] || printf ' no-tcpdump')"$'\n'"bands: ${BANDS_LINE:-?}"$'\n'"prox: uncal"
-[ "$HAVE_TCPDUMP" = 1 ] || LOG yellow "tcpdump missing: Watch disabled"
+[ "$HAVE_TCPDUMP" = 1 ] || LOG yellow "no tcpdump (or no hexdump/od): Watch disabled"
 main_menu
 REPORT_DONE_AT_EXIT=1; write_report quiet
 exit 0

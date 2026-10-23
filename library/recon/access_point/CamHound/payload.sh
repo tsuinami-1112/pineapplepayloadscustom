@@ -14,7 +14,7 @@
 # Author: tsuinami-1112
 # Version: 1.0
 # Category: reconnaissance
-# Dependencies: _pineap, tcpdump + hexdump (Watch), iwinfo, /lib/hak5/oui.txt; cam_signatures.txt next
+# Dependencies: _pineap, tcpdump + hexdump or od (Watch), iwinfo, /lib/hak5/oui.txt; cam_signatures.txt next
 #               to this file or in the user payload directory (both are probed).
 #
 # LED State Descriptions
@@ -342,6 +342,7 @@ INJ_PROBE_TS=0
 
 # inj_probe must run in the PARENT shell: it populates INJ_OK, and csa_injectable is
 # reached from posture_from_caps inside $( ), where writes to globals are discarded.
+# shellcheck disable=SC2120   # `force` is deliberate API for a manual re-probe; no call site yet
 inj_probe() {   # inj_probe [force] -> 0 when INJ_OK is usable
   local phy d line freq ch dis rows=""
   [ "$1" = force ] || { (( INJ_PROBED != 0 && EPOCHSECONDS - INJ_PROBE_TS < POSTURE_TTL )) && return $(( INJ_PROBED == 1 ? 0 : 1 )); }
@@ -496,6 +497,15 @@ rsn_caps() {   # rsn_caps <element 48 payload hex> -> 2-octet RSN Capabilities h
   cnt=$(hex_u16le "$h" "$p") || return 1; p=$(( p + 2 + 4 * cnt ))   # AKM suite list
   (( p + 2 <= n )) || return 1
   printf '%s' "${h:$(( p * 2 )):4}"
+}
+
+# Watch needs tcpdump plus a hex dumper. Both pcap readers below fall back to od, so either
+# dumper satisfies it; requiring hexdump specifically disabled Watch on hosts that have only od
+# (most non-busybox Linux) for no reason. A Pager always has busybox hexdump, so this only ever
+# mattered off-device -- but it made laptop and harness runs fail in a way that looked like a bug.
+capture_ready() {   # capture_ready -> 0 when a Watch capture can be taken and parsed
+  command -v tcpdump >/dev/null 2>&1 || return 1
+  command -v hexdump >/dev/null 2>&1 || command -v od >/dev/null 2>&1
 }
 
 pcap_bytes() {   # whole file as one lowercase hex string (od fallback mirrors pcap_words)
@@ -930,7 +940,7 @@ preflight() {
   printf -v RUN_ID '%(%Y%m%d_%H%M%S)T' -1; RUN_T0=$EPOCHSECONDS
   if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamHound: _pineap not found" 2>/dev/null; exit 0; fi
   command -v jq >/dev/null 2>&1 && HAVE_JQ=1
-  command -v tcpdump >/dev/null 2>&1 && command -v hexdump >/dev/null 2>&1 && HAVE_TCPDUMP=1
+  capture_ready && HAVE_TCPDUMP=1
   [ -r "$OUI_FILE" ] || OUI_FILE="$OUI_FILE_ALT"
   [ -r "$OUI_FILE" ] || LOG yellow "no oui.txt: vendor rows disabled, OUI rows only"
   for i in wlan0 wlan1 wlan1mon wlan0cli wlan0mon; do a=$(cat "/sys/class/net/$i/address" 2>/dev/null); [ -n "$a" ] && OWN_MACS+="${a,,} "; done
