@@ -74,32 +74,49 @@ fallback — and it is the **first real-world input to `inj_probe()`'s parser**,
 against the shipped `iw`'s format strings but has never seen live output. Diff what `inj_probe`
 produced against the raw text by hand, once.
 
-**9. THE VALUE GATE — one beacon capture, before spending any effort on 6 GHz.** Beacon protection
-is an **AP-side** switch, so the chamber AP decides it; no client is needed to find out. Capture one
+**9. THE VALUE GATE — a beacon capture plus the real client, before spending effort on 6 GHz.**
+Beacon protection takes **both** an AP that enables it and a client that can enforce it, so the
+capture below settles the AP half cheaply and the client half still needs the client. Capture one
 beacon from the 6E AP and read two fields:
 
-```sh
-# 1. does the AP advertise beacon protection?  (Ext Cap bit 84)
-tshark -i wlan0 -c 5 -T fields -e wlan.extcap.b84 \
-       -Y 'wlan.fc.type_subtype==8 && wlan.bssid==<AP>'
+**Capture to a file first, then filter.** Do not use `-c` with `-Y` on a live monitor interface:
+`-c` is a *capture* autostop count applied before the display filter, so it stops after the first N
+frames from anything on the channel and will usually print nothing at all. Capturing nothing is not
+a result.
 
-# 2. are its beacons actually carrying an MMIE?  (element 76) -- no output = not protected
-tshark -i wlan0 -c 5 \
-       -Y 'wlan.fc.type_subtype==8 && wlan.bssid==<AP> && wlan.tag.number==76'
+```sh
+# capture with a CAPTURE filter and a time bound, not a packet count
+tshark -i wlan0 -f 'type mgt subtype beacon' -a duration:15 -w /tmp/bp.pcap
+
+# 1. does the AP advertise beacon protection? (Ext Cap bit 84). Print the tag list too, so an
+#    absent Extended Capabilities element is distinguishable from a present-but-zero bit.
+tshark -r /tmp/bp.pcap -Y 'wlan.bssid==<AP>' -T fields -e wlan.tag.number -e wlan.extcap.b84
+
+# 2. are its beacons actually carrying an MMIE? (element 76)
+tshark -r /tmp/bp.pcap -Y 'wlan.bssid==<AP> && wlan.tag.number==76' | wc -l
 ```
 
-MMIE (element **76**) present **and** `wlan.extcap.b84 == 1` → beacon protection is on, and
-beacon-borne CSA is dead against anything associated to that AP. Neither → beacon-CSA is live.
-**Record which**, because "beacon CSA worked" may mean only "my AP does not enable it".
+Confirm you captured the AP at all (`tshark -r /tmp/bp.pcap -Y 'wlan.bssid==<AP>' | wc -l`) before
+reading anything into an empty result. Both present → that AP enables beacon protection. Neither →
+it does not, and beacon CSA moves clients. Expect "on" to be common: hostapd enables `beacon_prot`
+by itself whenever 11be is on with PMF.
 
-If it is on, the fallbacks are both poor and both verified from mac80211 source: probe-response CSA
-is **ignored outright** (the probe-resp path never reaches chanswitch), and an unprotected
-Public-Action eCSA only **stalls the client's TX queues** until the next clean beacon. Deauth is
-already dead by standard (PMF mandatory). The real client is still worth having — it confirms a
-switch actually happens, and non-Linux stacks may differ.
+**This answers the AP's policy, not the client's behaviour.** Enforcement needs the client to hold
+a BIGTK, which `nl80211` refuses unless the client's driver advertises
+`NL80211_EXT_FEATURE_BEACON_PROTECTION[_CLIENT]` — and hostapd distributes the BIGTK without
+checking. So a bit-84 AP can still have clients that enforce nothing. **The real 6 GHz client is
+required to finish this step.**
 
-> **If the deliverable is client disconnection, stop the 6 GHz branch here.** The answer is
-> "unlockable, and it will not work." Go to the DFS branch, which is unaffected.
+If protection is being enforced, know what still works before declaring the branch dead:
+probe-response CSA moves nothing in station mode, and an unprotected Public-Action eCSA stalls the
+client's TX queues rather than switching it (persistently — the unblock sits behind a beacon-CRC
+short-circuit) — but **connection denial survives beacon protection**. A forged CSA beacon reaches
+the BSS cache ahead of the protection check, and mac80211 then refuses auth and assoc while a
+cached CSA is present. Deauth is dead by standard (PMF mandatory).
+
+> **If the deliverable is "the client changes channel", this step may stop the 6 GHz branch. If it
+> is "the camera stops working", it does not** — the denial path survives. Decide which you need,
+> and record which effect you measured. Either way the DFS branch is unaffected.
 
 ---
 
@@ -145,12 +162,19 @@ changed. Set `uci set wireless.radio1.country=` too so netifd does not revert it
 **17. Inject on 6 GHz, confirm at the receiver.** Tune the receiver *first* — a `NO-IR` channel is
 passive-only, so scanning will never find it.
 
-**17b. If the AP turned out to have beacon protection on, test the one remaining outside path.**
-Unprotected Public-Action eCSA (category 4, action 4) is excluded from PMF's robust set, and the
-builder is already on the device — `dlopen("libwifi.so.0")` gets you `libwifi_create_action` and
-`libwifi_add_action_detail` without vendoring anything. Expect a TX stall on a current Linux client
-rather than a channel move; an older or non-Linux stack may switch properly. Watch the client's
-traffic, not just its association state.
+**17b. If beacon protection is being enforced, test the two remaining outside paths.**
+
+*Connection denial* first, because it is free and uses the frame pineapd already builds: flood the
+forged CSA beacon, then make the client disconnect and try to reconnect. A client that cannot
+re-associate while the flood runs is the result — watch for `"AP is in CSA process, reject assoc"`
+in the client's log if it is Linux.
+
+*Unprotected Public-Action eCSA* second (category 4, action 4, outside PMF's robust set). The
+builder is on the device — `dlopen("libwifi.so.0")` gets `libwifi_create_action` and
+`libwifi_add_action_detail`; do not try to link against the shipped `.so`. Set the CSA mode byte, or
+nothing at all happens. Expect a **persistent** uplink stall on a current Linux client rather than a
+channel move, and nothing whatsoever if its driver sets `HANDLES_QUIET_CSA`; an older or non-Linux
+stack may switch properly. Watch the client's traffic, not just its association state.
 
 ---
 

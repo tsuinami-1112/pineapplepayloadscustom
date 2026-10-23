@@ -101,36 +101,86 @@ Those last three matter practically: **pineapd solves the channel-contention pro
 because the same process owns both the channel hopping and the injection. You do not need to fight
 it for the radio the way a userspace injector would.
 
-Frame construction is `/usr/lib/libwifi.so.0.0.10` — Hak5's own Apache-2.0 802.11 library.
-`pineapd` imports exactly four builders — `libwifi_create_beacon`, `_deauth`, `_disassoc`,
-`_radiotap` — but **the shipped library exports the whole set**, including the ones pineapd never
-calls:
+Frame construction is `/usr/lib/libwifi.so.0.0.10` — upstream `github.com/libwifi/libwifi`,
+Apache-2.0, whose AUTHORS names Hak5 LLC among others. opkg records it as package `libwifi`
+version `main-r1`, source `extra_feeds/hak5/libs/libwifi`; internal version string `0.0.10`.
+
+`pineapd` imports **21** `libwifi_*` symbols, of which exactly **four are builders**
+(`libwifi_create_beacon`, `_deauth`, `_disassoc`, `_radiotap`); the rest are parse/free/get/check/
+dump. **The library exports 113 `libwifi_*` functions, so 92 ship unreferenced.** **[V]** — three
+independent readers (`nm -D`, `objdump -T`, `readelf --use-dynamic -sW`) agree exactly on both
+counts.
 
 ```sh
-objdump -T usr/lib/libwifi.so.0.0.10 | awk '/ DF .text/{print $NF}' | grep -E 'libwifi_(create|add)'
+# what the library exports / what pineapd imports -- anchor to ^libwifi_ and check the UND column
+readelf --use-dynamic -sW usr/lib/libwifi.so.0.0.10 | awk 'NR>3 && $8 ~ /^libwifi_/ && $7!="UND"'
+readelf --use-dynamic -sW usr/sbin/pineapd         | awk 'NR>3 && $8 ~ /^libwifi_/ && $7=="UND"'
 ```
 
-```
-libwifi_add_action_detail   libwifi_create_auth          libwifi_create_probe_resp
-libwifi_add_tag             libwifi_create_beacon        libwifi_create_radiotap
-libwifi_create_action       libwifi_create_cts           libwifi_create_reassoc_req
-libwifi_create_action_no_ack libwifi_create_deauth       libwifi_create_reassoc_resp
-libwifi_create_assoc_req    libwifi_create_disassoc      libwifi_create_rts
-libwifi_create_assoc_resp   libwifi_create_probe_req     libwifi_create_tag
-libwifi_create_atim         libwifi_create_timing_advert
-```
+**Anchor the match, or you get 29 instead of 21.** A bare `grep libwifi` on pineapd's dynsym also
+catches eight of pineapd's *own* defined C++ methods whose mangled names embed libwifi **struct**
+types (`...R11libwifi_bss...`, `libwifi_frame`, `libwifi_sta`, `libwifi_parsed_deauth`). Those are
+not libwifi functions.
 
-**[V]** — note the tooling trap: the `.so` has **no section headers**, so `readelf --dyn-syms`
-prints "Dynamic symbol information is not available" and `nm -D` fails. `objdump -T` reads the table
-through `PT_DYNAMIC` and works. An empty symbol list here is a tool artefact, not an absence.
+Among the 92 unused, the ones that matter here:
 
-So the device already ships an **action-frame builder** (`libwifi_create_action`,
-`libwifi_create_action_no_ack`, `libwifi_add_action_detail`) and a **probe-response builder**.
-pineapd just never references them. Anything that wants a genuine CSA action frame or a forged
-probe response can `dlopen("libwifi.so.0", RTLD_NOW)` + `dlsym` — the same resolution the loader
-already performs for pineapd — instead of vendoring libwifi or installing scapy. Linking `-lwifi`
-at build time wants a copy that still has section headers; match headers to upstream libwifi
-**0.0.10**.
+| Family | Shipped, never called by pineapd |
+|---|---|
+| Action frames | `libwifi_create_action`, `libwifi_create_action_no_ack`, `libwifi_add_action_detail`, plus free/dump/length |
+| Probe responses | `libwifi_create_probe_resp`, **`libwifi_set_probe_resp_channel`**, **`libwifi_set_probe_resp_ssid`**, plus free/dump/length |
+| Element editing | `libwifi_add_tag`, `libwifi_create_tag`, `libwifi_remove_tag`, `libwifi_quick_add_tag`, `libwifi_tag_iterator_*` |
+| Other | full assoc/reassoc/auth/ATIM/RTS/CTS/timing-advert builders, RSN/WPA cipher enumeration, `libwifi_random_mac` |
+
+The asymmetry is the point: pineapd **parses** probe responses (`libwifi_parse_probe_resp` is
+imported) and never builds one, and touches no Action symbol in either direction.
+
+### The tooling here lies, and it lies with exit status 0
+
+`e_shnum = 0` — the file has **no section headers** — so anything that walks the section table finds
+nothing. Measured, binutils 2.42, on this exact file. **Every one of these exits 0:**
+
+| Command | Result |
+|---|---|
+| `nm -D` | **works** — 138 symbols |
+| `objdump -T` | **works** |
+| `readelf --use-dynamic -sW` (`-DsW`) | **works** |
+| `readelf --dyn-syms` | prints **nothing at all**, zero bytes, empty stderr |
+| `readelf -s` | prints *"Dynamic symbol information is not available for displaying symbols."* |
+
+Counter-intuitively the BFD tools succeed and readelf fails: BFD reconstructs the table from
+`PT_DYNAMIC` automatically, while readelf needs `--use-dynamic` to be told to. Note `-D` pairs with
+`-s`, not with `--dyn-syms`. By ablating one dynamic tag at a time, `DT_HASH` is what all three
+working readers depend on — remove it and all three report zero; `DT_MIPS_SYMTABNO` is irrelevant.
+
+**An empty symbol list here is a tool artefact, not an absence** — and since the failures are silent
+and exit 0, this is exactly how the earlier "there is no action-frame builder" conclusion was
+reached. An earlier revision of this document also claimed `nm -D` fails. It does not.
+
+### Reaching the unused builders from a helper
+
+`dlopen("libwifi.so.0", RTLD_NOW)` + `dlsym` **works**: the runtime loader reads only `PT_DYNAMIC`,
+section headers are never mapped, `DT_HASH`/`DT_SYMTAB`/`DT_STRTAB` all sit inside the first
+`PT_LOAD`, exports are `GLOBAL`/`DEFAULT`/`FUNC` with no `VERDEF` so plain `dlsym` suffices, and the
+full symlink chain (`libwifi.so` → `.so.0` → `.so.0.0.10`) ships in `/usr/lib`, which is musl's
+default search path. pineapd itself is section-header-less and already binds these 21 symbols from
+this file through the same hash machinery.
+
+Three traps:
+
+1. **Linking `-lwifi` against this file fails.** Not "needs section headers" — it is refused:
+   `ld` says `file in wrong format`, gold says `may be corrupt`, both exit 1. Isolated by
+   experiment: an equivalent MIPS `.so` links fine, and `objcopy --strip-section-headers` on that
+   same file reproduces the failure verbatim. BFD's linker path for a shared-object *input* needs a
+   real `SHT_DYNSYM`; the `PT_DYNAMIC` synthesis that `nm`/`objdump` use is not wired into it.
+   Workarounds, tested: `dlopen`/`dlsym`, or generate a stub `.so` from the export list with
+   `-soname libwifi.so.0` and link against that — the binary then records `NEEDED: libwifi.so.0`
+   and binds the real library at runtime.
+2. **No headers and no static library ship** (`libwifi.list` holds only the three files), so a
+   helper must declare its own prototypes **and struct layouts**. Struct/ABI mismatch is the real
+   risk here, not symbol visibility. Match upstream libwifi `0.0.10`.
+3. **MIPS16: do not mask bit 0 of the address.** `st_value` carries the ISA bit —
+   `libwifi_create_action` is `0x3429`. `dlsym` returns the ISA-bit-set address and calling it
+   through a function pointer is correct; clearing bit 0 jumps into MIPS32 mode and crashes.
 
 ### Disassembling pineapd: it is MIPS16e, and the usual tools silently fail
 
@@ -199,22 +249,26 @@ disassoc and non-excluded action frames. A beacon is not in that set.
 **It is not a deauth, and calling it one causes mistakes.** It is a channel-switch spoof. Different
 frame, different reason it works, different detection signature.
 
-## Which CSA carrier actually moves a client
+## Which CSA carrier actually does what
 
-Four frame types can carry a channel switch. They are **not** interchangeable, and three of the
-four are weaker than the CSA literature implies. Verified by reading the receive path of the
-mac80211 this build backports — `ieee80211_sta_process_chanswitch()`,
-`ieee80211_rx_mgmt_probe_resp()`, `ieee80211_rx_get_bigtk()`. Categories from hostap
-`ieee802_11_defs.h`: Spectrum Mgmt `0`, Public `4`, Protected Dual of Public Action `9`;
-`WLAN_PA_EXT_CHANNEL_SWITCH_ANNOUNCE` is Public Action value `4`.
+Five frame types can carry a channel switch, and they are **not** interchangeable. The important
+structural point, which earlier revisions of this document got wrong twice: *moving* a client and
+*denying it a connection* are two different effects reached through two different code paths, and a
+carrier that is useless for one can be the best tool for the other.
 
-| Carrier | PMF covers it? | What a current mac80211 client does |
-|---|---|---|
-| **Beacon** + CSA element | No — a beacon is not a robust frame | **Switches channel.** `IEEE80211_CSA_SOURCE_BEACON`. This is the working attack; only beacon protection stops it. |
-| **Spectrum Management action** (cat 0) | **Yes** — robust | Switches, but needs a valid MIC → insider only. |
-| **Protected Dual of Public Action** (cat 9) | **Yes** — robust | Same: insider only. |
-| **Public Action / Extended CSA** (cat 4, action 4) | **No** — Public Action is excluded from the robust set | **Does not switch.** Tagged `IEEE80211_CSA_SOURCE_UNPROT_ACTION`; if the CSA mode bit is set it blocks the vif's TX queues and waits for a beacon, which then unblocks them. A TX stall, not a channel move. |
-| **Probe response** + CSA element | No | **Ignored entirely.** `ieee80211_rx_mgmt_probe_resp()` calls `ieee80211_rx_bss_info()` and `ieee80211_reset_ap_probe()` and never reaches the chanswitch path. |
+Read from the mac80211 this build backports (backports-6.12) —
+`ieee80211_sta_process_chanswitch()`, `ieee80211_rx_mgmt_probe_resp()`, `ieee80211_rx_get_bigtk()`,
+`ieee80211_scan_rx()`, `ieee80211_mgd_csa_in_process()`. Station mode throughout; mesh differs (see
+below). Categories from hostap `ieee802_11_defs.h`: Spectrum Mgmt `0`, Public `4`, Protected Dual
+`9`; `WLAN_PA_EXT_CHANNEL_SWITCH_ANNOUNCE` is Public Action value `4`.
+
+| Carrier | PMF covers it? | Against an **associated** client | Against a client **connecting** |
+|---|---|---|---|
+| **Beacon** + CSA element | No — a beacon is not a robust frame | **Switches channel** (`IEEE80211_CSA_SOURCE_BEACON`) — unless the client holds a BIGTK, which drops the beacon in rx before the element is parsed. | **Denies auth and assoc, beacon protection or not.** See below. |
+| **Spectrum Management action** (cat 0) | **Only when PMF is in use** | **Switches channel.** `:7506` assigns `PROT_ACTION` from the *category*, with no check that the frame arrived protected, and the protection filter in `ieee80211_drop_unencrypted_mgmt()` sits inside `if (rx->sta && test_sta_flag(rx->sta, WLAN_STA_MFP))`. So on a **non-PMF** BSS an unprotected, unicast cat-0 CSA moves the client with no MIC and no insider access. With PMF: dropped without keys → insider only. | n/a — needs association |
+| **Protected Dual of Public Action** (cat 9) | **Yes**, unconditionally | Insider only — an unprotected cat-9 frame is dropped outright (`RX_DROP_U_UNPROT_DUAL`), no MFP test required. | n/a |
+| **Public Action / Extended CSA** (cat 4, action 4) | **No** — Public Action is outside the robust set | **No switch.** Tagged `UNPROT_ACTION`; with the CSA mode byte set it blocks the vif's TX queues, with mode 0 it does nothing at all. **The stall is not self-healing** — see below. | n/a |
+| **Probe response** + CSA element | No | **Ignored** — `ieee80211_rx_mgmt_probe_resp()` never reaches the chanswitch path. | **Denies assoc while the client is scanning.** See below. |
 
 The kernel says why eCSA is handled that way, in its own comment:
 
@@ -222,37 +276,116 @@ The kernel says why eCSA is handled that way, in its own comment:
 > anyway, we should get a beacon soon to either know what the CSA really is, or figure out the
 > public action frame was actually an attack."*
 
-Two consequences worth carrying:
+### The connection-denial path, which beacon protection does not close
 
-- **Probe-response CSA is not a fallback for beacon protection.** Earlier revisions of the 6 GHz
-  plan called it "the one plausible survivor"; against mac80211 it moves nothing. **[V]** for
-  mac80211 — other client stacks are separate implementations and unmeasured.
-- **Unprotected eCSA is the only CSA-family frame that reaches a PMF + beacon-protected client from
-  outside**, and its ceiling is a self-healing TX stall. The `IEEE80211_CSA_SOURCE_*` split arrived
-  with the 2024 MLO rework, so an older or non-Linux client may still honour an unprotected eCSA by
-  actually switching. One bench test, not a plan. **[A]**
+A CSA element in a forged beacon reaches the cfg80211 BSS cache **before** any beacon-protection
+check, because `__ieee80211_rx_handle_packet()` hands every beacon to `ieee80211_scan_rx()` up front
+while `ieee80211_drop_unencrypted_mgmt()` sits at the tail of the per-sdata handler chain,
+downstream. For a beacon `ieee80211_scan_rx()` has **no "is a scan running" gate** — it needs only a
+broadcast DA, a non-disabled channel, and at least one non-monitor interface up — and it then
+replaces `bss->beacon_ies`. `ieee80211_mgd_csa_in_process()` reads those cached IEs and both
+`ieee80211_mgd_auth()` and `ieee80211_mgd_assoc()` bail on it: *"AP is in CSA process, reject
+auth"* / *"reject assoc"*. **[V]**
 
-All five rows apply to the carrier reaching an **associated** client: mac80211 drops action frames
-outright unless `u.mgd.associated` and the frame's BSSID equals the associated AP's address.
+So a sustained forged-CSA beacon flood stops a client (re)connecting to a beacon-protected AP. It
+is not a channel move, but a camera that cannot re-associate is off the air just the same. The real
+AP's beacons overwrite `beacon_ies` again, so it needs a flood rather than a single frame — which is
+what pineapd's CSA mode already emits — and it bites at connect/roam time, not on an
+already-associated client.
+
+The probe-response row reaches the same check through `bss->proberesp_ies`, with two differences:
+the probe-response branch of `ieee80211_scan_rx()` **does** require an active scan, and the
+`proberesp_ecsa_stuck` heuristic (added for CVE-2024-26682, "ECSA elements stuck in probe
+responses") can suppress it. That heuristic is narrow: keyed on `WLAN_EID_EXT_CHANSWITCH_ANN` (60)
+only, needs two identical copies at least a second apart, needs `mode != 0`, and needs the
+announced channel to equal the current one. A plain **CSA element (37)** in a probe response is
+never suppressed, nor is an eCSA pointing somewhere else. **[V]**
+
+### The eCSA stall persists; it does not heal
+
+The unblock is inside `ieee80211_sta_process_chanswitch()`, but the beacon handler short-circuits
+before reaching it:
+
+```c
+	if ((ncrc == link->u.mgd.beacon_crc && link->u.mgd.beacon_crc_valid) || ...)
+		goto free;                          /* <-- before process_chanswitch() */
+```
+
+and `ncrc` covers the beacon interval/capability plus **only** the elements in `care_about_ies`
+(COUNTRY, ERP_INFO, CHANNEL_SWITCH, PWR_CONSTRAINT, HT_CAPABILITY, HT_OPERATION,
+EXT_CHANSWITCH_ANN) — TIM, DTIM count and timestamp are excluded. A stable AP's beacon CRC is
+therefore constant, so every beacon after the first hits `goto free` and the unblock is never
+reached. An unprotected eCSA never sets `csa_active`, so the other two unblock sites
+(`chswitch_post_beacon`, `abort_chanswitch`) cannot fire either. The stall holds until the AP's
+CRC-relevant elements change or the client disconnects — and the client will not even transmit its
+own deauth on teardown while `blocked_tx` is set. **[V]**
+
+The opposite failure mode also exists: `ieee80211_vif_block_queues_csa()` returns immediately if the
+driver advertises `IEEE80211_HW_HANDLES_QUIET_CSA`, in which case the unprotected eCSA produces no
+observable effect at all. Which drivers set it is **[A]** — not determinable from the local sources.
+
+So "the ceiling is a self-healing TX stall", as an earlier revision put it, was wrong in both
+directions: against most drivers it is a *persistent* uplink stall, and against some it is nothing.
+
+### Scoping
+
+The action-frame rows require association and a spoofed BSSID matching the AP: `:7487` takes a
+`break` out of the CSA switch unless `u.mgd.associated` and `mgmt->bssid == vif.cfg.ap_addr` (the
+frame still reaches userspace; it is not dropped). That gate does **not** apply to the beacon and
+probe-response rows, which run through entirely different code — and the probe-response row's real
+effect happens precisely when the client is *not* associated.
+
+"A CSA element in a probe response is never acted on" is a **station-mode** statement. In mesh mode
+on the same tree it is false: `ieee80211_mesh_rx_bcn_presp()` handles beacons and probe responses
+alike and calls `ieee80211_mesh_process_chnswitch()`, which performs a real switch. Gated by
+`mesh_matches_local()`, so it is an unsecured-mesh vector. **[V]**
+
+A beacon CSA does not always switch, either. It disconnects instead on a cross-band announcement or
+an unusable chandef, is ignored on a same-channel announcement with `mode == 0`, and disconnects on
+a parse failure. "Switches channel" is one of several outcomes.
 
 ## What defeats it
 
 **Beacon protection.** Added in the Wi-Fi Alliance's WPA3 December-2020 update: a BIGTK plus a
-Management MIC element (MMIE, element ID 76) in the beacon. **mac80211 does enforce it** —
-`ieee80211_rx_get_bigtk()` deliberately selects a key whenever *either* BIGTK index is installed
-"so that `ieee80211_drop_unencrypted_mgmt()` can properly drop both unprotected Beacon frames and
-Beacon frames that claim to use another BIGTK key index". Once the client holds a BIGTK, an
-MME-less spoofed beacon dies in the rx path before any CSA element is parsed. **[V]**
+Management MIC element (MMIE, element ID 76) in the beacon. It defeats the beacon **channel-move**
+only. It does **not** close the connection-denial path above, because the BSS cache is updated
+ahead of the drop.
 
-It is an **AP-side switch**: the AP enables it and hands out the BIGTK in message 3 of the 4-way
-handshake, and only then can a client reject anything. hostapd advertises Ext Cap bit 84 only when
-`beacon_prot=1` **and** the driver sets `WPA_DRIVER_FLAGS_BEACON_PROTECTION`, so an AP whose driver
-lacks support cannot turn it on at all. Consequence for bench work: "beacon CSA worked" may mean
-only "this AP does not enable beacon protection" — always record the target's bit 84.
+**Where both AP and client enforce it, forged CSA beacons are dropped** — and both halves are
+required, which an earlier revision of this document lost by calling it an "AP-side switch":
 
-AP support is **mandatory in Wi-Fi 7**, so the attack decays. Whether beacon protection is
-*required* for 6 GHz specifically is **not established** — WPA3 and PMF are, beacon protection
-could not be confirmed as a 6 GHz requirement from any primary source.
+- **AP side.** hostapd advertises Ext Cap bit 84 only when `beacon_prot=1` **and** the driver sets
+  `WPA_DRIVER_FLAGS_BEACON_PROTECTION`, and it distributes the BIGTK whenever `beacon_prot=1` and
+  MFP is negotiated — it does **not** condition that on the client's bit 84. An AP whose driver
+  lacks support cannot turn it on at all.
+- **Client side.** Enforcement needs the client to actually hold a BIGTK, and that is a driver
+  capability: `nl80211` rejects key indices 6–7 with *"BIGTK not supported"* unless the wiphy sets
+  `NL80211_EXT_FEATURE_BEACON_PROTECTION`, or `..._BEACON_PROTECTION_CLIENT` for a station. A
+  client that cannot install one associates happily and enforces nothing. **[V]**
+
+So **the AP's bit 84 tells you the AP's policy, not whether a given client will drop a forged
+beacon.** It is a cheap and worthwhile free read, but it answers half the question; the other half
+needs the client.
+
+When the client does enforce, the mechanism is `ieee80211_rx_get_bigtk()` deliberately selecting a
+key whenever *either* BIGTK index is installed "so that `ieee80211_drop_unencrypted_mgmt()` can
+properly drop both unprotected Beacon frames and Beacon frames that claim to use another BIGTK key
+index", and the drop (`RX_DROP_U_UNPROT_BEACON`) precedes CSA parsing. Two conditions on it, both
+load-bearing: it sits inside `if (rx->sta && test_sta_flag(rx->sta, WLAN_STA_MFP))`, so **no MFP
+means no enforcement**; and the whole function returns early when `RX_FLAG_DECRYPTED` is set, so the
+check is skipped for frames the hardware claims to have handled. **[V]**
+
+AP support is **mandatory in Wi-Fi 7**, so the attack decays — and faster than "mandatory" suggests,
+because hostapd turns `beacon_prot` on *by itself* when 11be is enabled with PMF ("Enabling beacon
+protection as IEEE 802.11be is enabled for this BSS"). A current 6 GHz or Wi-Fi 7 AP will often have
+it on with nobody having configured it, so treat it as the default case rather than the exception.
+
+Whether beacon protection is *required* for 6 GHz specifically is **not established** — WPA3 and
+PMF are (hostapd's own `hostapd_config_check_bss_6g()` enforces RSN, `ieee80211w` required, no
+PSK/FT-PSK, no WEP/TKIP, SAE H2E, and says nothing about `beacon_prot`). The requirement that does
+exist was drafted by TGbe for EHT, not for the band. The Wi-Fi Alliance WPA3 specification itself
+could not be read — the download redirects into an SSO endpoint — so that leg is unverified rather
+than refuted; nothing found points the other way.
 
 Reading it from a beacon, for target triage:
 
