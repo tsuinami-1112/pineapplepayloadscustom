@@ -94,17 +94,45 @@ assuming an offset: version (2) + group cipher (4) + pairwise count (2) + 4×N +
 | `D?+C` | PMF optional (WPA3 transition) | partial | works |
 | `C` | PMF required (WPA3) | blocked | works |
 | `NONE` | PMF + beacon protection | blocked | blocked |
-| `NOINJ` | DFS 5 GHz or 6 GHz channel | cannot transmit | cannot transmit |
+| `NOINJ` | channel we cannot transmit on | cannot transmit | cannot transmit |
 | `?` | no beacon captured | unknown | unknown |
 
 Two honest limits baked into the model. `D?+C` **cannot be resolved from a beacon at all**, because
 PMF is negotiated per client — a transition-mode BSS can hold protected and unprotected clients
 simultaneously, so the badge says `partial` and means it. And `NOINJ` is a property of the
-*channel*, not the target: `cfg80211_reg_can_beacon()` gates monitor TX and
-`cfg80211_chandef_dfs_required()` returns 0 for a monitor interface, so the DFS relaxation can never
-apply. Frames on DFS 5 GHz or any 6 GHz channel are dropped before they reach the air regardless of
-how soft the target is. `csa_injectable()` therefore short-circuits the whole read: a channel we may
-not transmit on needs no capture.
+*channel*, not the target, so `csa_injectable()` short-circuits the whole read: a channel we cannot
+transmit on needs no capture.
+
+`NOINJ` is decided by **two independent gates in series**, which are easy to conflate:
+
+- **Gate 1 — pineapd, in userspace.** A compiled-in channel switch (`pineap_wifi_interface::inject`
+  at `0x46e800`–`0x46e826`, duplicated in `interface_tracker::inject_deauth` at
+  `0x472c66`–`0x472c8a`) refusing exactly the 16 FCC DFS channels
+  `52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 144`, plus 6 GHz when the channel's band
+  field says 6 GHz. It never consults the kernel's regulatory state — no `NL80211_CMD_GET_REG`
+  anywhere in the binary — so **no regdb edit or `iw reg set` can lift it**. `pcap_inject` has one
+  call site, inside the gated function, so every frame passes it. Encoded as the constant
+  `PINEAPD_DFS_BLOCKED`, because mirroring a compiled-in firmware policy is exactly what a constant
+  is for.
+- **Gate 2 — cfg80211, in the kernel.** `cfg80211_reg_check_beaconing()` (this kernel's rename of
+  `cfg80211_reg_can_beacon()`) prohibits `IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR` for a
+  monitor vif. **`IEEE80211_CHAN_RADAR` is not prohibited** — so under `country 'US'`, where no
+  5 GHz rule carries `NO-IR`, gate 2 permits all of 36–165 and the DFS block is entirely gate 1's.
+  This gate *does* follow the regulatory domain, so it is read live by `inj_probe()` from
+  `iw phy <phy> channels` and cached in `INJ_OK` keyed `band/channel`.
+
+Why reading gate 2 live rather than hardcoding it: a frame gate 2 rejects is freed with
+`NETDEV_TX_OK`, so nothing reports an error and an over-permissive verdict **reads back as the
+target having resisted**. That is strictly worse than refusing a channel that would have worked,
+which is why the fallback when the probe fails is only what is injectable under *both* the US and
+world domains — 2.4 GHz 1–11 and 5 GHz 36–48. Under the world domain even 149–165 is `NO-IR`, and
+2.4 GHz 12–14 are blocked under both (`DISABLED` under US, `NO-IR` under `00`).
+
+`inj_probe()` must run in the **parent shell** — `preflight()` and on entry to `disrupt_menu()`.
+`csa_injectable()` is reached from `posture_from_caps()` inside `$( )`, where writes to globals are
+discarded, so it is strictly read-only. Every phy is probed and merged; each registers only its own
+bands, so `band/channel` keys do not collide, and this avoids having to guess which interface
+pineapd will pick as its injector.
 
 **Where the posture comes from, and why.** From a beacon captured on `RECON_IF` (`wlan1mon`), not
 from `iw scan`. This is forced by the hardware: `radio0` is `band '2g'` and `radio1` carries **only**

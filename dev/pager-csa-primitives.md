@@ -106,11 +106,50 @@ exports `libwifi_create_beacon`, `libwifi_add_tag`, `libwifi_create_radiotap` an
 `libwifi_create_auth`. `pineapd` imports only the beacon/deauth/disassoc subset; the auth builder
 is shipped but unreferenced by anything on the device.
 
+### Disassembling pineapd: it is MIPS16e, and the usual tools silently fail
+
+Budget an hour if you skip this. `pineapd`'s C++ is **MIPS16e, not MIPS32**: `readelf -h` shows
+`Flags: 0x74001005 … mips16`, the ABIFLAGS segment has `ases = 0x400` (`AFL_ASE_MIPS16`), and every
+function symbol value is **odd** (the ISA bit) — e.g. `pineap_wifi_interface::inject` =
+`0x0046e7d1`. Only crt/INIT/PLT-adjacent code is MIPS32. The binary also has **no section headers**,
+so you must work from program headers and the dynamic symbol table.
+
+Neither a stock `objdump` (usually x86-only) nor `llvm-objdump` can disassemble MIPS16 — LLVM has no
+MIPS16 disassembler, and both will produce confident garbage rather than an error. What works:
+
+```sh
+apt-get install -y binutils-mipsel-linux-gnu
+# vma = 0x400000 + file offset, for the single executable PT_LOAD (offset 0, size 0x1380e0)
+mipsel-linux-gnu-objdump -D -b binary -m mips:16 -EL --adjust-vma=0x400000 \
+    --start-address=0x46e7d0 --stop-address=0x46ea40 usr/sbin/pineapd
+```
+
+`-m mips:16` (`bfd_mach_mips16`) is the load-bearing flag. Dynamic symbols: SYMTAB `0x404f0c`,
+STRTAB `0x40fc6c`, SYMENT 16, `MIPS_SYMTABNO` 2774. PLT: JMPREL `0x44488c`, 414 entries, MIPS16 PLT
+stubs are 16 bytes from `0x5367d0` with each stub's `.got.plt` slot address at stub+12.
+
+MIPS16 condition semantics, which are easy to misread backwards:
+
+| Instruction | Effect |
+|---|---|
+| `CMPI rx,imm` | `T = rx ^ imm` (so `T == 0` means **equal**) |
+| `SLTIU rx,imm` | `T = (rx <u imm)` |
+| `BTEQZ` / `BTNEZ` | branch if `T == 0` / `T != 0` |
+
+So `sltiu v0,145 ; bteqz L` reads **"if v0 >= 145 goto L"**, not the reverse.
+
 **Two things that are inferred, not confirmed** — do not state them as fact:
 
 - Whether `DEAUTHCSA` emits a CSA-bearing **beacon** or a spectrum-management **action frame**. The
   `inject_csa` signature plus `"Caught beacon for CSA"` and `libwifi_create_beacon` strongly imply
-  beacon, but nobody has captured it.
+  beacon, but nobody has captured it. What *is* verified: `recon_engine::inject_csa` (`0x4a125c`)
+  injects nothing itself — it holds no `libwifi_create_*`, no queue `emplace` and no `pcap_inject`.
+  It records a `csa_beacon_record` in an `unordered_map` and calls
+  `set_and_freeze_primary_channel_hop_s`, so the CSA leaves via the ordinary beacon path.
+  **Operational consequence:** firing CSA at a gate-1-blocked channel will still *set and freeze the
+  radio's primary channel* there, and only the subsequent beacon is refused — so it disrupts channel
+  hopping while transmitting nothing. `csa_injectable()` refusing those channels prevents that, which
+  is a second, independent reason the refusal is correct.
 - `PINEAPPLE_DEAUTH_CLIENT_ALL`'s `[target]` argument. Its help says "all Wi-Fi clients on an AP"
   yet it takes a target; pass `ff:ff:ff:ff:ff:ff` for broadcast, but the exact semantics are
   unverified.
@@ -163,32 +202,104 @@ A working implementation of all of this already exists in this repo:
 
 ## Hard constraints
 
-### Bands: 2.4 GHz and non-DFS 5 GHz only
+### Bands: two independent gates, and the obvious explanation is the wrong one
 
-`ieee80211_monitor_start_xmit()` calls `cfg80211_reg_can_beacon(wiphy, chandef, iftype)`, which
-fails on any channel flagged `IEEE80211_CHAN_NO_IR` — "no initiating radiation", meaning you may
-not *start* transmitting there on your own initiative, only respond to a legitimate master you have
-heard. Injecting on a monitor interface is unsolicited initiation by definition, so it is refused.
+A frame needs to clear **two gates in series**. Confusing them wastes a lot of time, because they
+block different channel sets for unrelated reasons and only one of them responds to the regulatory
+domain.
 
-**The refusal is silent.** The frame is freed and the function returns `NETDEV_TX_OK` — no errno,
-no dropped-frame counter, and `sendto()` reports the full byte count. If you are debugging "the
-command ran and nothing happened on the air", this is the first thing to suspect.
+#### Gate 1 — pineapd, in userspace. Hardcoded. The regulatory domain is irrelevant to it.
 
-The DFS escape hatch does not help: there is a relaxation permitting `NO_IR` channels once a DFS
-channel has completed its Channel Availability Check and a legitimate AP is operating, but
-`cfg80211_chandef_dfs_required()` returns 0 for `NL80211_IFTYPE_MONITOR` (grouped with
-STATION/AP_VLAN/NAN), so a monitor vif can never qualify.
+`pineapd` refuses before the kernel is ever involved. The policy is a compiled-in channel-number
+switch (GCC-lowered to range tests plus `0x1111` / `0x11111111` bitmask shifts), duplicated at:
 
-Both excluded ranges use that same mechanism for different reasons:
+| Function | Address range | File offset |
+|---|---|---|
+| `pineap_wifi_interface::inject` | `0x46e800`–`0x46e826` | `0x6e800`–`0x6e826` |
+| `interface_tracker::inject_deauth` | `0x472c66`–`0x472c8a` | `0x72c66`–`0x72c8a` |
 
-- **DFS 5 GHz (52–144)** — shared with weather and military radar, so the rule is "listen for radar
-  first".
-- **All 6 GHz** — 6 GHz has no unconditional transmit mode at all. Every device must fall under
-  LPI (low-power indoor, power-capped), SP (standard power, which requires **AFC** — reporting
-  geolocation to a coordination service and receiving an authorised channel and power list before
-  radiating, because the band is shared with incumbent licensed fixed microwave links), or VLP
-  (very low power, portable). A transmitter must be authorised *before* it radiates, which is
-  exactly what `NO_IR` encodes.
+The blocked set is **exactly** the 16 standard 20 MHz FCC DFS channels:
+
+```
+52 56 60 64  100 104 108 112  116 120 124 128 132 136 140 144
+```
+
+Everything else is allowed: `ch < 52`, `ch 65–99`, `ch 113–115`, `ch >= 145`. Note that **ETSI's
+DFS channels 68–96 are NOT blocked** — `68` takes the `65..115` branch, `68-100` underflows, fails
+the `sltiu 13` bound, and the inject proceeds.
+
+`pcap_inject` has **exactly one call site**, inside `pineap_wifi_interface::inject`, so every
+injected frame passes gate 1. `inject_deauth` checks the same predicate redundantly, so a deauth is
+tested twice.
+
+This gate **never asks the kernel about regulatory state**: there is no `NL80211_CMD_GET_REG`
+anywhere in the binary, no `alpha2`/`country`/`regdom`/`regulatory`/`radar`/`NO_IR` strings, and no
+regdb file access. Channel enumeration (`mac80211::nl80211_get_freqlist_cb`) reads only
+`NL80211_FREQUENCY_ATTR_FREQ` and `NL80211_FREQUENCY_ATTR_DISABLED` — never `RADAR`, `NO_IR`,
+`DFS_STATE` or `INDOOR_ONLY`. **So `iw reg set`, a custom `regulatory.db`, or
+`cfg80211.ieee80211_regdom=` cannot lift gate 1.** There is no environment variable (`getenv` is
+never called), no UCI option, and no debug flag that skips it.
+
+On refusal it logs and returns `-1` without reaching `set_channel` or `pcap_inject`.
+
+> **Debugging trap.** The DFS branch in `pineap_wifi_interface::inject` loads the **6 GHz** format
+> string, not the DFS one. So `"{} can not inject on 6GHz restricted channel X/Y"` (with an
+> interface-name prefix) is actually a **5 GHz DFS** refusal from the common path, while
+> `"can not inject on DFS restricted channel X/Y"` can only come from `inject_deauth`. Do not
+> diagnose by log wording.
+
+#### Gate 2 — cfg80211, in the kernel. This one does follow the regulatory domain.
+
+`ieee80211_monitor_start_xmit()` calls **`cfg80211_reg_check_beaconing()`** — the modern rename of
+`cfg80211_reg_can_beacon()`; on this build (kernel 6.6.86 + backports 6.12.61) `mac80211.ko`
+imports `cfg80211_reg_check_beaconing` and the old name is absent from both modules. For
+`NL80211_IFTYPE_MONITOR` the prohibited flags are:
+
+```
+IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR
+```
+
+**`IEEE80211_CHAN_RADAR` is not prohibited there.** The DFS relaxation branch is also never taken,
+because `cfg80211_chandef_dfs_required()` returns 0 for `MONITOR` — but that branch could only ever
+*grant* permission, so it is not what blocks DFS.
+
+**The refusal is silent.** The frame is freed and the function returns `NETDEV_TX_OK` — no errno, no
+dropped-frame counter, and `sendto()` reports the full byte count. If you are debugging "the command
+ran and nothing happened on the air", suspect this first.
+
+#### What the shipped regdb actually says
+
+Decoded from `/lib/firmware/regulatory.db` (RGDB v20, 6176 bytes, 175 countries):
+
+```
+US (dfs_region=FCC)
+  2400.0 - 2472.0 MHz  30.0 dBm  [-]
+  5150.0 - 5250.0 MHz  23.0 dBm  [AUTO-BW]
+  5250.0 - 5350.0 MHz  24.0 dBm  [DFS, AUTO-BW]        <- DFS, and NO-IR is NOT set
+  5470.0 - 5730.0 MHz  24.0 dBm  [DFS]                 <- DFS, and NO-IR is NOT set
+  5730.0 - 5850.0 MHz  30.0 dBm  [AUTO-BW]
+  5925.0 - 7125.0 MHz  12.0 dBm  [NO-OUTDOOR, NO-IR]
+00 (world)
+  5250.0 - 5330.0 MHz  [DFS, NO-IR, AUTO-BW]
+  5490.0 - 5730.0 MHz  [DFS, NO-IR]
+  5735.0 - 5835.0 MHz  [NO-IR]                         <- even 149-165 is NO-IR here
+GB (ETSI)
+  5925.0 - 6425.0 MHz  24.0 dBm  [NO-OUTDOOR]          <- 6 GHz with NO-IR NOT set
+```
+
+**So under `country 'US'` no 5 GHz channel carries `NO_IR` at all** — gate 2 permits all of 36–165,
+and the effective block on 52–144 is **entirely gate 1's**. An earlier version of this document
+blamed `NO_IR` for the DFS block; that was wrong. Under the world domain `00`, by contrast, gate 2
+*does* block 52–144 and 149–165, so which domain is live changes the answer for 149–165.
+
+Consequences worth internalising:
+
+- **Changing the regulatory domain will not open DFS.** Gate 1 is compiled in.
+- **2.4 GHz is not uniformly open.** Channels 12–14 are `DISABLED` under US (a 20 MHz channel 12
+  spans 2457–2477, past the 2472 rule edge) and `NO_IR` under `00`. Gate 1 allows them, so gate 2
+  silently eats them.
+- Only **2.4 GHz 1–11 and 5 GHz 36–48** are injectable under *both* domains. That is the only safe
+  assumption when the live domain is unknown, and it is what `csa_injectable()` falls back to.
 
 ### 6 GHz: do not conflate the two barriers
 
@@ -197,21 +308,53 @@ stops CSA:
 
 | Barrier | Blocks deauth? | Blocks CSA? |
 |---|---|---|
-| Regulatory `NO_IR` | yes | **yes — this is the real wall** |
+| Gate 1: pineapd band-field check | yes | yes — but see below, it may be reachable-around |
+| Gate 2: regulatory `NO_IR` | yes | **yes under US — the real regulatory wall** |
 | WPA3/PMF mandate | yes | **no** — beacons are not PMF-protected |
 
-So the Pager's 6 GHz radio is **reconnaissance surface only** because of regulation, not because of
-WPA3. If the regulatory block were ever absent — a VLP-authorised path, or a permissive regdomain —
-**CSA on 6 GHz would become viable while deauth stayed dead.** Do not write off 6 GHz CSA as
-doubly-blocked; it is singly-blocked, by regulation.
+So 6 GHz CSA is blocked by *mechanism*, not by WPA3. Do not write it off as doubly-blocked by
+crypto; PMF kills deauth there but leaves CSA untouched.
 
-Caveat on verification: the per-channel flags live in a binary regdb
-(`/lib/firmware/regulatory.db`, `wireless-regdb 2025.02.20` on 1.1.3) and reading them needs
-`regdbdump`, which is not on the device. The mechanism above is kernel behaviour and is solid; the
-exact flag set depends on regdb version and country code. `radio1` ships `country 'US'` and
-`band '5g'`, so 6 GHz operation depends on PineAP's runtime band selection anyway. Hak5's own
-`DEAUTH_CLIENT` docs state the 6 GHz injection limit independently, which corroborates this as a
-regulatory wall rather than a device limitation.
+**The hardware does 6 GHz.** Established, correcting an earlier assumption in this file: the only
+Wi-Fi blob shipped is `WIFI_RAM_CODE_MT7961_1.bin`, but MT7921AU (USB Filogic 330) loads that same
+blob and is a 6E part, and mt76 decides band 4 from a runtime NIC capability query, so the filename
+proves nothing either way. Decisively, Hak5 ship a 6 GHz toggle in the Pager's own recon UI —
+`lib/pager/themes/wargames/components/recon/recon_band_settings.json` defines menu item `id: "6ghz"`
+bound to `$_6Ghz_ENABLED` — and `preflight()` reads `uci get pineapd.wlan1mon.bands`, which is what
+that toggle drives. Confirm on hardware with `iw phy1 info | grep -A3 'Band 4'`.
+
+Both gates are worth probing separately, because neither is as solid as it looks:
+
+- **Gate 1 is a single equality on a struct field**, not a frequency bound:
+  `lw v0,28(chan); cmpi v0,8; bteqz <refuse>` — i.e. `chan->+0x1c == 8`, refusing 6 GHz wholesale
+  (the "restricted channel" wording is just the log format; there is no subset). That field is
+  written to `8` at **exactly one instruction in the whole binary**, inside
+  `pineap_wifi_channel::from_string` on the branch taken when the channel string matches `"%uW6e"`.
+  The other producers write different encodings: `mac80211::get_channel` hardcodes `0`, and
+  `mac80211::find_primary_widest_channel` writes the raw `nl80211_band` index (3 for 6 GHz).
+  **INFERRED, not verified on hardware:** a channel not parsed from `"<n>W6e"` text therefore never
+  carries `8`, so gate 1's 6 GHz check cannot fire for it — and the DFS switch does not catch it
+  either, since every valid 6 GHz 20 MHz channel number is ≡1 mod 4 while the blocked set is
+  ≡0 mod 4. `interface_tracker::command_send_deauth` builds its channel via `from_string` on the
+  command's string field, so **how CamHound spells the channel may decide whether gate 1 fires.**
+  Two incompatible encodings for one field looks like a firmware bug rather than a designed escape.
+- **Gate 2 is regdomain-dependent and the regdb is unsigned.** US sets `[NO-OUTDOOR, NO-IR]` on
+  5925–7125, but **GB sets only `[NO-OUTDOOR]` on 5925–6425** — no `NO-IR`, which maps to
+  `IEEE80211_CHAN_INDOOR_ONLY` and is *not* in the prohibited set. And
+  `CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=n` on this build: the `.p7s` filename literal is absent from
+  `cfg80211.ko`, there are no PKCS#7/keyring imports, and no `regulatory.db.p7s` exists in the
+  rootfs — so a replacement regdb should load unsigned. `mt7921-common.ko` also exposes
+  `disable_clc` for MediaTek's firmware-side country clamp.
+
+So the honest reading is: **6 GHz CSA is singly-blocked by regulation in the kernel, and possibly
+not blocked at all by pineapd depending on channel encoding.** That makes it worth testing rather
+than assuming. It is also where CSA is *least* likely to pay off, since 6 GHz clients are the newest
+silicon and therefore the most likely to implement beacon protection (Ext Cap bit 84), which defeats
+CSA outright and yields a `NONE` badge.
+
+`csa_injectable()` refuses all 6 GHz until this is settled on hardware — refusing a channel that
+would have worked is recoverable, whereas an over-permissive verdict is silently misread as the
+target resisting.
 
 ### No handshake behind it
 

