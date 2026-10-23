@@ -116,6 +116,7 @@ MIXED, IOT-MODULE, ENDPOINT, UNKNOWN.
 ## Watch
 
 - **Live view**: six 10 s windows, double-buffered captures, A stops after the current window.
+  STREAM needs four windows at streaming rate, so stopping before 40 s can give NONE at best.
   Each window prints `w3 10.0s U 196k D 4k as 48.9` and `big 14.2/s oth 3`. Verdict words:
   `STREAM` steady big uplink; `DOWN` download-heavy (call, update, phone); `IDLE`/`QUIET` small
   frames only; `NONE` traffic without a camera pattern; `INCONCLUSIVE` nothing from the target in
@@ -255,7 +256,8 @@ that reuse a captured beacon's timestamp.
 ## Loot (`/root/loot/CamHound/`, flat)
 
 - `inventory.tsv`: one `|`-separated row per MAC, rewritten atomically each cycle and kept across runs:
-  `first_seen` and `n_seen` carry over, rows older than `INVENTORY_KEEP_DAYS` are pruned at start, randomised
+  `first_seen`, `n_seen`, the strongest RSSI with its time and GPS fix, and Watch evidence (`beh_score`,
+  `beh_verdict`) carry over, rows older than `INVENTORY_KEEP_DAYS` are pruned at start, randomised
   client MACs are never stored, devices known from an earlier run carry the `SEEN` tag, and the report
   counts them as `returning`. Header:
   `#first_seen|last_seen|run_id|mac|role|cat|vendor|label|conf|id_score|beh_score|beh_verdict|band|ssid|ap_bssid|ch|freq|rssi_best|rssi_best_ts|rssi_last|prox|n_seen|pkt_rate|signals|lan_tag|lat|lon`

@@ -88,15 +88,17 @@ s_disrupt() {   # RESPONSE=1: Disrupt on the Reolink AP against log-only stubs; 
   check "disrupt: EXAMINE released, no lock file" "grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log && [ ! -e /tmp/cs_run.pid ]"
 }
 s_persist() {   # a second run with DEDUPE_H=24 stays silent on known devices; first_seen carries over; RAND rows are not stored
-  reset; rules persist1 '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; run
+  reset; rules persist1 '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Watch,Back' '^Watch ' 'Live view' '^(STREAM|EVENT|NONE|IDLE|DOWN|QUIET)' 'Back' "${COMMON[@]}"
+  answers t t B t t t t; run
   local fs1; fs1=$(grep '|ec:71:db:00:00:10|' "$LOOT/inventory.tsv" | cut -d'|' -f1)
-  check "persist: first run alerted and stored rows" "grep -q 'REO-OUI 00:00:10' $T/log && [ -n \"$fs1\" ]"
+  check "persist: first run alerted, watched and stored rows" "grep -q 'REO-OUI 00:00:10' $T/log && [ -n \"$fs1\" ] && grep -q '|ec:71:db:00:00:10|ap|NVRKIT|[^|]*|REO-OUI|100|80|55|STREAM|' $LOOT/inventory.tsv"
   check "persist: randomised client not stored" "! grep -q '|02:ab:cd:00:00:01|' $LOOT/inventory.tsv"
   reset keep; printf 'CYCLE_SECS=5\nDEDUPE_H=24\n' >"$HARNESS_CFG"
   rules persist2 '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   check "persist: known devices not re-alerted" "! grep -q '^LOG red CONFIRMED' $T/log && ! grep -q '^LOG yellow LIKELY' $T/log && grep -q 'dedupe known ec:71:db:00:00:10' $LOOT/events.log"
   check "persist: first_seen carried over" "[ \"\$(grep '|ec:71:db:00:00:10|' $LOOT/inventory.tsv | cut -d'|' -f1)\" = \"$fs1\" ]"
   check "persist: SEEN tag and returning count" "grep -q '|ec:71:db:00:00:10|.*SEEN' $LOOT/inventory.tsv && grep -q 'returning [1-9]' $LOOT/report_*.txt"
+  check "persist: Watch evidence carried into the second run" "grep -q '|ec:71:db:00:00:10|ap|NVRKIT|[^|]*|REO-OUI|100|80|55|STREAM|' $LOOT/inventory.tsv"
 }
 case "${1:-all}" in
   live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; persist) s_persist ;;
