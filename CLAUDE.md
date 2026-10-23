@@ -4,13 +4,22 @@ A fork of Hak5's WiFi Pineapple Pager payload library. Most of it is upstream co
 the work that matters here is **CamHound** (a WiFi camera hunter with an active-response rung) and a
 firmware investigation of the Pager's 6 GHz and 5 GHz DFS injection blocks.
 
-`README.md` at the root is upstream Hak5 content — **do not edit it**; changes there conflict on any
-future merge. Put project notes in `dev/`.
+**One file is off limits: the root `README.md`.** It is upstream Hak5 content and edits to it
+conflict on any future merge, so put project notes in `dev/` instead. That is the whole of the rule
+— it is about that one file, not about a category. Everything else is fair game: `library/` (payloads,
+including the upstream-derived ones), `dev/`, this file, and new directories. Do not read it as
+"don't touch upstream".
 
 ## Standing rules
 
 - Development happens on the branch named in the session prompt. **Never push to another branch
   without explicit permission.** Do not open a pull request unless asked.
+- **Assume you are not the only session.** More than one Claude session has worked this repo at the
+  same time, on separate branches and separate problems (CamHound's response rung; unlocking 6 GHz
+  and DFS injection). Before concluding that a file is stale or a claim is wrong, check whether
+  another branch is mid-change on it: `git branch -a` and `git log --all --oneline`. Do not
+  "correct" another branch's work from here, and do not assume this file reflects their findings —
+  it is written from this branch's.
 - The operator works in a shielded RF chamber, licensed and authorised. They have asked for legal
   caveats to be kept to a minimum — the containment question is settled, do not re-litigate it.
 - **Verify before reporting.** This project has caught sessions asserting things from memory that
@@ -114,10 +123,22 @@ fire + settle or it expires mid-measurement.
 Each of those cross-references the others; `pager-csa-primitives.md` is the reference the rest defer
 to on mechanism.
 
-## Settled — do not re-derive
+## Established so far — a snapshot, not a verdict
 
-Full working and citations are in the docs above. The short form, so you can recognise a question
-that is already answered:
+**Read this to recognise a question that has already had work done on it, not as a reason to stop
+asking it.** Everything below was derived from static analysis of firmware 1.1.3-stable and kernel
+source, as of commit `07916df`, with **no hardware on the bench**. Full working and citations are in
+the docs above.
+
+Over one day these conclusions needed three independent reviews and were materially wrong twice, in
+both directions. So: a session with the device in front of it outranks anything here; so does a
+contradicting primary source. If you overturn something, change it here and say so in the commit
+rather than leaving two answers in the repo. `dev/pager-csa-primitives.md` §"Re-deriving from
+scratch, if you do not trust this file" exists for exactly that.
+
+If you are working on **unlocking 6 GHz or DFS injection**, treat the gate claims below as the prior
+state of the investigation, not its conclusion — the determination plan is a plan precisely because
+the question is open.
 
 - **Two injection gates in series, and conflating them explains most confusion.** *Gate 1* is
   pineapd in userspace: a hardcoded refusal of the 16 FCC DFS channels
@@ -153,10 +174,13 @@ that is already answered:
   **linking `-lwifi` against the shipped file is refused** (no section headers). No headers or
   static lib ship, so write prototypes and struct layouts by hand against upstream `0.0.10`.
 
-**Refuted hypotheses, recorded so nobody re-derives them:** that the Pager has no 6 GHz radio; that
-it was 6 GHz receive-capable but never certified to transmit; that `cfg80211` is what blocks DFS
-injection; that `wlan0mon` can serve as the 5 GHz receiver; that probe-response CSA is a fallback
-for beacon protection.
+**Refuted hypotheses**, so they are not re-proposed — but note which rest on what:
+
+- *Hard, from the FCC filing (primary source):* that the Pager has no 6 GHz radio; that it was
+  6 GHz receive-capable but never certified to transmit; that `wlan0mon` could serve as the 5 GHz
+  receiver (the antenna map plus `radio0`'s `band '2g'` settle it).
+- *From source analysis, so re-openable by measurement:* that `cfg80211` is what blocks DFS
+  injection (the block is pineapd's); that probe-response CSA is a fallback for beacon protection.
 
 ## Open, and needs the hardware
 
