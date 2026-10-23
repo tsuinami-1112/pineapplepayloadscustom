@@ -410,3 +410,9 @@ to replace verification.
   https://github.com/libwifi/libwifi
 - In-repo working implementation and design notes:
   `library/user/reconnaissance/CamHound/payload.sh` and `dev/CamHound/RESPONSE.md`
+
+## The 6 GHz / DFS determination plan
+
+The operator runbook for settling whether 6 GHz and 5 GHz DFS injection can be unlocked on real
+hardware — decision tree, exact commands, rollbacks and early exits — is
+`dev/pager-6ghz-determination-plan.md`. Its addendum carries the disassembled pineapd gate.
