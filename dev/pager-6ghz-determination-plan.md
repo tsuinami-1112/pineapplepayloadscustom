@@ -2,6 +2,10 @@
 
 **Operator runbook. Execute top to bottom. Stop at the first early-exit that fires.**
 
+> For the condensed bench ordering — what to do first, and why each step sits where it
+> does — see **`dev/pager-day-one.md`**. This document holds the reasoning, exact commands,
+> rollbacks and early exits behind it.
+
 Target question: *can 6 GHz injection be unlocked on this device, yes or no, and if yes how?*
 
 Firmware under analysis: **1.1.3-stable**, `pineapd` sha256 `adc9d36d…8493`, `regulatory.db` sha256 `30954f89…4b44`, `_pineap` sha256 `e1739d97…7d69`.
