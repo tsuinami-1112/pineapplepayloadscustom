@@ -924,3 +924,62 @@ Attribute by **which binary logged it and whether the line is name-prefixed**, n
 gate-1-blocked channel therefore parks the radio there and transmits nothing — it will look like a
 silent failure while having actually disrupted channel hopping. If recon goes quiet after a failed
 CSA attempt, this is why. Unfreeze before continuing.
+
+---
+
+# Addendum 2 — the FCC filing, read
+
+Resolves §0.2 and item 1 of "What this plan does NOT resolve". Source: FCC ID **2A52Y-MK1**,
+grantee **Hak5 LLC**, test report **TZ0278250701FRF08** ("Radio Report_NII_6G"), filed 2025-09-25
+by Shenzhen Tongzhou Testing for manufacturer Shenzhen Gainstrong Technology. **[V]**
+
+```
+Product Name : Wifi Pineapple Pager        Model Number : Mk1
+WLAN         : Supported IEEE 802.11ax
+WLAN FCC Operation Frequency:
+    U-NII Band 5: 5945~6425 MHz
+    U-NII Band 6: 6425~6525 MHz
+    U-NII Band 7: 6525~6875 MHz
+    U-NII Band 8: 6875~7125 MHz
+Antenna Type And Gain : Internal Antenna, Ant. 1: 4.43 dBi, Ant. 2: 2.93 dBi
+                        802.11a/n/ac/ax support 2T2R [Antenna 1 and Antenna 2]
+```
+
+## What this settles
+
+- **The radio has a 6 GHz PHY.** The product was tested for radiated emissions across all four
+  6 GHz sub-bands. Step A2 (`Band 4` present) should now be expected to PASS, and early exit **E1
+  should not fire**. Run A2 anyway — it reads `has_6ghz` from this unit's firmware, which is the
+  per-unit fact — but treat a FAIL as surprising and re-check the phy mapping before believing it.
+- **The antennas pass 6 GHz.** Item 1 of "What this plan does NOT resolve" claimed only the FCC
+  filing or a teardown could answer whether the RF front end and antennas work at 6 GHz. They were
+  characterised at 6 GHz with measured gains. **Step B7 is demoted from an open question to a
+  sanity check**; a large 6 GHz-vs-5 GHz RSSI deficit now indicates a fault, not a design limit.
+- **A hypothesis that was wrong, recorded so it is not re-derived.** An earlier reading held that
+  the 6 GHz recon toggle plus the pineapd injection gate meant "receive-capable, never certified to
+  transmit". **That is refuted.** The product *is* certified to transmit on 6 GHz.
+
+## What it means for the gates
+
+The gate is therefore not a certification gap. The consistent reading is narrower: a certified
+6 GHz device may transmit **as a compliant AP or client**, and an FCC client device may transmit
+only after an enabling signal from an AP it is associated with. Monitor-mode injection is
+unsolicited transmission with no association, which is outside the certified operating mode even on
+a certified device. That is exactly what `NO_IR` ("no initiating radiation") encodes — so pineapd's
+hardcoded refusal and the regdb's `NO-IR` flag are two independent encodings of one rule: **the
+device may talk on 6 GHz, but never first.** **[A]** on the motive; **[V]** on the certification.
+
+Practical consequence: both gates are software, the silicon and antennas beneath them are known
+good, and the project's bottleneck is now entirely (a) getting past the two gates and (b) the value
+gate at §0.3 — PMF and beacon protection, which this filing does nothing to change.
+
+## Still worth pulling from the filing
+
+| Document | Why |
+|---|---|
+| `FCC Software Configuration Control Declaration Rev1.0` (Cover Letter, 122 KB) | For U-NII devices the FCC requires a declaration of how software prevents operation outside certified RF parameters. Bears directly on whether anything stronger than a userspace check guards the gate, i.e. on whether Stage C is realistic. |
+| `Internal Photos` (3.8 MB) | Module part number and antenna count — pins the exact MT7921 variant. |
+
+`Block Diagram`, `Schematics`, `Operational Description`, `BOM` and
+`FCC Software Security Requirements for UNII devices` are listed **Metadata only** under the
+filing's confidentiality request and cannot be downloaded.

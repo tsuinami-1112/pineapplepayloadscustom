@@ -323,6 +323,20 @@ proves nothing either way. Decisively, Hak5 ship a 6 GHz toggle in the Pager's o
 bound to `$_6Ghz_ENABLED` — and `preflight()` reads `uci get pineapd.wlan1mon.bands`, which is what
 that toggle drives. Confirm on hardware with `iw phy1 info | grep -A3 'Band 4'`.
 
+**Settled by the FCC filing.** FCC ID `2A52Y-MK1` (grantee Hak5 LLC), test report
+`TZ0278250701FRF08`, certifies the Pager to **transmit** on all four 6 GHz sub-bands — U-NII 5
+(5945–6425), 6 (6425–6525), 7 (6525–6875) and 8 (6875–7125 MHz) — 802.11ax, with measured internal
+antenna gains of 4.43 dBi and 2.93 dBi, 2T2R. So the PHY exists and the antennas are tuned for
+6 GHz; neither is an open question any more. A hypothesis that the device was receive-capable but
+never certified to transmit on 6 GHz is **refuted** — recorded here so it is not re-derived.
+
+The gate is therefore not a certification gap. A certified 6 GHz device may transmit as a compliant
+AP or client, and an FCC client may transmit only after an enabling signal from an AP it is
+associated with; monitor-mode injection is unsolicited transmission with no association. That is
+what `NO_IR` encodes, so pineapd's hardcoded refusal and the regdb flag are two independent
+encodings of one rule — **the device may talk on 6 GHz, but never first.** **[A]** on the motive,
+**[V]** on the certification. Details: `dev/pager-6ghz-determination-plan.md`, Addendum 2.
+
 Both gates are worth probing separately, because neither is as solid as it looks:
 
 - **Gate 1 is a single equality on a struct field**, not a frequency bound:
