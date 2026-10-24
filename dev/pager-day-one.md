@@ -148,7 +148,8 @@ the words.
 
 **12. Get an injector that is not pineapd.** This is what bypasses gate 1; `pcap_inject` has exactly
 one call site, inside the gated function. **Use `pagerinj`** — built, ABI-verified and
-frame-validated without hardware, 15.6 KB, `scp` it to `/tmp`: `dev/injector/`. It never sets the
+frame-validated without hardware (size and hash in `dev/injector/README.md`), `scp` it to `/tmp`:
+`dev/injector/`. It never sets the
 channel and holds no regulatory opinion, which is what makes it a clean probe, and it is the only
 one of the three that can build a CSA frame at all — step 17a needs that.
 

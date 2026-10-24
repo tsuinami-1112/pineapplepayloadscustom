@@ -236,10 +236,18 @@ static size_t csa_ie_build(uint8_t *out, uint8_t mode, uint8_t chan, uint8_t cou
  * leaving pineapd's own element byte-identical.  The two-arm version of 17a cannot tell "the count
  * value is what disqualifies it" from "element 37 is what gets looked at"; this can.
  *
- * The operating class is NOT defaulted, deliberately.  Getting it wrong is a plausible way to have
- * the element ignored for a reason that looks like the gate under test, and the right value is
- * readable off the target's own beacon (its Supported Operating Classes element) rather than from
- * anyone's memory of Annex E. */
+ * The operating class is NOT defaulted, deliberately -- but not for the reason first given here.
+ * A wrong class does NOT get the element ignored:
+ *   - the denial arm never sees it.  csa_present() (mlme.c:8328) reads datalen, count, mode and
+ *     new_ch_num only.
+ *   - the move arm falls back rather than failing.  spectmgmt.c:259 zeroes an unparseable class and
+ *     :272 re-reads element 37 -- INCLUDING ITS COUNT.  So with --count 0 --ecsa-count N a wrong
+ *     class silently takes element 37's 0 instead of the eCSA's N, turning a delayed switch into an
+ *     immediate one.
+ * It therefore changes what the move arm measures rather than breaking either arm, which is a
+ * better reason to insist on it: read the value off the target's own Supported Operating Classes
+ * element rather than from anyone's memory of Annex E.  A guess that happens to parse is worse
+ * than one that does not. */
 static size_t ecsa_ie_build(uint8_t *out, uint8_t mode, uint8_t op_class,
                             uint8_t chan, uint8_t count)
 {
