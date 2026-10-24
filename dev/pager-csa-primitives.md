@@ -349,6 +349,45 @@ only, needs two identical copies at least a second apart, needs `mode != 0`, and
 announced channel to equal the current one. A plain **CSA element (37)** in a probe response is
 never suppressed, nor is an eCSA pointing somewhere else. **[V]**
 
+### Building the frames: what the refusal check actually reads, and the one offset to get right
+
+Two things follow from the count-0 finding, and both are easy to get subtly wrong.
+
+**The eCSA arm is op-class-independent.** `ieee80211_mgd_csa_present()` reads exactly four things
+from an eCSA element: that `datalen == sizeof(struct ieee80211_ext_chansw_ie)` (4), then `count`,
+`mode` and `new_ch_num`. **It never reads `new_operating_class`.** So element 37 with `count = 0`
+plus an eCSA (60) with `count != 0` returns true — pineapd's own bytes stay byte-identical while the
+refusal fires — and it does so whatever the operating-class byte says. On the *move* path a wrong
+class does not abort either: `spectmgmt.c` fails `ieee80211_operating_class_to_band()`, zeroes
+`new_op_class`, and falls back to reading element 37. So a bad class degrades the move arm rather
+than silently killing either arm. Supply it correctly anyway — read it off the target's Supported
+Operating Classes element rather than from memory — but do not believe a guess will fail loudly.
+**[V]**
+
+**The Spectrum-Management action frame's length gate is 26, and the reason matters more than the
+number.** `rx612.c:3720` gates on
+`len < IEEE80211_MIN_ACTION_SIZE + sizeof(mgmt->u.action.u.chan_switch)`. You cannot evaluate that
+from a mismatched header (see below), but you do not need to: `mac80211_mlme.c:7496` computes
+`ies_len` from `offsetof(…, u.action.u.chan_switch.variable)` and parses the element stream from
+there, so `variable` **must** land on the first element byte — offset 26 (24 header + category +
+action code). Hence `chan_switch` carries exactly one fixed byte and `sizeof` is 1, giving a gate of
+**26**. If `sizeof` were 0 the parser would read the action code (`4`) as an element ID and overrun,
+so 26 is forced by the kernel's own internal consistency. A minimal correct frame is
+24 + 1 + 1 + 5 = **31 bytes**, clearing it with five to spare. **[V]** by that argument; the arithmetic
+is **[A]** on any particular header text.
+
+Also required for that frame, from `rx612.c:3713–3739`: iftype STATION, ADHOC or MESH_POINT, and
+**A3 must equal the BSSID** (`sdata->deflink.u.mgd.bssid` for a station). A wrong A3 is a `break` —
+dropped with no log, which is indistinguishable from the gate under test.
+
+> **Header-provenance warning.** `ieee80211.h` copies differ across trees in ways that silently
+> change these offsets. The copy pulled into this project's scratchpad disagrees with the `rx612.c`
+> it sits beside in at least two places: it defines `IEEE80211_MIN_ACTION_SIZE` as a *macro taking a
+> type* where `rx612.c` uses it as a bare constant, and its `measurement` struct has no
+> `action_code` field, which `rx612.c:3703` dereferences. Numbers computed from the wrong header
+> against this kernel will be wrong and will fail as silent drops. Derive offsets from the consuming
+> code's own internal consistency, as above, or pin the header to the exact tree.
+
 ### The eCSA stall persists; it does not heal
 
 The unblock is inside `ieee80211_sta_process_chanswitch()`, but the beacon handler short-circuits
