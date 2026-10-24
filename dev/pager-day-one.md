@@ -152,15 +152,30 @@ frame-validated without hardware, 11 KB, `scp` it to `/tmp`: `dev/injector/`. It
 channel and holds no regulatory opinion, which is what makes it a clean probe, and it is the only
 one of the three that can build a CSA frame at all — step 17a needs that.
 
-Run the pre-staged `hcxdumptool` ipk (`dev/pager-prearrival.md` §3,
-`opkg -d ram install /tmp/hcxdumptool_6.3.4-r1_mipsel_24kc.ipk`, no network needed) as a
-**cross-check, pinned to one channel** (`-c 52b`; its own help says a single `-c`/`-f` disables its
-frequency management). Two cautions, both from its shipped help text **[V]**: it has no option to
-inherit the interface's channel, so it will set the frequency itself; and it builds its list from
-"available frequencies … from INTERFACE" with a `disabled` marker, i.e. from regulatory state.
-Whether it *declines* a channel it marks disabled is **[A]** — if it does, it cannot be the primary
-instrument for a regulatory experiment. Finding out costs one invocation, so do it before relying
-on either result.
+**`hcxdumptool` splits by band, and the 6 GHz half is a trap.** Settled against the 6.3.4 tag: it
+reads only `FREQUENCY_ATTR_FREQ`, `MAX_TX_POWER` and `DISABLED` — **no `NO_IR`, no `RADAR`** **[V]**.
+So:
+
+- **On 5 GHz DFS it is a good cross-check.** ch 52 reports only `Radar detection`, which it never
+  looks at, so it arms and transmits. Run it pinned — `-c 52b` — as an independent second
+  instrument alongside `pagerinj`. Pre-staged per `dev/pager-prearrival.md` §3
+  (`opkg -d ram install /tmp/hcxdumptool_6.3.4-r1_mipsel_24kc.ipk`, no network needed).
+- **On 6 GHz do not use it at all.** It does not read `NO_IR`, so it arms and transmits happily —
+  and gate 2 *does* prohibit `NO_IR`, so mac80211 frees every frame and returns `NETDEV_TX_OK`.
+  Its `send_80211_*` only compares `write()`'s return against the length, `PACKET_IGNORE_OUTGOING`
+  on its RX socket means it never sees its own frames, and its TX counters count attempted writes.
+  **It will report success while nothing leaves the antenna.**
+
+Three things about it that cost bench time, all **[V]**:
+
+- **A regulatory refusal looks like a driver fault.** You will never see `failed to set frequency`
+  on a capture run — that string is in the `-m` path, downstream of the `set_interface()` call that
+  already failed. You get `failed to arm interface` and *"driver is broken / driver is busy"*. Do
+  not grep for the string in the binary; it will not appear.
+- **It randomises your MAC, forces monitor mode, kills powersave, and restores none of it.**
+  `rt_set_interfacemac()` at `:3908`, and a *failure* there only clears a flag rather than aborting.
+- **It transmits unasked** — deauth, probe-request, assoc and reassoc flags all default true
+  (`:52–55`). Use all five `--disable_*` flags or your gate test has company on the air.
 
 **13. Inject on ch 52 and confirm at the external 5 GHz receiver.** Not `wlan0mon` — `radio0` is
 `band '2g'` and cannot hear ch 52; its silence would be silence either way. Run the negative control
@@ -212,6 +227,29 @@ pagerinj -i wlan1mon --csa --bssid <AP> --chan 52 --count 0 --rate 20 --secs 30 
 pagerinj -i wlan1mon --csa --bssid <AP> --chan 52 --count 3 --rate 20 --secs 30
 ```
 
+**Run a third arm — it is better than the pair and costs one more invocation.**
+`ieee80211_mgd_csa_present()` discards **per element**:
+
+```c
+if (csa  && csa->count  == 0)  csa  = NULL;
+if (ecsa && ecsa->count == 0)  ecsa = NULL;
+return csa || ecsa;
+```
+
+So a frame carrying pineapd's element 37 with count 0 **plus** an eCSA (60) with a non-zero count
+returns true — while leaving pineapd's own bytes untouched:
+
+```sh
+pagerinj -i wlan1mon --csa --bssid <AP> --chan 52 --count 0 \
+         --ecsa-count 3 --ecsa-opclass <N> --rate 20 --secs 30
+```
+
+The two-arm version cannot distinguish **"the count value is what disqualifies it"** from
+**"element 37 is the one that gets looked at"**. This arm can, because it changes which element
+carries the live count without changing the count byte pineapd writes. Read `--ecsa-opclass` off the
+target's own Supported Operating Classes element — it is deliberately not defaulted, because a
+wrong operating class gets the element ignored for a reason that looks like the gate under test.
+
 It clones a real beacon from `--bssid` and appends the element, which is what
 `recon_engine::index_beacon_ns` does, so the only difference from pineapd's frame is the byte under
 test. That one-byte property is asserted in the tool's selftest and was confirmed on the wire
@@ -239,12 +277,29 @@ client disconnect and try to reconnect. A client that cannot re-associate while 
 the result; watch for `"AP is in CSA process, reject assoc"` in its log if it is Linux. That log
 line **cannot** appear for the count = 0 arm, which is what makes the pair a clean control.
 
-*Unprotected Public-Action eCSA* second (category 4, action 4, outside PMF's robust set). The
-builder is on the device — `dlopen("libwifi.so.0")` gets `libwifi_create_action` and
-`libwifi_add_action_detail`; do not try to link against the shipped `.so`. Set the CSA mode byte, or
-nothing at all happens. Expect a **persistent** uplink stall on a current Linux client rather than a
-channel move, and nothing whatsoever if its driver sets `HANDLES_QUIET_CSA`; an older or non-Linux
-stack may switch properly. Watch the client's traffic, not just its association state.
+*Unprotected Public-Action eCSA* second (category 4, action 4, outside PMF's robust set). Expect a
+**persistent** uplink stall on a current Linux client rather than a channel move, and nothing
+whatsoever if its driver sets `HANDLES_QUIET_CSA`; an older or non-Linux stack may switch properly.
+Watch the client's traffic, not just its association state. `pagerinj` does not build this one yet.
+
+**17c. The unicast Spectrum-Management CSA — do this on 2.4 / non-DFS 5 GHz, not 6 GHz.** Category
+**0**, action **4**, which is a different frame from 17b's category 4 and reaches a different path.
+`mac80211_mlme.c:7506` tags it `PROT_ACTION` from the **category alone**, with no check that it
+actually arrived protected, and the protection filter only runs under MFP — so on a **non-PMF BSS**
+an unprotected one is acted on, and because it is unicast there is no flood and no race against the
+real AP's beacons. Better targeting than a beacon, and it lands on the surface CamHound actually
+attacks.
+
+```sh
+pagerinj -i wlan1mon --action --bssid <AP> --client <STA> --chan <N> --count 3
+```
+
+Three constraints, all from the receive path, each the difference between working and a silent drop:
+
+- **A3 must equal the BSSID** — `rx612.c:3738` compares it against `sdata->deflink.u.mgd.bssid`.
+  `pagerinj` sets A3 from `--bssid` for you; a wrong one is dropped with no log at all.
+- **A1 is the client**, which is the whole point.
+- **The client must be associated.** No keys are needed on a non-PMF BSS, which is why this works.
 
 ---
 

@@ -247,14 +247,19 @@ The **instrument** for the injection side is no longer open: `dev/injector/` hol
 cross-built for `mipsel_24kc`/musl/soft-float, ABI-verified, and frame-validated with no radio (29
 selftest checks; capture → clone → append → transmit exercised over a `veth` pair, with the
 step-17a count pair confirmed to differ in exactly one byte on the wire). It replaces `hcxdumptool`
-as the primary injector for one sufficient reason — **neither hcxdumptool nor aireplay-ng can build
-a CSA frame**, which step 17a needs — plus two weaker ones read from hcxdumptool's shipped help:
-it always sets the frequency itself (no inherit-the-channel option) and it enumerates frequencies
-from regulatory state (`%6d [%3d] disabled`). Whether it *declines* a disabled channel is **[A]**
-and would settle whether it can serve a regulatory experiment at all; one invocation on the device
-answers it. An earlier revision of this paragraph said §B3's aireplay-ng objection applies to
-hcxdumptool unqualified — that was an overstatement, since a single `-c` disables its frequency
-management. What remains open is
+as the primary injector because **neither hcxdumptool nor aireplay-ng can build a CSA frame**, which
+step 17a needs. It now also carries 17a's third arm (`--ecsa-count`: element 37 count 0 plus a live
+eCSA, since `csa_present()` discards per element) and the unicast cat-0 Spectrum-Management CSA of
+day-one step 17c.
+
+**hcxdumptool splits by band, and the 6 GHz half is a trap** — settled against the 6.3.4 tag: it
+reads only `FREQUENCY_ATTR_FREQ`, `MAX_TX_POWER` and `DISABLED`, never `NO_IR` or `RADAR` **[V]**,
+and refuses by *not arming* (`usrfrequency_to_scanlist()`, `hcxdumptool.c:3846`) rather than by
+declining frames. On 5 GHz DFS it therefore arms and transmits and is a good independent
+cross-check; on 6 GHz it arms, transmits, and gate 2 drops everything silently while its own
+counters report success — a confident false positive. Also: a regulatory refusal presents as
+`failed to arm interface` / "driver is broken", not as the `failed to set frequency` string in the
+binary; and it randomises the MAC and forces monitor mode without restoring either. What remains open is
 everything a radio decides: whether a frame reaches the air, whether a client reacts, and whether a
 non-zero count actually produces the auth/assoc refusal — that last is `[A]` from
 `ieee80211_mgd_csa_present()`, never measured.

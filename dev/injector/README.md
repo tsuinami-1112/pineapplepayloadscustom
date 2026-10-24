@@ -22,15 +22,31 @@ its shipped help text **[V]**:
 - But a single `-c`/`-f` **disables its frequency management** (its own words), so `-c 52b` is
   close to what the experiment wants. Saying the aireplay-ng objection "applies to hcxdumptool" was
   an overstatement; one documented channel set is not an osdep layer.
-- The risk that actually matters is **regulatory, not channel**: it has a `%6d [%3d] disabled` row
-  format and calls its lists "available frequencies … from INTERFACE" / "of Regulatory Domain: %s"
-  **[V]**. Whether it *declines* a channel it marks disabled is **[A]** — unestablished from
-  strings, and decisive, because a regulatory experiment cannot run through a tool that applies
-  regulatory state itself. *Falsified either way by* one invocation on the device:
-  `hcxdumptool -c 52b` under a US domain either transmits or does not.
+- The risk that actually matters is **regulatory, not channel** — and it is settled, with a **split
+  answer**. Against the 6.3.4 tag (`8dad077`), the only `NL80211_FREQUENCY_ATTR_*` references in
+  the tree are `FREQ`, `MAX_TX_POWER` and `DISABLED`; **zero for `NO_IR` or `RADAR`** **[V]**. It
+  refuses by *not arming* (`usrfrequency_to_scanlist()`, `hcxdumptool.c:3846`), not by declining
+  frames.
+
+Composed with `dev/pager-prearrival.md` §5's per-channel table, that splits by band:
+
+| | hcxdumptool | consequence |
+|---|---|---|
+| **5 GHz DFS** (ch 52 → `Radar detection`) | never reads `RADAR` | arms and transmits — **a good independent cross-check** for `pagerinj` |
+| **6 GHz** (ch 37 → `No IR`) | never reads `NO_IR` | arms and transmits, **and gate 2 drops every frame silently** |
+
+**On 6 GHz it is worse than an unknown.** `send_80211_*` only compares `write()`'s return against
+the length, `PACKET_IGNORE_OUTGOING` on its RX socket means it never sees its own frames, and its
+TX counters count attempted writes — so **it reports success while nothing leaves the antenna**.
+A confident false positive, in the one direction this experiment cannot tolerate.
+
+Two more that cost bench time, both **[V]**: a regulatory refusal presents as **`failed to arm
+interface` / "driver is broken / driver is busy"** (the `failed to set frequency` string is in the
+`-m` path, downstream of the call that already failed — grepping for it will find nothing), and it
+randomises the MAC, forces monitor mode and kills powersave while restoring none of it.
 
 `pagerinj` sidesteps all of it by never setting the channel and holding no regulatory opinion. Keep
-hcxdumptool as the pinned cross-check.
+hcxdumptool as the pinned DFS cross-check and nothing more.
 
 ## The three jobs
 
@@ -38,7 +54,31 @@ hcxdumptool as the pinned cross-check.
 |---|---|---|
 | Prove a frame left the antenna on a gate-1 channel | `--nonce` | day-one step 13, plan §B4 |
 | Set a non-zero CSA Channel Switch Count | `--csa --count N` | day-one step 17a |
-| Choose the send rate (the ~100 ms BSS-cache race) | `--rate` | both |
+| Keep pineapd's element intact but add a live eCSA count | `--csa --ecsa-count N` | 17a's third arm |
+| Unicast Spectrum-Management CSA to one client | `--action --client <mac>` | day-one step 17c |
+| Choose the send rate (the ~100 ms BSS-cache race) | `--rate` | all of them |
+
+### 17a's third arm, and why it beats the pair
+
+`ieee80211_mgd_csa_present()` discards **per element** — `if (csa && csa->count == 0) csa = NULL;`
+then the same for `ecsa`, then `return csa || ecsa`. So element 37 with count 0 *plus* an eCSA (60)
+with a non-zero count returns true while pineapd's own bytes stay byte-identical. The two-arm
+version of 17a cannot separate *"the count value is what disqualifies it"* from *"element 37 is the
+one that gets looked at"*; this arm can.
+
+`--ecsa-opclass` has **no default on purpose**: a wrong operating class gets the element ignored for
+a reason that looks exactly like the gate under test. Read it off the target's own Supported
+Operating Classes element.
+
+### The action frame (`--action`), step 17c
+
+Category **0**, action **4** — not 17b's category 4. `mac80211_mlme.c:7506` tags it `PROT_ACTION`
+from the category alone with no check that it arrived protected, and the protection filter only
+runs under MFP, so on a **non-PMF BSS** an unprotected one is acted on. Unicast, so no flood and no
+beacon race. Constraints baked into the builder and asserted in the selftest: **A3 must equal the
+BSSID** (`rx612.c:3738`; a wrong A3 is dropped with no log), A1 is the client, the client must be
+associated, and the frame clears `IEEE80211_MIN_ACTION_SIZE + sizeof(u.action.u.chan_switch)` — 31
+bytes against a 26-byte gate.
 
 ## Build
 
@@ -56,7 +96,7 @@ Verified output, `gcc 13.3.0 r28597-0425664679`, byte-reproducible across rebuil
 
 | | |
 |---|---|
-| `pagerinj` | 11436 bytes, sha256 `00d63e86…a6a2` |
+| `pagerinj` | 15596 bytes, sha256 `d6ec152f…a9b0` |
 | ABI | `ELF32 LSB MIPS32r2`, little endian, interpreter `/lib/ld-musl-mipsel-sf.so.1` |
 | `NEEDED` | `libc.so` only |
 | `make static` | 84096 bytes, no loader, no libc — if the dynamic build ever fails on the device |
@@ -70,7 +110,7 @@ Binaries are `.gitignore`d — build them, don't commit them.
 ## Validation done without a radio
 
 ```sh
-make host && ./pagerinj-host --selftest        # 29 checks, 0 failed
+make host && ./pagerinj-host --selftest        # 48 checks, 0 failed
 ```
 
 The selftest covers the CSA element against the bytes pineapd writes at `0x4bee8a`

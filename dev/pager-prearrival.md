@@ -185,6 +185,15 @@ kernel because those lines never print there. ERE alternation confirmed under `m
 minimal implementation, as evidence for busybox awk on-device. Three selftest cases added
 (`157 checks, 0 failed`).
 
+**This table became load-bearing for something else.** Composed with the finding that `hcxdumptool`
+reads only `FREQUENCY_ATTR_FREQ`/`MAX_TX_POWER`/`DISABLED` — never `NO_IR` or `RADAR` — it decides
+whether hcxdumptool is usable per band: on 5 GHz DFS it arms and transmits (the `Radar detection`
+attribute is invisible to it), on 6 GHz it arms and transmits while gate 2 silently drops every
+frame. See §B3 of the determination plan. **Note the hinge:** the rows above come from a fixture
+built from the shipped `iw`'s *format strings*, not from a live radio, so that composition is
+strongly indicated rather than measured. Day-one step 8's live `iw phy <phy> channels` is what
+confirms it, and `hcxdumptool -I <iface>` gives a second rendering of the same list if you want one.
+
 **Still open, and only answerable on hardware:** which regulatory domain is actually live
 (`iw reg get`). Under US, 149–165 should come back injectable as above; under world/`00` they
 should not. That is day-one step 8.
