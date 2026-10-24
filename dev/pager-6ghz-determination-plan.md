@@ -539,7 +539,23 @@ ssh root@172.16.52.1 'df -h /overlay /tmp
 
 **Do NOT use `aireplay-ng` as the primary instrument** — its osdep layer has its own channel handling and would add a gate to an experiment whose whole purpose is isolating gates. Keep it as a cross-check only.
 
-**That objection also applies to `hcxdumptool`**, which manages its own channel too — so the primary instrument is now **`pagerinj`** (`dev/injector/`): ~250 lines, 11 KB, cross-built and ABI-verified against this exact target, frame-validated with no hardware, and it never touches the channel. It covers all three jobs above, including the non-zero CSA count that neither `hcxdumptool` nor `aireplay-ng` can produce. It deliberately does **not** `dlopen` libwifi: the CSA element is five bytes, and writing five bytes is safer than hand-guessing the struct layouts this paragraph warns about. Keep the pre-staged `hcxdumptool` ipk as the cross-check. The `hcxdumptool` channel claim is **[A]** — from reading its interface, not running it; falsified by a documented mode that transmits on the interface's existing channel without setting it.
+**`hcxdumptool` has a related but weaker problem.** Read from the shipped binary's own help text **[V]**:
+
+```
+-c <digit>  : set channel (1a,2a,36b,...)
+              to disable frequency management, set this option to a single frequency/channel
+-f <digit>  : set frequency (2412,2417,5180,...)
+-F          : use all available frequencies from INTERFACE
+```
+
+Two readings, both **[V]**, and they point different ways:
+
+- **It always sets the frequency itself.** There is no option to inherit the interface's current channel — the option list is `-c`/`-f`/`-F` and `failed to set frequency` is an error path. So you cannot hand it a pre-tuned `wlan1mon` and know it left it alone.
+- **But a single `-c`/`-f` disables its frequency *management*** (its own help says so), so pinning it with `-c 52b` is close to what the experiment wants. An earlier revision of this paragraph said the aireplay-ng objection "applies to hcxdumptool" unqualified — that was an overstatement: aireplay-ng's osdep layer is a different and worse problem than one documented channel set.
+
+**The real contamination risk is regulatory, not channel.** It reads per-channel regulatory state — it has a `%6d [%3d] disabled` row format, and calls its lists "available frequencies … from INTERFACE" and frequencies "of Regulatory Domain: %s" **[V]**. Whether it *refuses to transmit* on a channel its own enumeration marks `disabled` is **[A]**, not established from strings — and that is the question that matters, because an experiment asking "does regulatory state block injection here?" cannot be run through a tool that may apply regulatory state itself. *Falsified either way by:* running `hcxdumptool -c 52b` on the device under a US domain and seeing whether it transmits or declines.
+
+So the primary instrument is **`pagerinj`** (`dev/injector/`): ~250 lines, 11 KB, cross-built and ABI-verified against this exact target, frame-validated with no hardware. It never sets the channel and holds no regulatory opinion, which is what makes it a clean probe. It also covers the non-zero CSA count that neither `hcxdumptool` nor `aireplay-ng` can produce — that reason alone is sufficient and does not depend on any of the above. It deliberately does **not** `dlopen` libwifi: the CSA element is five bytes, and writing five bytes is safer than hand-guessing the struct layouts this paragraph warns about. Keep the pre-staged `hcxdumptool` ipk as a cross-check, pinned with `-c`, and compare the two.
 
 **Rollback:** `opkg -d ram remove hcxdumptool` (or reboot — tmpfs).
 

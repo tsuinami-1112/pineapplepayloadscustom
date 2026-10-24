@@ -148,12 +148,19 @@ the words.
 
 **12. Get an injector that is not pineapd.** This is what bypasses gate 1; `pcap_inject` has exactly
 one call site, inside the gated function. **Use `pagerinj`** — built, ABI-verified and
-frame-validated without hardware, 11 KB, `scp` it to `/tmp`: `dev/injector/`. It never touches the
-channel, which is the point: `hcxdumptool` manages its own channel, so B3's objection to
-aireplay-ng ("would add a gate to an experiment whose whole purpose is isolating gates") applies to
-it as well. The pre-staged `hcxdumptool` ipk (`dev/pager-prearrival.md` §3,
-`opkg -d ram install /tmp/hcxdumptool_6.3.4-r1_mipsel_24kc.ipk`, no network needed) stays as a
-cross-check — and it cannot build a CSA frame at all, which step 17a needs.
+frame-validated without hardware, 11 KB, `scp` it to `/tmp`: `dev/injector/`. It never sets the
+channel and holds no regulatory opinion, which is what makes it a clean probe, and it is the only
+one of the three that can build a CSA frame at all — step 17a needs that.
+
+Run the pre-staged `hcxdumptool` ipk (`dev/pager-prearrival.md` §3,
+`opkg -d ram install /tmp/hcxdumptool_6.3.4-r1_mipsel_24kc.ipk`, no network needed) as a
+**cross-check, pinned to one channel** (`-c 52b`; its own help says a single `-c`/`-f` disables its
+frequency management). Two cautions, both from its shipped help text **[V]**: it has no option to
+inherit the interface's channel, so it will set the frequency itself; and it builds its list from
+"available frequencies … from INTERFACE" with a `disabled` marker, i.e. from regulatory state.
+Whether it *declines* a channel it marks disabled is **[A]** — if it does, it cannot be the primary
+instrument for a regulatory experiment. Finding out costs one invocation, so do it before relying
+on either result.
 
 **13. Inject on ch 52 and confirm at the external 5 GHz receiver.** Not `wlan0mon` — `radio0` is
 `band '2g'` and cannot hear ch 52; its silence would be silence either way. Run the negative control

@@ -247,8 +247,14 @@ The **instrument** for the injection side is no longer open: `dev/injector/` hol
 cross-built for `mipsel_24kc`/musl/soft-float, ABI-verified, and frame-validated with no radio (29
 selftest checks; capture → clone → append → transmit exercised over a `veth` pair, with the
 step-17a count pair confirmed to differ in exactly one byte on the wire). It replaces `hcxdumptool`
-as the primary injector because hcxdumptool manages its own channel, which is the same objection
-§B3 raises against aireplay-ng, and because neither can build a CSA frame. What remains open is
+as the primary injector for one sufficient reason — **neither hcxdumptool nor aireplay-ng can build
+a CSA frame**, which step 17a needs — plus two weaker ones read from hcxdumptool's shipped help:
+it always sets the frequency itself (no inherit-the-channel option) and it enumerates frequencies
+from regulatory state (`%6d [%3d] disabled`). Whether it *declines* a disabled channel is **[A]**
+and would settle whether it can serve a regulatory experiment at all; one invocation on the device
+answers it. An earlier revision of this paragraph said §B3's aireplay-ng objection applies to
+hcxdumptool unqualified — that was an overstatement, since a single `-c` disables its frequency
+management. What remains open is
 everything a radio decides: whether a frame reaches the air, whether a client reacts, and whether a
 non-zero count actually produces the auth/assoc refusal — that last is `[A]` from
 `ieee80211_mgd_csa_present()`, never measured.

@@ -8,15 +8,29 @@ choice, is in the header comment of `pagerinj.c` — read that before changing i
 
 ## Why not hcxdumptool or aireplay-ng
 
-`dev/pager-6ghz-determination-plan.md` §B3 rules out aireplay-ng because "its osdep layer has its
-own channel handling and would add a gate to an experiment whose whole purpose is isolating gates."
-**hcxdumptool manages its channel too**, so the same objection applies to it — which is worth
-knowing, because §B4's transmit step names it. Treat the pre-staged `hcxdumptool` ipk
-(`dev/pager-prearrival.md` §3) as a cross-check, not the primary instrument. **[A]** — from reading
-hcxdumptool's interface, not from running it; falsified by a documented mode that transmits on the
-interface's existing channel without setting it.
+**The sufficient reason, which depends on nothing else: neither can build a CSA frame at all**
+(§B3's limitation note, **[V]**), and step 17a needs one with a settable count byte. If you read
+only one line of this section, that is it.
 
-Neither tool can build a CSA frame at all (§B3 limitation note), which is what step 17a needs.
+The channel argument is weaker than an earlier revision of these docs claimed, so here it is
+accurately. §B3 rules out aireplay-ng because "its osdep layer has its own channel handling and
+would add a gate to an experiment whose whole purpose is isolating gates." For `hcxdumptool`, from
+its shipped help text **[V]**:
+
+- It **always sets the frequency itself** — `-c`/`-f`/`-F`, and `failed to set frequency` is an
+  error path. There is no option to inherit the interface's current channel.
+- But a single `-c`/`-f` **disables its frequency management** (its own words), so `-c 52b` is
+  close to what the experiment wants. Saying the aireplay-ng objection "applies to hcxdumptool" was
+  an overstatement; one documented channel set is not an osdep layer.
+- The risk that actually matters is **regulatory, not channel**: it has a `%6d [%3d] disabled` row
+  format and calls its lists "available frequencies … from INTERFACE" / "of Regulatory Domain: %s"
+  **[V]**. Whether it *declines* a channel it marks disabled is **[A]** — unestablished from
+  strings, and decisive, because a regulatory experiment cannot run through a tool that applies
+  regulatory state itself. *Falsified either way by* one invocation on the device:
+  `hcxdumptool -c 52b` under a US domain either transmits or does not.
+
+`pagerinj` sidesteps all of it by never setting the channel and holding no regulatory opinion. Keep
+hcxdumptool as the pinned cross-check.
 
 ## The three jobs
 
