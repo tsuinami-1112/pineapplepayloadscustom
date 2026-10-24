@@ -96,7 +96,7 @@ Verified output, `gcc 13.3.0 r28597-0425664679`, byte-reproducible across rebuil
 
 | | |
 |---|---|
-| `pagerinj` | 15596 bytes, sha256 `d6ec152f…a9b0` |
+| `pagerinj` | 17308 bytes, sha256 `74132ba0…a8f9` |
 | ABI | `ELF32 LSB MIPS32r2`, little endian, interpreter `/lib/ld-musl-mipsel-sf.so.1` |
 | `NEEDED` | `libc.so` only |
 | `make static` | 84096 bytes, no loader, no libc — if the dynamic build ever fails on the device |
@@ -110,7 +110,7 @@ Binaries are `.gitignore`d — build them, don't commit them.
 ## Validation done without a radio
 
 ```sh
-make host && ./pagerinj-host --selftest        # 48 checks, 0 failed
+make host && ./pagerinj-host --selftest        # 59 checks, 0 failed
 ```
 
 The selftest covers the CSA element against the bytes pineapd writes at `0x4bee8a`
@@ -118,6 +118,14 @@ The selftest covers the CSA element against the bytes pineapd writes at `0x4bee8
 radiotap parsing including the trailing-FCS trap, and every rejection path. The load-bearing case
 is **"17a control: arms differ in exactly ONE byte"** — if that ever fails, step 17a is not a
 controlled comparison and its result means nothing.
+
+`strip_capture()` exists as a separate pure function because `csa_frame_build()` appends at
+`in_len` with no FCS handling of its own — correct only if the capture was already shortened, and
+by then radiotap is gone so there is no flag left to read. A review pointed out the old selftest
+*implied* that invariant without asserting it. It is asserted now, and the assertions were
+**mutation-tested**: deleting the `flen -= 4` fails four checks, including
+"CSA element directly follows the last IE, not the FCS" and "no 0xde FCS byte survives into the
+frame". A test that passes but would not catch the bug is worse than no test.
 
 The transmit path was then exercised end-to-end over a `veth` pair, with one instance beaconing as
 the AP and another capturing, cloning and re-transmitting it. On the wire:

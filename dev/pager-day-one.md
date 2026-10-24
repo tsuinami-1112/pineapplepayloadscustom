@@ -246,9 +246,20 @@ pagerinj -i wlan1mon --csa --bssid <AP> --chan 52 --count 0 \
 
 The two-arm version cannot distinguish **"the count value is what disqualifies it"** from
 **"element 37 is the one that gets looked at"**. This arm can, because it changes which element
-carries the live count without changing the count byte pineapd writes. Read `--ecsa-opclass` off the
-target's own Supported Operating Classes element — it is deliberately not defaulted, because a
-wrong operating class gets the element ignored for a reason that looks like the gate under test.
+carries the live count without changing the count byte pineapd writes.
+
+Read `--ecsa-opclass` off the target's own Supported Operating Classes element. It is deliberately
+not defaulted, but **not** for the reason an earlier revision of this line gave — a wrong class does
+*not* get the element ignored. The denial arm never reads the class at all, and on the move path a
+bad one zeroes `new_op_class` and **falls back to element 37's count**, which in this arm is 0. So a
+wrong class silently turns the move arm's delayed switch into an immediate one while leaving the
+denial arm untouched. It changes what you measure rather than breaking it, which is worse.
+
+**Also: leave `--mode` alone.** `csa_present()` discards any element with mode 0 that announces the
+channel the target is already on, before the count is even considered — so `--mode 0` plus the
+current channel is a silent no-op. pineapd hardcodes mode 1; so does `pagerinj` by default, and it
+warns if you override it. Both points: `dev/pager-csa-primitives.md`
+§"Four refinements, read at upstream v6.12".
 
 It clones a real beacon from `--bssid` and appends the element, which is what
 `recon_engine::index_beacon_ns` does, so the only difference from pineapd's frame is the byte under
