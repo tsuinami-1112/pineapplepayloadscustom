@@ -244,9 +244,11 @@ count-byte experiment (day-one step 17a). `inj_parse_channels` is format-validat
 against a live device.
 
 The **instrument** for the injection side is no longer open: `dev/injector/` holds `pagerinj`,
-cross-built for `mipsel_24kc`/musl/soft-float, ABI-verified, and frame-validated with no radio (29
-selftest checks; capture → clone → append → transmit exercised over a `veth` pair, with the
-step-17a count pair confirmed to differ in exactly one byte on the wire). It replaces `hcxdumptool`
+cross-built for `mipsel_24kc`/musl/soft-float, ABI-verified, and frame-validated with no radio
+(capture → clone → append → transmit exercised over a `veth` pair, with the step-17a count pair
+confirmed to differ in exactly one byte on the wire, and the FCS-strip precondition asserted by
+mutation test). **Current size, hash and selftest count live in `dev/injector/README.md`** — they
+have drifted twice already, so they are deliberately not restated here. It replaces `hcxdumptool`
 as the primary injector because **neither hcxdumptool nor aireplay-ng can build a CSA frame**, which
 step 17a needs. It now also carries 17a's third arm (`--ecsa-count`: element 37 count 0 plus a live
 eCSA, since `csa_present()` discards per element) and the unicast cat-0 Spectrum-Management CSA of

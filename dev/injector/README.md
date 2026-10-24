@@ -66,9 +66,14 @@ with a non-zero count returns true while pineapd's own bytes stay byte-identical
 version of 17a cannot separate *"the count value is what disqualifies it"* from *"element 37 is the
 one that gets looked at"*; this arm can.
 
-`--ecsa-opclass` has **no default on purpose**: a wrong operating class gets the element ignored for
-a reason that looks exactly like the gate under test. Read it off the target's own Supported
-Operating Classes element.
+`--ecsa-opclass` has **no default on purpose** — though not because a wrong class gets the element
+ignored, which was the original reason here and is wrong. The denial arm never reads the class at
+all (`csa_present()` reads only datalen, count, mode and new_ch_num), and the move arm *falls back*:
+`spectmgmt.c:259` zeroes an unparseable class and `:272` re-reads element 37 **including its count**,
+so with `--count 0 --ecsa-count N` a wrong class quietly takes element 37's `0` instead of the
+eCSA's `N` and you measure an immediate switch where you meant a delayed one. It changes what the
+move arm measures rather than breaking it. Read the value off the target's own Supported Operating
+Classes element.
 
 ### The action frame (`--action`), step 17c
 
