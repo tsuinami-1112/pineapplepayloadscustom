@@ -380,6 +380,64 @@ Also required for that frame, from `rx612.c:3713–3739`: iftype STATION, ADHOC 
 **A3 must equal the BSSID** (`sdata->deflink.u.mgd.bssid` for a station). A wrong A3 is a `break` —
 dropped with no log, which is indistinguishable from the gate under test.
 
+#### Four refinements, read at upstream v6.12 rather than inferred
+
+The length-gate arithmetic above is marked `[A]` "on any particular header text". It can be `[V]`:
+computed from `include/linux/ieee80211.h` at **v6.12**, the mgmt header is 24,
+`IEEE80211_MIN_ACTION_SIZE = offsetof(…, u.action.u)` is **25**, `chan_switch` is
+`{ u8 action_code; u8 variable[]; }` so `sizeof` is **1**, the gate is **26**, and
+`offsetof(…, u.action.u.chan_switch.variable)` is **26** — which is the consistency argument above,
+now with the arithmetic done rather than argued. Function offsets match too: `csa_present` at
+`mlme.c:8328`, `csa_in_process` at `:8368`, callers at `:8450` (auth) and `:8799` (assoc).
+
+**1. The element length must match *exactly*, not be at least.** `csa_present()` accepts an element
+only on equality:
+
+```c
+if (csa_elem  && csa_elem->datalen  == sizeof(*csa))   csa  = (void *)csa_elem->data;
+if (ecsa_elem && ecsa_elem->datalen == sizeof(*ecsa))  ecsa = (void *)ecsa_elem->data;
+```
+
+with `struct ieee80211_channel_sw_ie { mode, new_ch_num, count }` = **3** and
+`struct ieee80211_ext_chansw_ie { mode, new_operating_class, new_ch_num, count }` = **4**. A
+one-byte drift either way makes the element invisible, with no diagnostic anywhere. Both constants
+are pinned in `pagerinj`'s selftest for exactly that reason. **[V]**
+
+**2. There is a *second* per-element discard, and nothing above mentioned it.** Immediately after
+the count check, for both elements (`mlme.c:8350`):
+
+```c
+if (csa && !csa->mode && csa->new_ch_num == cur_channel)   csa = NULL;
+if (ecsa && !ecsa->mode && ecsa->new_ch_num == cur_channel) ecsa = NULL;
+```
+
+**Mode 0 announcing the channel the target is already on is discarded**, before the count is ever
+reached. pineapd hardcodes mode 1 so it never trips this, and `pagerinj` defaults to 1 — but
+`--mode 0` is reachable, and an injector cannot check the second half of the condition without
+reading the current channel, which `pagerinj` deliberately never does. It warns instead. **[V]**
+
+**3. A bad operating class does more than "degrade" the move arm — it changes which element's count
+the move path reads.** The fallback does not merely lose the class:
+
+```c
+if (!new_op_class && elems->ch_switch_ie) {
+        new_chan_no   = elems->ch_switch_ie->new_ch_num;
+        csa_ie->count = elems->ch_switch_ie->count;     /* <- element 37's count */
+```
+
+So in the third arm (element 37 `count = 0` + eCSA `count = 3`): a **good** class takes the eCSA's
+3 and never reads element 37; a **bad** class zeroes `new_op_class` (`spectmgmt.c:259`) and falls
+through to element 37's **0** — an immediate switch instead of a delayed one. The denial arm is
+unaffected either way. That is the real reason to read the class off the target rather than guess:
+a guess that happens to parse silently changes what the *move* arm measures. **[V]**
+(`spectmgmt.c:256–276`.)
+
+**4. The probe-response stuck heuristic cannot touch a beacon-borne arm.** `csa_present()`'s
+`ignore_ecsa` parameter is passed `false` for the `beacon_ies` call and only
+`bss->proberesp_ecsa_stuck` for the `proberesp_ies` call (`mlme.c:8377`/`:8384`). So CVE-2024-26682's
+suppression is structurally unreachable for a forged **beacon**, whatever its contents — one fewer
+thing to design around for the third arm. **[V]**
+
 > **Header-provenance warning.** `ieee80211.h` copies differ across trees in ways that silently
 > change these offsets. The copy pulled into this project's scratchpad disagrees with the `rx612.c`
 > it sits beside in at least two places: it defines `IEEE80211_MIN_ACTION_SIZE` as a *macro taking a
