@@ -117,13 +117,19 @@ required to finish this step.**
 If protection is being enforced, know what still works before declaring the branch dead:
 probe-response CSA moves nothing in station mode, and an unprotected Public-Action eCSA stalls the
 client's TX queues rather than switching it (persistently — the unblock sits behind a beacon-CRC
-short-circuit) — but **connection denial survives beacon protection**. A forged CSA beacon reaches
-the BSS cache ahead of the protection check, and mac80211 then refuses auth and assoc while a
-cached CSA is present. Deauth is dead by standard (PMF mandatory).
+short-circuit) — but **connection denial survives beacon protection as a mechanism**. A forged CSA
+beacon reaches the BSS cache ahead of the protection check, and mac80211 then refuses auth and
+assoc while a cached CSA is present. Deauth is dead by standard (PMF mandatory).
+
+**You cannot reach that mechanism with stock firmware.** pineapd's CSA carries Channel Switch
+Count = 0 and the kernel discards a count-0 CSA before the refusal check — see step 17a. Denial
+therefore costs the Stage-B injector, so it is a Stage-B deliverable, not something this step can
+hand you.
 
 > **If the deliverable is "the client changes channel", this step may stop the 6 GHz branch. If it
-> is "the camera stops working", it does not** — the denial path survives. Decide which you need,
-> and record which effect you measured. Either way the DFS branch is unaffected.
+> is "the camera stops working", the branch survives — but only via the Stage-B injector with
+> `count != 0`.** Decide which you need, price in the injector if it is the second, and record
+> which effect you measured. Either way the DFS branch is unaffected.
 
 ---
 
@@ -140,14 +146,53 @@ branch loads the 6 GHz format string. A line reading `"{} can not inject on 6GHz
 channel"` *with* an interface-name prefix is a **5 GHz DFS** refusal. Attribute by prefix, never by
 the words.
 
-**12. Get an injector that is not pineapd** — `opkg -d ram install hcxdumptool` (tmpfs, so reboot is
-the rollback). This is what bypasses gate 1; `pcap_inject` has exactly one call site, inside the
-gated function.
+**12. Get an injector that is not pineapd.** This is what bypasses gate 1; `pcap_inject` has exactly
+one call site, inside the gated function. **Use `pagerinj`** — built, ABI-verified and
+frame-validated without hardware, 11 KB, `scp` it to `/tmp`: `dev/injector/`. It never sets the
+channel and holds no regulatory opinion, which is what makes it a clean probe, and it is the only
+one of the three that can build a CSA frame at all — step 17a needs that.
+
+**`hcxdumptool` splits by band, and the 6 GHz half is a trap.** Settled against the 6.3.4 tag: it
+reads only `FREQUENCY_ATTR_FREQ`, `MAX_TX_POWER` and `DISABLED` — **no `NO_IR`, no `RADAR`** **[V]**.
+So:
+
+- **On 5 GHz DFS it is a good cross-check.** ch 52 reports only `Radar detection`, which it never
+  looks at, so it arms and transmits. Run it pinned — `-c 52b` — as an independent second
+  instrument alongside `pagerinj`. Pre-staged per `dev/pager-prearrival.md` §3
+  (`opkg -d ram install /tmp/hcxdumptool_6.3.4-r1_mipsel_24kc.ipk`, no network needed).
+- **On 6 GHz do not use it at all.** It does not read `NO_IR`, so it arms and transmits happily —
+  and gate 2 *does* prohibit `NO_IR`, so mac80211 frees every frame and returns `NETDEV_TX_OK`.
+  Its `send_80211_*` only compares `write()`'s return against the length, `PACKET_IGNORE_OUTGOING`
+  on its RX socket means it never sees its own frames, and its TX counters count attempted writes.
+  **It will report success while nothing leaves the antenna.**
+
+Three things about it that cost bench time, all **[V]**:
+
+- **A regulatory refusal looks like a driver fault.** You will never see `failed to set frequency`
+  on a capture run — that string is in the `-m` path, downstream of the `set_interface()` call that
+  already failed. You get `failed to arm interface` and *"driver is broken / driver is busy"*. Do
+  not grep for the string in the binary; it will not appear.
+- **It randomises your MAC, forces monitor mode, kills powersave, and restores none of it.**
+  `rt_set_interfacemac()` at `:3908`, and a *failure* there only clears a flag rather than aborting.
+- **It transmits unasked** — deauth, probe-request, assoc and reassoc flags all default true
+  (`:52–55`). Use all five `--disable_*` flags or your gate test has company on the air.
 
 **13. Inject on ch 52 and confirm at the external 5 GHz receiver.** Not `wlan0mon` — `radio0` is
 `band '2g'` and cannot hear ch 52; its silence would be silence either way. Run the negative control
 (Pager idle, require zero matches) and the positive control (ch 5180, same invocation) or the result
 means nothing.
+
+```sh
+iw dev wlan1mon set freq 5260 20          # set the channel yourself; pagerinj will not
+pagerinj -i wlan1mon --nonce PAGERINJ-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' ') \
+         --chan 52 --rate 20 --secs 15
+# receiver, separate adapter, already parked on 52:
+#   tshark -i wlanX -Y 'wlan.ssid contains "PAGERINJ"'
+```
+
+The nonce is in the SSID **and** in the source MAC, so the frame is identifiable two independent
+ways. `pagerinj`'s `sent=` counter is **not** evidence — a gate-2 drop returns `NETDEV_TX_OK`, so it
+counts calls, not transmissions. Only the receiver decides.
 
 **14. Attribute the gates** side by side on the same channel: pineapd refusing vs cfg80211 dropping
 vs it actually transmitting.
@@ -174,9 +219,44 @@ with **Channel Switch Count = 0** (`0x4bee8a`), and `ieee80211_mgd_csa_present()
 CSA before the auth/assoc refusal check. So pineapd's CSA can kick a client but can never deny it a
 reconnection. Any non-zero count survives that check.
 
-Build the Stage-B injector (it is needed for the DFS work anyway) and send the **same frame twice,
-differing only in that byte** — `count = 0`, then `count = 3`. Watch whether the client can
-re-associate while each flood runs. Use the jammer (or a power cycle) to force the disconnect, since
+The Stage-B injector is already built: `dev/injector/` (`pagerinj`). Send the **same frame twice,
+differing only in that byte** — `count = 0`, then `count = 3`:
+
+```sh
+pagerinj -i wlan1mon --csa --bssid <AP> --chan 52 --count 0 --rate 20 --secs 30   # control
+pagerinj -i wlan1mon --csa --bssid <AP> --chan 52 --count 3 --rate 20 --secs 30
+```
+
+**Run a third arm — it is better than the pair and costs one more invocation.**
+`ieee80211_mgd_csa_present()` discards **per element**:
+
+```c
+if (csa  && csa->count  == 0)  csa  = NULL;
+if (ecsa && ecsa->count == 0)  ecsa = NULL;
+return csa || ecsa;
+```
+
+So a frame carrying pineapd's element 37 with count 0 **plus** an eCSA (60) with a non-zero count
+returns true — while leaving pineapd's own bytes untouched:
+
+```sh
+pagerinj -i wlan1mon --csa --bssid <AP> --chan 52 --count 0 \
+         --ecsa-count 3 --ecsa-opclass <N> --rate 20 --secs 30
+```
+
+The two-arm version cannot distinguish **"the count value is what disqualifies it"** from
+**"element 37 is the one that gets looked at"**. This arm can, because it changes which element
+carries the live count without changing the count byte pineapd writes. Read `--ecsa-opclass` off the
+target's own Supported Operating Classes element — it is deliberately not defaulted, because a
+wrong operating class gets the element ignored for a reason that looks like the gate under test.
+
+It clones a real beacon from `--bssid` and appends the element, which is what
+`recon_engine::index_beacon_ns` does, so the only difference from pineapd's frame is the byte under
+test. That one-byte property is asserted in the tool's selftest and was confirmed on the wire
+(71-byte frames, differing at offset 70 only) — see `dev/injector/README.md`. Run the `count = 0`
+arm **first**: it is the negative control, and `"AP is in CSA process, reject assoc"` cannot appear
+for it. If it does, the count-0 finding is wrong, which is a bigger result than the experiment.
+Watch whether the client can re-associate while each flood runs. Use the jammer (or a power cycle) to force the disconnect, since
 deauth cannot: this is the one target class where PMF makes the usual kick unavailable. Run the
 jam-only control first and confirm the client *does* come back without the flood, or the result
 means nothing.
@@ -188,17 +268,38 @@ working: `dev/pager-csa-primitives.md`, section "THE ONE BYTE".
 
 **17b. If beacon protection is being enforced, test the two remaining outside paths.**
 
-*Connection denial* first, because it is free and uses the frame pineapd already builds: flood the
-forged CSA beacon, then make the client disconnect and try to reconnect. A client that cannot
-re-associate while the flood runs is the result — watch for `"AP is in CSA process, reject assoc"`
-in the client's log if it is Linux.
+*Connection denial* first, because it is the better outcome — but it is **not** free and it does
+**not** use the frame pineapd builds. That frame carries count = 0 and is discarded before the
+refusal check (step 17a), so flooding it tests nothing: the null result would read as "denial does
+not work" when what you actually sent was disqualified by its own contents. Run it as the
+`count = 3` arm of step 17a instead — same injector, same flood, one byte different — then make the
+client disconnect and try to reconnect. A client that cannot re-associate while the flood runs is
+the result; watch for `"AP is in CSA process, reject assoc"` in its log if it is Linux. That log
+line **cannot** appear for the count = 0 arm, which is what makes the pair a clean control.
 
-*Unprotected Public-Action eCSA* second (category 4, action 4, outside PMF's robust set). The
-builder is on the device — `dlopen("libwifi.so.0")` gets `libwifi_create_action` and
-`libwifi_add_action_detail`; do not try to link against the shipped `.so`. Set the CSA mode byte, or
-nothing at all happens. Expect a **persistent** uplink stall on a current Linux client rather than a
-channel move, and nothing whatsoever if its driver sets `HANDLES_QUIET_CSA`; an older or non-Linux
-stack may switch properly. Watch the client's traffic, not just its association state.
+*Unprotected Public-Action eCSA* second (category 4, action 4, outside PMF's robust set). Expect a
+**persistent** uplink stall on a current Linux client rather than a channel move, and nothing
+whatsoever if its driver sets `HANDLES_QUIET_CSA`; an older or non-Linux stack may switch properly.
+Watch the client's traffic, not just its association state. `pagerinj` does not build this one yet.
+
+**17c. The unicast Spectrum-Management CSA — do this on 2.4 / non-DFS 5 GHz, not 6 GHz.** Category
+**0**, action **4**, which is a different frame from 17b's category 4 and reaches a different path.
+`mac80211_mlme.c:7506` tags it `PROT_ACTION` from the **category alone**, with no check that it
+actually arrived protected, and the protection filter only runs under MFP — so on a **non-PMF BSS**
+an unprotected one is acted on, and because it is unicast there is no flood and no race against the
+real AP's beacons. Better targeting than a beacon, and it lands on the surface CamHound actually
+attacks.
+
+```sh
+pagerinj -i wlan1mon --action --bssid <AP> --client <STA> --chan <N> --count 3
+```
+
+Three constraints, all from the receive path, each the difference between working and a silent drop:
+
+- **A3 must equal the BSSID** — `rx612.c:3738` compares it against `sdata->deflink.u.mgd.bssid`.
+  `pagerinj` sets A3 from `--bssid` for you; a wrong one is dropped with no log at all.
+- **A1 is the client**, which is the whole point.
+- **The client must be associated.** No keys are needed on a non-PMF BSS, which is why this works.
 
 ---
 

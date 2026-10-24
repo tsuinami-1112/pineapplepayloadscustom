@@ -154,8 +154,11 @@ earlier revision of these notes collapsed them and got the conclusion wrong twic
 | Public-Action eCSA (cat 4, action 4) | Outside PMF's robust set, so it reaches a protected client — but it does not switch anything. With the CSA mode byte set it blocks the client's TX queues, and **the stall persists** (the unblock sits behind a beacon-CRC short-circuit that a stable AP never trips). On a driver advertising `HANDLES_QUIET_CSA`, it does nothing at all. |
 
 > If the deliverable is "the client changes channel", beacon protection may well end it. If the
-> deliverable is "the camera stops working", it does not — the denial path survives. Ask the
-> operator which one they need before declaring the branch dead, and say which effect you measured.
+> deliverable is "the camera stops working", the **mechanism** survives it — but that is not the
+> same as having the capability. §5a below shows pineapd's own CSA is disqualified by its count-0
+> byte, so reaching the denial path costs the Stage-B injector. Ask the operator which effect they
+> need before declaring the branch dead, say which one you measured, and do not quote denial as
+> something the stock firmware can do.
 
 ### §5a The one byte that settles it: pineapd's CSA carries Count = 0
 

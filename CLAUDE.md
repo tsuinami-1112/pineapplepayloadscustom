@@ -123,6 +123,7 @@ fire + settle or it expires mid-measurement.
 | What has already been closed without hardware, and how | `dev/pager-prearrival.md` |
 | Bench running order once hardware arrives | `dev/pager-day-one.md` |
 | Self-contained brief for the session that will walk the operator through the bench | `dev/pager-bench-handoff.md` |
+| The Stage-B injector: what it is for, how to build it, what it proves and does not | `dev/injector/README.md` (reasoning is in `pagerinj.c`'s header) |
 
 Each of those cross-references the others; `pager-csa-primitives.md` is the reference the rest defer
 to on mechanism.
@@ -241,6 +242,27 @@ closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowi
 packet counters move the way `resp_verdict` assumes; whether CSA moves a real client at all; and the
 count-byte experiment (day-one step 17a). `inj_parse_channels` is format-validated but has not run
 against a live device.
+
+The **instrument** for the injection side is no longer open: `dev/injector/` holds `pagerinj`,
+cross-built for `mipsel_24kc`/musl/soft-float, ABI-verified, and frame-validated with no radio (29
+selftest checks; capture → clone → append → transmit exercised over a `veth` pair, with the
+step-17a count pair confirmed to differ in exactly one byte on the wire). It replaces `hcxdumptool`
+as the primary injector because **neither hcxdumptool nor aireplay-ng can build a CSA frame**, which
+step 17a needs. It now also carries 17a's third arm (`--ecsa-count`: element 37 count 0 plus a live
+eCSA, since `csa_present()` discards per element) and the unicast cat-0 Spectrum-Management CSA of
+day-one step 17c.
+
+**hcxdumptool splits by band, and the 6 GHz half is a trap** — settled against the 6.3.4 tag: it
+reads only `FREQUENCY_ATTR_FREQ`, `MAX_TX_POWER` and `DISABLED`, never `NO_IR` or `RADAR` **[V]**,
+and refuses by *not arming* (`usrfrequency_to_scanlist()`, `hcxdumptool.c:3846`) rather than by
+declining frames. On 5 GHz DFS it therefore arms and transmits and is a good independent
+cross-check; on 6 GHz it arms, transmits, and gate 2 drops everything silently while its own
+counters report success — a confident false positive. Also: a regulatory refusal presents as
+`failed to arm interface` / "driver is broken", not as the `failed to set frequency` string in the
+binary; and it randomises the MAC and forces monitor mode without restoring either. What remains open is
+everything a radio decides: whether a frame reaches the air, whether a client reacts, and whether a
+non-zero count actually produces the auth/assoc refusal — that last is `[A]` from
+`ieee80211_mgd_csa_present()`, never measured.
 
 ## Re-obtaining the firmware
 

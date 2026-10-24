@@ -529,7 +529,7 @@ ssh root@172.16.52.1 'df -h /overlay /tmp
   /tmp/usr/bin/hcxdumptool --version 2>/dev/null || hcxdumptool --version'
 ```
 
-`hcxdumptool` is 40 KB download / 143 KB installed (`hcxdumptool_6.3.4-r1_mipsel_24kc.ipk`, 40034 bytes, sha256 `72508f11…265e`). Its **declared** dependencies (`libc`, `libpcap1`, `libopenssl3`) are already on the box **[V]** — but the declared set is not the linked set. `readelf -d` on the shipped binary gives `NEEDED libpcap.so.1, libgcc_s.so.1, libc.so`: **`libgcc_s.so.1` is in neither the package's `Depends:` nor this list**, so `opkg` will not pull it, and it links no libcrypto at all. Check `ls -l /lib/libgcc_s.so.1` before you need the injector. The binary is `ELF32 MIPS32r2`, interpreter `/lib/ld-musl-mipsel-sf.so.1`, and is itself MIPS16 with no section headers. **[V]** See `dev/pager-prearrival.md`.
+`hcxdumptool` is 40 KB download / 143 KB installed (`hcxdumptool_6.3.4-r1_mipsel_24kc.ipk`, 40034 bytes, sha256 `72508f11…265e`). Its **declared** dependencies (`libc`, `libpcap1`, `libopenssl3`) are already on the box **[V]** — but the declared set is not the linked set. `readelf -d` on the shipped binary gives `NEEDED libpcap.so.1, libgcc_s.so.1, libc.so`: **`libgcc_s.so.1` is in neither the package's `Depends:` nor this list**, so `opkg` will not pull it, and it links no libcrypto at all. Check `ls -l /lib/libgcc_s.so.1` before you need the injector. The binary is `ELF32 MIPS32r2`, interpreter `/lib/ld-musl-mipsel-sf.so.1`, has no section headers, and carries the MIPS16 ASE flag. **[V]** Whether its *body* is MIPS16-encoded is **not** established — that was an earlier overclaim here, corrected in `dev/pager-prearrival.md` §3, which also has the `libgcc_s` check.
 
 **Use `-d ram` (tmpfs), not `-d root`** — flash is small, and a reboot then becomes the rollback.
 
@@ -538,6 +538,47 @@ ssh root@172.16.52.1 'df -h /overlay /tmp
 **Limitation [V]:** `hcxdumptool`, `aireplay-ng` and `mdk4` do **not** generate CSA frames, and `mdk4` is not in the 24.10.1 feeds at all. For CSA without pineapd, note first that **the frame builders are already on the device**: `/usr/lib/libwifi.so.0.0.10` exports `libwifi_create_beacon`, `libwifi_create_probe_resp`, `libwifi_create_action`, `libwifi_add_action_detail`, `libwifi_set_probe_resp_channel` and `libwifi_create_tag` among 113 exports, so a helper can `dlopen("libwifi.so.0")` + `dlsym` instead of carrying its own 802.11 builder. **[V]** **Three jobs, one tool:** it bypasses gate 1 (DFS/6 GHz), it chooses its own send rate (needed to win the ~100 ms BSS-cache race against the real AP), and it can set a **non-zero Channel Switch Count**, which pineapd hardcodes to 0 and which is what blocks the connection-denial effect entirely — see day-one step 17a. That makes the helper smaller than estimated below and removes the libwifi vendoring step; it still has to be cross-compiled. **Do not plan on linking `-lwifi` against the shipped file — it is refused** (`file in wrong format`; no section headers). Use `dlopen`/`dlsym`, or generate a stub `.so` from the export list with `-soname libwifi.so.0` and link against that. No headers or static library ship, so prototypes **and struct layouts** must be written by hand against upstream libwifi `0.0.10`; and because the library is MIPS16, never mask bit 0 of a `dlsym` result. **[V]** Otherwise you need either `scapy` (~28 MB with python3 — almost certainly will not fit the overlay; use `-d mmc`) or a ~20 KB cross-compiled AF_PACKET helper built with `openwrt-sdk-24.10.1-ramips-mt76x8_gcc-13.3.0_musl.Linux-x86_64.tar.zst` (correct target: `mipsel_24kc`, musl, **soft-float** — the loader name `/lib/ld-musl-mipsel-sf.so.1` must match). New code needs only plain MIPS32; the vendor binaries' MIPS16e encoding is irrelevant. **[V]**
 
 **Do NOT use `aireplay-ng` as the primary instrument** — its osdep layer has its own channel handling and would add a gate to an experiment whose whole purpose is isolating gates. Keep it as a cross-check only.
+
+**`hcxdumptool` has a related but weaker problem.** Read from the shipped binary's own help text **[V]**:
+
+```
+-c <digit>  : set channel (1a,2a,36b,...)
+              to disable frequency management, set this option to a single frequency/channel
+-f <digit>  : set frequency (2412,2417,5180,...)
+-F          : use all available frequencies from INTERFACE
+```
+
+Two readings, both **[V]**, and they point different ways:
+
+- **It always sets the frequency itself.** There is no option to inherit the interface's current channel — the option list is `-c`/`-f`/`-F` and `failed to set frequency` is an error path. So you cannot hand it a pre-tuned `wlan1mon` and know it left it alone.
+- **But a single `-c`/`-f` disables its frequency *management*** (its own help says so), so pinning it with `-c 52b` is close to what the experiment wants. An earlier revision of this paragraph said the aireplay-ng objection "applies to hcxdumptool" unqualified — that was an overstatement: aireplay-ng's osdep layer is a different and worse problem than one documented channel set.
+
+**The real contamination risk is regulatory, not channel — and it is now settled, with a split answer.** Verified against the 6.3.4 tag (`8dad077`): the only three `NL80211_FREQUENCY_ATTR_*` references in the whole tree are `FREQ`, `MAX_TX_POWER` and `DISABLED`. **Zero hits for `NO_IR`, `RADAR`, `PASSIVE_SCAN` or `NO_IBSS` in any `.c` or `.h`.** **[V]**
+
+It refuses by **not arming**, not by declining frames. `usrfrequency_to_scanlist()` (`hcxdumptool.c:3846`) takes a channel only if it is present in the interface list *and* `status == 0`; on failure it simply returns — no message, no `errorcount++`. The channel is then silently absent from the scanlist, `nl_set_frequency()` sends `WIPHY_FREQ = 0`, and the run aborts before `open_socket_tx()` ever exists. **[V]** on the code path. *(That cfg80211 rejects `WIPHY_FREQ = 0` is an **inference** neither session has checked against the kernel. It does not change the outcome — either the kernel rejects it and you get the abort, or it accepts it and hcxdumptool runs with the channel never set — but do not relay it as a reading.)*
+
+Compose that with the per-channel attributes in `dev/pager-prearrival.md` §5 and the answer differs by band:
+
+| Attribute measured there | hcxdumptool reads it? | Consequence |
+|---|---|---|
+| 5 GHz ch 52/100 → `Radar detection` | **no** | `status == 0`, passes the filter, **arms and transmits**. Usable as a neutral injector, and a genuine independent cross-check for `pagerinj`. |
+| 6 GHz ch 1/37/233 → `No IR` | **no** | passes the filter, arms, transmits — **and gate 2 prohibits `NO_IR`**, so mac80211 frees the skb and returns `NETDEV_TX_OK`. |
+
+**For the DFS arm it works.** We can now *predict* that `hcxdumptool -c 52b` arms, because ch 52 reports only `Radar detection` and hcxdumptool never looks at that flag. Still run it — it is the confirming test — but it is a cross-check now, not an unknown.
+
+**For the 6 GHz arm it is a trap, and worse than an unknown.** It will arm, transmit, and gate 2 will drop every frame silently. Meanwhile every `send_80211_*` only compares `write()`'s return against the length, `PACKET_IGNORE_OUTGOING` is set on its RX socket so it never sees its own frames, and its printed TX counters count *attempted writes*. **So it reports success while nothing leaves the antenna** — a confident false positive, in precisely the direction this experiment cannot tolerate. Use `pagerinj` there, and treat the external receiver as non-negotiable.
+
+**One `[A]` hinge in that composition:** §5's table was built from a fixture derived from the shipped `iw`'s format strings, not from a live device. Strongly indicated, not measured. Day-one step 8's live `iw phy <phy> channels` confirms it, and `hcxdumptool -I <iface>` prints the same list in its own format if you want a second rendering.
+
+### Three operational findings about hcxdumptool, all [V], that bite at the bench
+
+1. **It rewrites your interface and restores nothing.** `set_interface` → `rt_set_interfacemac()` (`:3908`) randomises the MAC; note `if (rt_set_interfacemac() == false) vmflag = false;`, so a *failure* to set it does not abort, it just clears a flag. It also brings the interface down, forces monitor mode, brings it up and kills powersave — and restores none of it afterwards.
+2. **It transmits a great deal unasked.** `deauthenticationflag`, `proberequestflag`, `associationflag` and `reassociationflag` all default **true** (`:52–55`), and `beaconoffflag` defaults false. For a single-frame regulatory test you need all five `--disable_*` flags, and even `--rcascan=a` still emits undirected probe requests. Anything you did not intend to send is noise in a gate experiment.
+3. **The diagnostic is actively misleading, and this is the one to remember.** On a capture run you will **never** see `failed to set frequency` — that string lives in the `-m` path, downstream of the `set_interface()` call that already failed. What you actually get is `failed to arm interface`, followed by *"Possible reasons: driver is broken / driver is busy"*. **A regulatory refusal therefore presents as a driver fault**, and anyone grepping for the string visible in the shipped binary will miss it entirely.
+
+Also worth knowing if anything else is touching that radio: *"a single `-c` disables frequency management"* is true in effect and **false mechanically**. There is no single-entry special case — `scanlistindex++` still runs every dwell period, and `nl_set_frequency()` resets the index to 0 and re-issues `SET_WIPHY` for the same frequency. No hopping, but **a fresh `SET_WIPHY` every `-t` interval for the whole run**.
+
+So the primary instrument is **`pagerinj`** (`dev/injector/`): ~250 lines, 11 KB, cross-built and ABI-verified against this exact target, frame-validated with no hardware. It never sets the channel and holds no regulatory opinion, which is what makes it a clean probe. It also covers the non-zero CSA count that neither `hcxdumptool` nor `aireplay-ng` can produce — that reason alone is sufficient and does not depend on any of the above. It deliberately does **not** `dlopen` libwifi: the CSA element is five bytes, and writing five bytes is safer than hand-guessing the struct layouts this paragraph warns about. Keep the pre-staged `hcxdumptool` ipk as a cross-check, pinned with `-c`, and compare the two.
 
 **Rollback:** `opkg -d ram remove hcxdumptool` (or reboot — tmpfs).
 
@@ -558,7 +599,8 @@ ssh root@172.16.52.1 '/etc/init.d/pineapd stop; sleep 2; ip link set wlan1mon up
     iw dev wlan1mon set freq $F 20; echo "freq $F rc=$?"
     iw dev wlan1mon info | grep -E "channel|txpower"
     cat /sys/kernel/debug/ieee80211/$(cat /tmp/phy1name)/mt76/xmit-queues
-    # ... transmit the nonce-bearing frame here via hcxdumptool / the helper ...
+    # the nonce-bearing frame -- pagerinj does NOT touch the channel set above, which is the point
+    /tmp/pagerinj -i wlan1mon --nonce "PAGERINJ-$F" --chan $((F==5180?36:52)) --rate 20 --secs 10
     cat /sys/kernel/debug/ieee80211/$(cat /tmp/phy1name)/mt76/xmit-queues
   done'
 ```

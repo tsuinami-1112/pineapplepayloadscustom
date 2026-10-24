@@ -91,8 +91,22 @@ ls -l /lib/libgcc_s.so.1 /usr/lib/libgcc_s.so.1 2>/dev/null
 
 Conversely `libopenssl3` is declared but the binary links no libcrypto or libssl — harmless.
 
-Note also that `hcxdumptool` is itself MIPS16 with no section headers, so if you ever disassemble
-it, the tooling trap in `dev/pager-csa-primitives.md` applies to it too. **[V]**
+Note also that the file has **no section headers** and its ELF header carries the MIPS16 ASE flag
+(`Flags: 0x74001005`, and `0x74001005 & EF_MIPS_ARCH_ASE_M16` is set). Both **[V]**.
+
+**An earlier revision of this section said the binary "is itself MIPS16" and tagged that `[V]`.
+That was a conclusion drawn from the flag, not a reading, and it does not follow.** The flag says
+the ASE is present somewhere in the link; it does not say the main body is MIPS16-encoded. The test
+CLAUDE.md names — odd function-symbol values — cannot be applied here: the only addressed symbols
+are `_init`, `_fini` and two unnamed entries, all **even**, and those are MIPS32 even inside a
+MIPS16 binary (`dev/pager-csa-primitives.md`: "Only crt/INIT/PLT-adjacent code is MIPS32"). The
+entry point `0x403590` is even for the same reason. With no section headers there is no `.symtab`
+to read, so the body's encoding is **not established** — **[A]**, leaning MIPS16 only because
+OpenWrt builds this target with the ASE enabled.
+
+Practical effect: if you ever disassemble it, assume the MIPS16 tooling trap in
+`dev/pager-csa-primitives.md` *may* apply and check rather than trust the output. Nothing else here
+depends on it.
 
 ## 4. `iw` output format — confirmed against the shipped binary
 
@@ -170,6 +184,15 @@ is indistinguishable from a resisting target. Fixed by widening one regex to
 kernel because those lines never print there. ERE alternation confirmed under `mawk` 1.3.4, a
 minimal implementation, as evidence for busybox awk on-device. Three selftest cases added
 (`157 checks, 0 failed`).
+
+**This table became load-bearing for something else.** Composed with the finding that `hcxdumptool`
+reads only `FREQUENCY_ATTR_FREQ`/`MAX_TX_POWER`/`DISABLED` — never `NO_IR` or `RADAR` — it decides
+whether hcxdumptool is usable per band: on 5 GHz DFS it arms and transmits (the `Radar detection`
+attribute is invisible to it), on 6 GHz it arms and transmits while gate 2 silently drops every
+frame. See §B3 of the determination plan. **Note the hinge:** the rows above come from a fixture
+built from the shipped `iw`'s *format strings*, not from a live radio, so that composition is
+strongly indicated rather than measured. Day-one step 8's live `iw phy <phy> channels` is what
+confirms it, and `hcxdumptool -I <iface>` gives a second rendering of the same list if you want one.
 
 **Still open, and only answerable on hardware:** which regulatory domain is actually live
 (`iw reg get`). Under US, 149–165 should come back injectable as above; under world/`00` they
