@@ -91,8 +91,22 @@ ls -l /lib/libgcc_s.so.1 /usr/lib/libgcc_s.so.1 2>/dev/null
 
 Conversely `libopenssl3` is declared but the binary links no libcrypto or libssl — harmless.
 
-Note also that `hcxdumptool` is itself MIPS16 with no section headers, so if you ever disassemble
-it, the tooling trap in `dev/pager-csa-primitives.md` applies to it too. **[V]**
+Note also that the file has **no section headers** and its ELF header carries the MIPS16 ASE flag
+(`Flags: 0x74001005`, and `0x74001005 & EF_MIPS_ARCH_ASE_M16` is set). Both **[V]**.
+
+**An earlier revision of this section said the binary "is itself MIPS16" and tagged that `[V]`.
+That was a conclusion drawn from the flag, not a reading, and it does not follow.** The flag says
+the ASE is present somewhere in the link; it does not say the main body is MIPS16-encoded. The test
+CLAUDE.md names — odd function-symbol values — cannot be applied here: the only addressed symbols
+are `_init`, `_fini` and two unnamed entries, all **even**, and those are MIPS32 even inside a
+MIPS16 binary (`dev/pager-csa-primitives.md`: "Only crt/INIT/PLT-adjacent code is MIPS32"). The
+entry point `0x403590` is even for the same reason. With no section headers there is no `.symtab`
+to read, so the body's encoding is **not established** — **[A]**, leaning MIPS16 only because
+OpenWrt builds this target with the ASE enabled.
+
+Practical effect: if you ever disassemble it, assume the MIPS16 tooling trap in
+`dev/pager-csa-primitives.md` *may* apply and check rather than trust the output. Nothing else here
+depends on it.
 
 ## 4. `iw` output format — confirmed against the shipped binary
 

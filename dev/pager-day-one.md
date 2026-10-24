@@ -117,13 +117,19 @@ required to finish this step.**
 If protection is being enforced, know what still works before declaring the branch dead:
 probe-response CSA moves nothing in station mode, and an unprotected Public-Action eCSA stalls the
 client's TX queues rather than switching it (persistently — the unblock sits behind a beacon-CRC
-short-circuit) — but **connection denial survives beacon protection**. A forged CSA beacon reaches
-the BSS cache ahead of the protection check, and mac80211 then refuses auth and assoc while a
-cached CSA is present. Deauth is dead by standard (PMF mandatory).
+short-circuit) — but **connection denial survives beacon protection as a mechanism**. A forged CSA
+beacon reaches the BSS cache ahead of the protection check, and mac80211 then refuses auth and
+assoc while a cached CSA is present. Deauth is dead by standard (PMF mandatory).
+
+**You cannot reach that mechanism with stock firmware.** pineapd's CSA carries Channel Switch
+Count = 0 and the kernel discards a count-0 CSA before the refusal check — see step 17a. Denial
+therefore costs the Stage-B injector, so it is a Stage-B deliverable, not something this step can
+hand you.
 
 > **If the deliverable is "the client changes channel", this step may stop the 6 GHz branch. If it
-> is "the camera stops working", it does not** — the denial path survives. Decide which you need,
-> and record which effect you measured. Either way the DFS branch is unaffected.
+> is "the camera stops working", the branch survives — but only via the Stage-B injector with
+> `count != 0`.** Decide which you need, price in the injector if it is the second, and record
+> which effect you measured. Either way the DFS branch is unaffected.
 
 ---
 
@@ -188,10 +194,14 @@ working: `dev/pager-csa-primitives.md`, section "THE ONE BYTE".
 
 **17b. If beacon protection is being enforced, test the two remaining outside paths.**
 
-*Connection denial* first, because it is free and uses the frame pineapd already builds: flood the
-forged CSA beacon, then make the client disconnect and try to reconnect. A client that cannot
-re-associate while the flood runs is the result — watch for `"AP is in CSA process, reject assoc"`
-in the client's log if it is Linux.
+*Connection denial* first, because it is the better outcome — but it is **not** free and it does
+**not** use the frame pineapd builds. That frame carries count = 0 and is discarded before the
+refusal check (step 17a), so flooding it tests nothing: the null result would read as "denial does
+not work" when what you actually sent was disqualified by its own contents. Run it as the
+`count = 3` arm of step 17a instead — same injector, same flood, one byte different — then make the
+client disconnect and try to reconnect. A client that cannot re-associate while the flood runs is
+the result; watch for `"AP is in CSA process, reject assoc"` in its log if it is Linux. That log
+line **cannot** appear for the count = 0 arm, which is what makes the pair a clean control.
 
 *Unprotected Public-Action eCSA* second (category 4, action 4, outside PMF's robust set). The
 builder is on the device — `dlopen("libwifi.so.0")` gets `libwifi_create_action` and
