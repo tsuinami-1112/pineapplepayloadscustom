@@ -643,8 +643,13 @@ int main(int argc, char **argv)
     if (rate < 1) rate = 1;
     if (mode < 0 || mode > 255) { usage(); return 2; }
     if (ecsa_count >= 0) {
-        /* An eCSA with a guessed operating class can be ignored for a reason that looks like the
-         * gate under test, so it is not defaulted. */
+        /* Not defaulted, but the reason is narrower than it first looked.  csa_present()
+         * (mac80211_mlme.c:8328) reads only datalen, count, mode and new_ch_num -- it never reads
+         * the operating class -- so the DENIAL arm fires whatever this byte says.  And on the move
+         * path a bad class does not abort either: spectmgmt.c zeroes new_op_class and falls back to
+         * element 37.  So a wrong value degrades the move arm rather than silently killing either.
+         * Still required explicitly: read it off the target rather than guess, because a guess that
+         * happens to parse is worse than one that does not. */
         if (!do_csa || ecsa_count > 255 || ecsa_opclass < 0 || ecsa_opclass > 255) {
             fprintf(stderr, "--ecsa-count needs --csa and an explicit --ecsa-opclass\n");
             usage(); return 2;
