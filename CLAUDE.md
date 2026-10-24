@@ -123,6 +123,7 @@ fire + settle or it expires mid-measurement.
 | What has already been closed without hardware, and how | `dev/pager-prearrival.md` |
 | Bench running order once hardware arrives | `dev/pager-day-one.md` |
 | Self-contained brief for the session that will walk the operator through the bench | `dev/pager-bench-handoff.md` |
+| The Stage-B injector: what it is for, how to build it, what it proves and does not | `dev/injector/README.md` (reasoning is in `pagerinj.c`'s header) |
 
 Each of those cross-references the others; `pager-csa-primitives.md` is the reference the rest defer
 to on mechanism.
@@ -241,6 +242,16 @@ closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowi
 packet counters move the way `resp_verdict` assumes; whether CSA moves a real client at all; and the
 count-byte experiment (day-one step 17a). `inj_parse_channels` is format-validated but has not run
 against a live device.
+
+The **instrument** for the injection side is no longer open: `dev/injector/` holds `pagerinj`,
+cross-built for `mipsel_24kc`/musl/soft-float, ABI-verified, and frame-validated with no radio (29
+selftest checks; capture → clone → append → transmit exercised over a `veth` pair, with the
+step-17a count pair confirmed to differ in exactly one byte on the wire). It replaces `hcxdumptool`
+as the primary injector because hcxdumptool manages its own channel, which is the same objection
+§B3 raises against aireplay-ng, and because neither can build a CSA frame. What remains open is
+everything a radio decides: whether a frame reaches the air, whether a client reacts, and whether a
+non-zero count actually produces the auth/assoc refusal — that last is `[A]` from
+`ieee80211_mgd_csa_present()`, never measured.
 
 ## Re-obtaining the firmware
 

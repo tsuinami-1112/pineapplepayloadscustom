@@ -539,6 +539,8 @@ ssh root@172.16.52.1 'df -h /overlay /tmp
 
 **Do NOT use `aireplay-ng` as the primary instrument** — its osdep layer has its own channel handling and would add a gate to an experiment whose whole purpose is isolating gates. Keep it as a cross-check only.
 
+**That objection also applies to `hcxdumptool`**, which manages its own channel too — so the primary instrument is now **`pagerinj`** (`dev/injector/`): ~250 lines, 11 KB, cross-built and ABI-verified against this exact target, frame-validated with no hardware, and it never touches the channel. It covers all three jobs above, including the non-zero CSA count that neither `hcxdumptool` nor `aireplay-ng` can produce. It deliberately does **not** `dlopen` libwifi: the CSA element is five bytes, and writing five bytes is safer than hand-guessing the struct layouts this paragraph warns about. Keep the pre-staged `hcxdumptool` ipk as the cross-check. The `hcxdumptool` channel claim is **[A]** — from reading its interface, not running it; falsified by a documented mode that transmits on the interface's existing channel without setting it.
+
 **Rollback:** `opkg -d ram remove hcxdumptool` (or reboot — tmpfs).
 
 ## B4 [INV, risk: low] ★ Prove transmission on 5 GHz DFS — the real deliverable
@@ -558,7 +560,8 @@ ssh root@172.16.52.1 '/etc/init.d/pineapd stop; sleep 2; ip link set wlan1mon up
     iw dev wlan1mon set freq $F 20; echo "freq $F rc=$?"
     iw dev wlan1mon info | grep -E "channel|txpower"
     cat /sys/kernel/debug/ieee80211/$(cat /tmp/phy1name)/mt76/xmit-queues
-    # ... transmit the nonce-bearing frame here via hcxdumptool / the helper ...
+    # the nonce-bearing frame -- pagerinj does NOT touch the channel set above, which is the point
+    /tmp/pagerinj -i wlan1mon --nonce "PAGERINJ-$F" --chan $((F==5180?36:52)) --rate 20 --secs 10
     cat /sys/kernel/debug/ieee80211/$(cat /tmp/phy1name)/mt76/xmit-queues
   done'
 ```

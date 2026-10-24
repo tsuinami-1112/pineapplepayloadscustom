@@ -146,14 +146,31 @@ branch loads the 6 GHz format string. A line reading `"{} can not inject on 6GHz
 channel"` *with* an interface-name prefix is a **5 GHz DFS** refusal. Attribute by prefix, never by
 the words.
 
-**12. Get an injector that is not pineapd** — `opkg -d ram install hcxdumptool` (tmpfs, so reboot is
-the rollback). This is what bypasses gate 1; `pcap_inject` has exactly one call site, inside the
-gated function.
+**12. Get an injector that is not pineapd.** This is what bypasses gate 1; `pcap_inject` has exactly
+one call site, inside the gated function. **Use `pagerinj`** — built, ABI-verified and
+frame-validated without hardware, 11 KB, `scp` it to `/tmp`: `dev/injector/`. It never touches the
+channel, which is the point: `hcxdumptool` manages its own channel, so B3's objection to
+aireplay-ng ("would add a gate to an experiment whose whole purpose is isolating gates") applies to
+it as well. The pre-staged `hcxdumptool` ipk (`dev/pager-prearrival.md` §3,
+`opkg -d ram install /tmp/hcxdumptool_6.3.4-r1_mipsel_24kc.ipk`, no network needed) stays as a
+cross-check — and it cannot build a CSA frame at all, which step 17a needs.
 
 **13. Inject on ch 52 and confirm at the external 5 GHz receiver.** Not `wlan0mon` — `radio0` is
 `band '2g'` and cannot hear ch 52; its silence would be silence either way. Run the negative control
 (Pager idle, require zero matches) and the positive control (ch 5180, same invocation) or the result
 means nothing.
+
+```sh
+iw dev wlan1mon set freq 5260 20          # set the channel yourself; pagerinj will not
+pagerinj -i wlan1mon --nonce PAGERINJ-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' ') \
+         --chan 52 --rate 20 --secs 15
+# receiver, separate adapter, already parked on 52:
+#   tshark -i wlanX -Y 'wlan.ssid contains "PAGERINJ"'
+```
+
+The nonce is in the SSID **and** in the source MAC, so the frame is identifiable two independent
+ways. `pagerinj`'s `sent=` counter is **not** evidence — a gate-2 drop returns `NETDEV_TX_OK`, so it
+counts calls, not transmissions. Only the receiver decides.
 
 **14. Attribute the gates** side by side on the same channel: pineapd refusing vs cfg80211 dropping
 vs it actually transmitting.
@@ -180,9 +197,21 @@ with **Channel Switch Count = 0** (`0x4bee8a`), and `ieee80211_mgd_csa_present()
 CSA before the auth/assoc refusal check. So pineapd's CSA can kick a client but can never deny it a
 reconnection. Any non-zero count survives that check.
 
-Build the Stage-B injector (it is needed for the DFS work anyway) and send the **same frame twice,
-differing only in that byte** — `count = 0`, then `count = 3`. Watch whether the client can
-re-associate while each flood runs. Use the jammer (or a power cycle) to force the disconnect, since
+The Stage-B injector is already built: `dev/injector/` (`pagerinj`). Send the **same frame twice,
+differing only in that byte** — `count = 0`, then `count = 3`:
+
+```sh
+pagerinj -i wlan1mon --csa --bssid <AP> --chan 52 --count 0 --rate 20 --secs 30   # control
+pagerinj -i wlan1mon --csa --bssid <AP> --chan 52 --count 3 --rate 20 --secs 30
+```
+
+It clones a real beacon from `--bssid` and appends the element, which is what
+`recon_engine::index_beacon_ns` does, so the only difference from pineapd's frame is the byte under
+test. That one-byte property is asserted in the tool's selftest and was confirmed on the wire
+(71-byte frames, differing at offset 70 only) — see `dev/injector/README.md`. Run the `count = 0`
+arm **first**: it is the negative control, and `"AP is in CSA process, reject assoc"` cannot appear
+for it. If it does, the count-0 finding is wrong, which is a bigger result than the experiment.
+Watch whether the client can re-associate while each flood runs. Use the jammer (or a power cycle) to force the disconnect, since
 deauth cannot: this is the one target class where PMF makes the usual kick unavailable. Run the
 jam-only control first and confirm the client *does* come back without the flood, or the result
 means nothing.
