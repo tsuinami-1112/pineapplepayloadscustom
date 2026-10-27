@@ -57,7 +57,7 @@ confirms a device is streaming; it is a second key precisely because that rung t
 2. If the files came through Windows: `sed -i 's/\r$//' payload.sh cam_signatures.txt; chmod +x payload.sh`.
 3. Start **Recon in continuous mode** in the Pager GUI. CamHound only reads what Recon hears.
 4. Launch CamHound from the payload menu. Needs `_pineap`, `jq` (falls back to a built-in parser),
-   `tcpdump` + `hexdump` for Watch (without them Watch is greyed), `/lib/hak5/oui.txt`.
+   `tcpdump` plus `hexdump` or `od` for Watch (without them Watch is greyed), `/lib/hak5/oui.txt`.
 
 ## Quick start, the two-button flow
 
@@ -152,7 +152,10 @@ street survey keep a steady pace and set `GPS=1`; `inventory.tsv` keeps the stro
 
 Edit the config block at the top of `payload.sh`. Starred keys can also be set without editing and
 survive updates: `PAYLOAD_SET_CONFIG camhound CYCLE_SECS 10` (`PAYLOAD_DEL_CONFIG camhound CYCLE_SECS`
-removes it). Overrides are counted on the start screen and listed in `events.log`.
+removes it). Overrides are counted on the start screen and listed in `events.log`. The **Settings**
+menu item does the same from the device for the recon keys (CYCLE_SECS, THR_STREAM_UP, COOLDOWN_SECS,
+DEDUPE_H, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH, AUTO_LOCATE): numbers via NUMBER_PICKER, switches
+as On/Off, and `Reset defaults` deletes every saved override. Changes apply at once and persist.
 
 | Key | Default | Persist | Meaning |
 |---|---|---|---|
@@ -185,10 +188,11 @@ removes it). Overrides are counted on the start screen and listed in `events.log
 | ROW_W | 22 | | list row budget (36-40 expected after Phase 0 item 19) |
 | RESPONSE | 0 | * | master switch for the Disrupt rung; 0 = recon only, nothing transmits |
 | RESPONSE_CONFIRM | 1 | * | blocking confirmation before any transmit |
+| AUTO_RESPOND | 0 | * | let the funnel raise Disrupt by itself (needs RESPONSE=1) |
 | POSTURE_TTL | 300 | * | seconds a posture badge stays cached per BSSID |
 | RESP_SETTLE_SECS | 6 | * | wait after transmitting before re-reading the target to judge the effect |
 | BCN_CAP_SECS / BCN_CAP_COUNT | 4 / 5 | | beacon capture window and frame count for a posture read |
-| RESP_LOCK_SECS | 20 | * | EXAMINE lock duration held across a response; must exceed fire + settle |
+| RESP_LOCK_SECS | 20 | * | EXAMINE lock duration held across a response; raised to RESP_SETTLE_SECS + 5 when set lower |
 
 ## Response
 
@@ -211,9 +215,10 @@ captured under a short channel lock when no Watch lock is held, since Recon hops
 | `?` | no beacon captured | unknown | unknown |
 
 `D?+C` cannot be resolved from a beacon alone, because PMF is negotiated per client — a transition
--mode BSS can hold both protected and unprotected clients at once. `NOINJ` is a regulatory wall,
-not a property of the target: cfg80211 marks DFS and 6 GHz channels no-initiate-radiation for a
-monitor interface, so frames are dropped before they reach the air whatever the target's posture.
+-mode BSS can hold both protected and unprotected clients at once. `NOINJ` is a gate verdict,
+not a property of the target: pineapd refuses the 16 DFS channels and 6 GHz outright, and cfg80211
+drops frames on channels the live regulatory domain marks disabled or no-IR. Both drops are silent, so
+CamHound refuses rather than guesses (`csa_injectable`, two gates; see `dev/pager-csa-primitives.md`).
 
 **2 · Attack.** All three are always offered, ordered by what the beacon says will work and
 labelled `works` / `partial` / `blocked` / `unknown`. The first in the list is preselected, so the
@@ -281,8 +286,9 @@ that reuse a captured beacon's timestamp.
 
 ## Laptop checks
 
-`bash payload.sh --selftest` runs 39 checks (signature lint, both oui.txt layouts, every worked
-example above, proximity, row width, pcap parser) with `LOG`/`LED` stubbed; `--replay <pcap or
+`bash payload.sh --selftest` runs the self-checks (signature lint, both oui.txt layouts, every worked
+example above, proximity, row width, pcap parser, posture, response and settings vectors; it prints its
+own count, which grows with every addition) with `LOG`/`LED` stubbed; `--replay <pcap or
 bucket file>` runs the Watch parser on a saved window. BusyBox `hexdump` and `awk` are enough.
 
 ## Test matrix (fill the Measured column on your unit)
@@ -320,6 +326,7 @@ weights: they are fixed per TYPE. Ship unverified rows commented out.
 
 ## Roadmap
 
-v1.1: Recon-menu hooks (`library/recon/client|access_point/CamHound`), inventory persistence across
-runs, settings menu, band write (`PINEAPPLE_SET_BANDS`), WPS/IE peek, LAN confirm (opt-in RTSP
-DESCRIBE). v2: multi-channel passive behaviour sweep, BLE co-hit, pocket mode, external capture radio.
+Shipped since v1: Recon-menu hooks (`library/recon/client|access_point/CamHound`), inventory
+persistence across runs, the Settings menu, the response rung. v1.1 remaining: band write
+(`PINEAPPLE_SET_BANDS`), WPS/IE peek, LAN confirm (opt-in RTSP DESCRIBE). v2: multi-channel passive
+behaviour sweep, BLE co-hit, pocket mode, external capture radio.

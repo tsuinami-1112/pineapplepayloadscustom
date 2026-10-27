@@ -77,6 +77,7 @@ DEDUPE_H=0              # * hours: a device already in inventory.tsv within this
 INVENTORY_KEEP_DAYS=30  # inventory.tsv rows older than this are pruned at start (0 = never)
 ROW_W=22                # list row budget (spike 19; expected 36-40 on the default theme)
 RECON_IF="wlan1mon"     # PineAP monitor radio (tri-band)
+INJ_SYSFS="/sys/class/ieee80211"   # phy list for the regulatory probe (the laptop harness points this at a fixture)
 # response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
 RESPONSE=0              # * master switch for the response rung (0 = recon only)
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
@@ -149,6 +150,15 @@ set_state() {
   esac
 } 2>/dev/null
 
+# resp_clamp_lock: the EXAMINE lock must outlast lock_target's read-back (~2.5 s) + the fire + RESP_SETTLE_SECS,
+# or the post-fire Recon read happens after hopping resumed and a stalled counter reads as MOVED.
+resp_clamp_lock() {
+  local min=$(( RESP_SETTLE_SECS + 5 ))
+  if (( RESP_LOCK_SECS < min )); then
+    RESP_LOCK_SECS=$min; log warn "RESP_LOCK_SECS raised to $min: must exceed fire + settle"; ui_ok && LOG yellow "RESP_LOCK_SECS raised to $min"
+  fi
+  return 0
+}
 # cfg KEY DEFAULT [FLOOR] -> persisted integer override or the default
 cfg() {
   local v
@@ -174,6 +184,7 @@ load_overrides() {
   RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
   RESP_LOCK_SECS=$(cfg RESP_LOCK_SECS "$RESP_LOCK_SECS" 5)
   RESP_SETTLE_SECS=$(cfg RESP_SETTLE_SECS "$RESP_SETTLE_SECS" 1)
+  resp_clamp_lock
   AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
   POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
   DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
@@ -352,16 +363,16 @@ inj_probe() {   # inj_probe [force] -> 0 when INJ_OK is usable
   command -v iw >/dev/null 2>&1 || return 1
   # Every phy is probed and merged: pineapd picks its own inject interface, and each phy
   # registers only its own bands, so band/channel keys do not collide across them.
-  for d in /sys/class/ieee80211/*; do
+  for d in "$INJ_SYSFS"/*; do
     [ -e "$d" ] || continue
     phy=${d##*/}
     rows+=$(iw phy "$phy" channels 2>/dev/null)$'\n'
   done
   [ -n "${rows//[[:space:]]/}" ] || return 1
+  local band
   while IFS='|' read -r freq ch dis; do
     [[ $freq =~ ^[0-9]+$ && $ch =~ ^[0-9]+$ ]] || continue
-    local band; band=$(band_of "$freq")
-    [ "$band" = '?' ] && continue
+    if (( freq >= 5925 )); then band=6; elif (( freq >= 4900 )); then band=5; elif (( freq >= 2400 )); then band=2; else continue; fi
     if (( dis == 0 )); then INJ_OK[$band/$ch]=1; else INJ_OK[$band/$ch]=0; fi
   done < <(printf '%s' "$rows" | inj_parse_channels)
   (( ${#INJ_OK[@]} )) || return 1
@@ -801,6 +812,12 @@ score_device() {
   shopt -u nocasematch
 }
 
+# RSSI_MIN list gate on the session's best reading (0 = off; a device with no reading passes)
+rssi_gate_ok() {
+  (( RSSI_MIN == 0 )) && return 0
+  [[ ${RSSI_BEST[$1]:-x} =~ ^-?[0-9]+$ ]] || return 0
+  (( ${RSSI_BEST[$1]} >= RSSI_MIN ))
+}
 # proximity bucket from the best RSSI over the last 3 cycles; UNK fails open
 prox_of() {
   local mac="$1" best=-999 r near=$NEAR_DBM far=$FAR_DBM

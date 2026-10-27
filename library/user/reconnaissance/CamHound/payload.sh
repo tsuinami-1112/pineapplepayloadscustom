@@ -17,7 +17,7 @@
 #               tcpdump (Watch only; without it Watch is greyed), hexdump or od, awk, iwinfo,
 #               timeout, /lib/hak5/oui.txt (fallback /rom/lib/hak5/oui.txt; fallback built-in rows).
 # Data file:    cam_signatures.txt next to payload.sh (built-in copy used when missing).
-# Loot:         /root/loot/CamHound/{inventory.tsv,events.log,report_<run>.txt,watch_<ts>_<mac>.tsv}
+# Loot:         /root/loot/CamHound/{inventory.tsv,events.log,report_<run>.txt,watch_<ts>_<mac>.tsv,responses.tsv}
 #
 # LED State Descriptions
 # SETUP              - loading signatures and preflight
@@ -88,6 +88,7 @@ DEDUPE_H=0              # * hours: a device already in inventory.tsv within this
 INVENTORY_KEEP_DAYS=30  # inventory.tsv rows older than this are pruned at start (0 = never)
 ROW_W=22                # list row budget (spike 19; expected 36-40 on the default theme)
 RECON_IF="wlan1mon"     # PineAP monitor radio (tri-band)
+INJ_SYSFS="/sys/class/ieee80211"   # phy list for the regulatory probe (the laptop harness points this at a fixture)
 # response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
 RESPONSE=0              # * master switch for the response rung (0 = recon only)
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
@@ -160,6 +161,15 @@ set_state() {
   esac
 } 2>/dev/null
 
+# resp_clamp_lock: the EXAMINE lock must outlast lock_target's read-back (~2.5 s) + the fire + RESP_SETTLE_SECS,
+# or the post-fire Recon read happens after hopping resumed and a stalled counter reads as MOVED.
+resp_clamp_lock() {
+  local min=$(( RESP_SETTLE_SECS + 5 ))
+  if (( RESP_LOCK_SECS < min )); then
+    RESP_LOCK_SECS=$min; log warn "RESP_LOCK_SECS raised to $min: must exceed fire + settle"; ui_ok && LOG yellow "RESP_LOCK_SECS raised to $min"
+  fi
+  return 0
+}
 # cfg KEY DEFAULT [FLOOR] -> persisted integer override or the default
 cfg() {
   local v
@@ -185,6 +195,7 @@ load_overrides() {
   RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
   RESP_LOCK_SECS=$(cfg RESP_LOCK_SECS "$RESP_LOCK_SECS" 5)
   RESP_SETTLE_SECS=$(cfg RESP_SETTLE_SECS "$RESP_SETTLE_SECS" 1)
+  resp_clamp_lock
   AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
   POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
   DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
@@ -363,16 +374,16 @@ inj_probe() {   # inj_probe [force] -> 0 when INJ_OK is usable
   command -v iw >/dev/null 2>&1 || return 1
   # Every phy is probed and merged: pineapd picks its own inject interface, and each phy
   # registers only its own bands, so band/channel keys do not collide across them.
-  for d in /sys/class/ieee80211/*; do
+  for d in "$INJ_SYSFS"/*; do
     [ -e "$d" ] || continue
     phy=${d##*/}
     rows+=$(iw phy "$phy" channels 2>/dev/null)$'\n'
   done
   [ -n "${rows//[[:space:]]/}" ] || return 1
+  local band
   while IFS='|' read -r freq ch dis; do
     [[ $freq =~ ^[0-9]+$ && $ch =~ ^[0-9]+$ ]] || continue
-    local band; band=$(band_of "$freq")
-    [ "$band" = '?' ] && continue
+    if (( freq >= 5925 )); then band=6; elif (( freq >= 4900 )); then band=5; elif (( freq >= 2400 )); then band=2; else continue; fi
     if (( dis == 0 )); then INJ_OK[$band/$ch]=1; else INJ_OK[$band/$ch]=0; fi
   done < <(printf '%s' "$rows" | inj_parse_channels)
   (( ${#INJ_OK[@]} )) || return 1
@@ -812,6 +823,12 @@ score_device() {
   shopt -u nocasematch
 }
 
+# RSSI_MIN list gate on the session's best reading (0 = off; a device with no reading passes)
+rssi_gate_ok() {
+  (( RSSI_MIN == 0 )) && return 0
+  [[ ${RSSI_BEST[$1]:-x} =~ ^-?[0-9]+$ ]] || return 0
+  (( ${RSSI_BEST[$1]} >= RSSI_MIN ))
+}
 # proximity bucket from the best RSSI over the last 3 cycles; UNK fails open
 prox_of() {
   local mac="$1" best=-999 r near=$NEAR_DBM far=$FAR_DBM
@@ -1082,6 +1099,7 @@ run_cycle() {
   # alert collection
   for mac in "${!SCORED[@]}"; do
     [ -n "${IGNORED[$mac]}" ] && continue
+    rssi_gate_ok "$mac" || continue
     now_rank=$(band_rank "${BANDNAME[$mac]}"); prev=${ALERTED_BAND[$mac]:-0}
     if (( now_rank >= 1 )) && [[ ${TAGS[$mac]} != *RAND* ]] && [ "${LANE[$mac]}" != STREAM ] && [ "${BANDNAME[$mac]}" != MODULE ] && [ "${FIRST_CYCLE[$mac]:-0}" = "$CYCLE" ]; then
       k=$((k + 1)); (( ${CONF[$mac]} > top )) && top=${CONF[$mac]}
@@ -1244,6 +1262,7 @@ sort_macs() {   # by band rank desc, then prox N>M>F>?, then conf desc
   local kind="$1" mac key; local -a keyed=()
   for mac in "${!CONF[@]}"; do
     [ -n "${IGNORED[$mac]}" ] && continue
+    rssi_gate_ok "$mac" || continue
     prox_of "$mac"                                       # staleness: unseen > 90 s reads ? here, not its last bucket
     case "$kind" in
       hits)    (( ${CONF[$mac]} >= 20 )) || continue; [ "${BANDNAME[$mac]}" = MODULE ] && continue ;;
@@ -1344,6 +1363,71 @@ mode_menu() {
   case "$PICK" in ROOM|SITE) MODE="$PICK"; apply_mode; LOG "mode -> $MODE" ;; esac
 }
 
+
+# ================================================================================ settings ===
+# Table-driven settings menu over the starred recon keys: key|kind|floor|label. Values are applied
+# to the running session and persisted with PAYLOAD_SET_CONFIG; Reset deletes the overrides and
+# restores the config-block defaults captured at start (cfg_snapshot_defaults runs before
+# load_overrides). The response-rung keys are deliberately not listed here.
+SETTINGS_TABLE='CYCLE_SECS|int|5|scan period, s
+THR_STREAM_UP|int|1|STREAM big uplink fr/s
+COOLDOWN_SECS|int|0|re-alert suppression, s
+DEDUPE_H|int|0|dedupe horizon, h (0 off)
+RSSI_MIN|int|-100|list gate dBm (0 off)
+ALERT_DIALOG|bool|0|ALERT on new CONFIRMED
+SOUND|bool|0|ringtone on CONFIRMED
+AUTO_WATCH|bool|0|offer Watch
+AUTO_LOCATE|bool|0|offer Locate'
+declare -A CFG_DEFAULT
+cfg_snapshot_defaults() { local key _; while IFS='|' read -r key _; do [ -n "$key" ] && CFG_DEFAULT[$key]="${!key}"; done <<<"$SETTINGS_TABLE"; }
+settings_row() {   # settings_row KEY -> sets S_KIND S_FLOOR S_LABEL from the table
+  local key kind floor label; S_KIND=""; S_FLOOR=0; S_LABEL=""
+  while IFS='|' read -r key kind floor label; do [ "$key" = "$1" ] && { S_KIND=$kind; S_FLOOR=$floor; S_LABEL=$label; return 0; }; done <<<"$SETTINGS_TABLE"
+  return 1
+}
+S_KIND=""; S_FLOOR=0; S_LABEL=""
+settings_apply() {   # settings_apply KEY VALUE -> live variable + persisted override
+  local key="$1" val="$2"
+  printf -v "$key" '%s' "$val"
+  if command -v PAYLOAD_SET_CONFIG >/dev/null 2>&1 && PAYLOAD_SET_CONFIG "$PAYLOAD_NAME" "$key" "$val" >/dev/null 2>&1; then LOG "$key -> $val (saved)"
+  else LOG yellow "$key -> $val (this run only)"; fi
+  log cfg "set $key=$val"
+  [ "$key" = DEDUPE_H ] && DEDUPE_RUN=1
+  return 0
+}
+settings_reset() {
+  local key _
+  confirm "Reset all saved settings to defaults?" || return 0
+  while IFS='|' read -r key _; do
+    [ -n "$key" ] || continue
+    command -v PAYLOAD_DEL_CONFIG >/dev/null 2>&1 && PAYLOAD_DEL_CONFIG "$PAYLOAD_NAME" "$key" >/dev/null 2>&1
+    printf -v "$key" '%s' "${CFG_DEFAULT[$key]}"
+  done <<<"$SETTINGS_TABLE"
+  CFG_OVERRIDES=0; CFG_NOTE=""; DEDUPE_RUN=1
+  log cfg "reset defaults"; LOG "settings reset to defaults"
+}
+settings_menu() {
+  local key resp rc; local -a items
+  while :; do
+    items=()
+    while IFS='|' read -r key _; do [ -n "$key" ] && items+=("$key = ${!key}"); done <<<"$SETTINGS_TABLE"
+    items+=("Reset defaults" "Back")
+    pick_list "Settings (saved on device)" "Back" "${items[@]}" || return 0
+    case "$PICK" in "Back") return 0 ;; "Reset defaults") settings_reset; continue ;; esac
+    key=${PICK%% = *}; settings_row "$key" || continue
+    if [ "$S_KIND" = bool ]; then
+      pick_list "$key: $S_LABEL" "$( [ "${!key}" = 1 ] && printf On || printf Off )" "On" "Off" "Back" || continue
+      case "$PICK" in On) resp=1 ;; Off) resp=0 ;; *) continue ;; esac
+    else
+      resp=$(NUMBER_PICKER "$key: $S_LABEL (min $S_FLOOR)" "${!key}" 2>/dev/null); rc=$?
+      (( rc != 0 )) && continue
+      [[ $resp =~ ^-?[0-9]+$ ]] || { LOG yellow "$key: not a number"; continue; }
+      (( resp < S_FLOOR )) && { LOG yellow "$key: minimum is $S_FLOOR"; continue; }
+    fi
+    settings_apply "$key" "$resp"
+  done
+}
+
 # scan_loop: cycles until B opens Review and the operator picks Exit
 scan_loop() {
   local rc
@@ -1370,7 +1454,7 @@ scan_loop() {
 main_menu() {
   local def="Scan"
   while :; do
-    local -a menu=("Scan"); (( DEDUPE_H > 0 )) && menu+=("Scan (fresh)"); menu+=("Review hits"); [ "$SHOW_MODULES" = 1 ] && menu+=("Unidentified modules"); menu+=("Mode" "Write report" "Exit")
+    local -a menu=("Scan"); (( DEDUPE_H > 0 )) && menu+=("Scan (fresh)"); menu+=("Review hits"); [ "$SHOW_MODULES" = 1 ] && menu+=("Unidentified modules"); menu+=("Mode" "Settings" "Write report" "Exit")
     pick_list "CamHound $VERSION [$MODE] sigs:$SIG_COUNT" "$def" "${menu[@]}" || { def="Exit"; continue; }
     case "$PICK" in
       "Scan") scan_loop || def="Exit" ;;
@@ -1378,6 +1462,7 @@ main_menu() {
       "Review hits") review_list || def="Exit" ;;
       "Unidentified modules") modules_list ;;
       "Mode") mode_menu ;;
+      "Settings") settings_menu ;;
       "Write report") write_report; LOG "report: $LOOT_DIR/report_$RUN_ID.txt" ;;
       "Exit") if confirm "Exit CamHound?"; then return 0; fi; def="Scan" ;;
     esac
@@ -2176,7 +2261,7 @@ selftest() {
   st "inj probed: DFS ch52 gate-1 refused" "$(posture_from_caps 0c00 - 5 52)" "NOINJ"
   st "inj probed: DFS ch144 gate-1 refused" "$(posture_from_caps cc00 - 5 144)" "NOINJ"
   st "inj probed: 6 GHz still refused"    "$(posture_from_caps 0c00 - 6 37)"  "NOINJ"
-  st "inj probed: unregistered ch refused" "$(posture_from_caps 0c00 - 5 64)" "NOINJ"
+  st "inj probed: unregistered ch refused" "$(posture_from_caps 0c00 - 5 40)" "NOINJ"
   INJ_PROBED=$_ip; INJ_OK=(); for k in "${!_iok[@]}"; do INJ_OK[$k]=${_iok[$k]}; done
   # 7g the channel parser, against the shipped iw's real layout
   local _fx; _fx=$(inj_parse_channels <<'IWFIX'
@@ -2333,6 +2418,16 @@ IWFIX
   st "carry-over: behaviour evidence kept"      "${BEH[$C]} ${BEH_VERDICT[$C]} ${BEH_GATE[$C]}" "55 STREAM 55"
   record_seen $C ap "x" 6 2437 -40
   st "carry-over: a stronger reading still wins" "${RSSI_BEST[$C]}" "-40"
+  # 7h recon-side review fixes: lock clamp, RSSI_MIN gate, settings table round trip
+  RESP_SETTLE_SECS=6; RESP_LOCK_SECS=5; resp_clamp_lock; st "lock clamp: 5 s lock raised to settle + 5" "$RESP_LOCK_SECS" "11"
+  RESP_LOCK_SECS=20; resp_clamp_lock; st "lock clamp: 20 s lock kept" "$RESP_LOCK_SECS" "20"
+  RSSI_MIN=-50; RSSI_BEST[aa:00:00:00:00:01]=-58; rssi_gate_ok aa:00:00:00:00:01; st "rssi gate: below RSSI_MIN hidden" "$?" 1
+  RSSI_BEST[aa:00:00:00:00:01]=-40; rssi_gate_ok aa:00:00:00:00:01; st "rssi gate: above RSSI_MIN listed" "$?" 0
+  unset "RSSI_BEST[aa:00:00:00:00:99]"; rssi_gate_ok aa:00:00:00:00:99; st "rssi gate: no reading passes" "$?" 0
+  RSSI_MIN=0; RSSI_BEST[aa:00:00:00:00:01]=-90; rssi_gate_ok aa:00:00:00:00:01; st "rssi gate: off by default" "$?" 0
+  CYCLE_SECS=20; cfg_snapshot_defaults; CYCLE_SECS=7; st "settings: default captured" "${CFG_DEFAULT[CYCLE_SECS]}" "20"
+  settings_row CYCLE_SECS; st "settings: table row" "$S_KIND $S_FLOOR" "int 5"
+  settings_row NOSUCHKEY; st "settings: unknown key rc" "$?" 1
   # 8 marked blocks
   if command -v md5sum >/dev/null 2>&1 && [ -f "${BASH_SOURCE[0]}" ]; then
     printf 'lib block md5   %s\n' "$(sed -n '/^# --- camhound lib begin ---/,/^# --- camhound lib end ---/p' "${BASH_SOURCE[0]}" | md5sum | cut -c1-32)"
@@ -2369,6 +2464,7 @@ INSTALL_DIR=$(find_install_dir) || INSTALL_DIR=""
 run_lock
 preflight
 apply_mode
+cfg_snapshot_defaults
 load_overrides
 (( CFG_OVERRIDES > 0 )) && { LOG yellow "cfg: $CFG_OVERRIDES overrides"; log cfg "$CFG_NOTE"; }
 log run "start v$VERSION run=$RUN_ID sigs=$SIG_COUNT($SIG_SOURCE) jq=$HAVE_JQ tcpdump=$HAVE_TCPDUMP bands=${BANDS_LINE:-?} mode=$MODE loaded=$LOADED_ROWS dedupe_h=$DEDUPE_H"

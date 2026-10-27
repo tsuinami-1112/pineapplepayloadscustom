@@ -1,0 +1,11 @@
+#!/bin/bash
+printf 'IW %s\n' "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"
+[ "$1" = phy ] && [ "$3" = channels ] || exit 1
+printf 'Band 1:\n'
+for c in 1 2 3 4 5 6 7 8 9 10 11; do printf '\t* %d MHz [%d] \n\t  Maximum TX power: 20.0 dBm\n' $((2407 + c * 5)) "$c"; done
+for c in 12 13; do printf '\t* %d MHz [%d] (disabled)\n' $((2407 + c * 5)) "$c"; done
+printf 'Band 2:\n'
+for c in 36 40 44 48; do printf '\t* %d MHz [%d] \n\t  Maximum TX power: 23.0 dBm\n' $((5000 + c * 5)) "$c"; done
+for c in 52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 144; do printf '\t* %d MHz [%d] \n\t  Maximum TX power: 23.0 dBm\n\t  Radar detection\n' $((5000 + c * 5)) "$c"; done
+for c in 149 153 157 161 165; do printf '\t* %d MHz [%d] \n\t  Maximum TX power: 30.0 dBm\n' $((5000 + c * 5)) "$c"; done
+exit 0

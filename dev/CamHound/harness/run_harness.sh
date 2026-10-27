@@ -15,8 +15,11 @@ sed -e 's/^WIN_SECS=10 /WIN_SECS=5 /' -e 's/^LIVE_WINDOWS=6 /LIVE_WINDOWS=4 /' \
     -e 's/^WIN_BASE_S=30; WIN_STIM_S=20; WIN_POST_S=20 /WIN_BASE_S=6; WIN_STIM_S=5; WIN_POST_S=5 /' -e 's/^QUIET_SECS=15 /QUIET_SECS=3 /' \
     -e "s|^OUI_FILE=\"/lib/hak5/oui.txt\"; OUI_FILE_ALT=\"/rom/lib/hak5/oui.txt\"|OUI_FILE=\"$HERE/fix/oui.txt\"; OUI_FILE_ALT=\"$HERE/fix/oui.txt\"|" \
     -e 's/^RESP_SETTLE_SECS=6 /RESP_SETTLE_SECS=1 /' -e 's/^BCN_CAP_SECS=4 /BCN_CAP_SECS=2 /' \
+    -e "s|^INJ_SYSFS=\"/sys/class/ieee80211\"|INJ_SYSFS=\"$T/phy\"|" \
     -e "s|^LOOT_DIR=\"/root/loot/CamHound\"|LOOT_DIR=\"$LOOT\"|" "$SRC" >"$T/payload_fast.sh"
 grep -q "LOOT_DIR=\"$LOOT\"" "$T/payload_fast.sh" || { echo "sed on the config block failed"; exit 1; }
+grep -q "INJ_SYSFS=\"$T/phy\"" "$T/payload_fast.sh" || { echo "sed on INJ_SYSFS failed"; exit 1; }
+mkdir -p "$T/phy/phy0"          # one fake phy; the iw stub answers 'iw phy phy0 channels' with a US-like table
 printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
 PATHX="$HERE/stubs:$T/bin:$PATH"
 reset() { [ "${1:-}" = keep ] || rm -rf "$LOOT"; rm -rf "$T/log" "$T"/rules*.c* /tmp/cs_harness_chan /tmp/cs_harness_pps /tmp/cs_run.pid /tmp/cs_children; mkdir -p "$LOOT"; echo 0 >/tmp/cs_harness_cycle; }
@@ -75,6 +78,7 @@ s_disrupt() {   # RESPONSE=1: Disrupt on the Reolink AP against log-only stubs; 
   answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   check "disrupt: posture read under a lock on the target channel" "grep -q 'TCPDUMP beacon ec71db000010' $T/log && grep -q 'PINEAPPLE_EXAMINE_BSSID ec:71:db:00:00:10' $T/log"
   check "disrupt: badge D+C from the synthetic beacon" "grep -q 'PICKER\[Disrupt \[D+C\]' $T/log"
+  check "disrupt: regulatory probe ran against the fixture phy" "grep -q '^IW phy phy0 channels' $T/log"
   check "disrupt: stub command called with bssid, broadcast target, channel 36" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_ALL ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log"
   check "disrupt: lock verified ok (not by channel)" "grep -q 'lock: ok' $T/log"
   check "disrupt: one loot row per client, 16 fields, badge and raw caps" "[ \"\$(grep -c '^[0-9]' $LOOT/responses.tsv)\" = 2 ] && [ \"\$(sed -n 2p $LOOT/responses.tsv | awk -F'|' '{print NF}')\" = 16 ] && grep -q '|ec:71:db:00:00:11|36|5|D+C|0c00|' $LOOT/responses.tsv && grep -q '|ec:71:db:00:00:12|36|5|D+C|0c00|' $LOOT/responses.tsv"
@@ -100,10 +104,19 @@ s_persist() {   # a second run with DEDUPE_H=24 stays silent on known devices; f
   check "persist: SEEN tag and returning count" "grep -q '|ec:71:db:00:00:10|.*SEEN' $LOOT/inventory.tsv && grep -q 'returning [1-9]' $LOOT/report_*.txt"
   check "persist: Watch evidence carried into the second run" "grep -q '|ec:71:db:00:00:10|ap|NVRKIT|[^|]*|REO-OUI|100|80|55|STREAM|' $LOOT/inventory.tsv"
 }
+s_settings() {   # Settings menu: NUMBER_PICKER sets and persists a key, Reset deletes the overrides
+  reset; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  rules settings '^CamHound' 'Settings,Settings,Exit' '^Settings' 'CYCLE_SECS = 5,Back,Reset defaults,Back' '^CYCLE_SECS' '7' 'Reset all saved' '1' "${COMMON[@]}"
+  answers t; run
+  check "settings: value applied and persisted" "grep -q '^LOG CYCLE_SECS -> 7 (saved)' $T/log && grep -q 'cfg set CYCLE_SECS=7' $LOOT/events.log && grep -q 'PAYLOAD_SET_CONFIG camhound CYCLE_SECS 7' $T/log"
+  check "settings: reset deletes the override and logs it" "grep -q 'cfg reset defaults' $LOOT/events.log && ! grep -q '^CYCLE_SECS=' $HARNESS_CFG && grep -q 'PAYLOAD_DEL_CONFIG camhound CYCLE_SECS' $T/log"
+  check "settings: menu shows the live value after reset" "grep -q 'PICKER\[Settings.*CYCLE_SECS = 20;' $T/log"
+  printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+}
 case "${1:-all}" in
-  live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; persist) s_persist ;;
-  all) s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_persist ;;
-  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|persist|all]"; exit 2 ;;
+  live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; persist) s_persist ;; settings) s_settings ;;
+  all) s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_persist; s_settings ;;
+  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|persist|settings|all]"; exit 2 ;;
 esac
 printf '== harness: %s failure(s); temp dir %s ==\n' "$FAIL" "$T"
 exit $(( FAIL > 0 ))

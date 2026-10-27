@@ -263,7 +263,7 @@ harness.
 
 ## 9. Entry points
 
-Four ways to reach Disrupt, all gated on `RESPONSE=1`:
+Five ways to reach Disrupt, all gated on `RESPONSE=1`:
 
 1. **Device card** (`detail_card`) — the manual path, beside Watch and Locate. Shows a cached badge
    in the row when one is fresh; an uncached badge is not worth a capture just to render a menu.
@@ -286,7 +286,7 @@ Four ways to reach Disrupt, all gated on `RESPONSE=1`:
 | `POSTURE_TTL` | 300 | `*` | seconds a badge stays cached per BSSID |
 | `RESP_SETTLE_SECS` | 6 | `*` | wait after transmitting before judging the effect |
 | `BCN_CAP_SECS` / `BCN_CAP_COUNT` | 4 / 5 | | beacon capture window and frame count |
-| `RESP_LOCK_SECS` | 20 | | EXAMINE lock duration held across a response |
+| `RESP_LOCK_SECS` | 20 | `*` | EXAMINE lock duration held across a response; raised to `RESP_SETTLE_SECS + 5` when set lower |
 | `SCAN_IF` | `wlan0` | | reserved, currently unused |
 
 **Two keys, not one.** `RESPONSE` opens the manual rung; `AUTO_RESPOND` additionally lets CamHound
@@ -314,8 +314,8 @@ rows are the evidence, the aggregate is the summary.
 
 ## 12. What is verified
 
-Laptop only, no radio. Selftest is **127 checks, 0 failures** (was 39 before the response side; the
-most recent additions are recon-side, for inventory persistence), and
+Laptop only, no radio. The selftest ends **0 failed** (it prints its own count, which grows with every
+addition, so it is not restated here), and
 the harness has a `disrupt` scenario that exercises the whole chain end to end — log-only stubs for
 the three `PINEAPPLE_DEAUTH_CLIENT*` commands that record their arguments and transmit nothing, plus
 a synthetic-beacon branch in the fake `tcpdump`. That scenario checks the posture read happening
@@ -361,11 +361,11 @@ Needs a Pager:
 - whether Recon's packet counters move the way `resp_verdict` assumes
 - whether the CSA attack moves a real client **at all** — see §7
 
-**A note on running the harness where `hexdump` is absent.** `preflight()` sets `HAVE_TCPDUMP` only
-when **both** `tcpdump` and `hexdump` are present. On a machine without `hexdump`, `HAVE_TCPDUMP`
-stays 0, `capture_beacon` returns immediately, and every assertion that depends on a capture fails —
-the Watch scenarios and the posture half of `disrupt`. This is environmental and not a code defect:
-re-running with a small `od`-backed `hexdump` shim on `PATH` clears all of them. Worth knowing
+**A note on running the harness where no hex dumper is present.** `preflight()` sets `HAVE_TCPDUMP`
+when `tcpdump` and either `hexdump` or `od` are present (`capture_ready`). On a machine with neither
+dumper, `HAVE_TCPDUMP` stays 0, `capture_beacon` returns immediately, and every assertion that depends
+on a capture fails — the Watch scenarios and the posture half of `disrupt`. This is environmental and
+not a code defect; installing either dumper clears all of them. Worth knowing
 because the failures look alarming and are not.
 
 Mildly interesting: the gate requires `hexdump` even though **both** pcap readers have `od`
@@ -394,8 +394,9 @@ it.
   `count = 3` would get the move **and** the refusal. That needs a non-pineapd injector (Stage B of
   `dev/pager-6ghz-determination-plan.md`); there is no setting for it. Until that is measured,
   `posture_opts` offering nothing at `NONE` is right, not conservative.
-- **DFS and 6 GHz cannot be attacked from a monitor interface**, so the 6 GHz radio is recon-only
-  surface. 2.4 GHz and non-DFS 5 GHz only.
+- **DFS and 6 GHz are refused** by pineapd's compiled-in switch (gate 1) whatever the regulatory
+  domain, and cfg80211 (gate 2) silently drops frames on channels the live domain marks disabled or
+  no-IR; `csa_injectable` models both. From the stock commands: 2.4 GHz and non-DFS 5 GHz only.
 - **Detection is improving fast.** Kismet merged a CSA-flood alert (>20 CSA beacons from one BSSID
   in 2 s) and has an open signature targeting tools that copy a captured beacon and change only the
   sequence number — which is what `DEAUTHCSA` does. Expect this to be visible to a competent WIDS.

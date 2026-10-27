@@ -55,7 +55,7 @@ moves a hash depends on which region it lands in:
 
 | Region | Markers | Hash |
 |---|---|---|
-| config block | top of file → `# ... end config block ---` | neither |
+| config block | `PAYLOAD_REL=` → `# ... end config block ---` | neither |
 | shared lib | `# --- camhound lib begin ---` → `# --- camhound lib end ---` | **lib** |
 | watch core | `# --- watch core begin ---` → `# --- watch core end ---` | **watch** |
 | everything else | — | neither |

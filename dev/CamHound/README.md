@@ -16,7 +16,7 @@ facts that are settled so they do not get re-derived.
 | `gen_hooks.sh` | regenerates `library/recon/{client,access_point}/CamHound/` from the user payload (header + config + lib block + watch-core block + `hook_main.sh`) |
 | `check_sync.sh` | fails when the shared blocks differ between the user payload and the hooks |
 | `hook_header.sh`, `hook_main.sh` | the hook-only parts |
-| `harness/run_harness.sh` | laptop harness: stub DuckyScript commands, fake `_pineap`/`tcpdump`/`iwinfo`, RECON fixtures; scenarios live, stimulus, lock, nojq, locate |
+| `harness/run_harness.sh` | laptop harness: stub DuckyScript commands, fake `_pineap`/`tcpdump`/`iwinfo`, RECON fixtures; scenarios live, stimulus, lock, nojq, locate, disrupt, persist, settings |
 
 Rule: edit the user payload, then `gen_hooks.sh`, then `check_sync.sh`, then `payload.sh --selftest`
 and `harness/run_harness.sh`. The lib block (`# --- camhound lib begin/end ---`) and the watch-core

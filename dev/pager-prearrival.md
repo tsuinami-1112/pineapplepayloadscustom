@@ -183,7 +183,7 @@ is indistinguishable from a resisting target. Fixed by widening one regex to
 `/^[ \t]+(No IR|Passive scan|No IBSS)[ \t]*$/`, which cannot cause a false refusal on a current
 kernel because those lines never print there. ERE alternation confirmed under `mawk` 1.3.4, a
 minimal implementation, as evidence for busybox awk on-device. Three selftest cases added
-(`157 checks, 0 failed`).
+(the selftest ended `0 failed`; its count has grown since and is not restated here).
 
 **This table became load-bearing for something else.** Composed with the finding that `hcxdumptool`
 reads only `FREQUENCY_ATTR_FREQ`/`MAX_TX_POWER`/`DISABLED` — never `NO_IR` or `RADAR` — it decides
