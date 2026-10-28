@@ -16,7 +16,7 @@ facts that are settled so they do not get re-derived.
 | `gen_hooks.sh` | regenerates `library/recon/{client,access_point}/CamHound/` from the user payload (header + config + lib block + watch-core block + `hook_main.sh`) |
 | `check_sync.sh` | fails when the shared blocks differ between the user payload and the hooks |
 | `hook_header.sh`, `hook_main.sh` | the hook-only parts |
-| `harness/run_harness.sh` | laptop harness: stub DuckyScript commands, fake `_pineap`/`tcpdump`/`iwinfo`, RECON fixtures; scenarios live, stimulus, lock, nojq, locate, disrupt, persist, settings |
+| `harness/run_harness.sh` | laptop harness: stub DuckyScript commands, fake `_pineap`/`tcpdump`/`iwinfo`/`iw` (US-like channel table for a fixture phy dir), stub `NUMBER_PICKER`/`PAYLOAD_SET_CONFIG`/`PAYLOAD_DEL_CONFIG`, RECON fixtures; scenarios live, stimulus, lock, nojq, locate, disrupt, persist, settings |
 
 Rule: edit the user payload, then `gen_hooks.sh`, then `check_sync.sh`, then `payload.sh --selftest`
 and `harness/run_harness.sh`. The lib block (`# --- camhound lib begin/end ---`) and the watch-core
@@ -25,7 +25,7 @@ lives inside them.
 
 ## Status
 
-Coded and verified on a laptop only (selftest **112/112**, harness scenarios green, shellcheck
+Coded and verified on a laptop only (selftest ends `0 failed` and prints its own count, harness scenarios green, shellcheck
 clean). The v1.1 Recon hooks are generated and checked the same way. **No Pager has run any of it.**
 
 The payload is recon **and response**: it was renamed from CamScout when the Disrupt rung landed.
@@ -54,10 +54,12 @@ what remains unverified are in `RESPONSE.md`.
    zero CONFIRMED in empty rooms.
 5. **Phase 4 remainder**: clean install from a Windows zip, `PAYLOAD_DEL_CONFIG` of every
    calibration override, Measured column filled.
-6. **v1.1, one PR each, with on-device evidence**: Recon hooks (generated here; hook spike:
-   Recon keeps growing while the hook runs, Cancel runs the trap); inventory persistence across
-   runs (`DEDUPE_H`, clock guard, 30-day prune); settings menu (NUMBER_PICKER for five keys, Reset
-   via `PAYLOAD_DEL_CONFIG`); band write (`PINEAPPLE_SET_BANDS wlan1mon 2 5 [6]`, restored at exit,
+6. **v1.1, one PR each, with on-device evidence**. Shipped, laptop-verified, on-device evidence
+   still owed: Recon hooks (generated here; the hook spike -- Recon keeps growing while the hook
+   runs, Cancel runs the trap -- is the device check); inventory persistence across runs
+   (`DEDUPE_H`, clock guard, 30-day prune); settings menu (nine keys: CYCLE_SECS, THR_STREAM_UP,
+   COOLDOWN_SECS, DEDUPE_H, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH, AUTO_LOCATE; Reset via
+   `PAYLOAD_DEL_CONFIG`). Remaining: band write (`PINEAPPLE_SET_BANDS wlan1mon 2 5 [6]`, restored at exit,
    gate: no pineapd restart); WPS/IE peek (`tcpdump -xx -s 1024 -c 12` on beacons and probe
    responses, WPSMODEL +45/+40 as a new identity class, `ie_sig` column); retry percentage via
    BPF `wlan[1] & 0x08`; LAN confirm v1.1b (`LAN_CONFIRM=1`, 2.4 GHz join on wlan0cli, ARP

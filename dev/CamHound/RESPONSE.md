@@ -62,7 +62,8 @@ inferred:
 
 Consequence for this design: **no injector binary, no cross-compile, no OpenWrt SDK, no release
 artefact.** The response side is shell calling vendor primitives, exactly like the rest of the
-payload. That is why it is ~370 lines and not a C project.
+payload. That is why it is a few hundred lines of shell between the `response posture` and `response rung`
+markers in payload.sh (§8) and not a C project.
 
 ## 3. Posture: deciding what can work
 
@@ -267,7 +268,9 @@ Five ways to reach Disrupt, all gated on `RESPONSE=1`:
 
 1. **Device card** (`detail_card`) — the manual path, beside Watch and Locate. Shows a cached badge
    in the row when one is fresh; an uncached badge is not worth a capture just to render a menu.
-2. **Post-Watch picker** (`summary_card`) — after any Watch.
+2. **Post-Watch picker** (`summary_card`) — after any Watch that reaches a verdict (an INCONCLUSIVE
+   Watch logs and returns with no picker: `live_view` and `stimulus_test` call `summary_card` only on
+   the other branch).
 3. **Post-Watch auto-offer** — on a `STREAM` or `EVENT` verdict, the strongest evidence CamHound can
    produce that a device is a live camera. This is where the funnel closes: detect → Watch →
    confirmed → respond.
@@ -368,10 +371,9 @@ on a capture fails — the Watch scenarios and the posture half of `disrupt`. Th
 not a code defect; installing either dumper clears all of them. Worth knowing
 because the failures look alarming and are not.
 
-Mildly interesting: the gate requires `hexdump` even though **both** pcap readers have `od`
-fallbacks (`pcap_words` and `pcap_bytes`). On a Pager `hexdump` is always present via busybox, so
-this never matters in production — it only affects laptop runs. Gating on `hexdump || od` would fix
-it.
+History: an earlier gate required `hexdump` alone although **both** pcap readers (`pcap_words`,
+`pcap_bytes`) already had `od` fallbacks; `capture_ready` now accepts either dumper. On a Pager
+`hexdump` is always present via busybox, so this only ever mattered on a laptop.
 
 ## 14. Known limits
 

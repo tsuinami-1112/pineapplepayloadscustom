@@ -54,7 +54,7 @@ ALERT_DIALOG=1          # * blocking ALERT on NEW CONFIRMED when AUTO_WATCH=0 (0
 AUTO_WATCH=1            # * offer Watch on the top candidate / on NEW CONFIRMED-LIKELY (0 = off)
 AUTO_LOCATE=1           # * offer Locate after a STREAM/EVENT Watch (0 = off)
 AUTO_WATCH_RSSI=-72     # minimum last RSSI to auto-offer Watch
-RSSI_MIN=0              # * optional list gate on session rssi_best (0 = off, widest net)
+RSSI_MIN=0              # * optional list gate, dBm, on the best RSSI known for the MAC (0 = off, widest net)
 SOUND=0                 # * RINGTONE alert on NEW CONFIRMED (0 = off)
 SHOW_MODULES=1          # modules list in the menu
 MODULE_HINT_RSSI=-55    # client RSSI at or above which a BUSY module gets the "Watch?" hint
@@ -170,6 +170,13 @@ resp_clamp_lock() {
   fi
   return 0
 }
+# rssi_min_clamp: RSSI_MIN is a dBm threshold (negative) or 0 for off; a positive value would hide every device that has a reading
+rssi_min_clamp() {
+  if (( RSSI_MIN > 0 )); then
+    log warn "RSSI_MIN $RSSI_MIN is not a dBm value: gate off"; ui_ok && LOG yellow "RSSI_MIN $RSSI_MIN ignored: use 0 (off) or a negative dBm"; RSSI_MIN=0
+  fi
+  return 0
+}
 # cfg KEY DEFAULT [FLOOR] -> persisted integer override or the default
 cfg() {
   local v
@@ -182,23 +189,25 @@ cfg() {
 }
 CFG_OVERRIDES=0; CFG_NOTE=""
 load_overrides() {
-  command -v PAYLOAD_GET_CONFIG >/dev/null 2>&1 || return 0
-  CYCLE_SECS=$(cfg CYCLE_SECS "$CYCLE_SECS" 5)
-  COOLDOWN_SECS=$(cfg COOLDOWN_SECS "$COOLDOWN_SECS" 0)
-  ALERT_DIALOG=$(cfg ALERT_DIALOG "$ALERT_DIALOG" 0)
-  AUTO_WATCH=$(cfg AUTO_WATCH "$AUTO_WATCH" 0)
-  AUTO_LOCATE=$(cfg AUTO_LOCATE "$AUTO_LOCATE" 0)
-  RSSI_MIN=$(cfg RSSI_MIN "$RSSI_MIN" -100)
-  SOUND=$(cfg SOUND "$SOUND" 0)
-  THR_STREAM_UP=$(cfg THR_STREAM_UP "$THR_STREAM_UP" 1)
-  RESPONSE=$(cfg RESPONSE "$RESPONSE" 0)
-  RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
-  RESP_LOCK_SECS=$(cfg RESP_LOCK_SECS "$RESP_LOCK_SECS" 5)
-  RESP_SETTLE_SECS=$(cfg RESP_SETTLE_SECS "$RESP_SETTLE_SECS" 1)
-  resp_clamp_lock
-  AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
-  POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
-  DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
+  if command -v PAYLOAD_GET_CONFIG >/dev/null 2>&1; then
+    CYCLE_SECS=$(cfg CYCLE_SECS "$CYCLE_SECS" 5)
+    COOLDOWN_SECS=$(cfg COOLDOWN_SECS "$COOLDOWN_SECS" 0)
+    ALERT_DIALOG=$(cfg ALERT_DIALOG "$ALERT_DIALOG" 0)
+    AUTO_WATCH=$(cfg AUTO_WATCH "$AUTO_WATCH" 0)
+    AUTO_LOCATE=$(cfg AUTO_LOCATE "$AUTO_LOCATE" 0)
+    RSSI_MIN=$(cfg RSSI_MIN "$RSSI_MIN" -100)
+    SOUND=$(cfg SOUND "$SOUND" 0)
+    THR_STREAM_UP=$(cfg THR_STREAM_UP "$THR_STREAM_UP" 1)
+    RESPONSE=$(cfg RESPONSE "$RESPONSE" 0)
+    RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
+    RESP_LOCK_SECS=$(cfg RESP_LOCK_SECS "$RESP_LOCK_SECS" 5)
+    RESP_SETTLE_SECS=$(cfg RESP_SETTLE_SECS "$RESP_SETTLE_SECS" 1)
+    AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
+    POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
+    DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
+  fi
+  # both clamps also cover a config-block edit, so they run whether or not the device offers persistence
+  resp_clamp_lock; rssi_min_clamp
 }
 
 # install dir: the UI runs a copy from /tmp, so look for the data file where it can live
@@ -336,7 +345,7 @@ band_of() {
 #     Beacon protection is NOT in the RSNXE (ID 244) -- that element has no such bit.
 # Badges: D+C both work | D?+C deauth is per-client, CSA works | C CSA only
 #         NONE both blocked | NOINJ radio may not transmit here | ? posture unread
-declare -A POSTURE POSTURE_TS
+declare -A POSTURE POSTURE_TS POSTURE_RSN_C POSTURE_EXT_C   # badge, read time, and the caps it was read from, per BSSID
 
 hex_octet() {   # hex_octet <hexstring> <index0> -> decimal octet, nonzero rc if short
   local b="${1:$(( $2 * 2 )):2}"
@@ -596,20 +605,22 @@ posture_of() {   # posture_of <bssid> <band> <channel> -> badge (stdout and POST
   local bssid="$1" band="$2" ch="$3" f b now="$EPOCHSECONDS" locked_here=0
   # Both early returns below answer without reading a beacon, so the caps globals must not keep the
   # PREVIOUS target's values -- resp_write records them as this response's rsn_caps/beacon_prot and
-  # would otherwise attribute another BSSID's posture to this row. Only the badge itself is cached.
+  # would otherwise attribute another BSSID's posture to this row. The caps are cached per BSSID beside
+  # the badge, so a hit restores THIS target's caps instead of blanking its loot row.
   POSTURE_RSN=-; POSTURE_EXT=-
   if [ -n "${POSTURE[$bssid]}" ] && (( now - ${POSTURE_TS[$bssid]:-0} < POSTURE_TTL )); then
+    POSTURE_RSN="${POSTURE_RSN_C[$bssid]:--}"; POSTURE_EXT="${POSTURE_EXT_C[$bssid]:--}"
     POSTURE_LAST="${POSTURE[$bssid]}"; printf '%s' "$POSTURE_LAST"; return 0
   fi
   # A channel we may not transmit on needs no capture: the answer is NOINJ whatever the beacon says.
   if [ "$(posture_from_caps - - "$band" "$ch")" = NOINJ ]; then
-    POSTURE[$bssid]=NOINJ; POSTURE_TS[$bssid]=$now; POSTURE_LAST=NOINJ; printf 'NOINJ'; return 0
+    POSTURE[$bssid]=NOINJ; POSTURE_TS[$bssid]=$now; POSTURE_RSN_C[$bssid]=-; POSTURE_EXT_C[$bssid]=-; POSTURE_LAST=NOINJ; printf 'NOINJ'; return 0
   fi
   # Recon hops while unlocked, so a 4 s capture on one BSSID mostly misses; hold the channel for it.
   if [ "$WATCH_LOCKED" != 1 ]; then lock_target "$bssid" $(( BCN_CAP_SECS + 5 )) "$ch" >/dev/null; locked_here=1; fi
   if f=$(capture_beacon "$bssid"); then posture_read_pcap "$f" "$band" "$ch" >/dev/null; b="$POSTURE_BADGE"; rm -f "$f"; else POSTURE_RSN=-; POSTURE_EXT=-; b='?'; fi
   (( locked_here )) && unlock_target
-  if [ "$b" != '?' ]; then POSTURE[$bssid]="$b"; POSTURE_TS[$bssid]=$now; fi   # a failed read is not cached
+  if [ "$b" != '?' ]; then POSTURE[$bssid]="$b"; POSTURE_TS[$bssid]=$now; POSTURE_RSN_C[$bssid]="$POSTURE_RSN"; POSTURE_EXT_C[$bssid]="$POSTURE_EXT"; fi   # a failed read is not cached
   POSTURE_LAST="$b"; printf '%s' "$b"
 }
 # --- response posture end ---
@@ -620,7 +631,7 @@ cleanup() {
   kill_children
   if [ "$WATCH_LOCKED" = 1 ]; then _pineap EXAMINE CANCEL >/dev/null 2>&1; PINEAPPLE_EXAMINE_RESET >/dev/null 2>&1; fi
   [ -n "$RUN_ID" ] && [ "$REPORT_DONE_AT_EXIT" != 1 ] && write_report quiet
-  rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap /tmp/cs_*.err /tmp/cs_signal /tmp/cs_inv.new /tmp/cs_rows.tmp
+  rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
   log run "exit cycles=$CYCLE"
   ui_ok && set_state FINISH
 }
@@ -823,12 +834,17 @@ score_device() {
   shopt -u nocasematch
 }
 
-# RSSI_MIN list gate on the session's best reading (0 = off; a device with no reading passes)
+# RSSI_MIN list gate on the best reading known for the MAC -- the inventory's carried-over best included
+# (0 = off; a device with no reading passes). A kit AP also passes when any of its kit clients does: the
+# clients are NOALERT, so hiding a weak NVR behind strong cameras would lose the kit's one alert.
 rssi_gate_ok() {
   (( RSSI_MIN == 0 )) && return 0
-  [[ ${RSSI_BEST[$1]:-x} =~ ^-?[0-9]+$ ]] || return 0
-  (( ${RSSI_BEST[$1]} >= RSSI_MIN ))
+  rssi_gate_own "$1" && return 0
+  [ "${KITAP[$1]}" = 1 ] || return 1
+  local c; for c in ${CLIENTS_OF[$1]}; do [ "${KITCL[$c]}" = 1 ] && rssi_gate_own "$c" && return 0; done
+  return 1
 }
+rssi_gate_own() { [[ ${RSSI_BEST[$1]:-x} =~ ^-?[0-9]+$ ]] || return 0; (( ${RSSI_BEST[$1]} >= RSSI_MIN )); }
 # proximity bucket from the best RSSI over the last 3 cycles; UNK fails open
 prox_of() {
   local mac="$1" best=-999 r near=$NEAR_DBM far=$FAR_DBM
@@ -927,7 +943,7 @@ load_inventory() {   # read inventory.tsv once at start into SEEN_*; prune rows 
     CLOCK_OK=0; log warn "clock invalid: inventory newer than now; dedupe and prune disabled"; ui_ok && LOG yellow "clock invalid: dedupe off"; return 0
   fi
   if (( cutoff > 0 )); then
-    awk -F'|' -v c="$cutoff" '/^#/ { print; next } $2 ~ /^[0-9]+$/ && $2 >= c { print }' "$f" >/tmp/cs_inv.new 2>/dev/null && mv /tmp/cs_inv.new "$f"
+    awk -F'|' -v c="$cutoff" '/^#/ { print; next } $2 ~ /^[0-9]+$/ && $2 >= c { print }' "$f" >"$f.new" 2>/dev/null && mv "$f.new" "$f"
     for mac in "${!SEEN_LAST[@]}"; do (( ${SEEN_LAST[$mac]} < cutoff )) && unset "SEEN_LAST[$mac]" "SEEN_CONF[$mac]" "SEEN_RSSI[$mac]" "SEEN_RSSI_TS[$mac]" "SEEN_FIRST[$mac]" "SEEN_N[$mac]" "SEEN_LAT[$mac]" "SEEN_LON[$mac]" "SEEN_BEH[$mac]" "SEEN_VERDICT[$mac]"; done
   fi
   return 0
@@ -947,7 +963,7 @@ upsert_rows() {   # upsert_rows mac... -> merge these rows into inventory.tsv (r
   { for m in "$@"; do [ -n "${ROLE[$m]}" ] || continue; [ "${ROLE[$m]}" = cli ] && is_rand "$m" && continue; inv_row "$m"; done; } >/tmp/cs_rows.tmp
   [ -s /tmp/cs_rows.tmp ] || return 0
   [ -s "$f" ] || printf '%s\n' "$INV_HDR" >"$f"
-  awk -F'|' 'NR==FNR { new[$4]=$0; next } /^#/ { print; next } { if ($4 in new) { print new[$4]; delete new[$4] } else print } END { for (k in new) print new[k] }' /tmp/cs_rows.tmp "$f" >/tmp/cs_inv.new 2>/dev/null && mv /tmp/cs_inv.new "$f"
+  awk -F'|' 'NR==FNR { new[$4]=$0; next } /^#/ { print; next } { if ($4 in new) { print new[$4]; delete new[$4] } else print } END { for (k in new) print new[k] }' /tmp/cs_rows.tmp "$f" >"$f.new" 2>/dev/null && mv "$f.new" "$f"
   (( CYCLE % 5 == 0 )) && sync
   return 0
 }
@@ -1386,9 +1402,15 @@ settings_row() {   # settings_row KEY -> sets S_KIND S_FLOOR S_LABEL from the ta
   return 1
 }
 S_KIND=""; S_FLOOR=0; S_LABEL=""
+cfg_note_set() {   # cfg_note_set KEY VALUE|"" -> keep CFG_NOTE/CFG_OVERRIDES (start screen, report footer) in step with the overrides in force
+  local w; local -a keep=()
+  for w in $CFG_NOTE; do [ "${w%%=*}" = "$1" ] || keep+=("$w"); done
+  [ -n "$2" ] && keep+=("$1=$2")
+  CFG_NOTE=""; for w in "${keep[@]}"; do CFG_NOTE+=" $w"; done; CFG_OVERRIDES=${#keep[@]}
+}
 settings_apply() {   # settings_apply KEY VALUE -> live variable + persisted override
   local key="$1" val="$2"
-  printf -v "$key" '%s' "$val"
+  printf -v "$key" '%s' "$val"; cfg_note_set "$key" "$val"
   if command -v PAYLOAD_SET_CONFIG >/dev/null 2>&1 && PAYLOAD_SET_CONFIG "$PAYLOAD_NAME" "$key" "$val" >/dev/null 2>&1; then LOG "$key -> $val (saved)"
   else LOG yellow "$key -> $val (this run only)"; fi
   log cfg "set $key=$val"
@@ -1401,17 +1423,17 @@ settings_reset() {
   while IFS='|' read -r key _; do
     [ -n "$key" ] || continue
     command -v PAYLOAD_DEL_CONFIG >/dev/null 2>&1 && PAYLOAD_DEL_CONFIG "$PAYLOAD_NAME" "$key" >/dev/null 2>&1
-    printf -v "$key" '%s' "${CFG_DEFAULT[$key]}"
+    printf -v "$key" '%s' "${CFG_DEFAULT[$key]}"; cfg_note_set "$key" ""
   done <<<"$SETTINGS_TABLE"
-  CFG_OVERRIDES=0; CFG_NOTE=""; DEDUPE_RUN=1
+  DEDUPE_RUN=1   # the response-rung overrides stay in force and stay counted
   log cfg "reset defaults"; LOG "settings reset to defaults"
 }
 settings_menu() {
   local key resp rc; local -a items
   while :; do
-    items=()
+    items=("Back")   # first, so the default is on the page LIST_PICKER shows: Back + eight keys fill page 1, the ninth and Reset sit behind More...
     while IFS='|' read -r key _; do [ -n "$key" ] && items+=("$key = ${!key}"); done <<<"$SETTINGS_TABLE"
-    items+=("Reset defaults" "Back")
+    items+=("Reset defaults")
     pick_list "Settings (saved on device)" "Back" "${items[@]}" || return 0
     case "$PICK" in "Back") return 0 ;; "Reset defaults") settings_reset; continue ;; esac
     key=${PICK%% = *}; settings_row "$key" || continue
@@ -1423,6 +1445,7 @@ settings_menu() {
       (( rc != 0 )) && continue
       [[ $resp =~ ^-?[0-9]+$ ]] || { LOG yellow "$key: not a number"; continue; }
       (( resp < S_FLOOR )) && { LOG yellow "$key: minimum is $S_FLOOR"; continue; }
+      [ "$key" = RSSI_MIN ] && (( resp > 0 )) && { LOG yellow "RSSI_MIN: 0 (off) or a negative dBm"; continue; }
     fi
     settings_apply "$key" "$resp"
   done
@@ -2170,6 +2193,9 @@ selftest() {
   score_device cc:00:00:00:00:01; st "mixed vendor + EVENT + asym + BUSY = 79 LIKELY" "${CONF[cc:00:00:00:00:01]} ${BANDNAME[cc:00:00:00:00:01]}" "79 LIKELY"
   st_device cc:00:00:00:00:02 cli "Amazon Technologies Inc." "" 0 aa:00:00:00:00:99; score_device cc:00:00:00:00:02
   st "idle Blink on Amazon OUI = 20 POSSIBLE MIXED" "${CONF[cc:00:00:00:00:02]} ${BANDNAME[cc:00:00:00:00:02]} ${CAT[cc:00:00:00:00:02]}" "20 POSSIBLE MIXED"
+  BEH[cc:00:00:00:00:02]=-20; BEH_GATE[cc:00:00:00:00:02]=0; BEH_VERDICT[cc:00:00:00:00:02]=DOWN; score_device cc:00:00:00:00:02
+  st "Amazon client + DOWN = 0 none (the floor only protects identity 45+)" "${CONF[cc:00:00:00:00:02]} ${BANDNAME[cc:00:00:00:00:02]}" "0 none"
+  unset "BEH[cc:00:00:00:00:02]" "BEH_GATE[cc:00:00:00:00:02]" "BEH_VERDICT[cc:00:00:00:00:02]"; score_device cc:00:00:00:00:02
   st_device dd:00:00:00:00:01 cli "Espressif Inc." "" 0 aa:00:00:00:00:99; score_device dd:00:00:00:00:01
   st "Espressif alone = 0 MODULE" "${CONF[dd:00:00:00:00:01]} ${BANDNAME[dd:00:00:00:00:01]} ${CAT[dd:00:00:00:00:01]}" "0 MODULE IOTMOD"
   st_device dd:00:00:00:00:02 cli "Espressif Inc." "IPC_1234" 0 aa:00:00:00:00:98; score_device dd:00:00:00:00:02
@@ -2208,6 +2234,9 @@ selftest() {
   st_pcap "$tmp/t.pcap" 1200 20 1700000000; st "pcap buckets (10 s x 2 big frames)" "$(pcap_buckets "$tmp/t.pcap" | wc -l | tr -d ' ')" 10
   st "pcap bucket line" "$(pcap_buckets "$tmp/t.pcap" | head -1)" "1700000000 2400 2 2"
   pcap_buckets "$tmp/t.pcap" >"$tmp/t.b"; st "bucket stats" "$(bucket_stats "$tmp/t.b" | cut -d' ' -f1-4)" "10 20 24000 20"
+  printf '# 1700000000 up aa:bb:cc:dd:ee:ff\n1 1200 10 2\n2 1300 11 3\n# dn\n1 90 4 0\n2 80 3 0\n# 1700000020 up aa:bb:cc:dd:ee:ff\n1 1100 9 1\n# dn\n1 70 2 0\n' >"$tmp/raw.txt"
+  raw_up_rows "$tmp/raw.txt" >"$tmp/raw.b"; st "raw replay keeps the up rows of every window" "$(bucket_stats "$tmp/raw.b" | cut -d' ' -f1-4)" "3 30 3600 6"
+  st "raw replay passes a bucket file through" "$(raw_up_rows "$tmp/t.b" | md5sum | cut -c1-32)" "$(md5sum <"$tmp/t.b" | cut -c1-32)"
   printf 'garbage' >"$tmp/bad.pcap"; pcap_buckets "$tmp/bad.pcap" >/dev/null 2>&1; st "bad magic rejected" "$?" 1
   # 4b capture gate: tcpdump plus EITHER hex dumper. Stub dirs, so the verdict does not depend
   #    on what happens to be installed where the selftest runs.
@@ -2235,6 +2264,10 @@ selftest() {
   POSTURE[aa:00:00:00:00:f1]=C; POSTURE_TS[aa:00:00:00:00:f1]=$EPOCHSECONDS
   posture_of aa:00:00:00:00:f1 2 6 >/dev/null
   st "posture_of cache hit clears stale caps" "$POSTURE_RSN/$POSTURE_EXT" "-/-"
+  POSTURE_RSN=cc00; POSTURE_EXT=0000000000000000000010
+  POSTURE[aa:00:00:00:00:f3]='D?+C'; POSTURE_TS[aa:00:00:00:00:f3]=$EPOCHSECONDS; POSTURE_RSN_C[aa:00:00:00:00:f3]=8c00; POSTURE_EXT_C[aa:00:00:00:00:f3]=-
+  posture_of aa:00:00:00:00:f3 2 6 >/dev/null
+  st "posture_of cache hit restores this BSSID's caps" "$POSTURE_RSN/$POSTURE_EXT" "8c00/-"
   POSTURE_RSN=cc00; POSTURE_EXT=0000000000000000000010
   posture_of aa:00:00:00:00:f2 6 37 >/dev/null
   st "posture_of NOINJ exit clears stale caps" "$POSTURE_RSN/$POSTURE_EXT" "-/-"
@@ -2425,6 +2458,14 @@ IWFIX
   RSSI_BEST[aa:00:00:00:00:01]=-40; rssi_gate_ok aa:00:00:00:00:01; st "rssi gate: above RSSI_MIN listed" "$?" 0
   unset "RSSI_BEST[aa:00:00:00:00:99]"; rssi_gate_ok aa:00:00:00:00:99; st "rssi gate: no reading passes" "$?" 0
   RSSI_MIN=0; RSSI_BEST[aa:00:00:00:00:01]=-90; rssi_gate_ok aa:00:00:00:00:01; st "rssi gate: off by default" "$?" 0
+  RSSI_MIN=60; rssi_min_clamp; st "rssi gate: positive RSSI_MIN is not dBm, gate off" "$RSSI_MIN" "0"
+  RSSI_MIN=-65; RSSI_BEST[aa:00:00:00:00:7a]=-75; KITAP[aa:00:00:00:00:7a]=1; CLIENTS_OF[aa:00:00:00:00:7a]=" aa:00:00:00:00:7b"; KITCL[aa:00:00:00:00:7b]=1; RSSI_BEST[aa:00:00:00:00:7b]=-55
+  rssi_gate_ok aa:00:00:00:00:7a; st "rssi gate: weak kit AP passes on a strong kit client" "$?" 0
+  KITCL[aa:00:00:00:00:7b]=""; rssi_gate_ok aa:00:00:00:00:7a; st "rssi gate: weak AP with a non-kit client hidden" "$?" 1
+  unset "KITAP[aa:00:00:00:00:7a]" "CLIENTS_OF[aa:00:00:00:00:7a]" "KITCL[aa:00:00:00:00:7b]" "RSSI_BEST[aa:00:00:00:00:7a]" "RSSI_BEST[aa:00:00:00:00:7b]"; RSSI_MIN=0
+  RESP_SETTLE_SECS=6; RESP_LOCK_SECS=5; load_overrides; st "lock clamp runs with no persistence available" "$RESP_LOCK_SECS" "11"
+  CFG_NOTE=" RESPONSE=1 CYCLE_SECS=9"; CFG_OVERRIDES=2; cfg_note_set CYCLE_SECS 7; st "settings: footer note tracks an applied key" "$CFG_OVERRIDES:$CFG_NOTE" "2: RESPONSE=1 CYCLE_SECS=7"
+  cfg_note_set CYCLE_SECS ""; st "settings: reset keeps the response-rung overrides counted" "$CFG_OVERRIDES:$CFG_NOTE" "1: RESPONSE=1"; CFG_OVERRIDES=0; CFG_NOTE=""
   CYCLE_SECS=20; cfg_snapshot_defaults; CYCLE_SECS=7; st "settings: default captured" "${CFG_DEFAULT[CYCLE_SECS]}" "20"
   settings_row CYCLE_SECS; st "settings: table row" "$S_KIND $S_FLOOR" "int 5"
   settings_row NOSUCHKEY; st "settings: unknown key rc" "$?" 1
@@ -2437,11 +2478,14 @@ IWFIX
   printf '== %s checks, %s failed ==\n' "$ST_N" "$ST_FAIL"
   return $(( ST_FAIL > 0 ))
 }
-replay() {   # --replay <pcap or bucket file>
+# raw_up_rows <raw_<run>.txt> -> the up-direction bucket rows of every window; a header-less bucket file passes through unchanged
+# (window_metrics appends '# <epoch> up <mac>', the up rows, '# dn', the dn rows per window)
+raw_up_rows() { awk 'BEGIN { d = 1 } /^#/ { d = ($3 == "up"); next } d' "$1"; }
+replay() {   # --replay <pcap, bucket or raw file>
   local f="$1" m; st_stub_ui
   [ -r "$f" ] || { printf 'replay: cannot read %s\n' "$f"; return 1; }
   m=$(pcap_words "$f" | head -1)
-  case "$m" in 2712847316|2712812077|3569595041|1295823521) pcap_buckets "$f" >/tmp/cs_replay.b || { printf 'parse error\n'; return 1; } ;; *) cp "$f" /tmp/cs_replay.b ;; esac
+  case "$m" in 2712847316|2712812077|3569595041|1295823521) pcap_buckets "$f" >/tmp/cs_replay.b || { printf 'parse error\n'; return 1; } ;; *) raw_up_rows "$f" >/tmp/cs_replay.b ;; esac
   read -r WM_USEC WM_UF WM_UB WM_UG _ WM_UCV <<<"$(bucket_stats /tmp/cs_replay.b)"
   local r10=0; (( WM_USEC > 0 )) && r10=$(( WM_UG * 10 / WM_USEC ))
   printf 'secs %s frames %s bytes %s big %s big/s %s cv %s\n' "$WM_USEC" "$WM_UF" "$WM_UB" "$WM_UG" "$(fmt10 "$r10")" "$( (( WM_UCV >= 0 )) && fmt10 "$WM_UCV" || printf -)"
@@ -2457,7 +2501,7 @@ replay() {   # --replay <pcap or bucket file>
 case "${1:-}" in
   --selftest) selftest; exit $? ;;
   --replay)   replay "${2:-}"; exit $? ;;
-  -h|--help)  printf 'CamHound %s: run from the Pager UI. Laptop: --selftest | --replay <pcap|bucket file>\n' "$VERSION"; exit 0 ;;
+  -h|--help)  printf 'CamHound %s: run from the Pager UI. Laptop: --selftest | --replay <pcap|bucket|raw file>\n' "$VERSION"; exit 0 ;;
 esac
 set_state SETUP
 INSTALL_DIR=$(find_install_dir) || INSTALL_DIR=""

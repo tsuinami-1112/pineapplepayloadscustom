@@ -39,7 +39,7 @@ confirms a device is streaming; it is a second key precisely because that rung t
    or Apple (-25).
 2. **Behaviour** (30-120 s channel lock, one suspect at a time): header-only tcpdump captures split
    by direction in the kernel (`wlan addr2` = uplink, `wlan addr1` = downlink), parsed with
-   hexdump+awk. Live view grades STREAM / DOWN / IDLE / NONE / INCONCLUSIVE; the Stimulus test
+   hexdump (or od) + awk. Live view grades STREAM / DOWN / IDLE / NONE / INCONCLUSIVE; the Stimulus test
    grades EVENT / EVENT? by comparing a 30 s still baseline with 20 s of you moving in front of it
    plus a 20 s settle window.
 3. **Response** (opt-in, off by default): reads the target's PMF and beacon-protection posture from
@@ -84,7 +84,8 @@ Buttons: A = select / stop (Watch, Locate), B = back / pause, UP and DOWN scroll
 Two axes, one number. Identity `I` is the sum of identity rows; behaviour `Bh` the sum of Watch,
 stimulus and BUSY rows. `conf = I_eff + Bh_eff`, where a single identity class caps `I_eff` at 69,
 behaviour without identity caps `Bh_eff` at 69 (the yellow **STREAM lane**), and a negative
-behaviour row never lowers a grade that identity alone earns.
+behaviour row (DOWN, -20) never lowers a grade that identity of 45+ earns; below that it does lower
+`conf`, so a POSSIBLE row can drop out of Review hits after a DOWN Watch.
 
 | Band | conf | Colour | Reachable by |
 |---|---|---|---|
@@ -155,7 +156,8 @@ survive updates: `PAYLOAD_SET_CONFIG camhound CYCLE_SECS 10` (`PAYLOAD_DEL_CONFI
 removes it). Overrides are counted on the start screen and listed in `events.log`. The **Settings**
 menu item does the same from the device for the recon keys (CYCLE_SECS, THR_STREAM_UP, COOLDOWN_SECS,
 DEDUPE_H, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH, AUTO_LOCATE): numbers via NUMBER_PICKER, switches
-as On/Off, and `Reset defaults` deletes every saved override. Changes apply at once and persist.
+as On/Off, and `Reset defaults` deletes the saved overrides of those nine keys (response-rung overrides
+set with `PAYLOAD_SET_CONFIG` are kept, and stay counted). Changes apply at once and persist.
 
 | Key | Default | Persist | Meaning |
 |---|---|---|---|
@@ -165,7 +167,7 @@ as On/Off, and `Reset defaults` deletes every saved override. Changes apply at o
 | ALERT_DIALOG | 1 | * | blocking ALERT on NEW CONFIRMED when AUTO_WATCH=0 |
 | AUTO_WATCH / AUTO_LOCATE | 1 / 1 | * | the two-press funnel; set 0 for walk surveys |
 | AUTO_WATCH_RSSI | -72 | | minimum last RSSI to auto-offer Watch |
-| RSSI_MIN | 0 | * | optional list gate on the session's best RSSI (0 = widest net) |
+| RSSI_MIN | 0 | * | optional list gate, dBm, on the best RSSI known for the MAC, carried-over best included (0 = widest net; a kit AP passes when a kit client does) |
 | SOUND | 0 | * | ringtone on CONFIRMED |
 | SHOW_MODULES | 1 | | modules list in the menu |
 | MODULE_HINT_RSSI | -55 | | one-time "module strong+busy: Watch?" hint |
@@ -211,13 +213,14 @@ captured under a short channel lock when no Watch lock is held, since Recon hops
 | `D?+C` | PMF optional (transition mode) | per-client | works |
 | `C` | PMF required (WPA3) | ignored | works |
 | `NONE` | PMF + beacon protection | blocked | blocked |
-| `NOINJ` | DFS 5 GHz or 6 GHz channel | cannot transmit | cannot transmit |
+| `NOINJ` | channel we cannot transmit on: DFS 5 GHz, 6 GHz, or disabled/no-IR under the live domain | cannot transmit | cannot transmit |
 | `?` | no beacon captured | unknown | unknown |
 
 `D?+C` cannot be resolved from a beacon alone, because PMF is negotiated per client — a transition
 -mode BSS can hold both protected and unprotected clients at once. `NOINJ` is a gate verdict,
 not a property of the target: pineapd refuses the 16 DFS channels and 6 GHz outright, and cfg80211
-drops frames on channels the live regulatory domain marks disabled or no-IR. Both drops are silent, so
+drops frames on channels the live regulatory domain marks disabled or no-IR. pineapd logs its refusal
+and returns an error; cfg80211's drop is silent (the frame is freed and `sendto` reports success), so
 CamHound refuses rather than guesses (`csa_injectable`, two gates; see `dev/pager-csa-primitives.md`).
 
 **2 · Attack.** All three are always offered, ordered by what the beacon says will work and
@@ -282,14 +285,15 @@ that reuse a captured beacon's timestamp.
   `#epoch|mac|role|bssid|ch|freq|mode|run|secs|up|down|asym|cv|delta|rec|drops|verdict|batt_start|batt_end|charging`.
 - `report_<run>.txt`: headline counts, suspects by confidence, vendor census, AP-to-client tree
   (`BASE?` marks a hidden AP with 1-4 clients on a module/mixed OUI), modules, GPS, footer.
-- `raw_<run>.txt` (KEEP_RAW=1) replays on a laptop: `bash payload.sh --replay <file>`.
+- `raw_<run>.txt` (KEEP_RAW=1) replays on a laptop: `bash payload.sh --replay <file>` (it keeps the
+  up-direction rows of every window and reports them as one).
 
 ## Laptop checks
 
 `bash payload.sh --selftest` runs the self-checks (signature lint, both oui.txt layouts, every worked
 example above, proximity, row width, pcap parser, posture, response and settings vectors; it prints its
-own count, which grows with every addition) with `LOG`/`LED` stubbed; `--replay <pcap or
-bucket file>` runs the Watch parser on a saved window. BusyBox `hexdump` and `awk` are enough.
+own count, which grows with every addition) with `LOG`/`LED` stubbed; `--replay <pcap, bucket or
+raw file>` runs the Watch parser on a saved window (a raw file's up-direction rows, every window). BusyBox `hexdump` and `awk` are enough.
 
 ## Test matrix (fill the Measured column on your unit)
 

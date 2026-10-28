@@ -61,8 +61,12 @@ moves a hash depends on which region it lands in:
 | everything else | — | neither |
 
 The selftest prints both hashes at the end, so a changed hash is visible without running
-`check_sync.sh`. The harness needs `jq`; it stubs DuckyScript, `_pineap`, `tcpdump`, `iwinfo` and
-`uci` from `dev/CamHound/harness/stubs/`.
+`check_sync.sh`. The harness needs `jq`; it stubs DuckyScript (`NUMBER_PICKER` and `PAYLOAD_SET/DEL_CONFIG` included),
+`_pineap`, `tcpdump`, `iwinfo`, `uci` and `iw` (a US-like channel table, answered for the fixture phy
+directory the fast copy points `INJ_SYSFS` at, so `inj_probe`'s success path runs) from
+`dev/CamHound/harness/stubs/`. Its `LIST_PICKER` answers only with items on the page it was handed: an
+answer further down the list makes it press `More...` first, as an operator would, and an answer that is
+on no page is refused (logged as `not on this page`).
 
 Starred config constants (`# *`) are overridable at runtime via
 `PAYLOAD_SET_CONFIG camhound <KEY> <value>` — if you add a starred constant, wire it into
@@ -73,7 +77,10 @@ Starred config constants (`# *`) are overridable at runtime via
 Line numbers drift; find things by name (`grep -n '^name()' payload.sh`).
 
 **Recon rung** — `load_signatures`, `add_sig`, `vendor_of`, `score_device`, `clean_text`,
-`is_setup_ap`, `review_list`, `main_menu`, `preflight`, `write_report`.
+`is_setup_ap`, `review_list`, `main_menu`, `preflight`, `write_report`; `rssi_gate_ok` (the RSSI_MIN
+list gate, kit-aware: a kit AP passes when a kit client does) with `rssi_min_clamp`; the Settings menu
+(`SETTINGS_TABLE`, `cfg_snapshot_defaults`, `settings_menu`/`settings_apply`/`settings_reset`,
+`cfg_note_set` keeps the override count honest); `raw_up_rows` feeds `--replay` a `raw_<run>.txt`.
 
 **Watch rung** (behaviour without identity) — `watch_menu`, `start_caps`/`stop_caps`,
 `pcap_words`/`pcap_bytes` (both have `od` fallbacks), `pcap_buckets`, `bucket_stats`,
@@ -85,8 +92,9 @@ Line numbers drift; find things by name (`grep -n '^name()' payload.sh`).
 - `posture_from_caps <rsn> <ext> <band> <ch>` → the badge: `D+C` (no PMF), `D?+C` (PMF capable),
   `C` (PMF required), `NONE` (PMF + beacon protection), `NOINJ` (cannot transmit here), `?` (unread)
 - `posture_of` → cached per BSSID, `POSTURE_TTL`. **Call it directly, never inside `$( )`** — it
-  sets globals in the caller's shell. It resets `POSTURE_RSN`/`POSTURE_EXT` on entry so a cache hit
-  cannot attribute a previous target's caps to this response's loot row.
+  sets globals in the caller's shell. It resets `POSTURE_RSN`/`POSTURE_EXT` on entry and caches the caps
+  per BSSID beside the badge, so a cache hit restores this target's caps and never attributes a previous
+  target's to this response's loot row.
 - `posture_opts <badge>` → the offered attacks, **best first**; `pick_list` preselects element 0, so
   the string order *is* the default. Empty means nothing is offered, and `disrupt_menu` then asks
   "Nothing is expected to work — try anyway?".

@@ -1,9 +1,13 @@
 #!/bin/bash
-# Laptop harness for CamHound. Runs the user payload against stub DuckyScript commands, a fake
-# _pineap (RECON fixtures in fix/), a fake tcpdump (synthetic pcaps) and a fake iwinfo, then checks
-# the verdicts and the loot. Writes only under a temp directory and /tmp/cs_*.
+# Laptop harness for CamHound. Runs the user payload against stub DuckyScript commands (including
+# NUMBER_PICKER and PAYLOAD_SET/DEL_CONFIG), a fake _pineap (RECON fixtures in fix/), a fake tcpdump
+# (synthetic pcaps), a fake iwinfo and a fake iw (US-like channel table, answered for the fixture phy
+# directory the fast copy points INJ_SYSFS at), then checks the verdicts and the loot. Writes only
+# under a temp directory and /tmp/cs_*. The LIST_PICKER stub answers only with items on the page it
+# was handed: for an answer further down the list it presses 'More...' first, as an operator would,
+# and it refuses (exit 1, logged 'not on this page') an answer that is on no page.
 # Needs bash 5 and jq; uses busybox hexdump/awk when busybox is installed (closer to the Pager).
-# Usage: dev/CamHound/harness/run_harness.sh [live|stimulus|lock|nojq|locate|all]
+# Usage: dev/CamHound/harness/run_harness.sh [live|stimulus|lock|nojq|locate|disrupt|persist|settings|all]
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
 SRC="$ROOT/library/user/reconnaissance/CamHound/payload.sh"
@@ -79,6 +83,7 @@ s_disrupt() {   # RESPONSE=1: Disrupt on the Reolink AP against log-only stubs; 
   check "disrupt: posture read under a lock on the target channel" "grep -q 'TCPDUMP beacon ec71db000010' $T/log && grep -q 'PINEAPPLE_EXAMINE_BSSID ec:71:db:00:00:10' $T/log"
   check "disrupt: badge D+C from the synthetic beacon" "grep -q 'PICKER\[Disrupt \[D+C\]' $T/log"
   check "disrupt: regulatory probe ran against the fixture phy" "grep -q '^IW phy phy0 channels' $T/log"
+  check "disrupt: regulatory probe parsed the fixture (no fallback)" "! grep -q 'regulatory probe failed' $T/log"
   check "disrupt: stub command called with bssid, broadcast target, channel 36" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_ALL ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log"
   check "disrupt: lock verified ok (not by channel)" "grep -q 'lock: ok' $T/log"
   check "disrupt: one loot row per client, 16 fields, badge and raw caps" "[ \"\$(grep -c '^[0-9]' $LOOT/responses.tsv)\" = 2 ] && [ \"\$(sed -n 2p $LOOT/responses.tsv | awk -F'|' '{print NF}')\" = 16 ] && grep -q '|ec:71:db:00:00:11|36|5|D+C|0c00|' $LOOT/responses.tsv && grep -q '|ec:71:db:00:00:12|36|5|D+C|0c00|' $LOOT/responses.tsv"

@@ -1,8 +1,14 @@
 #!/bin/bash
-title="$1"; shift; n=$(( $# - 1 )); a=$(_rule "$title")
-printf 'PICKER[%s] items=%s -> %s\n' "$title" "$(printf '%s;' "${@:1:$n}")" "$a" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"
+# LIST_PICKER title item... default -> the rule's answer, but only ever an item on this page: a numeric answer
+# is a 1-based index into the page, a named answer further down the list presses 'More...' first (the answer
+# stays queued, as an operator paging towards it), and a name on no page is refused with exit 1.
+title="$1"; shift; n=$(( $# - 1 )); a=$(_rule "$title" peek); L="${HARNESS_LOG:-/tmp/cs_harness.log}"
+ITEMS=$(printf '%s;' "${@:1:$n}")   # captured here: inside say() "$@" would be say's own arguments
+say() { printf 'PICKER[%s] items=%s -> %s\n' "$title" "$ITEMS" "$1" >> "$L"; }
 case "$a" in
-  B|"") exit 1 ;;
-  [0-9]*) i=$a; (( i >= 1 && i <= n )) || exit 1; printf '%s' "${!i}"; exit 0 ;;
-  *) printf '%s' "$a"; exit 0 ;;
+  B|"") _rule "$title" >/dev/null; say "$a"; exit 1 ;;
+  [0-9]*) _rule "$title" >/dev/null; say "$a"; i=$a; (( i >= 1 && i <= n )) || exit 1; printf '%s' "${!i}"; exit 0 ;;
 esac
+for it in "${@:1:$n}"; do [ "$it" = "$a" ] && { _rule "$title" >/dev/null; say "$a"; printf '%s' "$a"; exit 0; }; done
+for it in "${@:1:$n}"; do [ "$it" = "More..." ] && { say "More... (paging for $a)"; printf 'More...'; exit 0; }; done
+_rule "$title" >/dev/null; say "$a"; printf 'PICKER[%s] answer %s is not on this page\n' "$title" "$a" >> "$L"; exit 1
