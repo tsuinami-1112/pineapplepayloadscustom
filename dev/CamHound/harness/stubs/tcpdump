@@ -3,6 +3,8 @@ out=""; filt=""
 while [ $# -gt 0 ]; do case "$1" in -w) out="$2"; shift ;; -i|-s|-c) shift ;; -nn) ;; *) filt="$filt $1" ;; esac; shift; done
 case "$filt" in *"subtype beacon"*)
   bss=$(printf '%s' "$filt" | sed -n 's/.*addr2 \([0-9a-fA-F:]*\).*/\1/p' | tr -d ':' | tr 'A-F' 'a-f')
+  # HARNESS_NO_BEACON=1: the target never beacons for us -- write nothing, so capture_beacon fails and the badge is ?
+  [ -n "${HARNESS_NO_BEACON:-}" ] && { printf 'TCPDUMP beacon suppressed %s\n' "$bss" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; exit 0; }
   le32h() { printf '%02x%02x%02x%02x' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 )); }
   rsn="0100000fac040100000fac040100000fac020c00"
   frame="000008000000000080000000ffffffffffff${bss}${bss}0000000000000000000064001104000463616d3130$(printf %02x $(( ${#rsn} / 2 )))$rsn"

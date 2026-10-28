@@ -45,7 +45,8 @@ pagerinj: pagerinj.c
 # Fully static: no loader, no libc.so, nothing to be absent.  Bigger, and immune to every ABI
 # question in this file.  If the dynamic build ever fails on the device, reach for this.
 static: pagerinj.c
-	@test -n "$(SDK)" || { echo "set SDK=..."; exit 1; }
+	@test -n "$(SDK)" || { echo "set SDK=/path/to/openwrt-sdk-24.10.1-ramips-mt76x8_..."; exit 1; }
+	@test -x "$(CC_CROSS)" || { echo "no cross gcc at $(CC_CROSS)"; exit 1; }
 	$(CC_CROSS) $(CFLAGS_CROSS) -static -s -o pagerinj-static $<
 	@echo "built pagerinj-static ($$(stat -c %s pagerinj-static) bytes)"
 
@@ -66,4 +67,4 @@ verify: pagerinj
 	@$(READELF) -d pagerinj | grep NEEDED || echo "    (static)"
 
 clean:
-	rm -f pagerinj pagerinj-host
+	rm -f pagerinj pagerinj-static pagerinj-host

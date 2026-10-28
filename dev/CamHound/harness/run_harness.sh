@@ -1,13 +1,14 @@
 #!/bin/bash
 # Laptop harness for CamHound. Runs the user payload against stub DuckyScript commands (including
 # NUMBER_PICKER and PAYLOAD_SET/DEL_CONFIG), a fake _pineap (RECON fixtures in fix/), a fake tcpdump
-# (synthetic pcaps), a fake iwinfo and a fake iw (US-like channel table, answered for the fixture phy
-# directory the fast copy points INJ_SYSFS at), then checks the verdicts and the loot. Writes only
-# under a temp directory and /tmp/cs_*. The LIST_PICKER stub answers only with items on the page it
+# (synthetic pcaps; HARNESS_NO_BEACON=1 makes its beacon branch capture nothing), a fake iwinfo and a
+# fake iw (US-like channel table, answered for the fixture phy directory the fast copy points INJ_SYSFS
+# at; a fixture net tree under NET_SYSFS names phy0 as wlan1mon's phy, so the probe takes its resolved
+# path), then checks the verdicts and the loot. Writes only under a temp directory and /tmp/cs_*. The LIST_PICKER stub answers only with items on the page it
 # was handed: for an answer further down the list it presses 'More...' first, as an operator would,
 # and it refuses (exit 1, logged 'not on this page') an answer that is on no page.
 # Needs bash 5 and jq; uses busybox hexdump/awk when busybox is installed (closer to the Pager).
-# Usage: dev/CamHound/harness/run_harness.sh [live|stimulus|lock|nojq|locate|disrupt|persist|settings|all]
+# Usage: dev/CamHound/harness/run_harness.sh [live|stimulus|lock|nojq|locate|disrupt|blind|noinj|persist|settings|all]
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
 SRC="$ROOT/library/user/reconnaissance/CamHound/payload.sh"
@@ -19,11 +20,13 @@ sed -e 's/^WIN_SECS=10 /WIN_SECS=5 /' -e 's/^LIVE_WINDOWS=6 /LIVE_WINDOWS=4 /' \
     -e 's/^WIN_BASE_S=30; WIN_STIM_S=20; WIN_POST_S=20 /WIN_BASE_S=6; WIN_STIM_S=5; WIN_POST_S=5 /' -e 's/^QUIET_SECS=15 /QUIET_SECS=3 /' \
     -e "s|^OUI_FILE=\"/lib/hak5/oui.txt\"; OUI_FILE_ALT=\"/rom/lib/hak5/oui.txt\"|OUI_FILE=\"$HERE/fix/oui.txt\"; OUI_FILE_ALT=\"$HERE/fix/oui.txt\"|" \
     -e 's/^RESP_SETTLE_SECS=6 /RESP_SETTLE_SECS=1 /' -e 's/^BCN_CAP_SECS=4 /BCN_CAP_SECS=2 /' \
-    -e "s|^INJ_SYSFS=\"/sys/class/ieee80211\"|INJ_SYSFS=\"$T/phy\"|" \
+    -e "s|^INJ_SYSFS=\"/sys/class/ieee80211\"|INJ_SYSFS=\"$T/phy\"|" -e "s|^NET_SYSFS=\"/sys/class/net\"|NET_SYSFS=\"$T/net\"|" \
     -e "s|^LOOT_DIR=\"/root/loot/CamHound\"|LOOT_DIR=\"$LOOT\"|" "$SRC" >"$T/payload_fast.sh"
 grep -q "LOOT_DIR=\"$LOOT\"" "$T/payload_fast.sh" || { echo "sed on the config block failed"; exit 1; }
 grep -q "INJ_SYSFS=\"$T/phy\"" "$T/payload_fast.sh" || { echo "sed on INJ_SYSFS failed"; exit 1; }
+grep -q "NET_SYSFS=\"$T/net\"" "$T/payload_fast.sh" || { echo "sed on NET_SYSFS failed"; exit 1; }
 mkdir -p "$T/phy/phy0"          # one fake phy; the iw stub answers 'iw phy phy0 channels' with a US-like table
+mkdir -p "$T/net/wlan1mon/phy80211"; printf 'phy0\n' >"$T/net/wlan1mon/phy80211/name"   # RECON_IF's phy: the probe reads this one, no merge
 printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
 PATHX="$HERE/stubs:$T/bin:$PATH"
 reset() { [ "${1:-}" = keep ] || rm -rf "$LOOT"; rm -rf "$T/log" "$T"/rules*.c* /tmp/cs_harness_chan /tmp/cs_harness_pps /tmp/cs_run.pid /tmp/cs_children; mkdir -p "$LOOT"; echo 0 >/tmp/cs_harness_cycle; }
@@ -84,6 +87,7 @@ s_disrupt() {   # RESPONSE=1: Disrupt on the Reolink AP against log-only stubs; 
   check "disrupt: badge D+C from the synthetic beacon" "grep -q 'PICKER\[Disrupt \[D+C\]' $T/log"
   check "disrupt: regulatory probe ran against the fixture phy" "grep -q '^IW phy phy0 channels' $T/log"
   check "disrupt: regulatory probe parsed the fixture (no fallback)" "! grep -q 'regulatory probe failed' $T/log"
+  check "disrupt: probe read the transmitting phy, not a merge" "grep -q 'inj probe: tx phy phy0' $LOOT/events.log && ! grep -q 'tx phy unresolved' $LOOT/events.log && ! grep -q 'tx phy unresolved' $T/log"
   check "disrupt: stub command called with bssid, broadcast target, channel 36" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_ALL ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log"
   check "disrupt: lock verified ok (not by channel)" "grep -q 'lock: ok' $T/log"
   check "disrupt: one loot row per client, 16 fields, badge and raw caps" "[ \"\$(grep -c '^[0-9]' $LOOT/responses.tsv)\" = 2 ] && [ \"\$(sed -n 2p $LOOT/responses.tsv | awk -F'|' '{print NF}')\" = 16 ] && grep -q '|ec:71:db:00:00:11|36|5|D+C|0c00|' $LOOT/responses.tsv && grep -q '|ec:71:db:00:00:12|36|5|D+C|0c00|' $LOOT/responses.tsv"
@@ -95,6 +99,29 @@ s_disrupt() {   # RESPONSE=1: Disrupt on the Reolink AP against log-only stubs; 
   check "disrupt: AP without clients refused, nothing sent" "grep -q 'no visible clients' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log && grep -q '|NO_CLIENTS$' $LOOT/responses.tsv"
   check "disrupt: cached badge shown on the card afterwards" "grep -q 'items=.*Disrupt \[D+C\]' $T/log"
   check "disrupt: EXAMINE released, no lock file" "grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log && [ ! -e /tmp/cs_run.pid ]"
+}
+s_blind() {   # RESPONSE=1 with no beacon capturable: the ? badge asks before firing blind; accepted leads CSA, declined sends nothing
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules blind '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' 'Fire blind' '1' '^Disrupt \[' '1' ' via ' '1' "${COMMON[@]}"
+  answers t t B; HARNESS_NO_BEACON=1 run
+  check "blind: capture attempted under a lock, nothing captured, badge ?" "grep -q 'TCPDUMP beacon suppressed ec71db000010' $T/log && grep -q 'PINEAPPLE_EXAMINE_BSSID ec:71:db:00:00:10' $T/log && grep -q '^LOG \[[?]\] 00:00:10 ch36 5GHz' $T/log"
+  check "blind: Fire blind confirm shown and accepted" "grep -q 'CONFIRM\[Posture unread on 00:00:10: no beacon captured. Fire blind[?]\] -> 1' $T/log"
+  check "blind: picker leads with CSA, every option labelled unknown" "grep -q 'PICKER\[Disrupt \[[?]\] ff:ff:ff\] items=CSA (unknown);BOTH (unknown);DEAUTH (unknown);' $T/log"
+  check "blind: CSA fired with bssid and channel only, badge ? in the event" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_CSA ec:71:db:00:00:10 36$' $T/log && grep -q 'fire CSA ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff ch36 badge=? ' $LOOT/events.log"
+  check "blind: loot rows carry badge ? and caps -, not a previous target's" "grep -q '|ec:71:db:00:00:11|36|5|?|-|-|CSA|PINEAPPLE_DEAUTH_CLIENT_CSA|ok|' $LOOT/responses.tsv && grep -q '|ec:71:db:00:00:12|36|5|?|-|-|CSA|' $LOOT/responses.tsv"
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules blind2 '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' 'Fire blind' '0' '^Disrupt \[' '1' ' via ' '1' "${COMMON[@]}"
+  answers t t B; HARNESS_NO_BEACON=1 run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "blind: declined -> no picker, nothing sent, no loot row" "grep -q 'Fire blind[?]\] -> 0' $T/log && ! grep -q 'PICKER\[Disrupt \[' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log && [ ! -e $LOOT/responses.tsv ]"
+}
+s_noinj() {   # the Reolink AP moved to DFS channel 52: gate 1 refuses before any capture or lock; "try anyway" declined sends nothing
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"; mkdir -p "$T/fix_noinj"
+  for f in "$HERE"/fix/*; do sed 's/"channel":36,"hidden":0,"freq":5180/"channel":52,"hidden":0,"freq":5260/' "$f" >"$T/fix_noinj/$(basename "$f")"; done
+  grep -q '"channel":52' "$T/fix_noinj/aps.json" || { echo "sed on the noinj fixture failed"; FAIL=$((FAIL + 1)); }
+  rules noinj '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' 'Nothing is expected' '0' '^Disrupt \[' '1' ' via ' '1' "${COMMON[@]}"
+  answers t t B; HARNESS_FIX="$T/fix_noinj" run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "noinj: NOINJ decided without a capture or a lock" "grep -q '^LOG \[NOINJ\] 00:00:10 ch52 5GHz' $T/log && ! grep -q 'TCPDUMP beacon' $T/log && ! grep -q 'PINEAPPLE_EXAMINE_BSSID' $T/log"
+  check "noinj: try-anyway confirm shown, declined, nothing sent" "grep -q 'CONFIRM\[Nothing is expected to work (NOINJ). Try anyway[?]\] -> 0' $T/log && ! grep -q 'PICKER\[Disrupt \[' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
 }
 s_persist() {   # a second run with DEDUPE_H=24 stays silent on known devices; first_seen carries over; RAND rows are not stored
   reset; rules persist1 '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Watch,Back' '^Watch ' 'Live view' '^(STREAM|EVENT|NONE|IDLE|DOWN|QUIET)' 'Back' "${COMMON[@]}"
@@ -119,9 +146,9 @@ s_settings() {   # Settings menu: NUMBER_PICKER sets and persists a key, Reset d
   printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
 }
 case "${1:-all}" in
-  live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; persist) s_persist ;; settings) s_settings ;;
-  all) s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_persist; s_settings ;;
-  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|persist|settings|all]"; exit 2 ;;
+  live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; blind) s_blind ;; noinj) s_noinj ;; persist) s_persist ;; settings) s_settings ;;
+  all) s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_blind; s_noinj; s_persist; s_settings ;;
+  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|blind|noinj|persist|settings|all]"; exit 2 ;;
 esac
 printf '== harness: %s failure(s); temp dir %s ==\n' "$FAIL" "$T"
 exit $(( FAIL > 0 ))

@@ -120,20 +120,32 @@ transmit on needs no capture.
   monitor vif. **`IEEE80211_CHAN_RADAR` is not prohibited** — so under `country 'US'`, where no
   5 GHz rule carries `NO-IR`, gate 2 permits all of 36–165 and the DFS block is entirely gate 1's.
   This gate *does* follow the regulatory domain, so it is read live by `inj_probe()` from
-  `iw phy <phy> channels` and cached in `INJ_OK` keyed `band/channel`.
+  `iw phy <phy> channels` on the transmitting phy and cached in `INJ_OK` keyed `band/channel`.
 
 Why reading gate 2 live rather than hardcoding it: a frame gate 2 rejects is freed with
 `NETDEV_TX_OK`, so nothing reports an error and an over-permissive verdict **reads back as the
 target having resisted**. That is strictly worse than refusing a channel that would have worked,
 which is why the fallback when the probe fails is only what is injectable under *both* the US and
 world domains — 2.4 GHz 1–11 and 5 GHz 36–48. Under the world domain even 149–165 is `NO-IR`, and
-2.4 GHz 12–14 are blocked under both (`DISABLED` under US, `NO-IR` under `00`).
+2.4 GHz 12–14 are blocked under both (`DISABLED` under US, `NO-IR` under `00`). **36–48 is in that
+set only because of the shipped `regulatory.db`**, which is upstream wireless-regdb 2025.02.20 with
+exactly one edit — `NO-IR` dropped from the world domain's 5170–5250 rule
+(`dev/pager-6ghz-determination-plan.md` §C2, a reading of the shipped db). Upstream `00` marks 36–48
+`NO-IR`, so a db rebuilt from upstream makes the fallback over-permissive on 36–48 and it must then
+shrink to 2.4 GHz 1–11. Falsifier: `iw phy <txphy> channels` printing `No IR` on 5180 MHz while
+`iw reg get` says `00`.
 
 `inj_probe()` must run in the **parent shell** — `preflight()` and on entry to `disrupt_menu()`.
 `csa_injectable()` is reached from `posture_from_caps()` inside `$( )`, where writes to globals are
-discarded, so it is strictly read-only. Every phy is probed and merged; each registers only its own
-bands, so `band/channel` keys do not collide, and this avoids having to guess which interface
-pineapd will pick as its injector.
+discarded, so it is strictly read-only. It reads the table of the **transmitting phy only** — the
+one behind `RECON_IF`, named by `<NET_SYSFS>/<RECON_IF>/phy80211/name` — because gate 2 is applied
+by the phy the frame leaves from. Only when that file cannot be read does it fall back to merging
+every phy under `INJ_SYSFS` (last row per `band/channel` key wins, in glob order), and then it logs,
+to `events.log` and as a yellow `LOG`, that the tx phy was unresolved and how many phys were merged:
+the merge is over-permissive wherever two phys share a band and disagree, and `radio0` registers
+2.4 GHz as the transmitter does, so every 2.4 GHz key is written twice. The selftest pins both modes
+on a two-phy fixture that disagrees on channel 6; the harness fixture names `phy0` as `wlan1mon`'s
+phy and the `disrupt` scenario asserts the resolved path was taken.
 
 **Where the posture comes from, and why.** From a beacon captured on `RECON_IF` (`wlan1mon`), not
 from `iw scan`. This is forced by the hardware: `radio0` is `band '2g'` and `radio1` carries **only**
@@ -275,9 +287,14 @@ Five ways to reach Disrupt, all gated on `RESPONSE=1`:
    produce that a device is a live camera. This is where the funnel closes: detect → Watch →
    confirmed → respond.
 4. **Recon hooks** (`hook_main.sh`) — a target selected from the Recon AP or client menu.
-5. **`offer_dialogs`** — a secondary rung for a CONFIRMED device that cannot be Watched at all (no
-   tcpdump, or not associated), placed below the existing Watch and Locate rungs so identification
-   still comes first.
+5. **`offer_dialogs`** — the third branch of its `if`/`elif` chain, reached by a CONFIRMED device
+   that the Watch and Locate branches above it did not take and that `auto_respond_ok` accepts
+   (`RESPONSE=1`, `AUTO_RESPOND=1`, not ignored, `resp_target` succeeds). With `AUTO_WATCH=1` that
+   is a device that cannot be Watched — no tcpdump; an unassociated client fails `resp_target` and
+   never gets here. With `AUTO_WATCH=0` (the README's walk-survey setting) it is **every newly
+   CONFIRMED device**, on identity evidence alone and with no Watch; with `AUTO_LOCATE=0` a
+   CONFIRMED setup AP too. The confirm dialog, the picker and `RESPONSE_CONFIRM` still gate the
+   transmit.
 
 ## 10. Config
 
@@ -325,7 +342,14 @@ a synthetic-beacon branch in the fake `tcpdump`. That scenario checks the postur
 under a lock on the target channel, the badge derived from the beacon, the correct command invoked
 with the right BSSID/target/channel, the lock verified as `ok` rather than by-channel, the
 per-subject loot rows with badge and raw caps, the aggregate verdict, the no-clients guard, the
-cached badge appearing on the card afterwards, and EXAMINE being released.
+cached badge appearing on the card afterwards, and EXAMINE being released. Two further scenarios
+reach the confirms the badge logic adds: `blind` (the fake `tcpdump` captures no beacon, so the badge
+is `?`) checks that the "Fire blind?" dialog appears, that accepting it offers CSA first with every
+option labelled `unknown`, fires `PINEAPPLE_DEAUTH_CLIENT_CSA` with bssid and channel only, and
+writes loot rows with badge `?` and caps `-`, and that declining it sends nothing and writes no row;
+`noinj` (the Reolink AP moved to DFS channel 52) checks that gate 1 answers `NOINJ` with no capture
+and no lock, and that declining "Try anyway?" sends nothing. An accepted "Try anyway?" is still
+unreached by any test.
 
 Unit coverage:
 

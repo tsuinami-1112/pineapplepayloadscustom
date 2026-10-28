@@ -78,6 +78,7 @@ INVENTORY_KEEP_DAYS=30  # inventory.tsv rows older than this are pruned at start
 ROW_W=22                # list row budget (spike 19; expected 36-40 on the default theme)
 RECON_IF="wlan1mon"     # PineAP monitor radio (tri-band)
 INJ_SYSFS="/sys/class/ieee80211"   # phy list for the regulatory probe (the laptop harness points this at a fixture)
+NET_SYSFS="/sys/class/net"         # netdev tree the probe resolves RECON_IF's phy from (the laptop harness points this at a fixture)
 # response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
 RESPONSE=0              # * master switch for the response rung (0 = recon only)
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
@@ -361,22 +362,39 @@ PINEAPD_DFS_BLOCKED=" 52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 14
 declare -A INJ_OK        # "<band>/<channel>" -> 1 permitted by gate 2, 0 refused
 INJ_PROBED=0             # 0 not yet probed, 1 probe usable, -1 probe failed -> fallback
 INJ_PROBE_TS=0
+INJ_TXPHY=""             # phy whose table INJ_OK holds; "" = unresolved, every phy under INJ_SYSFS merged
 
 # inj_probe must run in the PARENT shell: it populates INJ_OK, and csa_injectable is
 # reached from posture_from_caps inside $( ), where writes to globals are discarded.
-# shellcheck disable=SC2120   # `force` is deliberate API for a manual re-probe; no call site yet
+# shellcheck disable=SC2120   # `force` is deliberate API for a manual re-probe; the selftest is its only caller
 inj_probe() {   # inj_probe [force] -> 0 when INJ_OK is usable
-  local phy d line freq ch dis rows=""
+  local phy d line freq ch dis rows="" n=0 namef="$NET_SYSFS/$RECON_IF/phy80211/name"
   [ "$1" = force ] || { (( INJ_PROBED != 0 && EPOCHSECONDS - INJ_PROBE_TS < POSTURE_TTL )) && return $(( INJ_PROBED == 1 ? 0 : 1 )); }
-  INJ_PROBE_TS=$EPOCHSECONDS; INJ_PROBED=-1; INJ_OK=()
+  INJ_PROBE_TS=$EPOCHSECONDS; INJ_PROBED=-1; INJ_OK=(); INJ_TXPHY=""
   command -v iw >/dev/null 2>&1 || return 1
-  # Every phy is probed and merged: pineapd picks its own inject interface, and each phy
-  # registers only its own bands, so band/channel keys do not collide across them.
-  for d in "$INJ_SYSFS"/*; do
-    [ -e "$d" ] || continue
-    phy=${d##*/}
-    rows+=$(iw phy "$phy" channels 2>/dev/null)$'\n'
-  done
+  # Gate 2 is applied by the phy a frame leaves from, so only THAT phy's table is read: the one
+  # behind RECON_IF, named by $NET_SYSFS/$RECON_IF/phy80211/name (the same link the determination
+  # plan's A1 step reads with readlink, plan :267-268, treating its absence as the radio not having
+  # probed).  Merging every phy under $INJ_SYSFS -- the old behaviour, kept only as
+  # the fallback for when that file cannot be read -- is a plain last-row-wins overwrite per
+  # band/channel key in glob order, over-permissive wherever two phys share a band and disagree:
+  # the receive-only radio0 registers 2.4 GHz as the transmitter does (FCC antenna map and UCI
+  # band '2g', dev/pager-6ghz-determination-plan.md Addendum 2c), so every 2/<ch> key is written
+  # twice and the merged verdict is whichever phy sorts last, not the injecting one.  Hence the
+  # fallback is logged, never silent.  A resolved phy whose table reads empty fails the probe
+  # (conservative set) rather than merging radios that cannot be the transmitter.
+  if phy=$(cat "$namef" 2>/dev/null) && [[ $phy =~ ^[^[:space:]/]+$ ]]; then
+    INJ_TXPHY="$phy"; rows=$(iw phy "$phy" channels 2>/dev/null)$'\n'
+    log inj "probe: tx phy $phy ($namef)"
+  else
+    for d in "$INJ_SYSFS"/*; do
+      [ -e "$d" ] || continue
+      phy=${d##*/}; n=$((n + 1))
+      rows+=$(iw phy "$phy" channels 2>/dev/null)$'\n'
+    done
+    log warn "probe: tx phy unresolved ($namef unreadable); merged $n phys under $INJ_SYSFS"
+    ui_ok && LOG yellow "regulatory probe: tx phy unresolved, merged $n phys (over-permissive where they disagree)"
+  fi
   [ -n "${rows//[[:space:]]/}" ] || return 1
   local band
   while IFS='|' read -r freq ch dis; do
@@ -394,7 +412,10 @@ inj_probe() {   # inj_probe [force] -> 0 when INJ_OK is usable
 # prohibits DISABLED and NO_IR, never RADAR).  iw spells that attribute three ways: "No IR" when
 # the kernel sets both NO_IR and the separate legacy NO_IBSS slot, otherwise "Passive scan" or
 # "No IBSS" -- all three must block, or an older kernel's NO_IR channel reads as injectable.
-# Matching "MHz [n]" loosely also covers the "phy%d %d MHz [%d]:" variant in the same binary.
+# The "phy%d %d MHz [%d]:" layout that other iw subcommands print also matches the channel rule, but
+# the frequency is taken as the FIRST digit run on the line, so such a row carries the phy index as
+# its frequency ("phy1 5180 MHz [36]:" -> 1|36|0 under mawk and BusyBox awk; pinned by the selftest)
+# and inj_probe drops it at its band check (< 2400).  Only `iw phy <phy> channels` output is supported.
 inj_parse_channels() {   # stdin: iw phy <phy> channels -> "freq|channel|blocked" rows
   awk '
       function flush() { if (ch != "") printf "%d|%d|%d\n", freq, ch, bad }
@@ -427,6 +448,12 @@ csa_injectable() {   # csa_injectable <band> <channel> -> 0 when a frame can act
   # Fallback when the probe is unavailable: only what is injectable under BOTH the US
   # and the world ("00") domain, since we cannot tell which one is live.  Under 00,
   # 5 GHz 149-165 and 2.4 GHz 12-14 carry NO_IR and 2.4 GHz 12-14 are DISABLED under US.
+  # 5 GHz 36-48 is in the set only because the SHIPPED regulatory.db drops NO-IR from 00's
+  # 5170-5250 rule -- the vendor's one edit to upstream wireless-regdb 2025.02.20
+  # (dev/pager-6ghz-determination-plan.md §C2, a reading of the shipped db).  Upstream 00 marks
+  # 36-48 NO-IR, so a db rebuilt from upstream makes this branch over-permissive on 36-48 and
+  # it must then shrink to 2.4 GHz 1-11.  Falsifier: `iw phy <txphy> channels` printing No IR
+  # on 5180 MHz while `iw reg get` says 00.
   case "$b" in
     2) (( c >= 1 && c <= 11 )) && return 0; return 1 ;;
     5) (( c >= 36 && c <= 48 )) && return 0; return 1 ;;
