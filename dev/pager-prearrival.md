@@ -80,6 +80,15 @@ NEEDED  libgcc_s.so.1
 NEEDED  libc.so
 ```
 
+> **Resolved 2026-11-02: it does ship.** The 2.0.0 analysis session checked both rootfs images —
+> `libgcc_s.so.1` is present and **byte-identical** in 1.1.3 and 2.0.0,
+> `8138ad1091ea51c4dd8b4c2f062ac055348590caaf1db02cd68ba00f06d9dfcb`, 131359 B, soft-float o32
+> mips32r2. So the `[A]` below is discharged and the risk was theoretical. The check is still worth
+> the ten seconds on a live unit, and `-static-libgcc` in `dev/injector/Makefile` stays — it costs a
+> few KB and removes a runtime dependency for free — but it is now insurance, not a fix for a known
+> gap. The reasoning below is kept because the *package metadata* really is incomplete, which is
+> the transferable lesson.
+
 **`libgcc_s.so.1` appears in neither the plan's list nor the package's own `Depends:` field**, so
 `opkg` will not pull it and a file-install will not either. It is normally part of OpenWrt base, so
 it is very likely present — but that is **[A]**, and the failure mode is a loader error on the DFS

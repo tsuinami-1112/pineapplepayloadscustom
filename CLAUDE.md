@@ -216,6 +216,42 @@ session must not use `cat -A` or `sed -n l` to inspect whitespace — use target
 pinned to 1.1.3; versioned downloads still work
 (`…/firmwares/1.1.3-stable`, 303 → signed .bin, sha256 `3073d6b8…cd33`).
 
+### 2.0.0-stable, analysed — what it would and would not cost
+
+Static analysis of the shipped image by the firmware session, whole-rootfs diffed against 1.1.3.
+**No hardware**; the live bench readings above are the only measured data.
+
+**Unchanged, byte-identical between 1.1.3 and 2.0.0** — so everything we know about them transfers:
+`cfg80211.ko` and `mac80211.ko` (backports **6.12.61**, which tightens our "6.12" pin),
+`regulatory.db`, `iw`, `libwifi.so.0.0.10`, and the `pineapd.wlan1mon.bands '2,5'` uci block.
+
+**The gates did not move.** Same 16 FCC DFS channels by byte-identical mask code; the 6 GHz refusal
+is still the blanket `chan->+0x1c == 8`; no new refusal string, config option or capability check in
+any injection path; and **`pcap_inject` still has exactly one call site inside the gated function**,
+so the non-pineapd bypass remains valid.
+
+**What 2.0.0 does break: every `pineapd` address.** `adc9d36d…8493` → `d10ebedb…106f`,
+1320040 → 1451176 B. `inject` `0x46e7d0` → **`0x475870`**; `inject_deauth` `0x472c14` →
+**`0x4782d0`**. The MIPS16e disassembly recipe survives unchanged (same ELF flags, first PT_LOAD
+still maps offset 0 → `0x400000`). Note gate 1 is **four check instances in two functions**, not two.
+
+**So the cost of updating is confined to Stage C** — patching pineapd — which the plan itself labels
+"only if the above is exhausted". `pagerinj` bypasses pineapd entirely, so the DFS branch and the
+count-byte experiment are unaffected by the address moves.
+
+**New option found on the way:** `CONFIG_MODULE_SIG` is **off in both**, so a hand-built or patched
+`.ko` is not blocked by signature checks — a live alternative if the regdb route ever dies.
+`CONFIG_CFG80211_REQUIRE_SIGNED_REGDB` is also off in both, and no `regulatory.db.p7s` exists.
+
+**The changelog's "new firmware format"** is squashfs **xz → lz4**, 1 MiB → 256 KiB blocks (hence
+"boots twice as fast" and 33.9 → 50.7 MB). The **container and signing envelope are unchanged** —
+same `deadc0de` magic, same metadata versions, byte-identical `/etc/firmware-key` — which is mild
+evidence a downgrade would still be accepted, though no version check was looked for.
+
+**Still open:** whether CamHound's command surface survives. The `_pineap` / `hak5cmd` binaries and
+the three `PINEAPPLE_DEAUTH_CLIENT*` commands were **not** covered by that analysis, and they are
+what the payload actually drives.
+
 If you are working on **unlocking 6 GHz or DFS injection**, treat the gate claims below as the prior
 state of the investigation, not its conclusion — the determination plan is a plan precisely because
 the question is open.
