@@ -152,6 +152,22 @@ Recovery ladder, lowest tier last:
 https://downloads.hak5.org/api/devices/wifipineapplepager/firmwares/1.1.3-stable
 ```
 
+**The 2.0.0 image, for *analysis only* — never flash it to this device.** Every 2.0.0 claim in
+`CLAUDE.md` §"2.0.0-stable, analysed" was derived by diffing the two rootfs trees, so it is not
+re-checkable from the 1.1.3 image alone. Recorded here so a future session can rebuild the
+comparison; the hash below was verified against the download, and the API serves it with the same
+303 as above:
+
+```sh
+# 2.0.0-stable, sha256 17dab9757b6b9cf154b0a5f669498cabd0577a99a21df5029c62c386d03d7968,
+# 50726753 bytes, released 2026-10-29.  DO NOT FLASH — it voids every pineapd address in this plan.
+https://downloads.hak5.org/api/devices/wifipineapplepager/firmwares/2.0.0-stable
+```
+
+Its rootfs is **lz4** squashfs (1 MiB → 256 KiB blocks), where 1.1.3 is **xz**, so `unsquashfs`
+must be built with lz4 support — `unsquashfs -h` lists the decompressors, and one without lz4 opens
+1.1.3 fine and fails only on 2.0.0.
+
 First boot takes 3–4 min, or 10–15 min if freshly flashed — **do not interrupt it**; it partitions the eMMC and generates SSH keys. **[V]**
 
 **Then record the version**, which lives at `/etc/pineapplepager/version` — a **directory** containing a `version` file, 13 bytes, two lines: `1.1.3` then `Stable`. `/etc/openwrt_release` does **not** carry it; its `DISTRIB_DESCRIPTION` is the OpenWrt build (`Pineapple Pager 24.10.1 r28597-0425664679`). Expected there: kernel **6.6.86**, `DISTRIB_RELEASE 24.10.1`, `ramips/mt76x8`, `mipsel_24kc`. That revision `r28597-0425664679` is also the OpenWrt revision of the SDK `dev/injector` builds against, so a match confirms the toolchain, not merely the ABI. **[V]**
