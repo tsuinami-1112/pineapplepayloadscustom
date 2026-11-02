@@ -256,7 +256,7 @@ structural point, which earlier revisions of this document got wrong twice: *mov
 *denying it a connection* are two different effects reached through two different code paths, and a
 carrier that is useless for one can be the best tool for the other.
 
-Read from the mac80211 this build backports (backports-6.12) —
+Read from the mac80211 this build backports (**backports-6.12.61**) —
 `ieee80211_sta_process_chanswitch()`, `ieee80211_rx_mgmt_probe_resp()`, `ieee80211_rx_get_bigtk()`,
 `ieee80211_scan_rx()`, `ieee80211_mgd_csa_in_process()`. Station mode throughout; mesh differs (see
 below). Categories from hostap `ieee802_11_defs.h`: Spectrum Mgmt `0`, Public `4`, Protected Dual
