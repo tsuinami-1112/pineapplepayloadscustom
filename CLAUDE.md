@@ -272,6 +272,20 @@ still maps offset 0 → `0x400000`). Note gate 1 is **four check instances in tw
 "only if the above is exhausted". `pagerinj` bypasses pineapd entirely, so the DFS branch and the
 count-byte experiment are unaffected by the address moves.
 
+**And that cost has already been paid.** The 2.0.0 patch sites are mapped, so moving firmware no
+longer costs a re-derivation — four check instances in two functions, in both builds:
+
+| site | 1.1.3 | 2.0.0 |
+|---|---|---|
+| `pineap_wifi_interface::inject` | `0x46e7d0` | `0x475870` |
+| `interface_tracker::inject_deauth` | `0x472c14` | `0x4782d0` |
+| blanket 6 GHz check (`lw rX,28(rY); cmpi rX,8; bteqz`) | `0x46e800` / `0x472c66` | `0x4758a0` / … |
+| DFS range-chain entry | `0x46e810` / `0x472c76` | `0x4758b0` / `0x478332` |
+| `0x1111` mask immediate | `0x46e964` / `0x472d66` | `0x4759ea` / `0x478422` |
+
+Static, from the 2.0.0 image; not yet checked against a running 2.0.0 device. The 1.1.3 column is
+the one confirmed on hardware.
+
 **New option found on the way:** `CONFIG_MODULE_SIG` is **off in both**, so a hand-built or patched
 `.ko` is not blocked by signature checks — a live alternative if the regdb route ever dies.
 `CONFIG_CFG80211_REQUIRE_SIGNED_REGDB` is also off in both, and no `regulatory.db.p7s` exists.
