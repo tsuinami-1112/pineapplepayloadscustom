@@ -91,6 +91,22 @@ found and fixed one over-permissive defect (`dev/pager-prearrival.md` §5).
 > including the 5 GHz `No IR` case the fixture lacked, and was correct. **Nothing left to diff
 > by hand here**; on a different unit, repeat it.
 
+**8b. Two `_pineap` answers CamHound's recon rung needs** — neither needs the receiver.
+
+- **Where a client's association lives.** `RECON CLIENTS` is 2.0.0-only and its documented device
+  object has no association field (CLAUDE.md §"2.0.0-stable, analysed"), so on a 2.0.0 unit with an
+  associated client run `_pineap RECON CLIENTS format=json | jq '.[0]|keys'` and look for any key
+  carrying the BSSID. If none, look at what the Go UI's recon API returns for clients — `hak5cmd`
+  reaches it over `/tmp/api.sock`, and that binary is where `ap_mac` lives — and record the route and
+  one raw object. Until this is answered CamHound treats every client as unassociated (kit detection,
+  client Watch and per-client Disrupt dormant). On the 1.1.3 unit only the negative half is testable:
+  `_pineap RECON CLIENTS format=json` should return an error, not rows.
+- **What `PINEAPPLE_RECON_NEW`'s parameter is.** The firmware session reads it as the session *name*
+  (`_pineap RECON NEW {name=} {hop=} {channel=}`, no duration), while CamHound and two upstream
+  payloads pass a number of seconds. Run `PINEAPPLE_RECON_NEW` with no argument and with `60`, then
+  `_pineap RECON COUNT DEVICES` a minute later: does a session named `60` exist, and does any session
+  end on its own? CamHound's "Recon started (60 s)" line stands or falls on the answer.
+
 **9. THE VALUE GATE — a beacon capture plus the real client, before spending effort on 6 GHz.**
 Beacon protection takes **both** an AP that enables it and a client that can enforce it, so the
 capture below settles the AP half cheaply and the client half still needs the client. Capture one

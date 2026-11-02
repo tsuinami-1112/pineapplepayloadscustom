@@ -136,13 +136,18 @@ s_persist() {   # a second run with DEDUPE_H=24 stays silent on known devices; f
   check "persist: SEEN tag and returning count" "grep -q '|ec:71:db:00:00:10|.*SEEN' $LOOT/inventory.tsv && grep -q 'returning [1-9]' $LOOT/report_*.txt"
   check "persist: Watch evidence carried into the second run" "grep -q '|ec:71:db:00:00:10|ap|NVRKIT|[^|]*|REO-OUI|100|80|55|STREAM|' $LOOT/inventory.tsv"
 }
-s_settings() {   # Settings menu: NUMBER_PICKER sets and persists a key, Reset deletes the overrides
-  reset; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
-  rules settings '^CamHound' 'Settings,Settings,Exit' '^Settings' 'CYCLE_SECS = 5,Back,Reset defaults,Back' '^CYCLE_SECS' '7' 'Reset all saved' '1' "${COMMON[@]}"
+s_settings() {   # Settings: Recon page sets and persists a key; Response page's confirm-off asks first; Reset clears every table key
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules settings '^CamHound' 'Settings,Settings,Exit' '^Settings' 'Recon settings,Back,Response settings,Reset defaults,Recon settings,Back' \
+    '^Recon settings' 'CYCLE_SECS = 5,Back,Back' '^Response settings' 'RESPONSE_CONFIRM = 1,Back' '^RESPONSE_CONFIRM:' 'Off' 'Switch off the confirmation' '0' \
+    '^CYCLE_SECS' '7' 'Reset all saved' '1' "${COMMON[@]}"
   answers t; run
   check "settings: value applied and persisted" "grep -q '^LOG CYCLE_SECS -> 7 (saved)' $T/log && grep -q 'cfg set CYCLE_SECS=7' $LOOT/events.log && grep -q 'PAYLOAD_SET_CONFIG camhound CYCLE_SECS 7' $T/log"
-  check "settings: reset deletes the override and logs it" "grep -q 'cfg reset defaults' $LOOT/events.log && ! grep -q '^CYCLE_SECS=' $HARNESS_CFG && grep -q 'PAYLOAD_DEL_CONFIG camhound CYCLE_SECS' $T/log"
-  check "settings: menu shows the live value after reset" "grep -q 'PICKER\[Settings.*CYCLE_SECS = 20;' $T/log"
+  check "settings: top page is Back, Recon, Response, Reset" "grep -q 'PICKER\[Settings (saved on device)\] items=Back;Recon settings;Response settings;Reset defaults;' $T/log"
+  check "settings: response page lists the six response keys with live values" "grep -q 'PICKER\[Response settings\] items=Back;RESPONSE = 1;RESPONSE_CONFIRM = 1;AUTO_RESPOND = 0;RESP_LOCK_SECS = [0-9]*;RESP_SETTLE_SECS = [0-9]*;POSTURE_TTL = [0-9]*;' $T/log"
+  check "settings: switching the pre-transmit confirm off asks first; declined keeps it on" "grep -q 'CONFIRM\[Switch off the confirmation before every transmit[?]\] -> 0' $T/log && ! grep -q 'PAYLOAD_SET_CONFIG camhound RESPONSE_CONFIRM' $T/log"
+  check "settings: reset deletes the recon override and the response override" "grep -q 'cfg reset defaults' $LOOT/events.log && ! grep -q '^CYCLE_SECS=' $HARNESS_CFG && ! grep -q '^RESPONSE=' $HARNESS_CFG && grep -q 'PAYLOAD_DEL_CONFIG camhound RESPONSE$' $T/log"
+  check "settings: recon page shows the live value after reset" "grep -q 'PICKER\[Recon settings\] items=Back;CYCLE_SECS = 20;' $T/log"
   printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
 }
 case "${1:-all}" in

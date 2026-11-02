@@ -309,6 +309,11 @@ Five ways to reach Disrupt, all gated on `RESPONSE=1`:
 | `RESP_LOCK_SECS` | 20 | `*` | EXAMINE lock duration held across a response; raised to `RESP_SETTLE_SECS + 5` when set lower |
 | `SCAN_IF` | `wlan0` | | reserved, currently unused |
 
+The six starred keys are also on the device's **Settings → Response settings** page. Switching
+`RESPONSE_CONFIRM` off asks a second time, and a lock shorter than `RESP_SETTLE_SECS + 5` is raised
+on apply and saved as raised (`settings_apply` re-runs `resp_clamp_lock`), so the menu shows the value
+in force. `Reset defaults` clears these overrides along with the recon ones.
+
 **Two keys, not one.** `RESPONSE` opens the manual rung; `AUTO_RESPOND` additionally lets CamHound
 raise it unprompted. Both default off, so enabling response capability does not by itself create an
 unprompted transmit path.

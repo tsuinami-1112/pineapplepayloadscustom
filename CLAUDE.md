@@ -79,8 +79,12 @@ Line numbers drift; find things by name (`grep -n '^name()' payload.sh`).
 **Recon rung** — `load_signatures`, `add_sig`, `vendor_of`, `score_device`, `clean_text`,
 `is_setup_ap`, `review_list`, `main_menu`, `preflight`, `write_report`; `rssi_gate_ok` (the RSSI_MIN
 list gate, kit-aware: a kit AP passes when a kit client does) with `rssi_min_clamp`; the Settings menu
-(`SETTINGS_TABLE`, `cfg_snapshot_defaults`, `settings_menu`/`settings_apply`/`settings_reset`,
-`cfg_note_set` keeps the override count honest); `raw_up_rows` feeds `--replay` a `raw_<run>.txt`.
+(`SETTINGS_TABLE` rows are `KEY|kind|floor|group|label` over all fifteen starred keys; `settings_menu`
+is a short top page, `settings_group` one page per group, Recon and Response; `settings_apply` re-runs
+`resp_clamp_lock` for the two timing keys and persists a raised lock; RESPONSE_CONFIRM-off asks twice;
+`cfg_snapshot_defaults`/`settings_reset`; `cfg_note_set` keeps the override count honest);
+`JQ_CLI`/`parse_cli_fallback` read the 2.0.0 client object (`probe` is a hash-keyed object, no
+association key); `raw_up_rows` feeds `--replay` a `raw_<run>.txt`.
 
 **Watch rung** (behaviour without identity) — `watch_menu`, `start_caps`/`stop_caps`,
 `pcap_words`/`pcap_bytes` (both have `od` fallbacks), `pcap_buckets`, `bucket_stats`,
@@ -588,7 +592,9 @@ have drifted twice already, so they are deliberately not restated here. It repla
 as the primary injector because **neither hcxdumptool nor aireplay-ng can build a CSA frame**, which
 step 17a needs. It now also carries 17a's third arm (`--ecsa-count`: element 37 count 0 plus a live
 eCSA, since `csa_present()` discards per element) and the unicast cat-0 Spectrum-Management CSA of
-day-one step 17c.
+day-one step 17c. Since df756c3 it also binds its capture to `-i`, skips a clone source that already
+carries a CSA or eCSA element, refuses a `--chan` equal to the cloned beacon's DS channel unless
+`--allow-same-chan`, and emits a radiotap RATE field with `--phy-rate <Mbps>`.
 
 **hcxdumptool splits by band, and the 6 GHz half is a trap** — settled against the 6.3.4 tag: it
 reads only `FREQUENCY_ATTR_FREQ`, `MAX_TX_POWER` and `DISABLED`, never `NO_IR` or `RADAR` **[V]**,

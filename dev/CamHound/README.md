@@ -16,7 +16,7 @@ facts that are settled so they do not get re-derived.
 | `gen_hooks.sh` | regenerates `library/recon/{client,access_point}/CamHound/` from the user payload (header + config + lib block + watch-core block + `hook_main.sh`) |
 | `check_sync.sh` | fails when the shared blocks differ between the user payload and the hooks |
 | `hook_header.sh`, `hook_main.sh` | the hook-only parts |
-| `harness/run_harness.sh` | laptop harness: stub DuckyScript commands, fake `_pineap`/`tcpdump`/`iwinfo`/`iw` (US-like channel table for a fixture phy dir), stub `NUMBER_PICKER`/`PAYLOAD_SET_CONFIG`/`PAYLOAD_DEL_CONFIG`, RECON fixtures; scenarios live, stimulus, lock, nojq, locate, disrupt, persist, settings |
+| `harness/run_harness.sh` | laptop harness: stub DuckyScript commands, fake `_pineap`/`tcpdump`/`iwinfo`/`iw` (US-like channel table for a fixture phy dir), stub `NUMBER_PICKER`/`PAYLOAD_SET_CONFIG`/`PAYLOAD_DEL_CONFIG`, RECON fixtures (the client fixture is in the 2.0.0 `probe`-object shape, with `ap_mac` kept as a stand-in for the association the firmware does not expose; a net tree under `NET_SYSFS` names phy0 as wlan1mon's phy; `HARNESS_NO_BEACON=1` makes the fake tcpdump capture nothing); scenarios live, stimulus, lock, nojq, locate, disrupt, blind, noinj, persist, settings |
 
 Rule: edit the user payload, then `gen_hooks.sh`, then `check_sync.sh`, then `payload.sh --selftest`
 and `harness/run_harness.sh`. The lib block (`# --- camhound lib begin/end ---`) and the watch-core
@@ -57,8 +57,8 @@ what remains unverified are in `RESPONSE.md`.
 6. **v1.1, one PR each, with on-device evidence**. Shipped, laptop-verified, on-device evidence
    still owed: Recon hooks (generated here; the hook spike -- Recon keeps growing while the hook
    runs, Cancel runs the trap -- is the device check); inventory persistence across runs
-   (`DEDUPE_H`, clock guard, 30-day prune); settings menu (nine keys: CYCLE_SECS, THR_STREAM_UP,
-   COOLDOWN_SECS, DEDUPE_H, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH, AUTO_LOCATE; Reset via
+   (`DEDUPE_H`, clock guard, 30-day prune); settings menu (Recon and Response pages over all
+   fifteen starred keys; RESPONSE_CONFIRM-off asks twice; the lock clamp re-runs on apply; Reset via
    `PAYLOAD_DEL_CONFIG`). Remaining: band write (`PINEAPPLE_SET_BANDS wlan1mon 2 5 [6]`, restored at exit,
    gate: no pineapd restart); WPS/IE peek (`tcpdump -xx -s 1024 -c 12` on beacons and probe
    responses, WPSMODEL +45/+40 as a new identity class, `ie_sig` column); retry percentage via

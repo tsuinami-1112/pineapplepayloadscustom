@@ -710,10 +710,14 @@ JQ_APS='.[] | ([.beacon[]?, .response[]?]) as $e
  | (($e | map(.time // 0) | max) // 0) as $t
  | [.mac, (.packets // 0), ($ssid | tostring | gsub("[|;\n\r\t]"; "_") | .[0:32]), ($best.channel // 0), ($best.freq // 0), $sig, (if $hid then 1 else 0 end), $t]
  | map(tostring) | join("|")'
-JQ_CLI='.[] | ((.probes // .probed_ssids // .probed // []) ) as $p0
- | (if ($p0 | type) == "array" then $p0 else [$p0] end) as $p
+# Client objects (2.0.0 `_pineap HELP PARSE`, read in CLAUDE.md s"2.0.0-stable, analysed"; the verb does not exist
+# on 1.1.3): mac, time, signal, freq, packets, and a "probe" OBJECT keyed by an opaque SSID hash whose values carry
+# the ssid -- so the probed SSIDs are the object's values, not an array. No documented key carries the association;
+# ap_mac/bssid are read when present (the harness fixture's stand-in) and "-" otherwise, until the day-one spike
+# finds a source (the Go UI's own recon API carries ap_mac; _pineap does not).
+JQ_CLI='.[] | ([ (.probe // {})[]? | if type == "object" then ((.ssid // "") | select(length > 0)) else tostring end ]) as $p
  | [.mac, (.ap_mac // .bssid // "-"), (.packets // 0), (.signal // .rssi // "-"),
-    ($p | map(if type == "object" then (.ssid // "") else tostring end) | map(gsub("[|;,\n\r\t]"; "_")) | join(",")),
+    ($p | map(tostring | gsub("[|;,\n\r\t]"; "_")) | join(",")),
     (.freq // 0), (.time // .last_seen // 0), (.channel // 0)]
  | map(tostring) | join("|")'
 
@@ -735,19 +739,23 @@ parse_aps_fallback() {   # stdin: JSON -> stdout: mac|packets|ssid|ch|freq|signa
   done <<<"$json"
   [ -n "$mac" ] && printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "$pk" "$ssid" "$ch" "$fr" "$sig" "$hid" "$t"
 }
-parse_cli_fallback() {   # stdout: mac|ap_mac|packets|signal|probes|freq|time|channel
-  local json frag mac ap pk sig fr t ch
+parse_cli_fallback() {   # stdout: mac|ap_mac|packets|signal|probes|freq|time|channel  (same shape rules as JQ_CLI above)
+  local json frag pre rest mac ap pk sig fr t ch probes p
   json=$(cat); json=${json//\},\{/$'\n'}
   while IFS= read -r frag; do
     [[ $frag =~ \"mac\":\"([^\"]+)\" ]] || continue
-    mac=${BASH_REMATCH[1]}; ap="-"; pk=0; sig="-"; fr=0; t=0; ch=0
-    [[ $frag =~ \"ap_mac\":\"([^\"]*)\" ]] && ap=${BASH_REMATCH[1]}
-    [[ $frag =~ \"packets\":([0-9]+) ]] && pk=${BASH_REMATCH[1]}
-    [[ $frag =~ \"signal\":(-?[0-9]+) ]] && sig=${BASH_REMATCH[1]}
-    [[ $frag =~ \"freq\":([0-9]+) ]] && fr=${BASH_REMATCH[1]}
-    [[ $frag =~ \"time\":([0-9]+) ]] && t=${BASH_REMATCH[1]}
-    [[ $frag =~ \"channel\":([0-9]+) ]] && ch=${BASH_REMATCH[1]}
-    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "${ap:--}" "$pk" "$sig" "" "$fr" "$t" "$ch"
+    mac=${BASH_REMATCH[1]}; ap="-"; pk=0; sig="-"; fr=0; t=0; ch=0; probes=""
+    # the device's own fields come before its probe/beacon/response objects, whose values repeat time/signal/freq/channel
+    pre=${frag%%\"probe\":*}; pre=${pre%%\"beacon\":*}; pre=${pre%%\"response\":*}
+    [[ $pre =~ \"(ap_mac|bssid)\":\"([^\"]*)\" ]] && ap=${BASH_REMATCH[2]}
+    [[ $pre =~ \"packets\":([0-9]+) ]] && pk=${BASH_REMATCH[1]}
+    [[ $pre =~ \"signal\":(-?[0-9]+) ]] && sig=${BASH_REMATCH[1]}
+    [[ $pre =~ \"freq\":([0-9]+) ]] && fr=${BASH_REMATCH[1]}
+    [[ $pre =~ \"time\":([0-9]+) ]] && t=${BASH_REMATCH[1]}
+    [[ $pre =~ \"channel\":([0-9]+) ]] && ch=${BASH_REMATCH[1]}
+    rest=${frag#*\"probe\":}; [ "$rest" = "$frag" ] && rest=""   # every "ssid" inside the probe object is a probed SSID
+    while [[ $rest =~ \"ssid\":\"([^\"]*)\"(.*) ]]; do p=${BASH_REMATCH[1]}; rest=${BASH_REMATCH[2]}; [ -n "$p" ] || continue; p=${p//[|;,]/_}; probes+="${probes:+,}$p"; done
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "${ap:--}" "$pk" "$sig" "$probes" "$fr" "$t" "$ch"
   done <<<"$json"
 }
 recon_lines() {   # recon_lines APS|CLIENTS -> lines on stdout
@@ -1426,23 +1434,29 @@ mode_menu() {
 # to the running session and persisted with PAYLOAD_SET_CONFIG; Reset deletes the overrides and
 # restores the config-block defaults captured at start (cfg_snapshot_defaults runs before
 # load_overrides). The response-rung keys are deliberately not listed here.
-SETTINGS_TABLE='CYCLE_SECS|int|5|scan period, s
-THR_STREAM_UP|int|1|STREAM big uplink fr/s
-COOLDOWN_SECS|int|0|re-alert suppression, s
-DEDUPE_H|int|0|dedupe horizon, h (0 off)
-RSSI_MIN|int|-100|list gate dBm (0 off)
-ALERT_DIALOG|bool|0|ALERT on new CONFIRMED
-SOUND|bool|0|ringtone on CONFIRMED
-AUTO_WATCH|bool|0|offer Watch
-AUTO_LOCATE|bool|0|offer Locate'
+SETTINGS_TABLE='CYCLE_SECS|int|5|recon|scan period, s
+THR_STREAM_UP|int|1|recon|STREAM big uplink fr/s
+COOLDOWN_SECS|int|0|recon|re-alert suppression, s
+DEDUPE_H|int|0|recon|dedupe horizon, h (0 off)
+RSSI_MIN|int|-100|recon|list gate dBm (0 off)
+ALERT_DIALOG|bool|0|recon|ALERT on new CONFIRMED
+SOUND|bool|0|recon|ringtone on CONFIRMED
+AUTO_WATCH|bool|0|recon|offer Watch
+AUTO_LOCATE|bool|0|recon|offer Locate
+RESPONSE|bool|0|response|Disrupt rung (master switch)
+RESPONSE_CONFIRM|bool|0|response|confirm before any transmit
+AUTO_RESPOND|bool|0|response|funnel offers Disrupt itself
+RESP_LOCK_SECS|int|5|response|EXAMINE lock across a response, s
+RESP_SETTLE_SECS|int|1|response|settle before re-reading target, s
+POSTURE_TTL|int|0|response|badge cache, s (0 = re-read)'
 declare -A CFG_DEFAULT
 cfg_snapshot_defaults() { local key _; while IFS='|' read -r key _; do [ -n "$key" ] && CFG_DEFAULT[$key]="${!key}"; done <<<"$SETTINGS_TABLE"; }
-settings_row() {   # settings_row KEY -> sets S_KIND S_FLOOR S_LABEL from the table
-  local key kind floor label; S_KIND=""; S_FLOOR=0; S_LABEL=""
-  while IFS='|' read -r key kind floor label; do [ "$key" = "$1" ] && { S_KIND=$kind; S_FLOOR=$floor; S_LABEL=$label; return 0; }; done <<<"$SETTINGS_TABLE"
+settings_row() {   # settings_row KEY -> sets S_KIND S_FLOOR S_GROUP S_LABEL from the table (KEY|kind|floor|group|label)
+  local key kind floor group label; S_KIND=""; S_FLOOR=0; S_GROUP=""; S_LABEL=""
+  while IFS='|' read -r key kind floor group label; do [ "$key" = "$1" ] && { S_KIND=$kind; S_FLOOR=$floor; S_GROUP=$group; S_LABEL=$label; return 0; }; done <<<"$SETTINGS_TABLE"
   return 1
 }
-S_KIND=""; S_FLOOR=0; S_LABEL=""
+S_KIND=""; S_FLOOR=0; S_GROUP=""; S_LABEL=""
 cfg_note_set() {   # cfg_note_set KEY VALUE|"" -> keep CFG_NOTE/CFG_OVERRIDES (start screen, report footer) in step with the overrides in force
   local w; local -a keep=()
   for w in $CFG_NOTE; do [ "${w%%=*}" = "$1" ] || keep+=("$w"); done
@@ -1450,12 +1464,21 @@ cfg_note_set() {   # cfg_note_set KEY VALUE|"" -> keep CFG_NOTE/CFG_OVERRIDES (s
   CFG_NOTE=""; for w in "${keep[@]}"; do CFG_NOTE+=" $w"; done; CFG_OVERRIDES=${#keep[@]}
 }
 settings_apply() {   # settings_apply KEY VALUE -> live variable + persisted override
-  local key="$1" val="$2"
+  local key="$1" val="$2" before
   printf -v "$key" '%s' "$val"; cfg_note_set "$key" "$val"
   if command -v PAYLOAD_SET_CONFIG >/dev/null 2>&1 && PAYLOAD_SET_CONFIG "$PAYLOAD_NAME" "$key" "$val" >/dev/null 2>&1; then LOG "$key -> $val (saved)"
   else LOG yellow "$key -> $val (this run only)"; fi
   log cfg "set $key=$val"
-  [ "$key" = DEDUPE_H ] && DEDUPE_RUN=1
+  case "$key" in
+    DEDUPE_H) DEDUPE_RUN=1 ;;
+    RESP_LOCK_SECS|RESP_SETTLE_SECS)   # the lock must outlast fire + settle: re-clamp, and if the clamp moved the lock
+      before=$RESP_LOCK_SECS; resp_clamp_lock   # persist what is in force so the menu, the footer and the next start agree
+      if [ "$RESP_LOCK_SECS" != "$before" ]; then
+        cfg_note_set RESP_LOCK_SECS "$RESP_LOCK_SECS"
+        command -v PAYLOAD_SET_CONFIG >/dev/null 2>&1 && PAYLOAD_SET_CONFIG "$PAYLOAD_NAME" RESP_LOCK_SECS "$RESP_LOCK_SECS" >/dev/null 2>&1
+        log cfg "set RESP_LOCK_SECS=$RESP_LOCK_SECS (clamp)"
+      fi ;;
+  esac
   return 0
 }
 settings_reset() {
@@ -1466,21 +1489,33 @@ settings_reset() {
     command -v PAYLOAD_DEL_CONFIG >/dev/null 2>&1 && PAYLOAD_DEL_CONFIG "$PAYLOAD_NAME" "$key" >/dev/null 2>&1
     printf -v "$key" '%s' "${CFG_DEFAULT[$key]}"; cfg_note_set "$key" ""
   done <<<"$SETTINGS_TABLE"
-  DEDUPE_RUN=1   # the response-rung overrides stay in force and stay counted
+  resp_clamp_lock; rssi_min_clamp; DEDUPE_RUN=1   # every starred key is in the table, so nothing stays overridden after this
   log cfg "reset defaults"; LOG "settings reset to defaults"
 }
-settings_menu() {
-  local key resp rc; local -a items
+settings_menu() {   # one short top page, so the master switch and Reset are never behind More...
   while :; do
-    items=("Back")   # first, so the default is on the page LIST_PICKER shows: Back + eight keys fill page 1, the ninth and Reset sit behind More...
-    while IFS='|' read -r key _; do [ -n "$key" ] && items+=("$key = ${!key}"); done <<<"$SETTINGS_TABLE"
-    items+=("Reset defaults")
-    pick_list "Settings (saved on device)" "Back" "${items[@]}" || return 0
-    case "$PICK" in "Back") return 0 ;; "Reset defaults") settings_reset; continue ;; esac
+    pick_list "Settings (saved on device)" "Back" "Back" "Recon settings" "Response settings" "Reset defaults" || return 0
+    case "$PICK" in
+      "Back") return 0 ;;
+      "Recon settings") settings_group recon "Recon settings" ;;
+      "Response settings") settings_group response "Response settings" ;;
+      "Reset defaults") settings_reset ;;
+    esac
+  done
+}
+settings_group() {   # settings_group <group> <title>: the group's keys on one picker, Back first so the default is on page 1
+  local group="$1" title="$2" key kind floor g label resp rc; local -a items
+  while :; do
+    items=("Back")
+    while IFS='|' read -r key kind floor g label; do [ -n "$key" ] && [ "$g" = "$group" ] && items+=("$key = ${!key}"); done <<<"$SETTINGS_TABLE"
+    pick_list "$title" "Back" "${items[@]}" || return 0
+    [ "$PICK" = Back ] && return 0
     key=${PICK%% = *}; settings_row "$key" || continue
     if [ "$S_KIND" = bool ]; then
       pick_list "$key: $S_LABEL" "$( [ "${!key}" = 1 ] && printf On || printf Off )" "On" "Off" "Back" || continue
       case "$PICK" in On) resp=1 ;; Off) resp=0 ;; *) continue ;; esac
+      # the pre-transmit confirmation is the safety key: with the rung on, switching it off takes a deliberate second step
+      if [ "$key" = RESPONSE_CONFIRM ] && (( resp == 0 )); then confirm "Switch off the confirmation before every transmit?" || continue; fi
     else
       resp=$(NUMBER_PICKER "$key: $S_LABEL (min $S_FLOOR)" "${!key}" 2>/dev/null); rc=$?
       (( rc != 0 )) && continue
@@ -2529,10 +2564,28 @@ IWFIX
   unset "KITAP[aa:00:00:00:00:7a]" "CLIENTS_OF[aa:00:00:00:00:7a]" "KITCL[aa:00:00:00:00:7b]" "RSSI_BEST[aa:00:00:00:00:7a]" "RSSI_BEST[aa:00:00:00:00:7b]"; RSSI_MIN=0
   RESP_SETTLE_SECS=6; RESP_LOCK_SECS=5; load_overrides; st "lock clamp runs with no persistence available" "$RESP_LOCK_SECS" "11"
   CFG_NOTE=" RESPONSE=1 CYCLE_SECS=9"; CFG_OVERRIDES=2; cfg_note_set CYCLE_SECS 7; st "settings: footer note tracks an applied key" "$CFG_OVERRIDES:$CFG_NOTE" "2: RESPONSE=1 CYCLE_SECS=7"
-  cfg_note_set CYCLE_SECS ""; st "settings: reset keeps the response-rung overrides counted" "$CFG_OVERRIDES:$CFG_NOTE" "1: RESPONSE=1"; CFG_OVERRIDES=0; CFG_NOTE=""
+  cfg_note_set CYCLE_SECS ""; st "cfg_note_set: deleting one key keeps the others counted" "$CFG_OVERRIDES:$CFG_NOTE" "1: RESPONSE=1"; CFG_OVERRIDES=0; CFG_NOTE=""
   CYCLE_SECS=20; cfg_snapshot_defaults; CYCLE_SECS=7; st "settings: default captured" "${CFG_DEFAULT[CYCLE_SECS]}" "20"
-  settings_row CYCLE_SECS; st "settings: table row" "$S_KIND $S_FLOOR" "int 5"
+  settings_row CYCLE_SECS; st "settings: recon table row" "$S_KIND $S_FLOOR $S_GROUP" "int 5 recon"
+  settings_row RESP_LOCK_SECS; st "settings: response table row" "$S_KIND $S_FLOOR $S_GROUP" "int 5 response"
   settings_row NOSUCHKEY; st "settings: unknown key rc" "$?" 1
+  local _k _f _miss=""   # every table key is a starred override load_overrides reads, with the same floor
+  while IFS='|' read -r _k _ _f _; do
+    [ -n "$_k" ] || continue
+    [ "$(sed -n "s/^ *$_k=\$(cfg $_k \"\$$_k\" \(-\{0,1\}[0-9]*\)).*/\1/p" "${BASH_SOURCE[0]}")" = "$_f" ] || _miss+=" $_k"
+  done <<<"$SETTINGS_TABLE"
+  st "settings: every table key is read by load_overrides with the table's floor" "${_miss:-none}" "none"
+  RESP_SETTLE_SECS=6; RESP_LOCK_SECS=20; CFG_NOTE=""; CFG_OVERRIDES=0
+  settings_apply RESP_LOCK_SECS 5; st "settings: a short lock is clamped on apply and the clamp is what gets counted" "$RESP_LOCK_SECS:$CFG_NOTE" "11: RESP_LOCK_SECS=11"
+  settings_apply RESP_SETTLE_SECS 20; st "settings: raising settle re-clamps the lock" "$RESP_LOCK_SECS:$CFG_NOTE" "25: RESP_SETTLE_SECS=20 RESP_LOCK_SECS=25"
+  RESP_LOCK_SECS=20; RESP_SETTLE_SECS=6; CFG_NOTE=""; CFG_OVERRIDES=0
+  # 7i client rows in the 2.0.0 shape: probes are the values of a hash-keyed object, and nothing carries the association
+  local cj='[{"mac":"AA:BB:CC:00:00:01","time":1700000000,"signal":-57,"freq":2437,"packets":12,"probe":{"2918451234":{"ssid":"HomeNet","ssidlen":7,"count":3,"time":1700000005,"signal":-55,"freq":2437,"channel":6},"77":{"ssid":"Cam|Net","ssidlen":7,"count":1,"time":1700000001,"signal":-60,"freq":2437,"channel":6},"3":{"ssid":"","ssidlen":0,"count":9,"time":1700000003,"signal":-58,"freq":2437,"channel":6}}},{"mac":"AA:BB:CC:00:00:02","time":1700000002,"signal":-70,"freq":5180,"packets":3}]'
+  if command -v jq >/dev/null 2>&1; then
+    st "cli jq: probe object -> probed SSIDs (wildcard dropped), association unknown" "$(printf '%s' "$cj" | jq -r "$JQ_CLI" | sed -n 1p)" "AA:BB:CC:00:00:01|-|12|-57|HomeNet,Cam_Net|2437|1700000000|0"
+    st "cli jq: client with no probe object" "$(printf '%s' "$cj" | jq -r "$JQ_CLI" | sed -n 2p)" "AA:BB:CC:00:00:02|-|3|-70||5180|1700000002|0"
+  fi
+  st "cli fallback: same rows as jq from the same shape" "$(printf '%s' "$cj" | parse_cli_fallback | tr '\n' ' ')" "AA:BB:CC:00:00:01|-|12|-57|HomeNet,Cam_Net|2437|1700000000|0 AA:BB:CC:00:00:02|-|3|-70||5180|1700000002|0 "
   # 8 marked blocks
   if command -v md5sum >/dev/null 2>&1 && [ -f "${BASH_SOURCE[0]}" ]; then
     printf 'lib block md5   %s\n' "$(sed -n '/^# --- camhound lib begin ---/,/^# --- camhound lib end ---/p' "${BASH_SOURCE[0]}" | md5sum | cut -c1-32)"

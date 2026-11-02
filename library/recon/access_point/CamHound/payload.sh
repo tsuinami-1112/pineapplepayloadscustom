@@ -699,10 +699,14 @@ JQ_APS='.[] | ([.beacon[]?, .response[]?]) as $e
  | (($e | map(.time // 0) | max) // 0) as $t
  | [.mac, (.packets // 0), ($ssid | tostring | gsub("[|;\n\r\t]"; "_") | .[0:32]), ($best.channel // 0), ($best.freq // 0), $sig, (if $hid then 1 else 0 end), $t]
  | map(tostring) | join("|")'
-JQ_CLI='.[] | ((.probes // .probed_ssids // .probed // []) ) as $p0
- | (if ($p0 | type) == "array" then $p0 else [$p0] end) as $p
+# Client objects (2.0.0 `_pineap HELP PARSE`, read in CLAUDE.md s"2.0.0-stable, analysed"; the verb does not exist
+# on 1.1.3): mac, time, signal, freq, packets, and a "probe" OBJECT keyed by an opaque SSID hash whose values carry
+# the ssid -- so the probed SSIDs are the object's values, not an array. No documented key carries the association;
+# ap_mac/bssid are read when present (the harness fixture's stand-in) and "-" otherwise, until the day-one spike
+# finds a source (the Go UI's own recon API carries ap_mac; _pineap does not).
+JQ_CLI='.[] | ([ (.probe // {})[]? | if type == "object" then ((.ssid // "") | select(length > 0)) else tostring end ]) as $p
  | [.mac, (.ap_mac // .bssid // "-"), (.packets // 0), (.signal // .rssi // "-"),
-    ($p | map(if type == "object" then (.ssid // "") else tostring end) | map(gsub("[|;,\n\r\t]"; "_")) | join(",")),
+    ($p | map(tostring | gsub("[|;,\n\r\t]"; "_")) | join(",")),
     (.freq // 0), (.time // .last_seen // 0), (.channel // 0)]
  | map(tostring) | join("|")'
 
@@ -724,19 +728,23 @@ parse_aps_fallback() {   # stdin: JSON -> stdout: mac|packets|ssid|ch|freq|signa
   done <<<"$json"
   [ -n "$mac" ] && printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "$pk" "$ssid" "$ch" "$fr" "$sig" "$hid" "$t"
 }
-parse_cli_fallback() {   # stdout: mac|ap_mac|packets|signal|probes|freq|time|channel
-  local json frag mac ap pk sig fr t ch
+parse_cli_fallback() {   # stdout: mac|ap_mac|packets|signal|probes|freq|time|channel  (same shape rules as JQ_CLI above)
+  local json frag pre rest mac ap pk sig fr t ch probes p
   json=$(cat); json=${json//\},\{/$'\n'}
   while IFS= read -r frag; do
     [[ $frag =~ \"mac\":\"([^\"]+)\" ]] || continue
-    mac=${BASH_REMATCH[1]}; ap="-"; pk=0; sig="-"; fr=0; t=0; ch=0
-    [[ $frag =~ \"ap_mac\":\"([^\"]*)\" ]] && ap=${BASH_REMATCH[1]}
-    [[ $frag =~ \"packets\":([0-9]+) ]] && pk=${BASH_REMATCH[1]}
-    [[ $frag =~ \"signal\":(-?[0-9]+) ]] && sig=${BASH_REMATCH[1]}
-    [[ $frag =~ \"freq\":([0-9]+) ]] && fr=${BASH_REMATCH[1]}
-    [[ $frag =~ \"time\":([0-9]+) ]] && t=${BASH_REMATCH[1]}
-    [[ $frag =~ \"channel\":([0-9]+) ]] && ch=${BASH_REMATCH[1]}
-    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "${ap:--}" "$pk" "$sig" "" "$fr" "$t" "$ch"
+    mac=${BASH_REMATCH[1]}; ap="-"; pk=0; sig="-"; fr=0; t=0; ch=0; probes=""
+    # the device's own fields come before its probe/beacon/response objects, whose values repeat time/signal/freq/channel
+    pre=${frag%%\"probe\":*}; pre=${pre%%\"beacon\":*}; pre=${pre%%\"response\":*}
+    [[ $pre =~ \"(ap_mac|bssid)\":\"([^\"]*)\" ]] && ap=${BASH_REMATCH[2]}
+    [[ $pre =~ \"packets\":([0-9]+) ]] && pk=${BASH_REMATCH[1]}
+    [[ $pre =~ \"signal\":(-?[0-9]+) ]] && sig=${BASH_REMATCH[1]}
+    [[ $pre =~ \"freq\":([0-9]+) ]] && fr=${BASH_REMATCH[1]}
+    [[ $pre =~ \"time\":([0-9]+) ]] && t=${BASH_REMATCH[1]}
+    [[ $pre =~ \"channel\":([0-9]+) ]] && ch=${BASH_REMATCH[1]}
+    rest=${frag#*\"probe\":}; [ "$rest" = "$frag" ] && rest=""   # every "ssid" inside the probe object is a probed SSID
+    while [[ $rest =~ \"ssid\":\"([^\"]*)\"(.*) ]]; do p=${BASH_REMATCH[1]}; rest=${BASH_REMATCH[2]}; [ -n "$p" ] || continue; p=${p//[|;,]/_}; probes+="${probes:+,}$p"; done
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "${ap:--}" "$pk" "$sig" "$probes" "$fr" "$t" "$ch"
   done <<<"$json"
 }
 recon_lines() {   # recon_lines APS|CLIENTS -> lines on stdout

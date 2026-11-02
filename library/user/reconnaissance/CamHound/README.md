@@ -15,8 +15,10 @@ With `RESPONSE=1` a fourth rung appears on the device card — **Disrupt** — w
 protection posture from its own beacon and then disconnects it with deauthentication and
 disassociation, channel-switch announcements, or all three. See [Response](#response).
 **`RESPONSE` defaults to 0**, and with it off CamHound transmits nothing and behaves exactly as
-CamScout did. `AUTO_RESPOND=1` additionally lets the funnel raise Disrupt by itself once a Watch
-confirms a device is streaming; it is a second key precisely because that rung transmits.
+CamScout did. `AUTO_RESPOND=1` additionally lets the funnel *offer* Disrupt by itself: after a Watch
+confirms a device is streaming, or for a newly CONFIRMED device the Watch and Locate offers did not
+take (with `AUTO_WATCH=0` that is every new CONFIRMED device). The offer is a dialog, and
+`RESPONSE_CONFIRM` still gates the transmit; it is a second key precisely because that rung transmits.
 
 ## What it cannot see
 
@@ -30,6 +32,13 @@ confirms a device is streaming; it is a second key precisely because that rung t
   AzureWave, Sercomm or Espressif blocks and surface only in the **Unidentified modules** list until Watched.
 - A battery/event camera that is asleep looks idle in Watch. Use the Stimulus test.
 - INCONCLUSIVE is about the measurement (lock, band, distance), not about the device.
+
+**Which AP a client is associated to.** `_pineap RECON CLIENTS` is new in 2.0.0 (1.1.3 has no such
+verb, so the client rung has never produced a row on it) and its device object carries probed SSIDs
+but **no association field** (CLAUDE.md §"2.0.0-stable, analysed", read from the firmware's own
+`HELP PARSE` text). Until the day-one spike finds a source — the Go UI's recon API carries `ap_mac`,
+`_pineap` does not — every client reads as unassociated: kit detection, client Watch and Stimulus,
+and per-client Disrupt stay dormant, and the `ap_bssid` column reads `-`.
 
 ## How it works: four tiers
 
@@ -154,10 +163,13 @@ street survey keep a steady pace and set `GPS=1`; `inventory.tsv` keeps the stro
 Edit the config block at the top of `payload.sh`. Starred keys can also be set without editing and
 survive updates: `PAYLOAD_SET_CONFIG camhound CYCLE_SECS 10` (`PAYLOAD_DEL_CONFIG camhound CYCLE_SECS`
 removes it). Overrides are counted on the start screen and listed in `events.log`. The **Settings**
-menu item does the same from the device for the recon keys (CYCLE_SECS, THR_STREAM_UP, COOLDOWN_SECS,
-DEDUPE_H, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH, AUTO_LOCATE): numbers via NUMBER_PICKER, switches
-as On/Off, and `Reset defaults` deletes the saved overrides of those nine keys (response-rung overrides
-set with `PAYLOAD_SET_CONFIG` are kept, and stay counted). Changes apply at once and persist.
+menu item does the same from the device, on two pages. **Recon settings** holds CYCLE_SECS,
+THR_STREAM_UP, COOLDOWN_SECS, DEDUPE_H, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH and AUTO_LOCATE;
+**Response settings** holds RESPONSE, RESPONSE_CONFIRM, AUTO_RESPOND, RESP_LOCK_SECS, RESP_SETTLE_SECS
+and POSTURE_TTL. Numbers go through NUMBER_PICKER, switches are On/Off. Switching RESPONSE_CONFIRM off
+asks a second time, because it is the key that keeps every transmit behind a dialog; a lock shorter
+than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows what is in force.
+`Reset defaults` deletes the saved overrides of all fifteen keys. Changes apply at once and persist.
 
 | Key | Default | Persist | Meaning |
 |---|---|---|---|
@@ -189,7 +201,7 @@ set with `PAYLOAD_SET_CONFIG` are kept, and stay counted). Changes apply at once
 | INVENTORY_KEEP_DAYS | 30 | | inventory.tsv rows older than this are pruned at start (0 = never) |
 | ROW_W | 22 | | list row budget (36-40 expected after Phase 0 item 19) |
 | RESPONSE | 0 | * | master switch for the Disrupt rung; 0 = recon only, nothing transmits |
-| RESPONSE_CONFIRM | 1 | * | blocking confirmation before any transmit |
+| RESPONSE_CONFIRM | 1 | * | blocking confirmation before any transmit (Settings asks twice before switching it off) |
 | AUTO_RESPOND | 0 | * | let the funnel raise Disrupt by itself (needs RESPONSE=1) |
 | POSTURE_TTL | 300 | * | seconds a posture badge stays cached per BSSID |
 | RESP_SETTLE_SECS | 6 | * | wait after transmitting before re-reading the target to judge the effect |
