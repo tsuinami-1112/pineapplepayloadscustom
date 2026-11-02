@@ -199,14 +199,45 @@ ssh root@172.16.52.1 'cp /etc/config/pineapd /etc/config/pineapd.stock; cp /etc/
 
 ### P0.4 [RO] Irreplaceable flash dumps — streamed off-device
 
+**The real map, read off a V2.2.0 unit on 2026-11-02 — and the old index for `all` here was wrong:**
+
+```
+mtd0: 00030000 "u-boot"        192 KB
+mtd1: 00010000 "u-boot-env"     64 KB
+mtd2: 00010000 "factory"        64 KB      <- the irreplaceable one
+mtd3: 03fb0000 "firmware"
+mtd4: 00261681 "kernel"                    <- this step used to dump mtd4 AS "all"
+mtd5: 03d4e97f "rootfs"
+mtd6: 01f60000 "rootfs_data"
+mtd7: 04000000 "all"            64 MB      <- the actual full-flash device
+```
+
+`u-boot`/`u-boot-env`/`factory` were right at 0/1/2; **`all` is `mtd7`, not `mtd4`.** Dumping mtd4 under that name yields a 2.4 MB kernel image labelled as a 64 MB flash image — a silently wrong backup. This is exactly the shift the warning below describes, so **still read `/proc/mtd` and use your own indices**; the map above is one unit's, not a constant.
+
+**Do not use a PowerShell `>` redirect for these** — it treats the stream as text and corrupts binary. Dump on-device, hash there, `scp` off, hash again. `scp` is present at `/usr/bin/scp`.
+
 ```sh
-cd ~/pager-baseline
-# substitute the REAL indices from P0.3
-ssh root@172.16.52.1 'dd if=/dev/mtd2 bs=65536' > pager-factory.bin     # label "factory"
-ssh root@172.16.52.1 'dd if=/dev/mtd1 bs=65536' > pager-uboot-env.bin
-ssh root@172.16.52.1 'dd if=/dev/mtd0 bs=65536' > pager-uboot.bin
-ssh root@172.16.52.1 'dd if=/dev/mtd4 bs=65536' > pager-flash-all.bin    # read-only use ONLY
-sha256sum pager-*.bin | tee pager-backup.sha256
+# on the Pager -- /mmc has GBs free, /tmp is a 123 MB tmpfs
+mkdir -p /mmc/dump && cd /mmc/dump
+dd if=/dev/mtd0 of=u-boot.bin     bs=64k
+dd if=/dev/mtd1 of=u-boot-env.bin bs=64k
+dd if=/dev/mtd2 of=factory.bin    bs=64k
+dd if=/dev/mtd7 of=all.bin        bs=64k    # read-only use ONLY; ~26 s
+sha256sum *.bin
+```
+
+```sh
+# off-box, then compare the two hash sets -- that comparison IS the integrity check
+scp root@172.16.52.1:'/mmc/dump/*.bin' .
+```
+
+A `close - IO is still pending on closed socket` message from Windows OpenSSH after `scp` is cosmetic; the hash comparison is what decides. **Reference values from the first unit** (per-unit data, so `factory` and `u-boot-env` will differ on yours — recorded to show the shape, and because `u-boot` and `all` may well be identical across units):
+
+```
+factory.bin      65536 B    076f7bf5709e85c3064c2f90c8c339664ff27d3c242516bb7f5dfd85a9bf5ec2
+u-boot-env.bin   65536 B    71189f7fb6aed638640078fba3a35fda6c39c8962e74dcc75935aac948da9063
+u-boot.bin      196608 B    67c7e7b08018d004b9cffd247b99df90e42e2b920d5ec1077ffbd09e3d80b319
+all.bin       67108864 B    bb1761ba84c4cc1c977326117550390d5784ebbcd21859027de2c190fb97c384
 ```
 
 **PASS:** `pager-factory.bin` exactly 65536 bytes, `pager-uboot.bin` 196608 bytes, and the first 1024 bytes of `pager-factory.bin` are **not** uniform 0xFF/0x00 (that is real per-unit calibration data).
