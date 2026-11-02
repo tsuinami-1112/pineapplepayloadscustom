@@ -170,8 +170,51 @@ the grep, not to replace verification.
 
 **Read this to recognise a question that has already had work done on it, not as a reason to stop
 asking it.** Everything below was derived from static analysis of firmware 1.1.3-stable and kernel
-source, as of commit `07916df`, with **no hardware on the bench**. Full working and citations are in
-the docs above, and each claim carries the thing that would falsify it.
+source, as of commit `07916df`. Full working and citations are in the docs above, and each claim
+carries the thing that would falsify it.
+
+**The device arrived on 2026-11-02, and a first read-only session checked much of it.** What that
+confirmed, and the one thing it corrected, is in "First contact" immediately below. Claims not
+listed there are still static-analysis only.
+
+### First contact — what a real Pager confirmed, 2026-11-02
+
+Read-only session, no receiver present, firmware deliberately held at 1.1.3-stable.
+
+- **`Band 4:` is present** on `phy1` ⇒ `phy->cap.has_6ghz == 1`. The 6 GHz PHY exists and the
+  block is software. Early exit **E1 cleared**. Also corroborates the FCC-derived hardware claims
+  for this unit, which mattered because **this unit carries no FCC label at all** — not on the
+  case, not under the battery cover. A dual-band variant would not register Band 4.
+- **`/sys/class/ieee80211/phy1/device/of_node` does not exist** ⇒ the device-tree `power-limits`
+  clamp is inert, as predicted for a USB device. No second hardware gate.
+- **P0.2 identity gate passed exactly** — `pineapd` `adc9d36d…8493`, `_pineap` `e1739d97…7d69`,
+  `regulatory.db` `30954f89…4b44`. New reference value: **`/pineapple/pineapple` =
+  `4493c6c6c8339e1993b5f7642e19fa6ca09241e14361cc1b6eccb0f75090ad3e`** (the Go UI, which carries
+  the *"Cannot deauth clients on DFS or 6GHz channels"* refusal string).
+- **`iw reg get` shows `country US: DFS-FCC` with no `(self-managed)` block** ⇒ regdb edits do
+  govern this radio, as inferred from mt76 having no `REGULATORY_WIPHY_SELF_MANAGED`.
+- **The two-gate separation, observed.** The US rules `5250–5350` and `5470–5730` carry `DFS` and
+  **no** `NO-IR`; channel 52 reports `Radar detection` with no `No IR`. Gate 2 permits the DFS
+  set, so the block on 52–144 is **entirely pineapd's**. Channel 149 is clear of both.
+- **Channel counts:** 2.4 GHz 11, 5 GHz 28 / 0 disabled / 16 Radar, 6 GHz 59 / 0 disabled / 59
+  `No IR`. 6 GHz `NO_IR` comes from one rule: `(5925 - 7125 @ 320) … PASSIVE-SCAN`.
+- **`inj_parse_channels` validated against a live radio** — all 98 channel lines end `] ` with the
+  trailing space it keys on, and it correctly handled a **5 GHz `No IR` channel (169)**, a case
+  the synthetic fixture never contained. The parser's remaining "never seen a real device" caveat
+  is discharged.
+- **Corrected:** "under US no 5 GHz channel carries `NO_IR`" was too broad — **169/173/177 do**,
+  via `5850–5895 … PASSIVE-SCAN`. The narrow form, "permits all of 36–165", is correct.
+
+Operational facts the notes lacked: a box-fresh Pager ships **with no firmware** and boots to a web
+installer on **port 1471**, with the wizard only appearing after a flash (§P0.1 is corrected); the
+firmware version lives at **`/etc/pineapplepager/version`** (two lines, `1.1.3` / `Stable`), not in
+`/etc/openwrt_release`; the clock ships ~18 months stale at the image build date; and this BusyBox
+build has **no `cat` options at all and no `sed l`**, so command blocks written for a future bench
+session must not use `cat -A` or `sed -n l` to inspect whitespace — use targeted `grep -c` instead.
+
+**`2.0.0-stable` was released 2026-10-29** and is now what `latest` serves. Everything here remains
+pinned to 1.1.3; versioned downloads still work
+(`…/firmwares/1.1.3-stable`, 303 → signed .bin, sha256 `3073d6b8…cd33`).
 
 If you are working on **unlocking 6 GHz or DFS injection**, treat the gate claims below as the prior
 state of the investigation, not its conclusion — the determination plan is a plan precisely because
@@ -182,8 +225,11 @@ the question is open.
   (`52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 144`) plus a blanket 6 GHz check. Regdb-immune — no `iw reg set` or
   regulatory.db edit lifts it. `pcap_inject` has exactly one call site, inside the gated function,
   so a non-pineapd injector bypasses it entirely. *Gate 2* is cfg80211: it prohibits
-  `DISABLED | NO_IR`, **not** `RADAR`, so under US no 5 GHz channel is blocked by it and the DFS
-  refusal is entirely gate 1's. A gate-2 drop is **silent** — the frame is freed and the path
+  `DISABLED | NO_IR`, **not** `RADAR`, so under US **no 5 GHz channel in 36–165** is blocked by it
+  and the DFS refusal is entirely gate 1's. (Not "no 5 GHz channel at all", which this line used to
+  say: **169/173/177 do carry `NO_IR`**, from the US rule `5850–5895 … PASSIVE-SCAN`, which is the
+  `NO_IR` alias. Confirmed on hardware 2026-11-02 — see "First contact" below.)
+  A gate-2 drop is **silent** — the frame is freed and the path
   returns `NETDEV_TX_OK`, so `sendto()` reports success. Nothing on the Pager can tell
   "transmitted" from "dropped"; that is why an independent receiver is mandatory.
   *Falsified by:* a frame landing on an external receiver from a channel in the gate-1 set, or

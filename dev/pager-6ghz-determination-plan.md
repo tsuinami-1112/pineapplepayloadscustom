@@ -138,7 +138,25 @@ Recovery ladder, lowest tier last:
 
 ### P0.1 [RO] First boot and SSH
 
-Complete the on-screen wizard (PIN, root password, timezone). First boot takes 3–4 min, or 10–15 min if freshly flashed — **do not interrupt it**; it partitions the eMMC and generates SSH keys. **[V]**
+**Corrected against a real box-fresh unit, 2026-11-02.** This step used to say "complete the on-screen wizard" as the first action. That is not what a new Pager does. The actual sequence is:
+
+1. **It boots with no firmware installed** and shows only: `HTTP://172.16.52.1` / *"Connect WiFi Pineapple to computer via the USB-C port, then browse to the above URL"*. There is no wizard yet.
+2. **Windows/Linux gets a real DHCP lease** on `172.16.52.0/24` (DNS suffix `lan`, gateway `172.16.52.1`) — so a proper lease, not `169.254.x.x`, is itself evidence the system booted rather than dropped into something minimal.
+3. **Browsing there gives a firmware *installer*** — a file picker and a `SELECT FIRMWARE_` button — served on **port 1471** (`http://172.16.52.1:1471/#/`), not port 80. Note that this is the *same address* as recovery tier 6 in §0.4, so the URL alone does not tell you which you are in; the discriminators are whether **A/green** was held at power-on and whether the page offers a file picker.
+4. **Only after flashing** does the on-screen wizard appear (PIN, root password, timezone).
+
+**Flash 1.1.3 explicitly — do not use the page's "latest release" link.** As of 2026-10-29 `latest` is **2.0.0-stable**, which would void every address in this plan. Versioned downloads work and the API serves them with a 303:
+
+```sh
+# 1.1.3-stable, sha256 3073d6b8…cd33, 33884001 bytes
+https://downloads.hak5.org/api/devices/wifipineapplepager/firmwares/1.1.3-stable
+```
+
+First boot takes 3–4 min, or 10–15 min if freshly flashed — **do not interrupt it**; it partitions the eMMC and generates SSH keys. **[V]**
+
+**Then record the version**, which lives at `/etc/pineapplepager/version` — a **directory** containing a `version` file, 13 bytes, two lines: `1.1.3` then `Stable`. `/etc/openwrt_release` does **not** carry it; its `DISTRIB_DESCRIPTION` is the OpenWrt build (`Pineapple Pager 24.10.1 r28597-0425664679`). Expected there: kernel **6.6.86**, `DISTRIB_RELEASE 24.10.1`, `ramips/mt76x8`, `mipsel_24kc`. That revision `r28597-0425664679` is also the OpenWrt revision of the SDK `dev/injector` builds against, so a match confirms the toolchain, not merely the ABI. **[V]**
+
+**The clock ships wrong.** A freshly flashed unit comes up at the image build date (`2025-04-13`), roughly 18 months behind. `system.ntp` is configured but needs a route it does not have. Set it by hand — `date -s "YYYY-MM-DD HH:MM:SS"` — rather than connecting it to the internet, which is the one action that re-opens the update risk. Assume it does not survive a reboot. **[V]**
 
 ```sh
 ip -brief addr | grep -i 172.16.52

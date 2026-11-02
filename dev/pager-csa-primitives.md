@@ -639,10 +639,19 @@ GB (ETSI)
   5925.0 - 6425.0 MHz  24.0 dBm  [NO-OUTDOOR]          <- 6 GHz with NO-IR NOT set
 ```
 
-**So under `country 'US'` no 5 GHz channel carries `NO_IR` at all** — gate 2 permits all of 36–165,
-and the effective block on 52–144 is **entirely gate 1's**. An earlier version of this document
-blamed `NO_IR` for the DFS block; that was wrong. Under the world domain `00`, by contrast, gate 2
-*does* block 52–144 and 149–165, so which domain is live changes the answer for 149–165.
+**So under `country 'US'` gate 2 permits all of 36–165**, and the effective block on 52–144 is
+**entirely gate 1's**. An earlier version of this document blamed `NO_IR` for the DFS block; that
+was wrong. Under the world domain `00`, by contrast, gate 2 *does* block 52–144 and 149–165, so
+which domain is live changes the answer for 149–165.
+
+**Measured on hardware, 2026-11-02, and it corrects the wording above.** This paragraph used to
+open *"no 5 GHz channel carries `NO_IR` at all"*. Three do: **169, 173 and 177**, from the US rule
+`(5850 - 5895 @ 40) … NO-OUTDOOR, AUTO-BW, PASSIVE-SCAN` — `PASSIVE-SCAN` being the `NO_IR` alias,
+the same flag that puts it on all 59 6 GHz channels. They sit above 165, so the "36–165" claim is
+untouched; only the blanket restatement was wrong. Counts from the device under `country US:
+DFS-FCC`: 5 GHz **28 channels, 0 disabled, 3 `No IR` (169/173/177), 16 `Radar detection`**; 6 GHz
+**59 / 0 disabled / 59 `No IR`**. Channel 52 reports `Radar detection` and a DFS state with **no
+`No IR`**, which is the two-gate separation observed rather than argued. **[V]**
 
 Consequences worth internalising:
 

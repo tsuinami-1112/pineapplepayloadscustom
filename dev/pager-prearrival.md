@@ -185,6 +185,16 @@ kernel because those lines never print there. ERE alternation confirmed under `m
 minimal implementation, as evidence for busybox awk on-device. Three selftest cases added
 (`157 checks, 0 failed`).
 
+> **Confirmed on hardware, 2026-11-02 — this table was right, with one addition.** Against a live
+> Pager under `country US: DFS-FCC`: 2.4 GHz **11** channels, 5 GHz **28 / 0 disabled / 16 Radar**,
+> 6 GHz **59 / 0 disabled / 59 No IR**. Channel 52 shows `Radar detection` with **no** `No IR`, and
+> 149 shows neither — so gate 2 permits the DFS set and 149–165 exactly as predicted. **The
+> addition:** channels **169/173/177** *do* carry `No IR` (US rule `5850–5895 … PASSIVE-SCAN`),
+> a 5 GHz `No IR` case this fixture never contained. `inj_parse_channels` was re-run against the
+> device's real output including that case and handled it correctly — so the parser is now
+> validated against a live radio, not only against the shipped `iw`'s format strings. The
+> `[A]` hinge below is therefore discharged: §5's rows are **[V]**.
+
 **This table became load-bearing for something else.** Composed with the finding that `hcxdumptool`
 reads only `FREQUENCY_ATTR_FREQ`/`MAX_TX_POWER`/`DISABLED` — never `NO_IR` or `RADAR` — it decides
 whether hcxdumptool is usable per band: on 5 GHz DFS it arms and transmits (the `Radar detection`
