@@ -312,8 +312,13 @@ same `deadc0de` magic, same metadata versions, byte-identical `/etc/firmware-key
 evidence a downgrade would still be accepted, though no version check was looked for.
 
 **⚠ `BOTH` is untargeted, and it is the preselected default.** Four readings of the Go daemon,
-identical in 1.1.3 and 2.0.0, all **[V]**: `pineAPdDeauth`'s argument frame is 32 bytes against 28
-for both `_All` and `_Csa`; `_Deauth` allocates its request struct at size class **SC3** while
+identical in 1.1.3 and 2.0.0, all **[V]**: **`StartDeauth`**'s argument frame is 32 bytes against 28
+for both **`StartDeauthAll`** and **`StartDeauthCsa`** — *corrected 2026-11-03; this line previously
+attributed the 32-vs-28 split to `pineAPdDeauth` against `_All`/`_Csa`, which is wrong. All three
+`pineAPd*` HTTP handlers have a 16-byte frame, being the same `http.HandlerFunc` shape, so they do
+not discriminate; the split is in the `StartDeauth*` trio they call. The conclusion is unaffected —
+re-measured against `moduledata.text` on 2026-11-03.* `_Deauth` allocates its request struct at
+size class **SC3** while
 `_All` and `_Csa` both use **SC2**; `_Deauth` is 924 bytes and parses `net.ParseMAC` **twice**
 while `_All` and `_Csa` are **both exactly 668 bytes** and parse it **once**; and only one
 `json:"target"` tag string exists in the binary against three each of `bssid` and `channel`.
@@ -598,4 +603,8 @@ empty directory and treat it as untrusted per the standing rules.
 
 Note the rootfs is **lz4** squashfs in 2.0.0 and **xz** in 1.1.3, so an `unsquashfs` built without
 lz4 support will open 1.1.3 and fail on 2.0.0 — check `unsquashfs -h` for the decompressor list
-before concluding the image is bad.
+before concluding the image is bad. In practice the likelier failure is `unsquashfs` not being
+installed at all: a reclaimed container loses it, and `apt-get install squashfs-tools` then fails
+with "Unable to locate package" until you `apt-get update` first. Also note `-e` takes a *file*
+listing paths; to extract a few by name put them after the image
+(`unsquashfs -d out rootfs.sqfs pineapple/pineapple`).
