@@ -415,16 +415,9 @@ packet counters move the way `resp_verdict` assumes; whether CSA moves a real cl
 count-byte experiment (day-one step 17a). (`inj_parse_channels` is **no longer** on this list — it
 ran against a live radio on 2026-11-02 and was correct; see "First contact".)
 
-**A 2.0.0 hazard worth knowing even though it is not ours.** Two DuckyScript commands changed
-behaviour in 2.0.0, reported by another session with both call sites verified here:
-`WIGLE_UPLOAD`'s `--archive`/`--remove` stopped being dry runs (`echo rm`/`echo mv` → real
-`rm -f`/`mv`), so `library/user/exfiltration/wigle-toolkit/payload.sh:121` **really deletes loot**
-on the `LEFT` path — the "Press A if OK" guard at `:102` was decorative on 1.1.3 because nothing
-happened either way, and the UI is unchanged. And `GPS_CONFIGURE` gained a mandatory mode keyword
-(`PINEAP|GPSD`), so `library/user/general/wardrive_activate/payload.sh:172`, which passes
-`"$device" "$baud"`, is **broken on 2.0.0**. Neither touches CamHound, but together they show the
-DuckyScript surface is **not stable across this bump** — which is why CamHound's own command set
-is the open compatibility question above. Relayed, not independently binary-verified here.
+**Two 2.0.0 hazards in this repo's other payloads** — `wigle-toolkit` really deletes loot, and
+`wardrive_activate` is broken. Both are `[V]` from the rootfs trees and written up in full in
+§"2.0.0-stable, analysed" above; not repeated here, so there is one copy to keep correct.
 
 The **instrument** for the injection side is no longer open: `dev/injector/` holds `pagerinj`,
 cross-built for `mipsel_24kc`/musl/soft-float, ABI-verified, and frame-validated with no radio
