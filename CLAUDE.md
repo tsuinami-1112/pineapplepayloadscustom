@@ -98,8 +98,9 @@ Line numbers drift; find things by name (`grep -n '^name()' payload.sh`).
 `disrupt_menu` call it). `inj_parse_channels` is its awk parser. It is validated against a fixture
 built byte-for-byte from the shipped `iw` binary's own format strings — which found and fixed one
 over-permissive defect (`iw` spells the NO_IR attribute three ways; see
-`dev/pager-prearrival.md` §5). It has still never parsed output from a *running* Pager, so the
-day-one diff is now a confirmation rather than first contact.
+`dev/pager-prearrival.md` §5). **It has since been run against a live radio (2026-11-02) and was
+correct**, including a 5 GHz `No IR` channel (169) that the fixture never contained. No longer a
+pending validation.
 
 **Response rung** — `resp_target` (sets `R_BSSID`/`R_TARGET`/`R_CH`/`R_BAND`), `disrupt_menu`,
 `resp_fire`, `resp_snapshot`, `resp_verdict` (MOVED / NO_EFFECT / INCONCLUSIVE from recon packet
@@ -170,8 +171,225 @@ the grep, not to replace verification.
 
 **Read this to recognise a question that has already had work done on it, not as a reason to stop
 asking it.** Everything below was derived from static analysis of firmware 1.1.3-stable and kernel
-source, as of commit `07916df`, with **no hardware on the bench**. Full working and citations are in
-the docs above, and each claim carries the thing that would falsify it.
+source, as of commit `07916df`. Full working and citations are in the docs above, and each claim
+carries the thing that would falsify it.
+
+**The device arrived on 2026-11-02, and a first read-only session checked much of it.** What that
+confirmed, and the one thing it corrected, is in "First contact" immediately below. Claims not
+listed there are still static-analysis only.
+
+### First contact — what a real Pager confirmed, 2026-11-02
+
+Read-only session, no receiver present, firmware deliberately held at 1.1.3-stable.
+
+- **`Band 4:` is present** on `phy1` ⇒ `phy->cap.has_6ghz == 1`. The 6 GHz PHY exists and the
+  block is software. Early exit **E1 cleared**. Also corroborates the FCC-derived hardware claims
+  for this unit, which mattered because **this unit carries no FCC label at all** — not on the
+  case, not under the battery cover. A dual-band variant would not register Band 4.
+- **`/sys/class/ieee80211/phy1/device/of_node` does not exist** ⇒ the device-tree `power-limits`
+  clamp is inert, as predicted for a USB device. No second hardware gate.
+- **P0.2 identity gate passed exactly** — `pineapd` `adc9d36d…8493`, `_pineap` `e1739d97…7d69`,
+  `regulatory.db` `30954f89…4b44`. New reference value: **`/pineapple/pineapple` =
+  `4493c6c6c8339e1993b5f7642e19fa6ca09241e14361cc1b6eccb0f75090ad3e`** (the Go UI, which carries
+  the *"Cannot deauth clients on DFS or 6GHz channels"* refusal string).
+- **`iw reg get` shows `country US: DFS-FCC` with no `(self-managed)` block** ⇒ regdb edits do
+  govern this radio, as inferred from mt76 having no `REGULATORY_WIPHY_SELF_MANAGED`.
+- **The two-gate separation, observed.** The US rules `5250–5350` and `5470–5730` carry `DFS` and
+  **no** `NO-IR`; channel 52 reports `Radar detection` with no `No IR`. Gate 2 permits the DFS
+  set, so the block on 52–144 is **entirely pineapd's**. Channel 149 is clear of both.
+- **Channel counts:** 2.4 GHz 11, 5 GHz 28 / 0 disabled / 16 Radar, 6 GHz 59 / 0 disabled / 59
+  `No IR`. 6 GHz `NO_IR` comes from one rule: `(5925 - 7125 @ 320) … PASSIVE-SCAN`.
+- **`inj_parse_channels` validated against a live radio** — all 98 channel lines end `] ` with the
+  trailing space it keys on, and it correctly handled a **5 GHz `No IR` channel (169)**, a case
+  the synthetic fixture never contained. The parser's remaining "never seen a real device" caveat
+  is discharged.
+- **Corrected:** "under US no 5 GHz channel carries `NO_IR`" was too broad — **169/173/177 do**,
+  via `5850–5895 … PASSIVE-SCAN`. The narrow form, "permits all of 36–165", is correct.
+- **⭐ The two branches are NOT symmetric targets, and the live data is what shows it.** On
+  **5 GHz DFS only gate 1 fires** — those channels are radar-flagged but carry no `NO_IR`, so
+  cfg80211 permits them and pineapd alone refuses. On **6 GHz both gates fire** — all 59 channels
+  carry `NO_IR`, so even with pineapd bypassed, cfg80211 still drops the frame. Therefore
+  **5 GHz DFS needs only a non-pineapd injector** (`pagerinj`, already built), while **6 GHz needs
+  that *and* something about gate 2** (step B2's `iw reg set` to a domain whose 6 GHz rule lacks
+  `NO-IR`). That asymmetry was implicit in the static reading and is now explicit in measurement;
+  it is the clearest single argument for doing the DFS branch first.
+- **`pineapd`'s live cmdline**, which settles several things at once and is worth re-reading before
+  assuming anything about interface roles:
+  `--interface wlan1mon --band wlan1mon:2,5 --primary wlan1mon --inject wlan1mon`,
+  `--interface wlan0mon --band wlan0mon:2`,
+  `--interface wlan2mon --band wlan2mon:2,5`.
+  So **`wlan1mon` is the injection interface** (confirming where gate 1 applies), and pineapd only
+  ever asks **radio0 for 2.4 GHz**, independently corroborating the receive-only antenna finding.
+  `uci get pineapd.wlan1mon.bands` = `2,5` — band 6 is not scanned, the shipped default as
+  predicted. pineapd *is* running despite not autostarting: the Go UI brings it up.
+- **🆕 `wlan2mon` — pineapd is configured for a THIRD radio that does not exist on the device.**
+  Full interface spec, dual-band `2,5`, while `iw dev` shows only `wlan0`/`wlan0mon` (phy0) and
+  `wlan1mon` (phy1). Nothing in these notes anticipated it. The natural reading is a slot for an
+  **external USB radio**. **[A]** — that pineapd is *configured* for it does not prove the hardware
+  supports one. Worth chasing: if the Pager can host a USB adapter as `wlan2mon`, that is a
+  second, separate phy and could serve as the independent 5 GHz receiver the DFS branch needs,
+  which is currently the only thing blocking it. *Falsified by:* no spare USB port, or the
+  interface failing to appear when one is attached.
+- **Instrument inventory confirmed on-device**, matching the rootfs reading item for item:
+  `tcpdump`, `iw`, `hak5cmd`, `scp` present; `hcxdumptool`, `aireplay-ng`, `mdk4`, `python3`,
+  `horst`, `tc` all **absent**; `libpcap.so.1.10.5` present. No Python means no scapy.
+- **`libwifi.so.0.0.10` hash matches** the recorded `d3421de2…6ee1` on the live device, so the
+  113-export map holds for this unit.
+
+Operational facts the notes lacked: a box-fresh Pager ships **with no firmware** and boots to a web
+installer on **port 1471**, with the wizard only appearing after a flash (§P0.1 is corrected); the
+firmware version lives at **`/etc/pineapplepager/version`** (two lines, `1.1.3` / `Stable`), not in
+`/etc/openwrt_release`; the clock ships ~18 months stale at the image build date; and this BusyBox
+build has **no `cat` options at all and no `sed l`**, so command blocks written for a future bench
+session must not use `cat -A` or `sed -n l` to inspect whitespace — use targeted `grep -c` instead.
+
+**`2.0.0-stable` was released 2026-10-29** and is now what `latest` serves. Everything here remains
+pinned to 1.1.3; versioned downloads still work
+(`…/firmwares/1.1.3-stable`, 303 → signed .bin, sha256 `3073d6b8…cd33`).
+
+### 2.0.0-stable, analysed — what it would and would not cost
+
+Static analysis of the shipped image by the firmware session, whole-rootfs diffed against 1.1.3.
+**No hardware**; the live bench readings above are the only measured data.
+
+**Unchanged, byte-identical between 1.1.3 and 2.0.0** — so everything we know about them transfers:
+`cfg80211.ko` and `mac80211.ko` (backports **6.12.61**, confirmed from the 2.0.0 binaries —
+not a new fact, `pager-csa-primitives.md` already said 6.12.61; the looser "6.12" restatements are
+now reconciled),
+`regulatory.db`, `iw`, `libwifi.so.0.0.10`, and the `pineapd.wlan1mon.bands '2,5'` uci block.
+
+**The gates did not move.** Same 16 FCC DFS channels by byte-identical mask code; the 6 GHz refusal
+is still the blanket `chan->+0x1c == 8`; no new refusal string, config option or capability check in
+any injection path; and **`pcap_inject` still has exactly one call site inside the gated function**,
+so the non-pineapd bypass remains valid.
+
+**What 2.0.0 does break: every `pineapd` address.** `adc9d36d…8493` → `d10ebedb…106f`,
+1320040 → 1451176 B. `inject` `0x46e7d0` → **`0x475870`**; `inject_deauth` `0x472c14` →
+**`0x4782d0`**. The MIPS16e disassembly recipe survives unchanged (same ELF flags, first PT_LOAD
+still maps offset 0 → `0x400000`). Note gate 1 is **four check instances in two functions**, not two.
+
+**So the cost of updating is confined to Stage C** — patching pineapd — which the plan itself labels
+"only if the above is exhausted". `pagerinj` bypasses pineapd entirely, so the DFS branch and the
+count-byte experiment are unaffected by the address moves.
+
+**And that cost has already been paid.** The 2.0.0 patch sites are mapped, so moving firmware no
+longer costs a re-derivation — four check instances in two functions, in both builds:
+
+| site | 1.1.3 | 2.0.0 |
+|---|---|---|
+| `pineap_wifi_interface::inject` | `0x46e7d0` | `0x475870` |
+| `interface_tracker::inject_deauth` | `0x472c14` | `0x4782d0` |
+| blanket 6 GHz check (`lw rX,28(rY); cmpi rX,8; bteqz`) | `0x46e800` / `0x472c66` | `0x4758a0` / `0x478322` |
+| DFS range-chain entry | `0x46e810` / `0x472c76` | `0x4758b0` / `0x478332` |
+| `0x1111` mask immediate | `0x46e964` / `0x472d66` | `0x4759ea` / `0x478422` |
+
+Static, from the 2.0.0 image; not yet checked against a running 2.0.0 device. The 1.1.3 column is
+the one confirmed on hardware. All four 2.0.0 cells were disassembled rather than inferred: the two
+6 GHz checks are the bit-identical `9847 7208 f260 6006` at the **same intra-function offset +0x52**
+from each entry point, with only the `bteqz` target relocated, and both range-chain entries show
+`5a91 sltiu v0,145`. Reproduce with
+`objdump -D -b binary -m mips:16 -EL --adjust-vma=0x400000 --start-address=… usr/sbin/pineapd`.
+
+**New option found on the way:** `CONFIG_MODULE_SIG` is **off in both**, so a hand-built or patched
+`.ko` is not blocked by signature checks — a live alternative if the regdb route ever dies.
+`CONFIG_CFG80211_REQUIRE_SIGNED_REGDB` is also off in both, and no `regulatory.db.p7s` exists.
+
+**The changelog's "new firmware format"** is squashfs **xz → lz4**, 1 MiB → 256 KiB blocks (hence
+"boots twice as fast" and 33.9 → 50.7 MB). The **container and signing envelope are unchanged** —
+same `deadc0de` magic, same metadata versions, byte-identical `/etc/firmware-key` — which is mild
+evidence a downgrade would still be accepted, though no version check was looked for.
+
+**⚠ One open question that is CamHound's, raised by the handler analysis.** `pineAPdDeauth` calls
+`net.ParseMAC` **twice**; `pineAPdDeauthAll` and `pineAPdDeauthCsa` call it **once each**. But
+`resp_fire` (`payload.sh:1871`) passes three arguments to both `DEAUTH` *and* `BOTH`:
+`"$cmd" "$R_BSSID" "$R_TARGET" "$R_CH"`. If `_ALL` parses only the BSSID, then **`BOTH` is
+untargeted — it would hit every client on the BSSID, not the one the operator selected** — while
+`DEAUTH` is targeted. That is a materially different attack behind two adjacent menu entries, and
+CamHound's comment at `:448` documents `_ALL` as taking `[target]` because the **help text says so**
+— the third instance of help-not-matching-code in this binary. **[A]**: one `ParseMAC` call is
+evidence that an argument is dropped, not proof of *which*. *Falsified by:* firing `BOTH` at one
+client among several and seeing whether the others stay associated — cheap once there is a target
+AP in the chamber. The detailed handler write-up went to the CamHound-deauth session; this entry
+exists so the question is not lost, not to duplicate theirs.
+
+**ANSWERED 2026-11-02 — CamHound is clear, and the DuckyScript surface is narrower than feared.**
+Enumerated across `usr/bin`, `bin`, `sbin`, `usr/sbin`, `usr/libexec`: **69 commands in each
+version, zero added, zero removed, 60 byte-identical, 9 changed — and none of the nine is one
+CamHound uses.** All six uppercase commands it calls (`GPS_GET`, `LED`, `PAYLOAD_GET_CONFIG`,
+`PAYLOAD_SET_CONFIG`, `RINGTONE`, `VIBRATE`) are byte-identical, as are `tcpdump`, `uci`, `jq`,
+`hexdump`, `iw`, `libpcap.so.1.10.5` and `libwifi.so.0.0.10`.
+
+- **The three `PINEAPPLE_DEAUTH_CLIENT*` commands survive with identical arity**, confirmed **from
+  the parser** (`cmd_deauth` still does `cmpi a2,3`) rather than from help text. 46 `PINEAPPLE_*`
+  commands, zero added, zero removed.
+- **`hak5cmd` is a provable pure relink** — identical token and string sets, strings at a uniform
+  −4 offset, the only real change being the version literal. **`_pineap` is a genuine recompile**
+  (85.69% of bytes differ, 43 verbs retained, 13 added, 0 removed). *Both keep their exact size,
+  which means opposite things — equal size proves nothing; byte-diff and look at where the diffs
+  fall.* Related trap: `DISTRIB_REVISION` is 28 characters in both, so dozens of files are
+  same-size-different-hash from that string alone.
+- **Two caveats that bear on the failure mode this file warns about.** *Help text is not a
+  specification*, provable in both directions: 1.1.3's `_pineap` help advertised `RECON STOP`,
+  which the dispatcher never accepted, and 2.0.0's help says `DEAUTH [bssid] [target]` while the
+  parser still demands three. And *`hak5cmd` being unchanged does not establish runtime
+  behaviour*: it is only an HTTP client to `/tmp/api.sock`, and the handlers for those routes live
+  in **`pineapple/pineapple`**, a Go daemon that grew +1,388,760 bytes (`4493c6c6…ad3e` →
+  `b16887ba…`). *An earlier revision of this line called that daemon "outside static reach" and
+  said only a capture could settle it. **Both halves were wrong** and are withdrawn:* unlike
+  `pineapd` it is **Go 1.27.0, stripped but retaining all 42 section headers**, so `.gopclntab`
+  survives and the function table is recoverable (18815 → 19248 functions).
+
+  **Statically confirmed unchanged:** the three HTTP handlers (`pineAPdDeauth`/`All`/`Csa`), the
+  three logic functions (`StartDeauth`/`All`/`Csa`) and the forwarder `exchangeCommand` — identical
+  in size *and* mnemonic sequence, every differing word a `lui`/`addiu` address pair or a `jal` to
+  the same callee. `ValidateDeauthCapable` is inlined into byte-equivalent bodies, so the guard
+  cannot have changed either. **The Go daemon is a thin forwarder to pineapd**
+  (`StartDeauth*` → `exchangeCommand` → pineapd), corroborated by no `switch_count` / `csa_count` /
+  `chanswitch` string existing anywhere in it in either version — so CSA frame construction really
+  is pineapd's count-0 code and nothing in the Go layer touches it.
+
+  **What a capture is still for, narrowed:** two shared-infrastructure functions on the deauth path
+  did change — `GetStructFromBody` (same size, different mnemonic sequence) and `StartPineap`
+  (732 → 252 bytes) — and the PMF UI setters `Get/SetReconMFPAPDeauthOptions` could **not** be
+  resolved, because ~4.5% of functab entries come out ≤16 bytes (Go's tiny wrappers and
+  mid-function fragments) and those setters land in that band. One capture settles all three. The
+  seven functions above are unaffected by that caveat: identical size plus identical mnemonic
+  sequence are symbol-table-independent, and their sizes are exact instruction multiples.
+
+**The nine that did change** — none used by CamHound, but three matter to this repo's other
+payloads and one matters in a chamber:
+
+| command | change |
+|---|---|
+| `GPS_CONFIGURE` | **BREAKING.** Gained a mandatory `PINEAP\|GPSD` mode keyword; endpoint moved `gpsd/set_config` → `pineap/gps/set_mode`. Breaks `library/user/general/wardrive_activate/payload.sh:172`. |
+| `WIGLE_UPLOAD` | **Data-loss.** See below. |
+| `WIGLE_LOGIN` | Adds a **mandatory** reachability probe to `api.wigle.net` with `\|\| exit 1`. **In a shielded chamber it now fails closed where it used to prompt.** |
+| `WIFI_WAIT` | Off-by-one fixed, but **`check_count == 0` now waits forever** where it previously returned after one iteration. |
+| `WIFI_CONNECT` | Relaxed to 3–5 args; a 1.1.3-era 5-arg call still works. |
+| `WIFI_{MGMT,OPEN,WPA}_AP_CLEAR` | Posted the wrong JSON key on 1.1.3 and **silently did nothing**; now actually clear. |
+| `GPS_LIST` | Internal only. |
+
+**`WIGLE_UPLOAD` — `[V]`, read from the rootfs trees, not relayed:**
+
+```diff
+-  echo rm "$__file"
++  rm -f "$__file"
+-  echo mv "$__file" "$__archive_dir/$__file"
++  mv "$__file" "$__archive_dir/$(basename "$__file")"
++__archive_dir=/root/loot/archive/wigle
+```
+
+So on 1.1.3 `--archive` was a no-op *and* malformed (`__archive_dir` was unset, plus a double
+`shift` that broke the single-file case), and `--remove` echoed. On 2.0.0 both are real.
+`library/user/exfiltration/wigle-toolkit/payload.sh:121` therefore **really deletes loot** on the
+`LEFT` path, and its "Press A if OK" gate at `:102` was decorative on 1.1.3 because nothing
+happened either way. **Identical keystrokes, identical UI, real deletion.**
+
+*(One framing correction: `od` ships in neither image, so CamHound's `od` fallbacks in
+`pcap_words`/`pcap_bytes` never execute on a Pager. That is **by design, not dead code** — the
+comment at `payload.sh:519` says so, and the branch exists for the laptop `--replay`/`--selftest`
+path on hosts that lack `hexdump`. The finding confirms that comment's "a Pager always has busybox
+hexdump" assumption.)*
 
 If you are working on **unlocking 6 GHz or DFS injection**, treat the gate claims below as the prior
 state of the investigation, not its conclusion — the determination plan is a plan precisely because
@@ -182,8 +400,11 @@ the question is open.
   (`52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 144`) plus a blanket 6 GHz check. Regdb-immune — no `iw reg set` or
   regulatory.db edit lifts it. `pcap_inject` has exactly one call site, inside the gated function,
   so a non-pineapd injector bypasses it entirely. *Gate 2* is cfg80211: it prohibits
-  `DISABLED | NO_IR`, **not** `RADAR`, so under US no 5 GHz channel is blocked by it and the DFS
-  refusal is entirely gate 1's. A gate-2 drop is **silent** — the frame is freed and the path
+  `DISABLED | NO_IR`, **not** `RADAR`, so under US **no 5 GHz channel in 36–165** is blocked by it
+  and the DFS refusal is entirely gate 1's. (Not "no 5 GHz channel at all", which this line used to
+  say: **169/173/177 do carry `NO_IR`**, from the US rule `5850–5895 … PASSIVE-SCAN`, which is the
+  `NO_IR` alias. Confirmed on hardware 2026-11-02 — see "First contact" below.)
+  A gate-2 drop is **silent** — the frame is freed and the path
   returns `NETDEV_TX_OK`, so `sendto()` reports success. Nothing on the Pager can tell
   "transmitted" from "dropped"; that is why an independent receiver is mandatory.
   *Falsified by:* a frame landing on an external receiver from a channel in the gate-1 set, or
@@ -211,7 +432,8 @@ the question is open.
   `Pager V2.2.0` — a filing describes the unit that was submitted, not necessarily the one in your
   hand. `wlan0mon` returning 5 GHz frames would kill the receive-only half on its own.
 - **Firmware under analysis is 1.1.3-stable** — OpenWrt 24.10.1, `ramips/mt76x8`, `mipsel_24kc`,
-  mac80211 from backports-6.12. Every address above is pinned to it. `pineapd` is **MIPS16e** with
+  mac80211 from **backports-6.12.61** (read from the module binaries; the same in 2.0.0).
+  Every address above is pinned to it. `pineapd` is **MIPS16e** with
   no section headers: disassemble with `-m mips:16`, mask bit 0 off symbol values, and read symbols
   with `nm -D` / `objdump -T` / `readelf --use-dynamic -sW` — plain `readelf -s` and
   `readelf --dyn-syms` return nothing **and exit 0**.
@@ -240,8 +462,12 @@ Listed in `dev/CamHound/RESPONSE.md` §13, `dev/pager-day-one.md` and — for wh
 closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowing: the three
 `PINEAPPLE_DEAUTH_CLIENT*` commands are documented only by `hak5cmd`'s help text; whether Recon's
 packet counters move the way `resp_verdict` assumes; whether CSA moves a real client at all; and the
-count-byte experiment (day-one step 17a). `inj_parse_channels` is format-validated but has not run
-against a live device.
+count-byte experiment (day-one step 17a). (`inj_parse_channels` is **no longer** on this list — it
+ran against a live radio on 2026-11-02 and was correct; see "First contact".)
+
+**Two 2.0.0 hazards in this repo's other payloads** — `wigle-toolkit` really deletes loot, and
+`wardrive_activate` is broken. Both are `[V]` from the rootfs trees and written up in full in
+§"2.0.0-stable, analysed" above; not repeated here, so there is one copy to keep correct.
 
 The **instrument** for the injection side is no longer open: `dev/injector/` holds `pagerinj`,
 cross-built for `mipsel_24kc`/musl/soft-float, ABI-verified, and frame-validated with no radio

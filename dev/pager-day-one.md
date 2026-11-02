@@ -66,6 +66,10 @@ iw phy "$PHY" info | grep -E "^[[:space:]]+Band [0-9]+:"
 surprising and re-check the phy mapping before believing it. Regdomain-independent — do not re-run
 it under different countries.
 
+> **DONE 2026-11-02 — `Band 4:` IS present** (`phy1`, alongside Bands 1 and 2). The 6 GHz PHY
+> exists, the block is software, **early exit E1 cleared**. `of_node` also absent, so no
+> device-tree clamp. Re-run this on a different unit, not on this one.
+
 **8. Capture the real regulatory state.** Two outputs, saved verbatim:
 
 ```sh
@@ -77,9 +81,15 @@ uci get pineapd.wlan1mon.bands        # does pineapd even scan band 6?
 This settles whether the device runs US or world domain — the open question behind CamHound's
 fallback — and it is the **first live-device input to `inj_probe()`'s parser**. The parser has
 already been validated against a fixture built from the shipped `iw`'s own format strings, which
-found and fixed one over-permissive defect (`dev/pager-prearrival.md` §5), so this is a
-confirmation rather than first contact. Still diff what `inj_probe` produced against the raw text
-by hand, once — a real device can emit attribute lines the fixture did not.
+found and fixed one over-permissive defect (`dev/pager-prearrival.md` §5).
+
+> **DONE 2026-11-02.** Live domain is **`country US: DFS-FCC`**, no `(self-managed)` block.
+> Counts: 2.4 GHz **11**, 5 GHz **28 / 0 disabled / 3 No IR (169,173,177) / 16 Radar**,
+> 6 GHz **59 / 0 disabled / 59 No IR**. `pineapd.wlan1mon.bands` = `2,5`, so band 6 is **not**
+> scanned. Channel 52 shows `Radar detection` with **no** `No IR` and 149 shows neither — the
+> two-gate separation, observed. The parser was re-run against the device's real output,
+> including the 5 GHz `No IR` case the fixture lacked, and was correct. **Nothing left to diff
+> by hand here**; on a different unit, repeat it.
 
 **9. THE VALUE GATE — a beacon capture plus the real client, before spending effort on 6 GHz.**
 Beacon protection takes **both** an AP that enables it and a client that can enforce it, so the

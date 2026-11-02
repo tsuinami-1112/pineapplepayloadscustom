@@ -80,6 +80,15 @@ NEEDED  libgcc_s.so.1
 NEEDED  libc.so
 ```
 
+> **Resolved 2026-11-02: it does ship.** The 2.0.0 analysis session checked both rootfs images —
+> `libgcc_s.so.1` is present and **byte-identical** in 1.1.3 and 2.0.0,
+> `8138ad1091ea51c4dd8b4c2f062ac055348590caaf1db02cd68ba00f06d9dfcb`, 131359 B, soft-float o32
+> mips32r2. So the `[A]` below is discharged and the risk was theoretical. The check is still worth
+> the ten seconds on a live unit, and `-static-libgcc` in `dev/injector/Makefile` stays — it costs a
+> few KB and removes a runtime dependency for free — but it is now insurance, not a fix for a known
+> gap. The reasoning below is kept because the *package metadata* really is incomplete, which is
+> the transferable lesson.
+
 **`libgcc_s.so.1` appears in neither the plan's list nor the package's own `Depends:` field**, so
 `opkg` will not pull it and a file-install will not either. It is normally part of OpenWrt base, so
 it is very likely present — but that is **[A]**, and the failure mode is a loader error on the DFS
@@ -184,6 +193,16 @@ is indistinguishable from a resisting target. Fixed by widening one regex to
 kernel because those lines never print there. ERE alternation confirmed under `mawk` 1.3.4, a
 minimal implementation, as evidence for busybox awk on-device. Three selftest cases added
 (`157 checks, 0 failed`).
+
+> **Confirmed on hardware, 2026-11-02 — this table was right, with one addition.** Against a live
+> Pager under `country US: DFS-FCC`: 2.4 GHz **11** channels, 5 GHz **28 / 0 disabled / 16 Radar**,
+> 6 GHz **59 / 0 disabled / 59 No IR**. Channel 52 shows `Radar detection` with **no** `No IR`, and
+> 149 shows neither — so gate 2 permits the DFS set and 149–165 exactly as predicted. **The
+> addition:** channels **169/173/177** *do* carry `No IR` (US rule `5850–5895 … PASSIVE-SCAN`),
+> a 5 GHz `No IR` case this fixture never contained. `inj_parse_channels` was re-run against the
+> device's real output including that case and handled it correctly — so the parser is now
+> validated against a live radio, not only against the shipped `iw`'s format strings. The
+> `[A]` hinge below is therefore discharged: §5's rows are **[V]**.
 
 **This table became load-bearing for something else.** Composed with the finding that `hcxdumptool`
 reads only `FREQUENCY_ATTR_FREQ`/`MAX_TX_POWER`/`DISABLED` — never `NO_IR` or `RADAR` — it decides
