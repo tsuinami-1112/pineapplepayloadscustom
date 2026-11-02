@@ -258,6 +258,16 @@ not a new fact, `pager-csa-primitives.md` already said 6.12.61; the looser "6.12
 now reconciled),
 `regulatory.db`, `iw`, `libwifi.so.0.0.10`, and the `pineapd.wlan1mon.bands '2,5'` uci block.
 
+**The one wireless driver that did change** is `mt76-usb.ko`, 16104 → 19396 bytes, adding three
+functions absent from 1.1.3 — `mt76u_rx_desync`, `mt76u_rx_recovery_work`, `mt76u_rx_submit_error`
+(0 occurrences each in the 1.1.3 module, 1 each in 2.0.0) — plus a new `usb->rx_lock` and
+delayed-work machinery. **[V]** It is a USB **receive**-path recovery patch, which is the path the
+"`wlan0mon` is receive-only, so it cannot hear 5 GHz" claim rests on, so it is worth knowing about
+before interpreting any 2.0.0 reception result. The mt76 upstream snapshot did **not** move — both
+carry the embedded tag `mt76-2025.11.06~eb567bc7` — so this is Hak5's own patch, not a version
+bump; every other `mt76*.ko` differs only as a recompile. *Falsified by:* any of those three
+symbols appearing in the 1.1.3 module, or the embedded tags differing.
+
 **The gates did not move.** Same 16 FCC DFS channels by byte-identical mask code; the 6 GHz refusal
 is still the blanket `chan->+0x1c == 8`; no new refusal string, config option or capability check in
 any injection path; and **`pcap_inject` still has exactly one call site inside the gated function**,
@@ -323,6 +333,79 @@ of help-not-matching-code in this binary, and the first with an operator-visible
 associated; or statically, by a `target` field reachable from `_All`'s type descriptor.
 **Whether to relabel or reorder the menu is the CamHound-deauth session's call, not this
 branch's** — only the factually wrong comment was fixed here.
+
+**⚠ `_pineap RECON CLIENTS` is new in 2.0.0 — CamHound's client rung has never actually run.**
+Reading **[V]**: the byte string `CLIENTS` occurs **0 times** in 1.1.3's `/usr/bin/_pineap` and
+**12 times** in 2.0.0's; lowercase `clients` 0 vs 4, `client` 0 vs 5. Count them with
+`python3 -I -c "import sys;print(open(sys.argv[1],'rb').read().count(b'CLIENTS'))" <_pineap>` —
+**not** with `grep -c`, which counts matching *lines* and on a binary with few newlines returns a
+smaller, method-dependent number (an earlier revision of this line said "6 times" for exactly that
+reason). The `0` is the robust half either way: absent is absent. So `recon_lines CLIENTS` has
+returned nothing on every firmware the payload has ever run on, and starts returning rows the
+moment the Pager is flashed.
+
+Corroborated by the help lines themselves — `strings -a <_pineap> | grep -E '^RECON '`, sorted:
+
+| 1.1.3 | 2.0.0 |
+|---|---|
+| APS, CHANNELS, COUNT APS, COUNT DEVICES, DEVICES, NEW, WAIT | same, plus **CLIENTS** and **COUNT CLIENTS** |
+| IRSEARCH, ISEARCH, RSEARCH, SEARCH *(flat)* | `RECON {APS\|CLIENTS\|DEVICES} SEARCH\|ISEARCH\|RSEARCH\|IRSEARCH` *(now take a subject)* |
+| **STOP** | **END** |
+
+`cmd_dispatch_search` is a new symbol in 2.0.0 (`nm -D`, 0 occurrences → 1), which is what the
+SEARCH verbs moving under a subject looks like. `_Z18cmd_dispatch_reconR14command_socketiPPc` sits
+at `0x453308` in 1.1.3 and `0x4554fc` in 2.0.0 (`nm -D`, verified). Note the `STOP` → `END` row is
+**not** a removed verb: `STOP` was never accepted by the recon dispatcher in either build — 1.1.3's
+help was simply wrong — so a reviewer diffing only help tables will report a false regression here.
+
+**The 2.0.0 device object, [V] from `_pineap HELP PARSE`** — itself a verb new in 2.0.0 (the byte
+string `HELP PARSE` occurs 0 times in 1.1.3 and 3 times in 2.0.0; `keyed by an internal SSID hash`
+0 and 1):
+
+```
+device: mac, time, signal, freq, packets,
+        beacon / response / probe        (objects; absent if none)
+beacon|response|probe are objects keyed by an opaque internal SSID hash (decimal string);
+  each value: ssid, ssidlen, count, time, signal, freq, channel
+  beacon values also: hidden, encryption, encryption_str, mfp_supported, mfp_required
+```
+
+Three consequences for CamHound. All are **pre-existing defects that become visible on flash, not
+2.0.0 regressions** — they behave identically on both firmwares, and were simply unreachable while
+`RECON CLIENTS` returned nothing. Line numbers are master's and will drift:
+
+1. **`JQ_CLI` (`payload.sh:664`) reads probes as `.probes // .probed_ssids // .probed`** — none of
+   the three exists. The key is **`probe`, singular**, and it is an **object, not an array**, so
+   adding `.probe` to that chain *still* yields nothing: `$p0` becomes the object, the
+   `if type == "array"` guard wraps it as `[$p0]`, and `map(.ssid // "")` returns `""` because the
+   hash-keyed outer object has no `.ssid` of its own. The correct form reads the object's
+   **values** — `[(.probe // {})[].ssid]`. *A relay from the firmware session called this "a
+   one-word fix"; that was wrong, and this is the correction.*
+2. **`JQ_CLI` reads association as `.ap_mac // .bssid`** — the device object has **no association
+   field at all**, so every client row gets `-`. Not a typo to fix but a question of what source
+   could fill the column. `dev/CamHound/PLAN_v2.md:256` already carried "no ap_mac" as a *risk*
+   with "log one raw object to spike.log" as the mitigation; that Phase 0 spike is now **answered
+   from the binary and can be retired**.
+3. **`parse_cli_fallback` carries both defects independently of jq**: its `ap_mac` regex can never
+   match, and its probes slot is a **hardcoded empty string** in its `printf` — contradicting the
+   function's own header comment, which advertises `mac|ap_mac|packets|signal|probes|freq|time|channel`.
+   So fixing `JQ_CLI` alone would leave `HAVE_JQ=0` operators broken.
+
+*Falsified by:* `_pineap RECON CLIENTS format=json | jq '.[0]|keys'` on a 2.0.0 Pager with an
+associated client returning a key that carries the BSSID — documented or not. That would collapse
+(2) to a one-word fix.
+
+**Also newly available, and relevant to the posture rung:** the `mfp_supported`, `mfp_required`,
+`encryption` and `encryption_str` fields on beacon values are **2.0.0-only** — byte-string counts
+1.1.3 → 2.0.0 are `mfp_supported` 0 → 2, `mfp_required` 0 → 3, `encryption_str` 0 → 4 (bare
+`encryption` is a substring of `encryption_str`, so it is not counted separately).
+`posture_*` currently derives PMF from a beacon
+capture via `rsn_caps`; on 2.0.0 the recon JSON exposes it per beaconed SSID directly. Whether to
+use it is the CamHound sessions' call — recorded here only so it is not re-derived.
+
+**Fixing the payload is `clever-wozniak`'s to do, not this branch's** — it has 281 lines of
+in-flight change on that exact file, and the standing rule is not to correct another branch's work
+from here.
 
 **ANSWERED 2026-11-02 — CamHound is clear, and the DuckyScript surface is narrower than feared.**
 Enumerated across `usr/bin`, `bin`, `sbin`, `usr/sbin`, `usr/libexec`: **69 commands in each
@@ -507,5 +590,12 @@ non-zero count actually produces the auth/assoc refusal — that last is `[A]` f
 ## Re-obtaining the firmware
 
 Extraction lives in a session scratchpad and **will not exist for a future session**. To rebuild it:
-the image URL and its sha256 are in `dev/pager-6ghz-determination-plan.md` §0.4 (with the recovery
-ladder); the version-identity gate is §P0.2. Put it in its own new empty directory and treat it as untrusted per the standing rules.
+the image URLs and their sha256s are in `dev/pager-6ghz-determination-plan.md` §0.4 (with the recovery
+ladder); the version-identity gate is §P0.2. **Both** 1.1.3-stable (`3073d6b8…cd33`, 33884001 B)
+and 2.0.0-stable (`17dab975…7968`, 50726753 B) are recorded there, because every 2.0.0 claim in this
+file was derived by diffing the two and is not re-checkable from one alone. Put each in its own new
+empty directory and treat it as untrusted per the standing rules.
+
+Note the rootfs is **lz4** squashfs in 2.0.0 and **xz** in 1.1.3, so an `unsquashfs` built without
+lz4 support will open 1.1.3 and fail on 2.0.0 — check `unsquashfs -h` for the decompressor list
+before concluding the image is bad.
