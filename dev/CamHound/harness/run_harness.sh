@@ -2,9 +2,9 @@
 # Laptop harness for CamHound. Runs the user payload against stub DuckyScript commands (including
 # NUMBER_PICKER and PAYLOAD_SET/DEL_CONFIG), a fake _pineap (RECON fixtures in fix/), a fake tcpdump
 # (synthetic pcaps; HARNESS_NO_BEACON=1 makes its beacon branch capture nothing), a fake iwinfo and a
-# fake iw (US-like channel table, answered for the fixture phy directory the fast copy points INJ_SYSFS
-# at; a fixture net tree under NET_SYSFS names phy0 as wlan1mon's phy, so the probe takes its resolved
-# path), then checks the verdicts and the loot. Writes only under a temp directory and /tmp/cs_*. The LIST_PICKER stub answers only with items on the page it
+# fake iw (US-like channel table, answered for whatever phy the net fixture under NET_SYSFS names
+# as wlan1mon's phy (phy0), so the probe takes its resolved path; the INJ_SYSFS directory is reached
+# only by the fallback), then checks the verdicts and the loot. Writes only under a temp directory and /tmp/cs_*. The LIST_PICKER stub answers only with items on the page it
 # was handed: for an answer further down the list it presses 'More...' first, as an operator would,
 # and it refuses (exit 1, logged 'not on this page') an answer that is on no page.
 # Needs bash 5 and jq; uses busybox hexdump/awk when busybox is installed (closer to the Pager).
@@ -25,7 +25,7 @@ sed -e 's/^WIN_SECS=10 /WIN_SECS=5 /' -e 's/^LIVE_WINDOWS=6 /LIVE_WINDOWS=4 /' \
 grep -q "LOOT_DIR=\"$LOOT\"" "$T/payload_fast.sh" || { echo "sed on the config block failed"; exit 1; }
 grep -q "INJ_SYSFS=\"$T/phy\"" "$T/payload_fast.sh" || { echo "sed on INJ_SYSFS failed"; exit 1; }
 grep -q "NET_SYSFS=\"$T/net\"" "$T/payload_fast.sh" || { echo "sed on NET_SYSFS failed"; exit 1; }
-mkdir -p "$T/phy/phy0"          # one fake phy; the iw stub answers 'iw phy phy0 channels' with a US-like table
+mkdir -p "$T/phy/phy0"          # fallback-merge fixture only: with the net tree below naming phy0, no scenario lists this directory
 mkdir -p "$T/net/wlan1mon/phy80211"; printf 'phy0\n' >"$T/net/wlan1mon/phy80211/name"   # RECON_IF's phy: the probe reads this one, no merge
 printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
 PATHX="$HERE/stubs:$T/bin:$PATH"
@@ -85,7 +85,7 @@ s_disrupt() {   # RESPONSE=1: Disrupt on the Reolink AP against log-only stubs; 
   answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   check "disrupt: posture read under a lock on the target channel" "grep -q 'TCPDUMP beacon ec71db000010' $T/log && grep -q 'PINEAPPLE_EXAMINE_BSSID ec:71:db:00:00:10' $T/log"
   check "disrupt: badge D+C from the synthetic beacon" "grep -q 'PICKER\[Disrupt \[D+C\]' $T/log"
-  check "disrupt: regulatory probe ran against the fixture phy" "grep -q '^IW phy phy0 channels' $T/log"
+  check "disrupt: regulatory probe ran against phy0, the phy the net fixture names" "grep -q '^IW phy phy0 channels' $T/log"
   check "disrupt: regulatory probe parsed the fixture (no fallback)" "! grep -q 'regulatory probe failed' $T/log"
   check "disrupt: probe read the transmitting phy, not a merge" "grep -q 'inj probe: tx phy phy0' $LOOT/events.log && ! grep -q 'tx phy unresolved' $LOOT/events.log && ! grep -q 'tx phy unresolved' $T/log"
   check "disrupt: stub command called with bssid, broadcast target, channel 36" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_ALL ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log"
@@ -108,7 +108,7 @@ s_blind() {   # RESPONSE=1 with no beacon capturable: the ? badge asks before fi
   check "blind: Fire blind confirm shown and accepted" "grep -q 'CONFIRM\[Posture unread on 00:00:10: no beacon captured. Fire blind[?]\] -> 1' $T/log"
   check "blind: picker leads with CSA, every option labelled unknown" "grep -q 'PICKER\[Disrupt \[[?]\] ff:ff:ff\] items=CSA (unknown);BOTH (unknown);DEAUTH (unknown);' $T/log"
   check "blind: CSA fired with bssid and channel only, badge ? in the event" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_CSA ec:71:db:00:00:10 36$' $T/log && grep -q 'fire CSA ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff ch36 badge=? ' $LOOT/events.log"
-  check "blind: loot rows carry badge ? and caps -, not a previous target's" "grep -q '|ec:71:db:00:00:11|36|5|?|-|-|CSA|PINEAPPLE_DEAUTH_CLIENT_CSA|ok|' $LOOT/responses.tsv && grep -q '|ec:71:db:00:00:12|36|5|?|-|-|CSA|' $LOOT/responses.tsv"
+  check "blind: loot rows carry badge ? and caps -" "grep -q '|ec:71:db:00:00:11|36|5|?|-|-|CSA|PINEAPPLE_DEAUTH_CLIENT_CSA|ok|' $LOOT/responses.tsv && grep -q '|ec:71:db:00:00:12|36|5|?|-|-|CSA|' $LOOT/responses.tsv"
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules blind2 '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' 'Fire blind' '0' '^Disrupt \[' '1' ' via ' '1' "${COMMON[@]}"
   answers t t B; HARNESS_NO_BEACON=1 run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"

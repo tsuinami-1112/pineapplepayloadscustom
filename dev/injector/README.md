@@ -2,7 +2,8 @@
 
 An AF_PACKET sender for the Pager bench work. **It never touches the channel**; whatever
 `iw dev <if> set freq` left is what it uses. Its capture socket is bound to `-i`, so what it clones
-is what that interface heard and nothing else.
+passed through that interface — received there, or injected on it by another process (which is why
+CSA-bearing beacons are skipped) — and came from no other interface.
 
 Built and validated with **no hardware**. What it is for, and the reasoning behind every design
 choice, is in the header comment of `pagerinj.c` — read that before changing it.
@@ -153,7 +154,7 @@ Keeping it: a few KB to drop a runtime dependency is still the right trade for a
 
 `-static-libgcc` is deliberate: the default link wants `libgcc_s.so.1`, which is the one library
 `dev/pager-prearrival.md` §3 flags as **unverified** on the Pager. Linking it in costs a few KB and
-removes a dependency nobody can check until the device is in hand.
+removes a dependency the device has since been shown to carry.
 
 Binaries are `.gitignore`d — build them, don't commit them.
 

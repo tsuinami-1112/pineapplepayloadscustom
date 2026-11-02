@@ -25,10 +25,10 @@ export STAGING_DIR = $(SDK)/staging_dir
 
 # -mips32r2 -msoft-float matches the target; -Os because this lives in /tmp on a small device.
 #
-# -static-libgcc is deliberate.  The default build wants libgcc_s.so.1 at runtime, and that is the
-# one library dev/pager-prearrival.md §3 flags as *unverified* on the Pager — it is in neither
-# hcxdumptool's declared deps nor its NEEDED list, so nothing guarantees it is installed.  Linking
-# it in costs a few KB and removes a dependency we cannot check until the device is in hand.
+# -static-libgcc is deliberate.  The default link wants libgcc_s.so.1 at runtime, which hcxdumptool's
+# NEEDED list carries but its declared Depends does not (dev/pager-prearrival.md §3).  It does ship
+# on the Pager (resolved 2026-11-02, see that section), so the flag is insurance: a few KB to drop a
+# runtime dependency.
 # `make static` goes further and removes libc too, for when you want zero loader risk at all.
 CFLAGS_COMMON = -Os -Wall -Wextra -Werror -std=gnu99
 CFLAGS_CROSS  = $(CFLAGS_COMMON) -mips32r2 -msoft-float -static-libgcc

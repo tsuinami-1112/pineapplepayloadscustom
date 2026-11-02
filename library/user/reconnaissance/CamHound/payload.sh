@@ -385,8 +385,12 @@ inj_probe() {   # inj_probe [force] -> 0 when INJ_OK is usable
   command -v iw >/dev/null 2>&1 || return 1
   # Gate 2 is applied by the phy a frame leaves from, so only THAT phy's table is read: the one
   # behind RECON_IF, named by $NET_SYSFS/$RECON_IF/phy80211/name (the same link the determination
-  # plan's A1 step reads with readlink, plan :267-268, treating its absence as the radio not having
-  # probed).  Merging every phy under $INJ_SYSFS -- the old behaviour, kept only as
+  # plan's A1 step reads with readlink, plan §A1, treating its absence as the radio not having
+  # probed).  RECON_IF is that phy because pineapd injects on it -- its live cmdline carries
+  # `--inject wlan1mon` (CLAUDE.md "First contact"); falsified by
+  # `cat /proc/$(pgrep -n pineapd)/cmdline | tr "\0" " "` showing --inject on another interface,
+  # in which case RECON_IF is the wrong phy to read.
+  # Merging every phy under $INJ_SYSFS -- the old behaviour, kept only as
   # the fallback for when that file cannot be read -- is a plain last-row-wins overwrite per
   # band/channel key in glob order, over-permissive wherever two phys share a band and disagree:
   # the receive-only radio0 registers 2.4 GHz as the transmitter does (FCC antenna map and UCI

@@ -118,7 +118,9 @@ transmit on needs no capture.
 - **Gate 2 — cfg80211, in the kernel.** `cfg80211_reg_check_beaconing()` (this kernel's rename of
   `cfg80211_reg_can_beacon()`) prohibits `IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR` for a
   monitor vif. **`IEEE80211_CHAN_RADAR` is not prohibited** — so under `country 'US'`, where no
-  5 GHz rule carries `NO-IR`, gate 2 permits all of 36–165 and the DFS block is entirely gate 1's.
+  5 GHz rule below 5850 MHz carries `NO-IR` (169/173/177 do, via `5850–5895 … PASSIVE-SCAN`,
+  measured 2026-11-02 — CLAUDE.md §First contact), gate 2 permits all of 36–165 and the DFS block
+  is entirely gate 1's.
   This gate *does* follow the regulatory domain, so it is read live by `inj_probe()` from
   `iw phy <phy> channels` on the transmitting phy and cached in `INJ_OK` keyed `band/channel`.
 
@@ -139,8 +141,12 @@ shrink to 2.4 GHz 1–11. Falsifier: `iw phy <txphy> channels` printing `No IR` 
 `csa_injectable()` is reached from `posture_from_caps()` inside `$( )`, where writes to globals are
 discarded, so it is strictly read-only. It reads the table of the **transmitting phy only** — the
 one behind `RECON_IF`, named by `<NET_SYSFS>/<RECON_IF>/phy80211/name` — because gate 2 is applied
-by the phy the frame leaves from. Only when that file cannot be read does it fall back to merging
-every phy under `INJ_SYSFS` (last row per `band/channel` key wins, in glob order), and then it logs,
+by the phy the frame leaves from, and pineapd injects on that interface: its live cmdline carries
+`--inject wlan1mon` (CLAUDE.md §First contact). Falsified by
+`cat /proc/$(pgrep -n pineapd)/cmdline | tr "\0" " "` showing `--inject` on another interface, in
+which case `RECON_IF` is the wrong phy to read. Only when that file cannot be read does it fall
+back to merging every phy under `INJ_SYSFS` (last row per `band/channel` key wins, in glob order),
+and then it logs,
 to `events.log` and as a yellow `LOG`, that the tx phy was unresolved and how many phys were merged:
 the merge is over-permissive wherever two phys share a band and disagree, and `radio0` registers
 2.4 GHz as the transmitter does, so every 2.4 GHz key is written twice. The selftest pins both modes

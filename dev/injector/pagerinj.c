@@ -369,12 +369,16 @@ static size_t csa_frame_build(const uint8_t *in, size_t in_len,
  * So on a non-PMF BSS an unprotected one is acted on -- and being unicast it needs no flood and
  * loses no race against the real AP's beacons.
  *
- * Three constraints that make the difference between working and a silent drop, all from the
- * receive path:
+ * Four constraints that make the difference between working and a silent drop, all from the
+ * receive path (dev/pager-day-one.md step 17c lists the same four):
  *   - A3 must equal the BSSID.  rx612.c:3738 compares it against sdata->deflink.u.mgd.bssid; a
  *     wrong A3 is dropped with no log.
  *   - A1 is the client, which is the entire point.
  *   - the client must be associated.
+ *   - --chan must name a channel the BSS is not on: ieee80211_sta_process_chanswitch() ignores an
+ *     action-frame CSA whose chandef equals the current one whatever the mode (mlme.c:2533-2543 at
+ *     v6.12, `chandef_identical && (!mode || source != IEEE80211_CSA_SOURCE_BEACON)`).  This path
+ *     reads no beacon, so unlike --csa it cannot check that for you.
  * The length gate is cleared with margin (see ACTION_CHAN_SWITCH_MIN above).
  *
  * Returns the length written, or 0 if the output buffer is too small. */
@@ -1055,7 +1059,7 @@ int main(int argc, char **argv)
     if (phy_rate && rtap_tx_set_rate(phy_rate) < 0) { usage(); return 2; }
 
     /* csa_present() carries a SECOND per-element discard that is easy to walk into, and that
-     * neither this file nor the docs mentioned until it was read at v6.12 (mlme.c:8350, and the
+     * neither this file nor the docs mentioned until it was read at v6.12 (mlme.c:8351, and the
      * same pair for the eCSA):
      *
      *     if (csa && !csa->mode && csa->new_ch_num == cur_channel)   csa = NULL;
@@ -1066,7 +1070,7 @@ int main(int argc, char **argv)
      * condition because it deliberately never reads the current channel. */
     if ((do_csa || do_action) && mode == 0)
         fprintf(stderr, "warning: --mode 0 is discarded outright by csa_present() if --chan %d is "
-                        "the channel the target is already on (mlme.c:8350). pineapd uses mode 1.\n",
+                        "the channel the target is already on (mlme.c:8351). pineapd uses mode 1.\n",
                 chan);
 
     int ifindex = 0;
@@ -1153,6 +1157,11 @@ int main(int argc, char **argv)
     while (!stop_flag) {
         if (end && time(NULL) >= end) break;
         if (tx(fd, ifindex, frame, flen) < 0) {
+            /* A stop signal landing inside a sendto() blocked on sndbuf space returns EINTR
+             * (sock_alloc_send_pskb() -> sock_intr_errno(), sock.c:2885-2896 and sock.h:2542-2545
+             * at v6.12; on_stop is installed without SA_RESTART).  That is the interrupt, not a
+             * send failure, so it is not counted as one. */
+            if (errno == EINTR && stop_flag) break;
             if (failed == 0) perror("sendto");
             failed++;
         } else {
