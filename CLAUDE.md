@@ -279,12 +279,16 @@ longer costs a re-derivation — four check instances in two functions, in both 
 |---|---|---|
 | `pineap_wifi_interface::inject` | `0x46e7d0` | `0x475870` |
 | `interface_tracker::inject_deauth` | `0x472c14` | `0x4782d0` |
-| blanket 6 GHz check (`lw rX,28(rY); cmpi rX,8; bteqz`) | `0x46e800` / `0x472c66` | `0x4758a0` / … |
+| blanket 6 GHz check (`lw rX,28(rY); cmpi rX,8; bteqz`) | `0x46e800` / `0x472c66` | `0x4758a0` / `0x478322` |
 | DFS range-chain entry | `0x46e810` / `0x472c76` | `0x4758b0` / `0x478332` |
 | `0x1111` mask immediate | `0x46e964` / `0x472d66` | `0x4759ea` / `0x478422` |
 
 Static, from the 2.0.0 image; not yet checked against a running 2.0.0 device. The 1.1.3 column is
-the one confirmed on hardware.
+the one confirmed on hardware. All four 2.0.0 cells were disassembled rather than inferred: the two
+6 GHz checks are the bit-identical `9847 7208 f260 6006` at the **same intra-function offset +0x52**
+from each entry point, with only the `bteqz` target relocated, and both range-chain entries show
+`5a91 sltiu v0,145`. Reproduce with
+`objdump -D -b binary -m mips:16 -EL --adjust-vma=0x400000 --start-address=… usr/sbin/pineapd`.
 
 **New option found on the way:** `CONFIG_MODULE_SIG` is **off in both**, so a hand-built or patched
 `.ko` is not blocked by signature checks — a live alternative if the regdb route ever dies.
@@ -294,6 +298,19 @@ the one confirmed on hardware.
 "boots twice as fast" and 33.9 → 50.7 MB). The **container and signing envelope are unchanged** —
 same `deadc0de` magic, same metadata versions, byte-identical `/etc/firmware-key` — which is mild
 evidence a downgrade would still be accepted, though no version check was looked for.
+
+**⚠ One open question that is CamHound's, raised by the handler analysis.** `pineAPdDeauth` calls
+`net.ParseMAC` **twice**; `pineAPdDeauthAll` and `pineAPdDeauthCsa` call it **once each**. But
+`resp_fire` (`payload.sh:1871`) passes three arguments to both `DEAUTH` *and* `BOTH`:
+`"$cmd" "$R_BSSID" "$R_TARGET" "$R_CH"`. If `_ALL` parses only the BSSID, then **`BOTH` is
+untargeted — it would hit every client on the BSSID, not the one the operator selected** — while
+`DEAUTH` is targeted. That is a materially different attack behind two adjacent menu entries, and
+CamHound's comment at `:448` documents `_ALL` as taking `[target]` because the **help text says so**
+— the third instance of help-not-matching-code in this binary. **[A]**: one `ParseMAC` call is
+evidence that an argument is dropped, not proof of *which*. *Falsified by:* firing `BOTH` at one
+client among several and seeing whether the others stay associated — cheap once there is a target
+AP in the chamber. The detailed handler write-up went to the CamHound-deauth session; this entry
+exists so the question is not lost, not to duplicate theirs.
 
 **ANSWERED 2026-11-02 — CamHound is clear, and the DuckyScript surface is narrower than feared.**
 Enumerated across `usr/bin`, `bin`, `sbin`, `usr/sbin`, `usr/libexec`: **69 commands in each
@@ -316,9 +333,28 @@ CamHound uses.** All six uppercase commands it calls (`GPS_GET`, `LED`, `PAYLOAD
   which the dispatcher never accepted, and 2.0.0's help says `DEAUTH [bssid] [target]` while the
   parser still demands three. And *`hak5cmd` being unchanged does not establish runtime
   behaviour*: it is only an HTTP client to `/tmp/api.sock`, and the handlers for those routes live
-  in **`pineapple/pineapple`, a Go daemon that grew +1,388,760 bytes**
-  (`4493c6c6…ad3e` → `b16887ba…`) and is **outside static reach**. A capture of a 2.0.0
-  `PINEAPPLE_DEAUTH_CLIENT_CSA` would settle it; nothing short of that will.
+  in **`pineapple/pineapple`**, a Go daemon that grew +1,388,760 bytes (`4493c6c6…ad3e` →
+  `b16887ba…`). *An earlier revision of this line called that daemon "outside static reach" and
+  said only a capture could settle it. **Both halves were wrong** and are withdrawn:* unlike
+  `pineapd` it is **Go 1.27.0, stripped but retaining all 42 section headers**, so `.gopclntab`
+  survives and the function table is recoverable (18815 → 19248 functions).
+
+  **Statically confirmed unchanged:** the three HTTP handlers (`pineAPdDeauth`/`All`/`Csa`), the
+  three logic functions (`StartDeauth`/`All`/`Csa`) and the forwarder `exchangeCommand` — identical
+  in size *and* mnemonic sequence, every differing word a `lui`/`addiu` address pair or a `jal` to
+  the same callee. `ValidateDeauthCapable` is inlined into byte-equivalent bodies, so the guard
+  cannot have changed either. **The Go daemon is a thin forwarder to pineapd**
+  (`StartDeauth*` → `exchangeCommand` → pineapd), corroborated by no `switch_count` / `csa_count` /
+  `chanswitch` string existing anywhere in it in either version — so CSA frame construction really
+  is pineapd's count-0 code and nothing in the Go layer touches it.
+
+  **What a capture is still for, narrowed:** two shared-infrastructure functions on the deauth path
+  did change — `GetStructFromBody` (same size, different mnemonic sequence) and `StartPineap`
+  (732 → 252 bytes) — and the PMF UI setters `Get/SetReconMFPAPDeauthOptions` could **not** be
+  resolved, because ~4.5% of functab entries come out ≤16 bytes (Go's tiny wrappers and
+  mid-function fragments) and those setters land in that band. One capture settles all three. The
+  seven functions above are unaffected by that caveat: identical size plus identical mnemonic
+  sequence are symbol-table-independent, and their sizes are exact instruction multiples.
 
 **The nine that did change** — none used by CamHound, but three matter to this repo's other
 payloads and one matters in a chamber:
