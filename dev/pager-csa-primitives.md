@@ -214,7 +214,7 @@ MIPS16 condition semantics, which are easy to misread backwards:
 
 So `sltiu v0,145 ; bteqz L` reads **"if v0 >= 145 goto L"**, not the reverse.
 
-**Two things that are inferred, not confirmed** — do not state them as fact:
+**One thing that is inferred, not confirmed** — do not state it as fact:
 
 - Whether `DEAUTHCSA` emits a CSA-bearing **beacon** or a spectrum-management **action frame**. The
   `inject_csa` signature plus `"Caught beacon for CSA"` and `libwifi_create_beacon` strongly imply
@@ -226,9 +226,88 @@ So `sltiu v0,145 ; bteqz L` reads **"if v0 >= 145 goto L"**, not the reverse.
   radio's primary channel* there, and only the subsequent beacon is refused — so it disrupts channel
   hopping while transmitting nothing. `csa_injectable()` refusing those channels prevents that, which
   is a second, independent reason the refusal is correct.
-- `PINEAPPLE_DEAUTH_CLIENT_ALL`'s `[target]` argument. Its help says "all Wi-Fi clients on an AP"
-  yet it takes a target; pass `ff:ff:ff:ff:ff:ff` for broadcast, but the exact semantics are
-  unverified.
+
+**Discharged 2026-11-03 — `PINEAPPLE_DEAUTH_CLIENT_ALL`'s `[target]` argument is ignored.** This
+section used to list it as a second unconfirmed item, advising `ff:ff:ff:ff:ff:ff` for broadcast.
+That advice is moot: the request struct behind `/api/pineap/deauth_all` carries **no `target`
+field**, its handler parses one MAC where the targeted handler parses two, and Go's
+`json.Unmarshal` drops the extra positional silently. So `_ALL` is **untargeted whatever you pass**
+— it hits every client on the BSSID. Full evidence, and the operator-visible consequence for
+CamHound's menu, is in `CLAUDE.md` §"2.0.0-stable, analysed" (one copy, kept there). Method for
+re-deriving it is the next section.
+
+### Recovering Go symbols from `/pineapple/pineapple` — and the two traps that cost a session
+
+`pineapd` is the C++ half. The **Go** half, `/pineapple/pineapple`, owns the HTTP API
+(`/api/pineap/deauth*` and the rest) and is where `hak5cmd` actually sends its commands, so
+anything about *runtime* deauth behaviour lives here, not in `pineapd`. It is stripped — but unlike
+`pineapd` it **keeps all 42 section headers**, so `.gopclntab` survives and the whole function
+table is recoverable: names, entry addresses, byte sizes and argument-frame sizes. 19248 functions
+in 2.0.0, 18815 in 1.1.3. There is no Go toolchain on the bench and `go tool objdump` is not
+needed; 40 lines of Python is enough.
+
+Layout, 32-bit (`ptrSize` 4, magic `0xfffffff1` = Go 1.20+; `.go.buildinfo` pins this build to
+exactly `go1.27.0`). All offsets are from the start of `.gopclntab`:
+
+| Field | Offset | Value here (2.0.0) |
+|---|---|---|
+| `magic` | +0x00 | `0xfffffff1` |
+| `minLC` / `ptrSize` | +0x06 / +0x07 | 4 / 4 |
+| `nfunc` / `nfiles` | +0x08 / +0x0c | 19248 / 1356 |
+| **`textStart`** | **+0x10** | **`0`** — see trap 1 |
+| `funcnameOffset` | +0x14 | `0x28` |
+| `cuOffset` | +0x18 | `0x1134a8` |
+| `pclnOffset` | +0x24 | `0x2f62c0` |
+
+`funcnametab` is NUL-separated names in `[funcnameOffset, cuOffset)`. The `functab` at `pclnOffset`
+is `nfunc+1` pairs of `(entryOffset uint32, funcOff uint32)`; the `_func` at `pclnOffset + funcOff`
+begins `entryOff uint32`, `nameOff int32`, **`args int32`**. The trailing entry is an
+end-of-text sentinel, which is where each function's byte size comes from.
+
+**Trap 1 — the base is `moduledata.text`, not `.text`'s virtual address.** `pcHeader.textStart`
+reads **0** here, so the header cannot supply it. The base is the moduledata's `text` field,
+`0x00400fd0` — read it from `.go.module` (here file offset `0x10d4c20`, 284 B) at word 22, `+0x58`.
+That is **272 bytes above** `.text`'s vaddr `0x00400ec0`, because this is an externally linked
+musl/cgo binary whose `.text` opens with `crt1.o`'s `_start` (also the ELF entry point); Go's text
+begins after it. **[V]** for the readings.
+
+*Inference step, kept separate:* that `0x400fd0` is the base is not taken from the field's name.
+Under it, **119234 of 119234 (100.00%)** intra-`.text` `jal` targets land exactly on a function-table
+entry; under `.text`'s vaddr, **519 of 119234 (0.44%)**. It also equals `moduledata.minpc`, and
+`base + sentinel` equals `moduledata.maxpc` exactly where `.text`'s vaddr does not.
+*Falsified by:* a jal-alignment rate that fails to separate the two candidates. **Do not hardcode
+the 272** — a statically linked Go binary has no crt prologue and the two coincide, so read the field.
+
+**Trap 2 — the obvious self-consistency check cannot detect trap 1, and passing it feels like
+validation.** Each function's entry offset is stored twice: in `functab[i].entryOffset` and in the
+`entryOff` field of the `_func` it points at. Comparing them across **every** entry gives
+**0 mismatches of 19248** on a correct parse, and it does catch realistic mis-parses — a wrong
+functab stride of 4/12/16/24 gives 9624/9260/8107/10556 mismatches, and reading `_func.entryOff`
+from the wrong offset gives 19247. "Every entry" is load-bearing: under stride 4 exactly half pass
+by construction, so a sampled or early-exit check misses it.
+
+**But both sides of that comparison are text-relative, so the check never reads the base and
+provably cannot detect a wrong one.** It returns 0 whether the base is right or 272 bytes wrong.
+Validate the base separately, with the jal-alignment test above.
+
+**What that cost, recorded because the shape of the mistake is the point.** With the base 272 bytes
+low, `pineAPdDeauthAll` appeared to begin mid-function, opening on an HTTP-400 return path instead
+of a prologue. The invariant above had passed 0/19248, so the parse "was" validated — and the
+symptom got explained away as Go placing a cold block first. Both halves were wrong: correctly
+based, `pineAPdDeauthAll` is at `0x00c9ef80` and opens with the ordinary mipsel Go prologue
+(stack-growth check, `jal runtime.morestack_noctxt`, then frame allocation), with its three
+HTTP-400 blocks at the **tail** — hot-first, cold-last. **13784 of 19248 functions (71.6%)** open
+with that same pair (counted as: first word opcode `0x23` = `lw`, second word SPECIAL with funct
+`0x2b` = `sltu`), so the stack check is emitted at the **start** on this architecture. A
+disassembly that looks like a wrong base usually is one; prefer re-deriving the base over inventing
+a compiler behaviour that explains the symptom.
+
+**What survives a wrong base, and what does not.** Byte sizes, instruction counts, mnemonic
+sequences and `_func.args` are all **base-independent**, so conclusions resting only on those hold
+regardless. Absolute addresses and any symbol resolution of `jal` targets do **not** — though a
+wrong base can still resolve targets to plausible-looking neighbours when functions are larger than
+the error, which is exactly why the output looked right. Anything quoting an address from this
+binary should state which base it used.
 
 ## Why CSA works where deauth does not
 
