@@ -443,9 +443,20 @@ posture_from_caps() {   # posture_from_caps <rsncaps_hex|-> <extcap_hex|-> <band
 }
 
 # The three operator-selectable attacks. The badge advises; it never decides.
-#   DEAUTH  PINEAPPLE_DEAUTH_CLIENT     [bssid] [target] [channel]  deauth + disassoc
+#   DEAUTH  PINEAPPLE_DEAUTH_CLIENT     [bssid] [target] [channel]  deauth + disassoc, TARGETED
 #   CSA     PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]           channel-switch announcements
 #   BOTH    PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]  all three frame types
+#
+# BOTH IS NOT TARGETED, despite the [target] in its documented signature above -- that signature
+# is hak5cmd's help text, and the help text is wrong. The handler behind it, pineAPdDeauthAll,
+# parses ONE MAC where pineAPdDeauth parses two, and its request struct carries no target field
+# (same arg frame, alloc size class and handler size as the CSA handler, not the deauth one).
+# resp_fire still passes three positionals; Go's json.Unmarshal drops the unknown one silently.
+# So BOTH hits EVERY client on the BSSID while DEAUTH beside it in the same menu hits one.
+# Note posture_opts lists BOTH first on the common badges and pick_list preselects element 0,
+# so the broad attack is the default.  Readings [V] from the 1.1.3 and 2.0.0 daemons; the
+# "parses the bssid, discards the target" conclusion is [A] -- falsify by firing BOTH at one
+# client among several and seeing whether the others stay associated.
 response_cmd() {
   case "$1" in
     DEAUTH) printf 'PINEAPPLE_DEAUTH_CLIENT' ;;

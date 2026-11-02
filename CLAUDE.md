@@ -282,6 +282,8 @@ longer costs a re-derivation — four check instances in two functions, in both 
 | blanket 6 GHz check (`lw rX,28(rY); cmpi rX,8; bteqz`) | `0x46e800` / `0x472c66` | `0x4758a0` / `0x478322` |
 | DFS range-chain entry | `0x46e810` / `0x472c76` | `0x4758b0` / `0x478332` |
 | `0x1111` mask immediate | `0x46e964` / `0x472d66` | `0x4759ea` / `0x478422` |
+| CSA element construction (`index_beacon_ns+0xc0a` in both) | `0x4bee8a` | `0x4c6aea` |
+| `li s1,0` feeding the count byte | `0x4bee6c` | `0x4c6acc` |
 
 Static, from the 2.0.0 image; not yet checked against a running 2.0.0 device. The 1.1.3 column is
 the one confirmed on hardware. All four 2.0.0 cells were disassembled rather than inferred: the two
@@ -299,18 +301,28 @@ from each entry point, with only the `bteqz` target relocated, and both range-ch
 same `deadc0de` magic, same metadata versions, byte-identical `/etc/firmware-key` — which is mild
 evidence a downgrade would still be accepted, though no version check was looked for.
 
-**⚠ One open question that is CamHound's, raised by the handler analysis.** `pineAPdDeauth` calls
-`net.ParseMAC` **twice**; `pineAPdDeauthAll` and `pineAPdDeauthCsa` call it **once each**. But
-`resp_fire` (`payload.sh:1871`) passes three arguments to both `DEAUTH` *and* `BOTH`:
-`"$cmd" "$R_BSSID" "$R_TARGET" "$R_CH"`. If `_ALL` parses only the BSSID, then **`BOTH` is
-untargeted — it would hit every client on the BSSID, not the one the operator selected** — while
-`DEAUTH` is targeted. That is a materially different attack behind two adjacent menu entries, and
-CamHound's comment at `:448` documents `_ALL` as taking `[target]` because the **help text says so**
-— the third instance of help-not-matching-code in this binary. **[A]**: one `ParseMAC` call is
-evidence that an argument is dropped, not proof of *which*. *Falsified by:* firing `BOTH` at one
-client among several and seeing whether the others stay associated — cheap once there is a target
-AP in the chamber. The detailed handler write-up went to the CamHound-deauth session; this entry
-exists so the question is not lost, not to duplicate theirs.
+**⚠ `BOTH` is untargeted, and it is the preselected default.** Four readings of the Go daemon,
+identical in 1.1.3 and 2.0.0, all **[V]**: `pineAPdDeauth`'s argument frame is 32 bytes against 28
+for both `_All` and `_Csa`; `_Deauth` allocates its request struct at size class **SC3** while
+`_All` and `_Csa` both use **SC2**; `_Deauth` is 924 bytes and parses `net.ParseMAC` **twice**
+while `_All` and `_Csa` are **both exactly 668 bytes** and parse it **once**; and only one
+`json:"target"` tag string exists in the binary against three each of `bssid` and `channel`.
+
+**The inference, kept separate and tagged [A] because it is one:** three independent size
+measurements put `_All` with `_Csa` rather than with `_Deauth`, and `_Csa`'s single MAC is
+unambiguously the BSSID — so `_All`'s struct is `{bssid, channel}` and its one `ParseMAC` is the
+BSSID. `resp_fire` (`payload.sh:1871`) still passes three positionals and Go's `json.Unmarshal`
+drops the unknown field silently.
+
+So **`BOTH` hits every client on the BSSID while `DEAUTH` beside it in the same menu hits one** —
+and `posture_opts` lists `BOTH` first on the common badges while `pick_list` preselects element 0,
+so **the broad attack is the default**. The payload's own comment documented `_ALL` as taking
+`[target]` because hak5cmd's help says so; that comment is now corrected in place. Third instance
+of help-not-matching-code in this binary, and the first with an operator-visible consequence.
+*Falsified by:* firing `BOTH` at one client among several and seeing whether the others stay
+associated; or statically, by a `target` field reachable from `_All`'s type descriptor.
+**Whether to relabel or reorder the menu is the CamHound-deauth session's call, not this
+branch's** — only the factually wrong comment was fixed here.
 
 **ANSWERED 2026-11-02 — CamHound is clear, and the DuckyScript surface is narrower than feared.**
 Enumerated across `usr/bin`, `bin`, `sbin`, `usr/sbin`, `usr/libexec`: **69 commands in each
