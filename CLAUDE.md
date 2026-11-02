@@ -98,8 +98,9 @@ Line numbers drift; find things by name (`grep -n '^name()' payload.sh`).
 `disrupt_menu` call it). `inj_parse_channels` is its awk parser. It is validated against a fixture
 built byte-for-byte from the shipped `iw` binary's own format strings — which found and fixed one
 over-permissive defect (`iw` spells the NO_IR attribute three ways; see
-`dev/pager-prearrival.md` §5). It has still never parsed output from a *running* Pager, so the
-day-one diff is now a confirmation rather than first contact.
+`dev/pager-prearrival.md` §5). **It has since been run against a live radio (2026-11-02) and was
+correct**, including a 5 GHz `No IR` channel (169) that the fixture never contained. No longer a
+pending validation.
 
 **Response rung** — `resp_target` (sets `R_BSSID`/`R_TARGET`/`R_CH`/`R_BAND`), `disrupt_menu`,
 `resp_fire`, `resp_snapshot`, `resp_verdict` (MOVED / NO_EFFECT / INCONCLUSIVE from recon packet
@@ -204,6 +205,28 @@ Read-only session, no receiver present, firmware deliberately held at 1.1.3-stab
   is discharged.
 - **Corrected:** "under US no 5 GHz channel carries `NO_IR`" was too broad — **169/173/177 do**,
   via `5850–5895 … PASSIVE-SCAN`. The narrow form, "permits all of 36–165", is correct.
+- **`pineapd`'s live cmdline**, which settles several things at once and is worth re-reading before
+  assuming anything about interface roles:
+  `--interface wlan1mon --band wlan1mon:2,5 --primary wlan1mon --inject wlan1mon`,
+  `--interface wlan0mon --band wlan0mon:2`,
+  `--interface wlan2mon --band wlan2mon:2,5`.
+  So **`wlan1mon` is the injection interface** (confirming where gate 1 applies), and pineapd only
+  ever asks **radio0 for 2.4 GHz**, independently corroborating the receive-only antenna finding.
+  `uci get pineapd.wlan1mon.bands` = `2,5` — band 6 is not scanned, the shipped default as
+  predicted. pineapd *is* running despite not autostarting: the Go UI brings it up.
+- **🆕 `wlan2mon` — pineapd is configured for a THIRD radio that does not exist on the device.**
+  Full interface spec, dual-band `2,5`, while `iw dev` shows only `wlan0`/`wlan0mon` (phy0) and
+  `wlan1mon` (phy1). Nothing in these notes anticipated it. The natural reading is a slot for an
+  **external USB radio**. **[A]** — that pineapd is *configured* for it does not prove the hardware
+  supports one. Worth chasing: if the Pager can host a USB adapter as `wlan2mon`, that is a
+  second, separate phy and could serve as the independent 5 GHz receiver the DFS branch needs,
+  which is currently the only thing blocking it. *Falsified by:* no spare USB port, or the
+  interface failing to appear when one is attached.
+- **Instrument inventory confirmed on-device**, matching the rootfs reading item for item:
+  `tcpdump`, `iw`, `hak5cmd`, `scp` present; `hcxdumptool`, `aireplay-ng`, `mdk4`, `python3`,
+  `horst`, `tc` all **absent**; `libpcap.so.1.10.5` present. No Python means no scapy.
+- **`libwifi.so.0.0.10` hash matches** the recorded `d3421de2…6ee1` on the live device, so the
+  113-export map holds for this unit.
 
 Operational facts the notes lacked: a box-fresh Pager ships **with no firmware** and boots to a web
 installer on **port 1471**, with the wizard only appearing after a flash (§P0.1 is corrected); the
@@ -322,8 +345,19 @@ Listed in `dev/CamHound/RESPONSE.md` §13, `dev/pager-day-one.md` and — for wh
 closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowing: the three
 `PINEAPPLE_DEAUTH_CLIENT*` commands are documented only by `hak5cmd`'s help text; whether Recon's
 packet counters move the way `resp_verdict` assumes; whether CSA moves a real client at all; and the
-count-byte experiment (day-one step 17a). `inj_parse_channels` is format-validated but has not run
-against a live device.
+count-byte experiment (day-one step 17a). (`inj_parse_channels` is **no longer** on this list — it
+ran against a live radio on 2026-11-02 and was correct; see "First contact".)
+
+**A 2.0.0 hazard worth knowing even though it is not ours.** Two DuckyScript commands changed
+behaviour in 2.0.0, reported by another session with both call sites verified here:
+`WIGLE_UPLOAD`'s `--archive`/`--remove` stopped being dry runs (`echo rm`/`echo mv` → real
+`rm -f`/`mv`), so `library/user/exfiltration/wigle-toolkit/payload.sh:121` **really deletes loot**
+on the `LEFT` path — the "Press A if OK" guard at `:102` was decorative on 1.1.3 because nothing
+happened either way, and the UI is unchanged. And `GPS_CONFIGURE` gained a mandatory mode keyword
+(`PINEAP|GPSD`), so `library/user/general/wardrive_activate/payload.sh:172`, which passes
+`"$device" "$baud"`, is **broken on 2.0.0**. Neither touches CamHound, but together they show the
+DuckyScript surface is **not stable across this bump** — which is why CamHound's own command set
+is the open compatibility question above. Relayed, not independently binary-verified here.
 
 The **instrument** for the injection side is no longer open: `dev/injector/` holds `pagerinj`,
 cross-built for `mipsel_24kc`/musl/soft-float, ABI-verified, and frame-validated with no radio

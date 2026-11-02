@@ -4,6 +4,13 @@
 the development session that did the firmware analysis. Everything here is on disk; nothing depends
 on that session still existing.
 
+> **First contact happened on 2026-11-02.** This file is no longer a forecast for most of §1–§3.
+> What a real unit confirmed, what it corrected, and the operational facts these notes lacked (the
+> box-fresh firmware-installer flow, the version-string path, the stale clock, the wrong `mtd`
+> index for `all`) are recorded in **CLAUDE.md § "First contact"** and in the relevant plan steps.
+> Read that before treating anything here as an open question — several are closed. The device is
+> deliberately held at **1.1.3-stable**; `2.0.0-stable` exists and is analysed in CLAUDE.md.
+
 Read this first, then `dev/pager-day-one.md` for the running order. The reasoning behind every step
 is in `dev/pager-6ghz-determination-plan.md`; the gate and primitive facts are in
 `dev/pager-csa-primitives.md`; CamHound's response side is in `dev/CamHound/RESPONSE.md`.
@@ -266,7 +273,10 @@ will fire at a target. It models both gates:
 
 Two things to check on-device, both free:
 
-1. **`inj_probe()`'s parser is format-validated but has never run on a live device.** It has been
+1. **`inj_probe()`'s parser — DONE, 2026-11-02. It ran against a live radio and was correct**,
+   including a 5 GHz `No IR` channel (169) absent from the fixture, and all 98 channel lines
+   carried the trailing space it keys on. Nothing to check here any more; the history below is
+   kept because the defect it found is the kind that recurs. It had been
    checked against a fixture built byte-for-byte from the shipped `iw` binary's format strings, and
    that found one real over-permissive defect — `iw` spells the NO_IR attribute three ways
    (`No IR`, `Passive scan`, `No IBSS`) and the parser matched only the first, so a NO_IR channel
