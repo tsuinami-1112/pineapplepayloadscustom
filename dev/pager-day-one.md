@@ -105,7 +105,9 @@ found and fixed one over-permissive defect (`dev/pager-prearrival.md` §5).
   (`_pineap RECON NEW {name=} {hop=} {channel=}`, no duration), while CamHound and two upstream
   payloads pass a number of seconds. Run `PINEAPPLE_RECON_NEW` with no argument and with `60`, then
   `_pineap RECON COUNT DEVICES` a minute later: does a session named `60` exist, and does any session
-  end on its own? CamHound's "Recon started (60 s)" line stands or falls on the answer.
+  end on its own? CamHound now calls it bare and logs "Recon session requested", which is right under
+  either reading; the answer decides whether a name is worth passing and whether the scan loop must
+  ever restart a session that ended on its own.
 
 **9. THE VALUE GATE — a beacon capture plus the real client, before spending effort on 6 GHz.**
 Beacon protection takes **both** an AP that enables it and a client that can enforce it, so the

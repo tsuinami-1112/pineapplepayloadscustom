@@ -1536,7 +1536,10 @@ scan_loop() {
     run_cycle; emit_cycle
     if (( RECON_EMPTY >= 3 )); then
       RECON_EMPTY=0
-      if confirm "Recon list empty. Start a 60 s Recon scan?"; then PINEAPPLE_RECON_NEW 60 >/dev/null 2>&1; LOG "Recon started (60 s)"; fi
+      # PINEAPPLE_RECON_NEW's one parameter is a session NAME in the 2.0.0 firmware's own help (no duration exists
+      # there; day-one 8b checks it on the bench), so it is called bare: correct under either reading, and an
+      # unbounded session is what a continuous scan wants anyway. An earlier version passed 60 and logged "(60 s)".
+      if confirm "Recon list empty. Start a Recon session?"; then PINEAPPLE_RECON_NEW >/dev/null 2>&1; log recon "RECON_NEW requested"; LOG "Recon session requested"; fi
     fi
     offer_dialogs
     set_state SCAN
