@@ -147,6 +147,10 @@ across two rebuilds. These figures move with every edit to `pagerinj.c`; trust y
 | `NEEDED` | `libc.so` only |
 | `make static` | 98288 bytes, sha256 `706e138c…7033`, no loader, no libc — if the dynamic build ever fails on the device |
 
+*(Update 2026-11-02: `libgcc_s.so.1` **does** ship, byte-identical in 1.1.3 and 2.0.0 —
+`8138ad10…9dfcb`, 131359 B. So the flag below is now insurance rather than a fix for a known gap.
+Keeping it: a few KB to drop a runtime dependency is still the right trade for a bench tool.)*
+
 `-static-libgcc` is deliberate: the default link wants `libgcc_s.so.1`, which is the one library
 `dev/pager-prearrival.md` §3 flags as **unverified** on the Pager. Linking it in costs a few KB and
 removes a dependency nobody can check until the device is in hand.

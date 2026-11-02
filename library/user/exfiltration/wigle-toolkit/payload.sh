@@ -88,6 +88,13 @@ case ${resp} in
                     - Press DOWN to leave them as they are
                     - Press any other key to abort"
         resp=$(WAIT_FOR_INPUT)
+        # WARNING: --remove and --archive are REAL from firmware 2.0.0 onward.
+        # On 1.1.3 and earlier WIGLE_UPLOAD only echoed them ("echo rm" / "echo mv"), and
+        # __archive_dir was unset, so LEFT and UP both quietly did nothing. 2.0.0 changed
+        # them to "rm -f" / "mv" and defined the archive dir -- same keystrokes, same
+        # prompts, real deletion. The "Press A if OK" gate below was decorative before and
+        # is the only thing standing between LEFT and your loot now. Verified by diffing
+        # usr/bin/WIGLE_UPLOAD between the 1.1.3 and 2.0.0 rootfs images.
         case ${resp} in
         	"UP")
                 LOG blue "Your files will be moved to archive folder after upload"
