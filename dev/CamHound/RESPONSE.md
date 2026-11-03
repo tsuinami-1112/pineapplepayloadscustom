@@ -454,7 +454,7 @@ firmware version:
 
 | firmware | what happens | where |
 |---|---|---|
-| **1.1.3** | `_pineap RECON CLIENTS` does not exist, so `recon_lines CLIENTS` returns nothing and no client row is ever recorded. Every row in the list is an AP row, `R_TARGET` is broadcast, subjects are 0 → `NO_CLIENTS`. | `payload.sh:1166` loop never runs; `resp_fire` refusal |
+| **1.1.3** | `_pineap RECON CLIENTS` does not exist (measured 2026-11-03: `Unknown recon command`, rc 255); since that day `recon_lines CLIENTS` reads `RECON DEVICES` instead, whose object carries no association, so a client row has `AP_OF` `-` and `resp_target` refuses it like 2.0.0's. Every AP row has `R_TARGET` broadcast, subjects are 0 → `NO_CLIENTS`. | `payload.sh:1166` loop never runs; `resp_fire` refusal |
 | **2.0.0** | client rows arrive, but the device object has no association field, so `JQ_CLI`'s `(.ap_mac // .bssid // "-")` yields `-` for all of them. An **AP row** finds 0 matching clients → `NO_CLIENTS`. A **client row** never reaches the sweep: `AP_OF` is `-`, so `resp_target` returns 1 and `disrupt_menu` aborts with "nothing to attack: no associated BSS". | `payload.sh:1983-1984`; `resp_snapshot`'s `[ "$a" = "$R_BSSID" ]` |
 
 *Corrected 2026-11-03. An earlier revision of this section said the rung was "inert until the device

@@ -59,8 +59,10 @@ the firmware primitives it calls and the list of what remains unverified are in 
    runs, Cancel runs the trap -- is the device check); inventory persistence across runs
    (`DEDUPE_H`, clock guard, 30-day prune); settings menu (Recon and Response pages over all
    fifteen starred keys; RESPONSE_CONFIRM-off asks twice; the lock clamp re-runs on apply; Reset via
-   `PAYLOAD_DEL_CONFIG`). Remaining: band write (`PINEAPPLE_SET_BANDS wlan1mon 2 5 [6]`, restored at exit,
-   gate: no pineapd restart); WPS/IE peek (`tcpdump -xx -s 1024 -c 12` on beacons and probe
+   `PAYLOAD_DEL_CONFIG`); band write (`BAND6`: `PINEAPPLE_SET_BANDS wlan1mon <bands> 6` once after the
+   overrides, trusted only when uci reads the 6 back, restored in cleanup; a pineapd restart is detected
+   by pid and reported — whether the call restarts it is day-one 8c, unmeasured); clients from
+   `RECON DEVICES` where `CLIENTS` is refused (1.1.3, measured). Remaining: WPS/IE peek (`tcpdump -xx -s 1024 -c 12` on beacons and probe
    responses, WPSMODEL +45/+40 as a new identity class, `ie_sig` column); retry percentage via
    BPF `wlan[1] & 0x08`; LAN confirm v1.1b (`LAN_CONFIRM=1`, 2.4 GHz join on wlan0cli, ARP
    candidates that are scored rows, port precheck, RTSP OPTIONS/DESCRIBE over `/dev/tcp`, ONVIF

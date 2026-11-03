@@ -84,7 +84,11 @@ is a short top page, `settings_group` one page per group, Recon and Response; `s
 `resp_clamp_lock` for the two timing keys and persists a raised lock; RESPONSE_CONFIRM-off asks twice;
 `cfg_snapshot_defaults`/`settings_reset`; `cfg_note_set` keeps the override count honest);
 `JQ_CLI`/`parse_cli_fallback` read the 2.0.0 client object (`probe` is a hash-keyed object, no
-association key); `raw_up_rows` feeds `--replay` a `raw_<run>.txt`.
+association key), and `recon_verb_probe` picks `RECON DEVICES` (`JQ_DEVCLI`: devices that neither
+beacon nor answer probes) where `RECON CLIENTS` is refused, as on 1.1.3; `bands_plan`/`bands_apply`/
+`bands_restore` are the opt-in 6 GHz band write (`BAND6`; `bands_live6` samples the live channel and
+the write is trusted only when 6 GHz is seen there or in uci — on bare 1.1.3 it was a no-op with
+pineapd running, day-one 8c; restored in `cleanup`, not copied into the hooks); `raw_up_rows` feeds `--replay` a `raw_<run>.txt`.
 
 **Watch rung** (behaviour without identity) — `watch_menu`, `start_caps`/`stop_caps`,
 `pcap_words`/`pcap_bytes` (both have `od` fallbacks), `pcap_buckets`, `bucket_stats`,
@@ -435,6 +439,22 @@ Three consequences for CamHound. All are **pre-existing defects that become visi
 associated client returning a key that carries the BSSID — documented or not. That would collapse
 (2) to a one-word fix.
 
+**Measured on the 1.1.3 unit, 2026-11-03 (bare firmware, nothing of ours installed):**
+`_pineap RECON CLIENTS format=json` prints `Unknown recon command` and exits **255**, so the absence
+is now **[V]** by measurement, not only by byte count. `_pineap RECON DEVICES format=json` and
+`RECON APS format=json` both return the device object in exactly the shape the 2.0.0 `HELP PARSE`
+text describes — `beacon` / `response` / `probe` as hash-keyed objects whose values carry `ssid`,
+`ssidlen`, `count`, `time`, `signal`, `freq`, `channel`, beacon values also `hidden` (a JSON
+boolean), the device's own keys in alphabetical order (`freq`, `mac`, `packets`, `signal`, `time`)
+beside them — and **no association key**. So the 1.1.3 object is the 2.0.0 object; the parsers
+written for 2.0.0 read it unchanged (the fallback parser needed one fix: the device's own `signal`
+and `time` sit *after* its `probe` object, not before). Consequence: CamHound now takes its client
+rows from `RECON DEVICES` where `CLIENTS` is refused (`recon_verb_probe`, one call at start; a
+client is a device that neither beacons nor answers probes), so **probe-only clients are listed on
+1.1.3 today**, with probed SSIDs — still without association, which is what kit detection, client
+Watch and per-client Disrupt wait on. The remaining source to check is the Go UI's recon API
+(day-one 8b).
+
 **Also newly available, and relevant to the posture rung:** the `mfp_supported`, `mfp_required`,
 `encryption` and `encryption_str` fields on beacon values are **2.0.0-only** — byte-string counts
 1.1.3 → 2.0.0 are `mfp_supported` 0 → 2, `mfp_required` 0 → 3, `encryption_str` 0 → 4 (bare
@@ -608,8 +628,10 @@ ran against a live radio on 2026-11-02 and was correct; see "First contact".)
 **⚠ The response rung cannot transmit from the USER PAYLOAD on any shipped firmware, and flashing
 does not fix that. The Recon hooks are a different story — see the exception below.**
 The blocker is the **association column**, not the firmware version. On **1.1.3** `_pineap RECON
-CLIENTS` does not exist, so no client row is ever recorded and every list row is an AP row:
-`R_TARGET` is broadcast, subjects are 0, `resp_fire` refuses with `NO_CLIENTS`. On **2.0.0** client
+CLIENTS` does not exist; since 2026-11-03 client rows come from `RECON DEVICES` instead, but that
+object carries no association either, so every client row has `AP_OF` `-` and `resp_target` refuses
+it exactly as on 2.0.0 (below), while every AP row has `R_TARGET` broadcast, 0 subjects, and
+`resp_fire` refuses with `NO_CLIENTS`. On **2.0.0** client
 rows arrive but the device object has no association field, so `JQ_CLI`'s `(.ap_mac // .bssid //
 "-")` gives `-` for every one; an AP row then finds 0 matching clients and refuses the same way,
 while a client row never even reaches the sweep because `AP_OF` is `-` and `resp_target` returns 1

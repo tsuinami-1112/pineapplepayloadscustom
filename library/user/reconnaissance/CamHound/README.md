@@ -29,7 +29,8 @@ take (with `AUTO_WATCH=0` that is every new CONFIRMED device). The offer is a di
 
 - A camera that is powered off, or one that only records to a card and never talks to Wi-Fi.
 - Wired (PoE) cameras. Only the NVR/base station may show up, as an AP or a client.
-- 6 GHz devices unless 6 GHz is enabled in the Recon settings (status line says `6 GHz not scanned`).
+- 6 GHz devices unless 6 GHz is enabled in the Recon settings or `BAND6=1` (Settings → Recon settings)
+  writes it for the run; the status line says `6 GHz not scanned` otherwise.
 - 5 GHz 40/80 MHz streams may be invisible to Watch if the lock parks the radio at 20 MHz (Phase 0 item 28).
 - Sub-300 kbps streams and Wi-Fi 6 UL-OFDMA uplinks under-count in Watch (frames under 1000 bytes
   are not "big"); Watch reports them as IDLE or NONE.
@@ -38,12 +39,13 @@ take (with `AUTO_WATCH=0` that is every new CONFIRMED device). The offer is a di
 - A battery/event camera that is asleep looks idle in Watch. Use the Stimulus test.
 - INCONCLUSIVE is about the measurement (lock, band, distance), not about the device.
 
-**Which AP a client is associated to.** `_pineap RECON CLIENTS` is new in 2.0.0 (1.1.3 has no such
-verb, so the client rung has never produced a row on it) and its device object carries probed SSIDs
-but **no association field** (CLAUDE.md §"2.0.0-stable, analysed", read from the firmware's own
-`HELP PARSE` text). Until the day-one spike finds a source — the Go UI's recon API carries `ap_mac`,
-`_pineap` does not — every client reads as unassociated: kit detection, client Watch and Stimulus,
-and per-client Disrupt stay dormant, and the `ap_bssid` column reads `-`.
+**Which AP a client is associated to.** `_pineap RECON CLIENTS` is new in 2.0.0; on 1.1.3 it is
+`Unknown recon command` (measured 2026-11-03), so CamHound reads clients from `RECON DEVICES` there
+(a device that neither beacons nor answers probes). Both verbs return the same object, which carries
+probed SSIDs but **no association field** (CLAUDE.md §"2.0.0-stable, analysed"). Until the day-one
+spike finds a source — the Go UI's recon API carries `ap_mac`, `_pineap` does not — every client
+reads as unassociated: kit detection, client Watch and Stimulus, and per-client Disrupt stay dormant,
+and the `ap_bssid` column reads `-`.
 
 ## How it works: four tiers
 
@@ -185,6 +187,7 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 | AUTO_WATCH / AUTO_LOCATE | 1 / 1 | * | the two-press funnel; set 0 for walk surveys |
 | AUTO_WATCH_RSSI | -72 | | minimum last RSSI to auto-offer Watch |
 | RSSI_MIN | 0 | * | optional list gate, dBm, on the best RSSI known for the MAC, carried-over best included (0 = widest net; a kit AP passes when a kit client does) |
+| BAND6 | 0 | * | also scan 6 GHz: writes the device's bands plus 6 for this run, trusted only when the radio is then seen on a 6 GHz channel (or uci reads it back), restored at exit; 2.4 GHz dwell drops to about a third. On bare 1.1.3 the write was a no-op with pineapd running (day-one 8c), and the status line says so |
 | SOUND | 0 | * | ringtone on CONFIRMED |
 | SHOW_MODULES | 1 | | modules list in the menu |
 | MODULE_HINT_RSSI | -55 | | one-time "module strong+busy: Watch?" hint |
@@ -365,6 +368,6 @@ weights: they are fixed per TYPE. Ship unverified rows commented out.
 ## Roadmap
 
 Shipped since v1: Recon-menu hooks (`library/recon/client|access_point/CamHound`), inventory
-persistence across runs, the Settings menu, the response rung. v1.1 remaining: band write
-(`PINEAPPLE_SET_BANDS`), WPS/IE peek, LAN confirm (opt-in RTSP DESCRIBE). v2: multi-channel passive
+persistence across runs, the Settings menu, the response rung, the band write (`BAND6`). v1.1
+remaining: WPS/IE peek, LAN confirm (opt-in RTSP DESCRIBE). v2: multi-channel passive
 behaviour sweep, BLE co-hit, pocket mode, external capture radio.

@@ -1,5 +1,10 @@
 #!/bin/bash
 printf 'IW %s\n' "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"
+if [ "$1" = dev ] && [ "$3" = info ]; then   # the live channel follows the bands the SET_BANDS stub wrote (6 => a 6 GHz channel)
+  f="${HARNESS_BANDS:-/tmp/cs_harness_bands}"
+  if [ -f "$f" ] && grep -q 6 "$f"; then echo 'channel 37 (5975 MHz), width: 20 MHz, center1: 5975 MHz'; else echo 'channel 6 (2437 MHz), width: 20 MHz, center1: 2437 MHz'; fi
+  exit 0
+fi
 [ "$1" = phy ] && [ "$3" = channels ] || exit 1
 printf 'Band 1:\n'
 for c in 1 2 3 4 5 6 7 8 9 10 11; do printf '\t* %d MHz [%d] \n\t  Maximum TX power: 20.0 dBm\n' $((2407 + c * 5)) "$c"; done

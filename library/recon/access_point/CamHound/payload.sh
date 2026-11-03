@@ -47,6 +47,7 @@ AUTO_WATCH=1            # * offer Watch on the top candidate / on NEW CONFIRMED-
 AUTO_LOCATE=1           # * offer Locate after a STREAM/EVENT Watch (0 = off)
 AUTO_WATCH_RSSI=-72     # minimum last RSSI to auto-offer Watch
 RSSI_MIN=0              # * optional list gate, dBm, on the best RSSI known for the MAC (0 = off, widest net)
+BAND6=0                 # * also scan 6 GHz: writes the device's bands + 6 for this run, restores them at exit (0 = leave as set)
 SOUND=0                 # * RINGTONE alert on NEW CONFIRMED (0 = off)
 SHOW_MODULES=1          # modules list in the menu
 MODULE_HINT_RSSI=-55    # client RSSI at or above which a BUSY module gets the "Watch?" hint
@@ -82,6 +83,7 @@ ROW_W=22                # list row budget (spike 19; expected 36-40 on the defau
 RECON_IF="wlan1mon"     # PineAP monitor radio (tri-band)
 INJ_SYSFS="/sys/class/ieee80211"   # phy list for the regulatory probe (the laptop harness points this at a fixture)
 NET_SYSFS="/sys/class/net"         # netdev tree the probe resolves RECON_IF's phy from (the laptop harness points this at a fixture)
+BANDS_PROBE_N=12; BANDS_PROBE_WAIT=0.5   # band write check: samples of the live channel, and the gap between them (~6 s)
 # response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
 RESPONSE=1              # * master switch for the response rung (0 = recon only, transmits nothing)
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
@@ -194,6 +196,7 @@ load_overrides() {
     AUTO_LOCATE=$(cfg AUTO_LOCATE "$AUTO_LOCATE" 0)
     RSSI_MIN=$(cfg RSSI_MIN "$RSSI_MIN" -100)
     SOUND=$(cfg SOUND "$SOUND" 0)
+    BAND6=$(cfg BAND6 "$BAND6" 0)
     THR_STREAM_UP=$(cfg THR_STREAM_UP "$THR_STREAM_UP" 1)
     RESPONSE=$(cfg RESPONSE "$RESPONSE" 0)
     RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
@@ -697,6 +700,7 @@ cleanup() {
   kill_children
   if [ "$WATCH_LOCKED" = 1 ]; then _pineap EXAMINE CANCEL >/dev/null 2>&1; PINEAPPLE_EXAMINE_RESET >/dev/null 2>&1; fi
   [ -n "$RUN_ID" ] && [ "$REPORT_DONE_AT_EXIT" != 1 ] && write_report quiet
+  command -v bands_restore >/dev/null 2>&1 && bands_restore         # user payload only; the hooks never change bands
   rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
   log run "exit cycles=$CYCLE"
   ui_ok && set_state FINISH
@@ -743,11 +747,15 @@ JQ_APS='.[] | ([.beacon[]?, .response[]?]) as $e
 # the ssid -- so the probed SSIDs are the object's values, not an array. No documented key carries the association;
 # ap_mac/bssid are read when present (the harness fixture's stand-in) and "-" otherwise, until the day-one spike
 # finds a source (the Go UI's own recon API carries ap_mac; _pineap does not).
-JQ_CLI='.[] | ([ (.probe // {})[]? | if type == "object" then ((.ssid // "") | select(length > 0)) else tostring end ]) as $p
+JQ_CLI_ROW='([ (.probe // {})[]? | if type == "object" then ((.ssid // "") | select(length > 0)) else tostring end ]) as $p
  | [.mac, (.ap_mac // .bssid // "-"), (.packets // 0), (.signal // .rssi // "-"),
     ($p | map(tostring | gsub("[|;,\n\r\t]"; "_")) | join(",")),
     (.freq // 0), (.time // .last_seen // 0), (.channel // 0)]
  | map(tostring) | join("|")'
+JQ_CLI='.[] | '"$JQ_CLI_ROW"
+# 1.1.3 has no RECON CLIENTS verb (measured 2026-11-03: "Unknown recon command", rc 255) but RECON DEVICES lists every
+# device in the same object shape, so a client there is a device that neither beacons nor answers probes.
+JQ_DEVCLI='.[] | select(((.beacon // {}) | length) == 0 and ((.response // {}) | length) == 0) | '"$JQ_CLI_ROW"
 
 # fallback parser (no jq): split the JSON on "},{" and read fields with bash regex. Reduced fidelity.
 parse_aps_fallback() {   # stdin: JSON -> stdout: mac|packets|ssid|ch|freq|signal|hidden|time
@@ -768,33 +776,44 @@ parse_aps_fallback() {   # stdin: JSON -> stdout: mac|packets|ssid|ch|freq|signa
   [ -n "$mac" ] && printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "$pk" "$ssid" "$ch" "$fr" "$sig" "$hid" "$t"
 }
 parse_cli_fallback() {   # stdout: mac|ap_mac|packets|signal|probes|freq|time|channel  (same shape rules as JQ_CLI above)
-  local json frag pre rest mac ap pk sig fr t ch probes p
+  local json frag top rest mac ap pk sig fr t ch probes p
   json=$(cat); json=${json//\},\{/$'\n'}
   while IFS= read -r frag; do
     [[ $frag =~ \"mac\":\"([^\"]+)\" ]] || continue
+    [[ $frag == *\"beacon\":* || $frag == *\"response\":* ]] && continue   # an AP (RECON DEVICES lists both kinds)
     mac=${BASH_REMATCH[1]}; ap="-"; pk=0; sig="-"; fr=0; t=0; ch=0; probes=""
-    # the device's own fields come before its probe/beacon/response objects, whose values repeat time/signal/freq/channel
-    pre=${frag%%\"probe\":*}; pre=${pre%%\"beacon\":*}; pre=${pre%%\"response\":*}
-    [[ $pre =~ \"(ap_mac|bssid)\":\"([^\"]*)\" ]] && ap=${BASH_REMATCH[2]}
-    [[ $pre =~ \"packets\":([0-9]+) ]] && pk=${BASH_REMATCH[1]}
-    [[ $pre =~ \"signal\":(-?[0-9]+) ]] && sig=${BASH_REMATCH[1]}
-    [[ $pre =~ \"freq\":([0-9]+) ]] && fr=${BASH_REMATCH[1]}
-    [[ $pre =~ \"time\":([0-9]+) ]] && t=${BASH_REMATCH[1]}
-    [[ $pre =~ \"channel\":([0-9]+) ]] && ch=${BASH_REMATCH[1]}
+    # the device's own fields sit beside its probe object (keys are alphabetical on the device: freq, mac, packets,
+    # probe, signal, time), and the probe values repeat time/signal/freq/channel -- so strip every nested {...}
+    # group, innermost first, and read the top-level fields from what is left
+    top=$frag; while [[ $top =~ (.*:)\{[^{}]*\}(.*) ]]; do top="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"; done   # only groups that are a key's value: the object's own braces stay
+    [[ $top =~ \"(ap_mac|bssid)\":\"([^\"]*)\" ]] && ap=${BASH_REMATCH[2]}
+    [[ $top =~ \"packets\":([0-9]+) ]] && pk=${BASH_REMATCH[1]}
+    [[ $top =~ \"signal\":(-?[0-9]+) ]] && sig=${BASH_REMATCH[1]}
+    [[ $top =~ \"freq\":([0-9]+) ]] && fr=${BASH_REMATCH[1]}
+    [[ $top =~ \"time\":([0-9]+) ]] && t=${BASH_REMATCH[1]}
+    [[ $top =~ \"channel\":([0-9]+) ]] && ch=${BASH_REMATCH[1]}
     rest=${frag#*\"probe\":}; [ "$rest" = "$frag" ] && rest=""   # every "ssid" inside the probe object is a probed SSID
     while [[ $rest =~ \"ssid\":\"([^\"]*)\"(.*) ]]; do p=${BASH_REMATCH[1]}; rest=${BASH_REMATCH[2]}; [ -n "$p" ] || continue; p=${p//[|;,]/_}; probes+="${probes:+,}$p"; done
     printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "${ap:--}" "$pk" "$sig" "$probes" "$fr" "$t" "$ch"
   done <<<"$json"
 }
+RECON_CLI_VERB=CLIENTS   # CLIENTS on 2.0.0; DEVICES on 1.1.3, where CLIENTS is "Unknown recon command" (recon_verb_probe)
+recon_verb_probe() {   # one call at start: pick the client verb this firmware has. rc 255 = unknown verb; a timeout keeps CLIENTS
+  timeout 15 _pineap RECON CLIENTS format=json >/dev/null 2>&1
+  [ $? = 255 ] && RECON_CLI_VERB=DEVICES
+  log recon "client verb: $RECON_CLI_VERB"
+}
 recon_lines() {   # recon_lines APS|CLIENTS -> lines on stdout
-  local what="$1" prog
-  [ "$what" = APS ] && prog="$JQ_APS" || prog="$JQ_CLI"
+  local what="$1" prog verb
+  if [ "$what" = APS ]; then prog="$JQ_APS"; verb=APS
+  elif [ "$RECON_CLI_VERB" = DEVICES ]; then prog="$JQ_DEVCLI"; verb=DEVICES
+  else prog="$JQ_CLI"; verb=CLIENTS; fi
   if [ "$HAVE_JQ" = 1 ]; then
-    timeout 15 _pineap RECON "$what" format=json 2>/dev/null | jq -r "$prog" 2>/dev/null
+    timeout 15 _pineap RECON "$verb" format=json 2>/dev/null | jq -r "$prog" 2>/dev/null
   elif [ "$what" = APS ]; then
     timeout 15 _pineap RECON APS format=json 2>/dev/null | parse_aps_fallback
   else
-    timeout 15 _pineap RECON CLIENTS format=json 2>/dev/null | parse_cli_fallback
+    timeout 15 _pineap RECON "$verb" format=json 2>/dev/null | parse_cli_fallback
   fi
 }
 
@@ -1067,6 +1086,7 @@ preflight() {
   printf -v RUN_ID '%(%Y%m%d_%H%M%S)T' -1; RUN_T0=$EPOCHSECONDS
   if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamHound: _pineap not found" 2>/dev/null; exit 0; fi
   command -v jq >/dev/null 2>&1 && HAVE_JQ=1
+  recon_verb_probe
   capture_ready && HAVE_TCPDUMP=1
   [ -r "$OUI_FILE" ] || OUI_FILE="$OUI_FILE_ALT"
   [ -r "$OUI_FILE" ] || LOG yellow "no oui.txt: vendor rows disabled, OUI rows only"

@@ -8,7 +8,7 @@
 # was handed: for an answer further down the list it presses 'More...' first, as an operator would,
 # and it refuses (exit 1, logged 'not on this page') an answer that is on no page.
 # Needs bash 5 and jq; uses busybox hexdump/awk when busybox is installed (closer to the Pager).
-# Usage: dev/CamHound/harness/run_harness.sh [live|stimulus|lock|nojq|locate|disrupt|cliscope|blind|noinj|persist|settings|all]
+# Usage: dev/CamHound/harness/run_harness.sh [live|stimulus|lock|nojq|locate|disrupt|cliscope|blind|noinj|persist|settings|bands|devices|all]
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
 SRC="$ROOT/library/user/reconnaissance/CamHound/payload.sh"
@@ -21,6 +21,7 @@ sed -e 's/^WIN_SECS=10 /WIN_SECS=5 /' -e 's/^LIVE_WINDOWS=6 /LIVE_WINDOWS=4 /' \
     -e "s|^OUI_FILE=\"/lib/hak5/oui.txt\"; OUI_FILE_ALT=\"/rom/lib/hak5/oui.txt\"|OUI_FILE=\"$HERE/fix/oui.txt\"; OUI_FILE_ALT=\"$HERE/fix/oui.txt\"|" \
     -e 's/^RESP_SETTLE_SECS=6 /RESP_SETTLE_SECS=1 /' -e 's/^BCN_CAP_SECS=4 /BCN_CAP_SECS=2 /' \
     -e "s|^INJ_SYSFS=\"/sys/class/ieee80211\"|INJ_SYSFS=\"$T/phy\"|" -e "s|^NET_SYSFS=\"/sys/class/net\"|NET_SYSFS=\"$T/net\"|" \
+    -e 's/^BANDS_PROBE_N=12; BANDS_PROBE_WAIT=0.5 /BANDS_PROBE_N=2; BANDS_PROBE_WAIT=0.1 /' \
     -e "s|^LOOT_DIR=\"/root/loot/CamHound\"|LOOT_DIR=\"$LOOT\"|" "$SRC" >"$T/payload_fast.sh"
 grep -q "LOOT_DIR=\"$LOOT\"" "$T/payload_fast.sh" || { echo "sed on the config block failed"; exit 1; }
 grep -q "INJ_SYSFS=\"$T/phy\"" "$T/payload_fast.sh" || { echo "sed on INJ_SYSFS failed"; exit 1; }
@@ -29,7 +30,7 @@ mkdir -p "$T/phy/phy0"          # fallback-merge fixture only: with the net tree
 mkdir -p "$T/net/wlan1mon/phy80211"; printf 'phy0\n' >"$T/net/wlan1mon/phy80211/name"   # RECON_IF's phy: the probe reads this one, no merge
 printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
 PATHX="$HERE/stubs:$T/bin:$PATH"
-reset() { [ "${1:-}" = keep ] || rm -rf "$LOOT"; rm -rf "$T/log" "$T"/rules*.c* /tmp/cs_harness_chan /tmp/cs_harness_pps /tmp/cs_run.pid /tmp/cs_children; mkdir -p "$LOOT"; echo 0 >/tmp/cs_harness_cycle; }
+reset() { [ "${1:-}" = keep ] || rm -rf "$LOOT"; rm -rf "$T/log" "$T"/rules*.c* /tmp/cs_harness_chan /tmp/cs_harness_pps /tmp/cs_harness_bands /tmp/cs_run.pid /tmp/cs_children; mkdir -p "$LOOT"; echo 0 >/tmp/cs_harness_cycle; }
 rules() { local f="$T/rules_$1"; shift; printf '%s\t%s\n' "$@" >"$f"; export HARNESS_RULES="$f"; }
 answers() { printf '%s\n' "$@" >"$HARNESS_ANSWERS"; }
 check() { if eval "$2"; then printf 'PASS %s\n' "$1"; else printf 'FAIL %s\n' "$1"; FAIL=$((FAIL + 1)); fi; }
@@ -171,10 +172,26 @@ s_cliscope() {   # RESPONSE=1: Disrupt on the Wyze CLIENT row -- the only menu t
   check "cliscope: the loot covers the collateral, not just the pick" "grep -q '|a4:da:22:20:00:01|' $LOOT/responses.tsv && grep -q '|3c:6a:2c:00:00:01|' $LOOT/responses.tsv && grep -q '|00:fc:8b:00:00:01|' $LOOT/responses.tsv"
   check "cliscope: the picked device's own verdict is still named" "grep -q 'picked a4:da:22:20:00:01 ' $LOOT/events.log && grep -q '^LOG picked 20:00:01: ' $T/log"
 }
+s_bands() {   # BAND6=1: the band write at start (trusted on read-back), the status line, the footer, the restore at exit
+  reset; printf 'CYCLE_SECS=5\nBAND6=1\n' >"$HARNESS_CFG"
+  rules bands '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "bands: written once at start as the device's bands plus 6, verified on the live channel" "[ \"\$(grep -c '^PINEAPPLE_SET_BANDS wlan1mon 2 5 6$' $T/log)\" = 1 ] && grep -q 'bands set 2 5 6 (was 2,5; live 6 GHz=yes, uci=2,5,6)' $LOOT/events.log"
+  check "bands: status line and report footer carry the run's bands" "grep -q '^LOG bands: 2,5,6' $T/log && grep -q 'bands 2,5,6' $LOOT/report_*.txt"
+  check "bands: restored at exit, after the report" "grep -q '^PINEAPPLE_SET_BANDS wlan1mon 2 5$' $T/log && grep -q 'bands restored 2,5' $LOOT/events.log && [ \"\$(cat /tmp/cs_harness_bands)\" = 2,5 ]"
+  reset; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  rules bands2 '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; run
+  check "bands: nothing written at the default" "! grep -q '^PINEAPPLE_SET_BANDS' $T/log && grep -q '6 GHz not scanned' $T/log"
+}
+s_devices() {   # 1.1.3: no CLIENTS verb, so clients come from RECON DEVICES (devices that neither beacon nor answer probes), with no association
+  reset; rules devices '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 run
+  check "devices: the verb probe picked DEVICES after CLIENTS was refused" "grep -q 'client verb: DEVICES' $LOOT/events.log && grep -q '^RECON DEVICES' $T/log"
+  check "devices: client rows exist, role cli, no association" "awk -F'|' '\$4==\"a4:da:22:20:00:01\" && \$5==\"cli\" && \$15==\"-\"' $LOOT/inventory.tsv | grep -q ."
+  check "devices: APs are not duplicated as clients" "! grep -q '|9c:3d:cf:11:22:33|cli|' $LOOT/inventory.tsv && grep -q '|9c:3d:cf:11:22:33|ap|' $LOOT/inventory.tsv"
+}
 case "${1:-all}" in
-  live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; cliscope) s_cliscope ;; blind) s_blind ;; noinj) s_noinj ;; persist) s_persist ;; settings) s_settings ;;
-  all) s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_cliscope; s_blind; s_noinj; s_persist; s_settings ;;
-  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|cliscope|blind|noinj|persist|settings|all]"; exit 2 ;;
+  live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; cliscope) s_cliscope ;; blind) s_blind ;; noinj) s_noinj ;; persist) s_persist ;; settings) s_settings ;; bands) s_bands ;; devices) s_devices ;;
+  all) s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_cliscope; s_blind; s_noinj; s_persist; s_settings; s_bands; s_devices ;;
+  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|cliscope|blind|noinj|persist|settings|bands|devices|all]"; exit 2 ;;
 esac
 printf '== harness: %s failure(s); temp dir %s ==\n' "$FAIL" "$T"
 exit $(( FAIL > 0 ))

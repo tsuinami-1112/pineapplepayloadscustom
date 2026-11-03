@@ -57,6 +57,7 @@ AUTO_WATCH=1            # * offer Watch on the top candidate / on NEW CONFIRMED-
 AUTO_LOCATE=1           # * offer Locate after a STREAM/EVENT Watch (0 = off)
 AUTO_WATCH_RSSI=-72     # minimum last RSSI to auto-offer Watch
 RSSI_MIN=0              # * optional list gate, dBm, on the best RSSI known for the MAC (0 = off, widest net)
+BAND6=0                 # * also scan 6 GHz: writes the device's bands + 6 for this run, restores them at exit (0 = leave as set)
 SOUND=0                 # * RINGTONE alert on NEW CONFIRMED (0 = off)
 SHOW_MODULES=1          # modules list in the menu
 MODULE_HINT_RSSI=-55    # client RSSI at or above which a BUSY module gets the "Watch?" hint
@@ -92,6 +93,7 @@ ROW_W=22                # list row budget (spike 19; expected 36-40 on the defau
 RECON_IF="wlan1mon"     # PineAP monitor radio (tri-band)
 INJ_SYSFS="/sys/class/ieee80211"   # phy list for the regulatory probe (the laptop harness points this at a fixture)
 NET_SYSFS="/sys/class/net"         # netdev tree the probe resolves RECON_IF's phy from (the laptop harness points this at a fixture)
+BANDS_PROBE_N=12; BANDS_PROBE_WAIT=0.5   # band write check: samples of the live channel, and the gap between them (~6 s)
 # response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
 RESPONSE=1              # * master switch for the response rung (0 = recon only, transmits nothing)
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
@@ -204,6 +206,7 @@ load_overrides() {
     AUTO_LOCATE=$(cfg AUTO_LOCATE "$AUTO_LOCATE" 0)
     RSSI_MIN=$(cfg RSSI_MIN "$RSSI_MIN" -100)
     SOUND=$(cfg SOUND "$SOUND" 0)
+    BAND6=$(cfg BAND6 "$BAND6" 0)
     THR_STREAM_UP=$(cfg THR_STREAM_UP "$THR_STREAM_UP" 1)
     RESPONSE=$(cfg RESPONSE "$RESPONSE" 0)
     RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
@@ -707,6 +710,7 @@ cleanup() {
   kill_children
   if [ "$WATCH_LOCKED" = 1 ]; then _pineap EXAMINE CANCEL >/dev/null 2>&1; PINEAPPLE_EXAMINE_RESET >/dev/null 2>&1; fi
   [ -n "$RUN_ID" ] && [ "$REPORT_DONE_AT_EXIT" != 1 ] && write_report quiet
+  command -v bands_restore >/dev/null 2>&1 && bands_restore         # user payload only; the hooks never change bands
   rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
   log run "exit cycles=$CYCLE"
   ui_ok && set_state FINISH
@@ -753,11 +757,15 @@ JQ_APS='.[] | ([.beacon[]?, .response[]?]) as $e
 # the ssid -- so the probed SSIDs are the object's values, not an array. No documented key carries the association;
 # ap_mac/bssid are read when present (the harness fixture's stand-in) and "-" otherwise, until the day-one spike
 # finds a source (the Go UI's own recon API carries ap_mac; _pineap does not).
-JQ_CLI='.[] | ([ (.probe // {})[]? | if type == "object" then ((.ssid // "") | select(length > 0)) else tostring end ]) as $p
+JQ_CLI_ROW='([ (.probe // {})[]? | if type == "object" then ((.ssid // "") | select(length > 0)) else tostring end ]) as $p
  | [.mac, (.ap_mac // .bssid // "-"), (.packets // 0), (.signal // .rssi // "-"),
     ($p | map(tostring | gsub("[|;,\n\r\t]"; "_")) | join(",")),
     (.freq // 0), (.time // .last_seen // 0), (.channel // 0)]
  | map(tostring) | join("|")'
+JQ_CLI='.[] | '"$JQ_CLI_ROW"
+# 1.1.3 has no RECON CLIENTS verb (measured 2026-11-03: "Unknown recon command", rc 255) but RECON DEVICES lists every
+# device in the same object shape, so a client there is a device that neither beacons nor answers probes.
+JQ_DEVCLI='.[] | select(((.beacon // {}) | length) == 0 and ((.response // {}) | length) == 0) | '"$JQ_CLI_ROW"
 
 # fallback parser (no jq): split the JSON on "},{" and read fields with bash regex. Reduced fidelity.
 parse_aps_fallback() {   # stdin: JSON -> stdout: mac|packets|ssid|ch|freq|signal|hidden|time
@@ -778,33 +786,44 @@ parse_aps_fallback() {   # stdin: JSON -> stdout: mac|packets|ssid|ch|freq|signa
   [ -n "$mac" ] && printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "$pk" "$ssid" "$ch" "$fr" "$sig" "$hid" "$t"
 }
 parse_cli_fallback() {   # stdout: mac|ap_mac|packets|signal|probes|freq|time|channel  (same shape rules as JQ_CLI above)
-  local json frag pre rest mac ap pk sig fr t ch probes p
+  local json frag top rest mac ap pk sig fr t ch probes p
   json=$(cat); json=${json//\},\{/$'\n'}
   while IFS= read -r frag; do
     [[ $frag =~ \"mac\":\"([^\"]+)\" ]] || continue
+    [[ $frag == *\"beacon\":* || $frag == *\"response\":* ]] && continue   # an AP (RECON DEVICES lists both kinds)
     mac=${BASH_REMATCH[1]}; ap="-"; pk=0; sig="-"; fr=0; t=0; ch=0; probes=""
-    # the device's own fields come before its probe/beacon/response objects, whose values repeat time/signal/freq/channel
-    pre=${frag%%\"probe\":*}; pre=${pre%%\"beacon\":*}; pre=${pre%%\"response\":*}
-    [[ $pre =~ \"(ap_mac|bssid)\":\"([^\"]*)\" ]] && ap=${BASH_REMATCH[2]}
-    [[ $pre =~ \"packets\":([0-9]+) ]] && pk=${BASH_REMATCH[1]}
-    [[ $pre =~ \"signal\":(-?[0-9]+) ]] && sig=${BASH_REMATCH[1]}
-    [[ $pre =~ \"freq\":([0-9]+) ]] && fr=${BASH_REMATCH[1]}
-    [[ $pre =~ \"time\":([0-9]+) ]] && t=${BASH_REMATCH[1]}
-    [[ $pre =~ \"channel\":([0-9]+) ]] && ch=${BASH_REMATCH[1]}
+    # the device's own fields sit beside its probe object (keys are alphabetical on the device: freq, mac, packets,
+    # probe, signal, time), and the probe values repeat time/signal/freq/channel -- so strip every nested {...}
+    # group, innermost first, and read the top-level fields from what is left
+    top=$frag; while [[ $top =~ (.*:)\{[^{}]*\}(.*) ]]; do top="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"; done   # only groups that are a key's value: the object's own braces stay
+    [[ $top =~ \"(ap_mac|bssid)\":\"([^\"]*)\" ]] && ap=${BASH_REMATCH[2]}
+    [[ $top =~ \"packets\":([0-9]+) ]] && pk=${BASH_REMATCH[1]}
+    [[ $top =~ \"signal\":(-?[0-9]+) ]] && sig=${BASH_REMATCH[1]}
+    [[ $top =~ \"freq\":([0-9]+) ]] && fr=${BASH_REMATCH[1]}
+    [[ $top =~ \"time\":([0-9]+) ]] && t=${BASH_REMATCH[1]}
+    [[ $top =~ \"channel\":([0-9]+) ]] && ch=${BASH_REMATCH[1]}
     rest=${frag#*\"probe\":}; [ "$rest" = "$frag" ] && rest=""   # every "ssid" inside the probe object is a probed SSID
     while [[ $rest =~ \"ssid\":\"([^\"]*)\"(.*) ]]; do p=${BASH_REMATCH[1]}; rest=${BASH_REMATCH[2]}; [ -n "$p" ] || continue; p=${p//[|;,]/_}; probes+="${probes:+,}$p"; done
     printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "${ap:--}" "$pk" "$sig" "$probes" "$fr" "$t" "$ch"
   done <<<"$json"
 }
+RECON_CLI_VERB=CLIENTS   # CLIENTS on 2.0.0; DEVICES on 1.1.3, where CLIENTS is "Unknown recon command" (recon_verb_probe)
+recon_verb_probe() {   # one call at start: pick the client verb this firmware has. rc 255 = unknown verb; a timeout keeps CLIENTS
+  timeout 15 _pineap RECON CLIENTS format=json >/dev/null 2>&1
+  [ $? = 255 ] && RECON_CLI_VERB=DEVICES
+  log recon "client verb: $RECON_CLI_VERB"
+}
 recon_lines() {   # recon_lines APS|CLIENTS -> lines on stdout
-  local what="$1" prog
-  [ "$what" = APS ] && prog="$JQ_APS" || prog="$JQ_CLI"
+  local what="$1" prog verb
+  if [ "$what" = APS ]; then prog="$JQ_APS"; verb=APS
+  elif [ "$RECON_CLI_VERB" = DEVICES ]; then prog="$JQ_DEVCLI"; verb=DEVICES
+  else prog="$JQ_CLI"; verb=CLIENTS; fi
   if [ "$HAVE_JQ" = 1 ]; then
-    timeout 15 _pineap RECON "$what" format=json 2>/dev/null | jq -r "$prog" 2>/dev/null
+    timeout 15 _pineap RECON "$verb" format=json 2>/dev/null | jq -r "$prog" 2>/dev/null
   elif [ "$what" = APS ]; then
     timeout 15 _pineap RECON APS format=json 2>/dev/null | parse_aps_fallback
   else
-    timeout 15 _pineap RECON CLIENTS format=json 2>/dev/null | parse_cli_fallback
+    timeout 15 _pineap RECON "$verb" format=json 2>/dev/null | parse_cli_fallback
   fi
 }
 
@@ -1077,6 +1096,7 @@ preflight() {
   printf -v RUN_ID '%(%Y%m%d_%H%M%S)T' -1; RUN_T0=$EPOCHSECONDS
   if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamHound: _pineap not found" 2>/dev/null; exit 0; fi
   command -v jq >/dev/null 2>&1 && HAVE_JQ=1
+  recon_verb_probe
   capture_ready && HAVE_TCPDUMP=1
   [ -r "$OUI_FILE" ] || OUI_FILE="$OUI_FILE_ALT"
   [ -r "$OUI_FILE" ] || LOG yellow "no oui.txt: vendor rows disabled, OUI rows only"
@@ -1482,6 +1502,7 @@ ALERT_DIALOG|bool|0|recon|ALERT on new CONFIRMED
 SOUND|bool|0|recon|ringtone on CONFIRMED
 AUTO_WATCH|bool|0|recon|offer Watch
 AUTO_LOCATE|bool|0|recon|offer Locate
+BAND6|bool|0|recon|also scan 6 GHz (restored at exit)
 RESPONSE|bool|0|response|Disrupt rung (master switch)
 RESPONSE_CONFIRM|bool|0|response|confirm before any transmit
 AUTO_RESPOND|bool|0|response|funnel offers Disrupt itself
@@ -1510,6 +1531,7 @@ settings_apply() {   # settings_apply KEY VALUE -> live variable + persisted ove
   log cfg "set $key=$val"
   case "$key" in
     DEDUPE_H) DEDUPE_RUN=1 ;;
+    BAND6) if [ "$val" = 1 ]; then bands_apply; else bands_restore; fi ;;   # takes effect now, not at the next start
     RESP_LOCK_SECS|RESP_SETTLE_SECS)   # the lock must outlast fire + settle: re-clamp, and if the clamp moved the lock
       before=$RESP_LOCK_SECS; resp_clamp_lock   # persist what is in force so the menu, the footer and the next start agree
       if [ "$RESP_LOCK_SECS" != "$before" ]; then
@@ -1564,6 +1586,64 @@ settings_group() {   # settings_group <group> <title>: the group's keys on one p
     fi
     settings_apply "$key" "$resp"
   done
+}
+
+# =================================================================================== bands ===
+# Opt-in 6 GHz for this run: PINEAPPLE_SET_BANDS <iface> <current bands> 6 once after the overrides, put
+# back in cleanup. Two argument forms are seen in the wild -- `<iface> 2 5 [6]` (Hak5 docs; PLAN_v2 row 32)
+# and `both` (nosey-neighbor) -- so a write is trusted only when uci reads the bands back with a 6, and a
+# pineapd restart (which empties Recon) is detected by pid and said out loud. Neither has run on a device
+# yet: day-one 8c. 6 GHz costs dwell on the bands cameras actually use (PLAN_v2 item 21), hence opt-in.
+# Not copied into the hooks: a hook runs inside a Recon selection and must not change what Recon scans.
+BANDS_ORIG=""     # the device's bands before this run changed them; "" = nothing to restore
+bands_read() { local a; a=$(uci -q get "pineapd.$RECON_IF.bands" 2>/dev/null || uci -q get pineapd.wlan1.bands 2>/dev/null); printf '%s' "${a//[![:alnum:],]/}"; }
+bands_plan() {   # bands_plan <current, e.g. 2,5> -> the SET_BANDS band tokens with 6 added, or "" when nothing needs writing
+  local cur="$1" b out=""
+  [ -n "$cur" ] || return 0
+  [[ ,$cur, == *,6,* ]] && return 0
+  for b in ${cur//,/ }; do out+="${out:+ }$b"; done
+  printf '%s 6' "$out"
+}
+bands_live6() {   # 0 when the radio is seen on a 6 GHz channel within the sampling window: the direct test of what BAND6 is for
+  local i f
+  command -v iw >/dev/null 2>&1 || return 1
+  for ((i = 0; i < BANDS_PROBE_N; i++)); do
+    f=$(iw dev "$RECON_IF" info 2>/dev/null | sed -n 's/.*(\([0-9]*\) MHz).*/\1/p' | head -1)
+    [[ $f =~ ^[0-9]+$ ]] && (( f >= 5925 )) && return 0
+    sleep "$BANDS_PROBE_WAIT"
+  done
+  return 1
+}
+bands_apply() {   # write the device's bands + 6 for this run; BANDS_ORIG remembers what to restore
+  # Verified by the live channel, not by uci: on the bare 1.1.3 unit (day-one 8c, 2026-11-03) the call left uci
+  # at 2,5 AND the hop set on 2.4/5 GHz with pineapd running, so uci alone cannot tell "applied at runtime"
+  # from "no-op", and the hop set is the thing an operator switching BAND6 on actually wants.
+  local cur want got live=no pid0 pid1
+  [ -n "$BANDS_ORIG" ] && return 0                                  # already applied this run
+  cur=$(bands_read); want=$(bands_plan "$cur")
+  [ -n "$want" ] || { log bands "no write: bands ${cur:-unreadable}"; return 0; }
+  command -v PINEAPPLE_SET_BANDS >/dev/null 2>&1 || { log warn "bands: PINEAPPLE_SET_BANDS not present"; ui_ok && LOG yellow "band write: command not present"; return 1; }
+  pid0=$(pidof pineapd 2>/dev/null)
+  # shellcheck disable=SC2086   # the tokens are the argument list
+  PINEAPPLE_SET_BANDS "$RECON_IF" $want >/dev/null 2>&1; sleep 1
+  bands_live6 && live=yes; got=$(bands_read); pid1=$(pidof pineapd 2>/dev/null)
+  if [ "$live" = yes ] || [[ ,$got, == *,6,* ]]; then
+    BANDS_ORIG="$cur"; BANDS_LINE="${cur:+$cur,}6"; [[ ,$got, == *,6,* ]] && BANDS_LINE="$got"
+    log bands "set $want (was $cur; live 6 GHz=$live, uci=$got)"; ui_ok && LOG "bands: $BANDS_LINE (2.4 GHz dwell ~1/3 of normal)"
+    if [ "$pid0" != "$pid1" ]; then log warn "bands: pineapd restarted by the band write ($pid0 -> $pid1): Recon reset"; ui_ok && LOG yellow "band write restarted pineapd: Recon starts over"; fi
+  else
+    log warn "bands: write not applied (no 6 GHz channel seen in ${BANDS_PROBE_N} samples, uci still '${got:-?}') after SET_BANDS $want"
+    ui_ok && LOG yellow "band write not applied: radio stayed on ${got:-?}"
+  fi
+  return 0
+}
+bands_restore() {   # put the device's bands back; a no-op unless this run changed them
+  [ -n "$BANDS_ORIG" ] || return 0
+  # shellcheck disable=SC2086
+  PINEAPPLE_SET_BANDS "$RECON_IF" ${BANDS_ORIG//,/ } >/dev/null 2>&1
+  log bands "restored $BANDS_ORIG"; BANDS_ORIG=""
+  BANDS_LINE=$(bands_read); [ -n "$BANDS_LINE" ] && [[ $BANDS_LINE != *6* ]] && BANDS_LINE+=" (6 GHz not scanned)"
+  return 0
 }
 
 # scan_loop: cycles until B opens Review and the operator picks Exit
@@ -2705,6 +2785,26 @@ IWFIX
     [ "$(sed -n "s/^ *$_k=\$(cfg $_k \"\$$_k\" \(-\{0,1\}[0-9]*\)).*/\1/p" "${BASH_SOURCE[0]}")" = "$_f" ] || _miss+=" $_k"
   done <<<"$SETTINGS_TABLE"
   st "settings: every table key is read by load_overrides with the table's floor" "${_miss:-none}" "none"
+  # 7j band write: plan from the uci value, trust the write only on read-back, restore what was there
+  st "bands plan: adds 6"             "$(bands_plan 2,5)"   "2 5 6"
+  st "bands plan: already has 6"      "$(bands_plan 2,5,6)" ""
+  st "bands plan: single band"        "$(bands_plan 5)"     "5 6"
+  st "bands plan: unreadable"         "$(bands_plan "")"    ""
+  local _rif=$RECON_IF _bl=$BANDS_LINE _bn=$BANDS_PROBE_N _bw=$BANDS_PROBE_WAIT; RECON_IF=wlan9mon; BANDS_ORIG=""; : >"$tmp/bands.log"; printf '2,5' >"$tmp/bands"
+  BANDS_PROBE_N=2; BANDS_PROBE_WAIT=0.05
+  uci() { cat "$tmp/bands"; }
+  iw() { if grep -q 6 "$tmp/bands"; then echo 'channel 37 (5975 MHz), width: 20 MHz'; else echo 'channel 6 (2437 MHz), width: 20 MHz'; fi; }
+  PINEAPPLE_SET_BANDS() { printf '%s\n' "$*" >>"$tmp/bands.log"; local IFS=,; printf '%s' "${*:2}" >"$tmp/bands"; }
+  bands_apply; st "bands apply: writes current + 6"      "$(sed -n 1p "$tmp/bands.log")" "wlan9mon 2 5 6"
+  st "bands apply: remembers the original"               "$BANDS_ORIG:$BANDS_LINE" "2,5:2,5,6"
+  bands_apply; st "bands apply: once per run"            "$(wc -l <"$tmp/bands.log" | tr -d ' ')" "1"
+  bands_restore; st "bands restore: puts the original back" "$(sed -n 2p "$tmp/bands.log"):$BANDS_ORIG" "wlan9mon 2 5:"
+  st "bands restore: status line follows"                "$BANDS_LINE" "2,5 (6 GHz not scanned)"
+  PINEAPPLE_SET_BANDS() { printf '%s\n' "$*" >>"$tmp/bands.log"; }   # a write that does not take
+  bands_apply; st "bands apply: not trusted unless 6 GHz is seen live or in uci" "$BANDS_ORIG:$BANDS_LINE" ":2,5 (6 GHz not scanned)"
+  uci() { echo '2,5'; }; iw() { echo 'channel 37 (5975 MHz), width: 20 MHz'; }   # applied at runtime, uci untouched
+  bands_apply; st "bands apply: a live 6 GHz channel is enough, uci lagging" "$BANDS_ORIG:$BANDS_LINE" "2,5:2,5,6"
+  BANDS_ORIG=""; unset -f uci iw PINEAPPLE_SET_BANDS; RECON_IF=$_rif; BANDS_LINE=$_bl; BANDS_PROBE_N=$_bn; BANDS_PROBE_WAIT=$_bw
   RESP_SETTLE_SECS=6; RESP_LOCK_SECS=20; CFG_NOTE=""; CFG_OVERRIDES=0
   settings_apply RESP_LOCK_SECS 5; st "settings: a short lock is clamped on apply and the clamp is what gets counted" "$RESP_LOCK_SECS:$CFG_NOTE" "11: RESP_LOCK_SECS=11"
   settings_apply RESP_SETTLE_SECS 20; st "settings: raising settle re-clamps the lock" "$RESP_LOCK_SECS:$CFG_NOTE" "25: RESP_SETTLE_SECS=20 RESP_LOCK_SECS=25"
@@ -2715,6 +2815,11 @@ IWFIX
     st "cli jq: probe object -> probed SSIDs (wildcard dropped), association unknown" "$(printf '%s' "$cj" | jq -r "$JQ_CLI" | sed -n 1p)" "AA:BB:CC:00:00:01|-|12|-57|HomeNet,Cam_Net|2437|1700000000|0"
     st "cli jq: client with no probe object" "$(printf '%s' "$cj" | jq -r "$JQ_CLI" | sed -n 2p)" "AA:BB:CC:00:00:02|-|3|-70||5180|1700000002|0"
   fi
+  local dj='[{"beacon":{"3488417929":{"channel":1,"count":269148,"freq":2412,"hidden":false,"signal":-61,"ssid":"Lab AP","ssidlen":6,"time":1700000000}},"freq":2412,"mac":"AA:BB:CC:00:00:10","packets":325816,"probe":{"25061":{"channel":10,"count":3142,"freq":2457,"signal":-68,"ssid":"","ssidlen":0,"time":1700000000}},"response":{"5550":{"channel":1,"count":53526,"freq":2412,"signal":-63,"ssid":"Lab AP","ssidlen":6,"time":1700000000}},"signal":-61,"time":1700000000},{"freq":2437,"mac":"AA:BB:CC:00:00:01","packets":12,"probe":{"2918451234":{"channel":6,"count":3,"freq":2437,"signal":-55,"ssid":"HomeNet","ssidlen":7,"time":1700000005}},"signal":-57,"time":1700000000}]'
+  if command -v jq >/dev/null 2>&1; then
+    st "cli jq via DEVICES: an AP that also probes is not a client" "$(printf '%s' "$dj" | jq -r "$JQ_DEVCLI" | tr '\n' ' ')" "AA:BB:CC:00:00:01|-|12|-57|HomeNet|2437|1700000000|0 "
+  fi
+  st "cli fallback via DEVICES: same one row" "$(printf '%s' "$dj" | parse_cli_fallback | tr '\n' ' ')" "AA:BB:CC:00:00:01|-|12|-57|HomeNet|2437|1700000000|0 "
   st "cli fallback: same rows as jq from the same shape" "$(printf '%s' "$cj" | parse_cli_fallback | tr '\n' ' ')" "AA:BB:CC:00:00:01|-|12|-57|HomeNet,Cam_Net|2437|1700000000|0 AA:BB:CC:00:00:02|-|3|-70||5180|1700000002|0 "
   # 8 marked blocks
   if command -v md5sum >/dev/null 2>&1 && [ -f "${BASH_SOURCE[0]}" ]; then
@@ -2757,6 +2862,7 @@ preflight
 apply_mode
 cfg_snapshot_defaults
 load_overrides
+[ "$BAND6" = 1 ] && bands_apply
 (( CFG_OVERRIDES > 0 )) && { LOG yellow "cfg: $CFG_OVERRIDES overrides"; log cfg "$CFG_NOTE"; }
 log run "start v$VERSION run=$RUN_ID sigs=$SIG_COUNT($SIG_SOURCE) jq=$HAVE_JQ tcpdump=$HAVE_TCPDUMP bands=${BANDS_LINE:-?} mode=$MODE loaded=$LOADED_ROWS dedupe_h=$DEDUPE_H"
 LOG "CamHound $VERSION [$MODE]"$'\n'"sigs: $SIG_COUNT ($SIG_SOURCE)$( [ "$HAVE_JQ" = 1 ] || printf ' no-jq')$( [ "$HAVE_TCPDUMP" = 1 ] || printf ' no-tcpdump')"$'\n'"bands: ${BANDS_LINE:-?}"$'\n'"prox: uncal"
