@@ -8,7 +8,7 @@
 # was handed: for an answer further down the list it presses 'More...' first, as an operator would,
 # and it refuses (exit 1, logged 'not on this page') an answer that is on no page.
 # Needs bash 5 and jq; uses busybox hexdump/awk when busybox is installed (closer to the Pager).
-# Usage: dev/CamHound/harness/run_harness.sh [live|stimulus|lock|nojq|locate|disrupt|blind|noinj|persist|settings|all]
+# Usage: dev/CamHound/harness/run_harness.sh [live|stimulus|lock|nojq|locate|disrupt|cliscope|blind|noinj|persist|settings|all]
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
 SRC="$ROOT/library/user/reconnaissance/CamHound/payload.sh"
@@ -91,7 +91,7 @@ s_disrupt() {   # RESPONSE=1: Disrupt on the Reolink AP against log-only stubs; 
   check "disrupt: stub command called with bssid, broadcast target, channel 36" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_ALL ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log"
   check "disrupt: lock verified ok (not by channel)" "grep -q 'lock: ok' $T/log"
   check "disrupt: one loot row per client, 16 fields, badge and raw caps" "[ \"\$(grep -c '^[0-9]' $LOOT/responses.tsv)\" = 2 ] && [ \"\$(sed -n 2p $LOOT/responses.tsv | awk -F'|' '{print NF}')\" = 16 ] && grep -q '|ec:71:db:00:00:11|36|5|D+C|0c00|' $LOOT/responses.tsv && grep -q '|ec:71:db:00:00:12|36|5|D+C|0c00|' $LOOT/responses.tsv"
-  check "disrupt: aggregate verdict over both clients" "grep -q 'verdict MOVED ff:ff:ff:ff:ff:ff moved=2 no_effect=0 inconclusive=0 of 2' $LOOT/events.log"
+  check "disrupt: aggregate verdict over both clients" "grep -q 'verdict MOVED ff:ff:ff:ff:ff:ff scope=bss moved=2 no_effect=0 inconclusive=0 of 2' $LOOT/events.log"
   # guard: an AP with no visible clients (the Hikvision setup AP) is refused before anything is sent
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules disrupt2 '^CamHound' 'Scan,Exit' 'Review hits' '3,Exit' '^[0-9]+ HIK' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
@@ -151,10 +151,29 @@ s_settings() {   # Settings: Recon page sets and persists a key; Response page's
   check "settings: recon page shows the live value after reset" "grep -q 'PICKER\[Recon settings\] items=Back;CYCLE_SECS = 20;' $T/log"
   printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
 }
+s_cliscope() {   # RESPONSE=1: Disrupt on the Wyze CLIENT row -- the only menu that holds both scopes
+  # DEAUTH (page item 2) is the one targeted option: cli scope, the picked device alone.
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules cli1 '^CamHound' 'Scan,Exit' 'Review hits' '8,Exit' '^[0-9]+ WYZE' 'Disrupt,Back' '^Disrupt \[' '2' ' ch ' '1' "${COMMON[@]}"
+  answers t t B; run
+  check "cliscope: client row offers a mixed marker list, BOTH preselected" "grep -q 'PICKER\[Disrupt \[D+C\] 20:00:01\] items=BOTH bss (works);DEAUTH (works);CSA bss (works);' $T/log"
+  check "cliscope: DEAUTH confirm names the one device, not the BSS" "grep -q 'CONFIRM\[DEAUTH on 20:00:01 via 11:22:33 ch 6[?]\] -> 1' $T/log"
+  check "cliscope: DEAUTH sent with the client as its target" "grep -q '^PINEAPPLE_DEAUTH_CLIENT 9c:3d:cf:11:22:33 a4:da:22:20:00:01 6$' $T/log"
+  check "cliscope: cli scope measures the picked device alone" "grep -q 'scope=cli subjects=1' $LOOT/events.log && [ \"\$(grep -c '^[0-9]' $LOOT/responses.tsv)\" = 1 ]"
+  check "cliscope: no picked line when the pick is the only subject" "! grep -q 'picked a4:da:22:20:00:01' $LOOT/events.log"
+  # BOTH (page item 1, which pick_list preselects) is BSS-wide from that same client row.
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules cli2 '^CamHound' 'Scan,Exit' 'Review hits' '8,Exit' '^[0-9]+ WYZE' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
+  answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "cliscope: BOTH confirm names every client of the BSS" "grep -q 'CONFIRM\[BOTH on EVERY client of 11:22:33 ch 6[?]\] -> 1' $T/log"
+  check "cliscope: bss scope from a client row measures all four clients" "grep -q 'scope=bss subjects=4' $LOOT/events.log && [ \"\$(grep -c '^[0-9]' $LOOT/responses.tsv)\" = 4 ]"
+  check "cliscope: the loot covers the collateral, not just the pick" "grep -q '|a4:da:22:20:00:01|' $LOOT/responses.tsv && grep -q '|3c:6a:2c:00:00:01|' $LOOT/responses.tsv && grep -q '|00:fc:8b:00:00:01|' $LOOT/responses.tsv"
+  check "cliscope: the picked device's own verdict is still named" "grep -q 'picked a4:da:22:20:00:01 ' $LOOT/events.log && grep -q '^LOG picked 20:00:01: ' $T/log"
+}
 case "${1:-all}" in
-  live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; blind) s_blind ;; noinj) s_noinj ;; persist) s_persist ;; settings) s_settings ;;
-  all) s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_blind; s_noinj; s_persist; s_settings ;;
-  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|blind|noinj|persist|settings|all]"; exit 2 ;;
+  live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; cliscope) s_cliscope ;; blind) s_blind ;; noinj) s_noinj ;; persist) s_persist ;; settings) s_settings ;;
+  all) s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_cliscope; s_blind; s_noinj; s_persist; s_settings ;;
+  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|cliscope|blind|noinj|persist|settings|all]"; exit 2 ;;
 esac
 printf '== harness: %s failure(s); temp dir %s ==\n' "$FAIL" "$T"
 exit $(( FAIL > 0 ))

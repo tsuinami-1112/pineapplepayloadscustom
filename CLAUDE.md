@@ -129,9 +129,19 @@ there. `disrupt_menu` reads it twice — the picker appends ` bss` to a broad op
 pre-transmit confirm says "on EVERY client of <bssid>" instead of naming one device. `posture_opts`
 still orders by efficacy, so a BSS-wide attack stays preselected on the common badges; the marker
 and the confirm carry the breadth rather than the ordering.
+**`resp_snapshot <scope>` reads it too, and that was a defect until 2026-11-03**: subjects were
+selected by *row type* (`R_TARGET == ff:ff:ff:ff:ff:ff`), so a client-row `CSA`/`BOTH` transmitted
+BSS-wide and then measured and looted exactly one device. Subjects now follow the attack's scope,
+the picked target is always among them (even behind a randomised MAC the `bss` sweep skips), and
+`resp_fire` names that device's own verdict when there is more than one subject so a collateral
+`NO_EFFECT` cannot read as "my camera stayed up". Harness scenario `cliscope` drives both arms.
+Caveat worth knowing before trusting the wider loot: the `bss` sweep matches `ap_mac` against
+`R_BSSID`, and the 2.0.0 device object exposes **no association field**, so on real firmware the
+sweep finds nothing and measurement degrades to the picked target alone. The selection rule is
+right; the data to feed it is not there yet.
 
 **Selftest** — `selftest()` plus `st_*` helpers (`st_device`, `st_pcap`, `st_beacon_pcap`,
-`st_gate`, `st_hex2bin`). Runs on a laptop with no radio. Add a case for anything you change.
+`st_gate`, `st_hex2bin`, `st_subjects`). Runs on a laptop with no radio. Add a case for anything you change.
 
 ## Where the documentation is
 
@@ -586,6 +596,18 @@ closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowi
 packet counters move the way `resp_verdict` assumes; whether CSA moves a real client at all; and the
 count-byte experiment (day-one step 17a). (`inj_parse_channels` is **no longer** on this list — it
 ran against a live radio on 2026-11-02 and was correct; see "First contact".)
+
+**⚠ On 1.1.3 the response rung cannot transmit at all — it is inert, not merely untested.**
+`_pineap RECON CLIENTS` does not exist before 2.0.0, so `recon_lines CLIENTS` returns nothing,
+`resp_snapshot` finds no subjects, and an AP row is refused with `NO_CLIENTS` before anything is
+sent. Client rows never populate `CLI_LINES`, so no client row exists to take the other branch —
+every reachable Disrupt target on 1.1.3 is an AP row, and every one is refused. It fails **safe**
+(nothing transmitted, refusal logged) but `RESPONSE=1` buys nothing until the device is flashed,
+and flashing to 2.0.0 voids every `pineapd` address pinned above. **[A]** — the `CLIENTS` byte
+count is `[V]` and the refusal path was read in the payload; composing them is the inference. Note
+this is a *fourth* consequence of the `CLIENTS` gap; the three recorded above are all about the
+client **parsers**, and none of them covers the response rung. *Falsified by:* a Disrupt on an AP
+row on a 1.1.3 Pager transmitting, or returning anything but `NO_CLIENTS`.
 
 **Two 2.0.0 hazards in this repo's other payloads** — `wigle-toolkit` really deletes loot, and
 `wardrive_activate` is broken. Both are `[V]` from the rootfs trees and written up in full in

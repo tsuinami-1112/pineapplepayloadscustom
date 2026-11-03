@@ -527,8 +527,14 @@ response_cmd() {
 }
 
 # attack_scope <attack key> -> cli | bss.  Reads R_TARGET, so call it after resp_target.
-# DEAUTH is the only command that takes a target it honours, and an AP row resolves R_TARGET to
-# broadcast, so every attack on one is BSS-wide regardless of which key is picked.
+# Read from the signatures (response_cmd above): CSA takes <bssid> <ch> and has no target argument
+# at all, so it is BSS-wide by construction; _ALL advertises [target] but parses one MAC, so its
+# target is accepted and discarded; only DEAUTH parses two and can aim.
+# [A] An AP row resolves R_TARGET to ff:ff:ff:ff:ff:ff and this reports that as BSS-wide. Nothing
+# in the repo records pineapd honouring a broadcast [target] rather than rejecting it. If it
+# rejects, the attack does nothing and every subject reads NO_EFFECT, which is the safe direction.
+# Falsified by: PINEAPPLE_DEAUTH_CLIENT <bssid> ff:ff:ff:ff:ff:ff <ch> disconnecting one client, or
+# none, with several associated.
 attack_scope() {
   case "$1" in
     DEAUTH) [ "$R_TARGET" = 'ff:ff:ff:ff:ff:ff' ] && printf 'bss' || printf 'cli' ;;
@@ -1453,10 +1459,11 @@ mode_menu() {
 
 
 # ================================================================================ settings ===
-# Table-driven settings menu over the starred recon keys: key|kind|floor|label. Values are applied
-# to the running session and persisted with PAYLOAD_SET_CONFIG; Reset deletes the overrides and
-# restores the config-block defaults captured at start (cfg_snapshot_defaults runs before
-# load_overrides). The response-rung keys are deliberately not listed here.
+# Table-driven settings menu over all fifteen starred keys: key|kind|floor|group|label, where group
+# is recon or response and settings_menu routes one page per group. Values are applied to the
+# running session and persisted with PAYLOAD_SET_CONFIG; Reset deletes the overrides and restores
+# the config-block defaults captured at start (cfg_snapshot_defaults runs before load_overrides).
+# The third field is a floor, not a default: the shipped value lives in the config block.
 SETTINGS_TABLE='CYCLE_SECS|int|5|recon|scan period, s
 THR_STREAM_UP|int|1|recon|STREAM big uplink fr/s
 COOLDOWN_SECS|int|0|recon|re-alert suppression, s
@@ -2023,16 +2030,23 @@ resp_write() {   # resp_write <mac> <badge> <attack> <cmd> <lock> <pk0> <pk1> <v
     "$2" "${POSTURE_RSN:--}" "$bp" "$3" "$4" "$5" "$6" "$7" "$8" >>"$f" 2>/dev/null
 }
 
-# resp_snapshot -> RS_PK/RS_T (packets, last-seen) for the subjects of the attempt, from one Recon read:
-# a client target measures itself; a broadcast (AP) target measures the AP's visible, non-random clients.
+# resp_snapshot <scope> -> RS_PK/RS_T (packets, last-seen) for the subjects of the attempt, from one
+# Recon read. The subjects are whatever the chosen attack reaches, which is NOT what the picked row
+# implies: CSA and BOTH transmit BSS-wide even from a client row (see attack_scope), so measuring
+# only the picked device would report a one-camera result as the outcome of a BSS-wide transmit and
+# leave the rest of the BSS out of the loot. scope cli measures the one target; scope bss measures
+# the BSSID's visible, non-random clients.
+# The picked target is always a subject, even behind a randomised MAC the bss sweep otherwise skips.
 # The AP's own counter is never the subject: it keeps beaconing whatever happens to its clients.
 declare -A RS_PK RS_T
 resp_snapshot() {
-  local m a pk sig pr fr t ch s
+  local scope="${1:-cli}" m a pk sig pr fr t ch s
   RS_PK=(); RS_T=()
   while IFS='|' read -r m a pk sig pr fr t ch; do
     m=${m,,}; a=${a,,}
-    if [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ]; then [ "$a" = "$R_BSSID" ] || continue; is_rand "$m" && continue
+    if [ "$scope" = bss ]; then
+      [ "$a" = "$R_BSSID" ] || continue
+      [ "$m" != "$R_TARGET" ] && is_rand "$m" && continue
     else [ "$m" = "$R_TARGET" ] || continue; fi
     RS_PK[$m]="${pk:-0}"; RS_T[$m]="${t:-0}"
   done < <(recon_lines CLIENTS)
@@ -2049,13 +2063,15 @@ resp_aggregate() {
 
 resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was reached
   local mac="$1" k="$2" badge="$3" cmd lock rc m p0 t0 p1 t1 present verdict nmv=0 nne=0 ninc=0 n
+  local scope tgt_verdict=-
   local -a subjects=(); local -A P0=() T0=()
   cmd=$(response_cmd "$k")
   [ -n "$cmd" ] || return 1
   if ! command -v "$cmd" >/dev/null 2>&1; then
     LOG red "$cmd not present in this firmware"; log resp "missing $cmd"; return 1
   fi
-  resp_snapshot
+  scope=$(attack_scope "$k")      # what the command can reach, which is not what the row implies
+  resp_snapshot "$scope"
   for m in "${!RS_PK[@]}"; do subjects+=("$m"); P0[$m]="${RS_PK[$m]}"; T0[$m]="${RS_T[$m]}"; done
   if [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ]; then
     if (( ${#subjects[@]} == 0 )); then                        # nothing to disconnect, nothing to measure
@@ -2077,27 +2093,34 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   fi
   set_state RESPOND
   LOG "$k -> ${R_BSSID:9} ch $R_CH"$'\n'"lock: $lock, $n subject(s)"
-  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock subjects=$n"
+  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock scope=$scope subjects=$n"
   if [ "$k" = CSA ]; then "$cmd" "$R_BSSID" "$R_CH" >/dev/null 2>&1
   else "$cmd" "$R_BSSID" "$R_TARGET" "$R_CH" >/dev/null 2>&1; fi
   sleep "$RESP_SETTLE_SECS"
-  resp_snapshot
+  resp_snapshot "$scope"
   unlock_target
   for m in "${subjects[@]}"; do
     p0="${P0[$m]}"; t0="${T0[$m]}"; present=1; p1=-; t1=-
     if [ -n "${RS_PK[$m]+x}" ]; then p1="${RS_PK[$m]}"; t1="${RS_T[$m]}"; else present=0; fi
     verdict=$(resp_verdict "$p0" "$t0" "$p1" "$t1" "$present")
     case "$verdict" in MOVED) nmv=$((nmv + 1)) ;; NO_EFFECT) nne=$((nne + 1)) ;; *) ninc=$((ninc + 1)) ;; esac
+    [ "$m" = "$R_TARGET" ] && tgt_verdict="$verdict"
     resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "$p0" "$p1" "$verdict" "$m"
     log resp "subject $m $verdict pk $p0 -> $p1 present=$present"
   done
   verdict=$(resp_aggregate "$nmv" "$nne" "$ninc")
-  log resp "verdict $verdict $R_TARGET moved=$nmv no_effect=$nne inconclusive=$ninc of $n"
+  log resp "verdict $verdict $R_TARGET scope=$scope moved=$nmv no_effect=$nne inconclusive=$ninc of $n"
   case "$verdict" in
     MOVED)     set_state RESPOND_HIT; LOG green "$verdict: $nmv/$n quiet" ;;
     NO_EFFECT) set_state RESPOND_NIL; LOG yellow "$verdict: $nne/$n still transmitting" ;;
     *)         set_state INCONCLUSIVE; LOG yellow "$verdict: $ninc/$n unsettled, $nmv quiet" ;;
   esac
+  # The aggregate word covers the whole blast radius, which is the honest summary of a BSS-wide
+  # transmit. The operator still picked one device, so name that device's own verdict too, or a
+  # collateral NO_EFFECT reads as "the camera I aimed at stayed up".
+  if [ "$R_TARGET" != ff:ff:ff:ff:ff:ff ] && (( n > 1 )); then
+    LOG "picked ${R_TARGET:9}: $tgt_verdict"; log resp "picked $R_TARGET $tgt_verdict of $n subjects"
+  fi
   return 0
 }
 
@@ -2250,6 +2273,11 @@ st_gate() {   # st_gate <bindir> -> capture_ready's verdict with PATH masked to 
 }
 st_le32h() { printf '%02x%02x%02x%02x' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 )); }
 st_hex2bin() { local h="$1" i; for ((i = 0; i < ${#h}; i += 2)); do printf "\\x${h:$i:2}"; done; }
+st_subjects() {   # the measured subject set, sorted and space-joined, so the compare is stable
+  local m out=''
+  while read -r m; do [ -n "$m" ] && out="${out:+$out }$m"; done < <(printf '%s\n' "${!RS_PK[@]}" | sort)
+  printf '%s' "$out"
+}
 st_beacon_pcap() {   # st_beacon_pcap file bssid12hex [rsn payload hex] [extcap payload hex]
   local f="$1" bss="$2" rsn="$3" ext="$4" ies frame flen gh rec
   ies="000463616d31"                                              # SSID "cam1"
@@ -2570,6 +2598,36 @@ IWFIX
   st "aggregate: nothing measured"   "$(resp_aggregate 0 0 0)" "INCONCLUSIVE"
   rm -f "$tmp/responses.tsv"; resp_write aa:00:00:00:00:10 C CSA PINEAPPLE_DEAUTH_CLIENT_CSA ok 10 10 MOVED aa:00:00:00:00:11
   st "response row: measured target override" "$(sed -n 2p "$tmp/responses.tsv" | cut -d'|' -f5)" "aa:00:00:00:00:11"
+  # resp_snapshot picks subjects by the attack's scope, not by the picked row. A client-row CSA/BOTH
+  # transmits BSS-wide, so it must measure the BSS, or the verdict and the loot under-report what was
+  # actually hit. Note is_rand keys on the MAC's second character, so these fixtures use ec:71:db
+  # (not the aa: ones above, which read as randomised) wherever a client must survive the bss sweep.
+  # The stub logs each call, because the one thing the in-sweep target guard buys over the
+  # recon_stat fallback below it is staying within a single Recon read.
+  local orig_recon; orig_recon=$(declare -f recon_lines)
+  recon_lines() {   # mac|ap_mac|packets|signal|probes|freq|time|channel
+    printf 'x\n' >>"$tmp/recon_calls"
+    printf '%s\n' \
+      'ec:71:db:00:00:11|ec:71:db:00:00:10|100|-50|-|2437|1700000000|6' \
+      'ec:71:db:00:00:12|ec:71:db:00:00:10|200|-60|-|2437|1700000000|6' \
+      'ec:71:db:00:00:13|ec:71:db:00:00:99|300|-70|-|2437|1700000000|6' \
+      'a2:71:db:00:00:14|ec:71:db:00:00:10|400|-65|-|2437|1700000000|6'
+  }
+  R_BSSID=ec:71:db:00:00:10; R_CH=6; R_BAND=2
+  R_TARGET=ff:ff:ff:ff:ff:ff; resp_snapshot bss
+  st "snapshot bss: own BSS, no randoms" "$(st_subjects)" "ec:71:db:00:00:11 ec:71:db:00:00:12"
+  R_TARGET=ec:71:db:00:00:11; resp_snapshot cli
+  st "snapshot cli: the one target"      "$(st_subjects)" "ec:71:db:00:00:11"
+  R_TARGET=ec:71:db:00:00:11; resp_snapshot bss
+  st "snapshot bss from a client row"    "$(st_subjects)" "ec:71:db:00:00:11 ec:71:db:00:00:12"
+  R_TARGET=ec:71:db:00:00:13; resp_snapshot cli
+  st "snapshot cli ignores the BSSID"    "$(st_subjects)" "ec:71:db:00:00:13"
+  rm -f "$tmp/recon_calls"; R_TARGET=a2:71:db:00:00:14; resp_snapshot bss
+  st "snapshot bss keeps a random pick"  "$(st_subjects)" "a2:71:db:00:00:14 ec:71:db:00:00:11 ec:71:db:00:00:12"
+  st "snapshot bss stays at one read"    "$(wc -l <"$tmp/recon_calls" | tr -d ' ')" "1"
+  rm -f "$tmp/recon_calls"
+  eval "$orig_recon"
+  RS_PK=(); RS_T=(); R_BSSID=aa:00:00:00:00:10; R_TARGET=ff:ff:ff:ff:ff:ff; R_CH=6; R_BAND=2
   # 7e persistence: dedupe gate and the inventory loader
   DEDUPE_H=24; DEDUPE_RUN=1; CLOCK_OK=1; local K=aa:00:00:00:00:30
   SEEN_LAST[$K]=$((EPOCHSECONDS - 3600)); SEEN_CONF[$K]=90; SEEN_RSSI[$K]=-60; RSSI_LAST[$K]=-58
