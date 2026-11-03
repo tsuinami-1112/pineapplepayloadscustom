@@ -206,6 +206,28 @@ session after you to adjudicate. `dev/pager-csa-primitives.md` §"Re-deriving fr
 not trust this file" exists for exactly this; as it says, the point of these files is to save you
 the grep, not to replace verification.
 
+## Review workflows: the standing rules
+
+Set by the operator on 2026-11-03 for every session that runs an agent review here.
+
+1. **Tier the verification by consequence and by likelihood of error.** A finding gets the full
+   three-lens adversarial pass (trace, intent, impact) when a fix would change code the device runs,
+   when it contradicts a fact measured on hardware, or when it is an inference composed from verified
+   readings — the error shape this project has been bitten by twice. Freshly written code rates
+   higher on likelihood of error than code that has survived a prior pass and a harness run, even at
+   equal consequence. Everything else — docs, comments, stale counts, wording, test gaps — gets one
+   sceptical verifier whose prompt says: default to refuted unless you can reproduce it from the
+   artifact. Heavier shapes (judge panels, a critic round, fix-then-reverify loops) stay available for
+   novel or hardware-facing work and for mistakes that are expensive to unwind; say why when you use
+   one.
+2. **Cap the finder pool at four dimensions per review.** Batch verification at nine findings per
+   agent, grouped by file. Never one agent per finding per lens.
+3. **Report the refutation count in the first line of every review summary.** A pass that refutes
+   nothing is a warning about the verifiers, not a clean bill; say so when it happens.
+4. **Name what is already settled before the finders start** — measured on hardware, verified in a
+   prior pass, or owned by another session — in the preamble every agent sees. Finders may challenge
+   it with a better artifact, but should not re-report it.
+
 ## Established so far — a snapshot, not a verdict
 
 **Read this to recognise a question that has already had work done on it, not as a reason to stop
