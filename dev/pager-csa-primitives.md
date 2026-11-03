@@ -835,7 +835,7 @@ beacon). Assume a competent WIDS sees this.
 # 1. current firmware metadata (version, release date, sha256)
 curl -s https://downloads.hak5.org/api/devices/wifipineapplepager
 # 2. fetch the image
-curl -s -L -o pager.bin https://downloads.hak5.org/api/devices/wifipineapplepager/firmwares/latest
+curl -s -L -o pager.bin https://downloads.hak5.org/api/devices/wifipineapplepager/firmwares/1.1.3-stable   # not /latest, which serves 2.0.0 and voids every address below
 # 3. verify sha256 against the API value, then extract
 binwalk -e pager.bin      # uImage (LZMA kernel) + squashfs rootfs
 # 4. grep the rootfs as shown above

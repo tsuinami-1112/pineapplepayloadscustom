@@ -261,11 +261,11 @@ overridden:
 - **`?`** — the beacon could not be read, so none of the labels mean anything. CSA leads, because it
   works on every badge but `NONE`, and you are asked once ("Fire blind?") before the picker.
 
-| Option | Command | Frames |
-|---|---|---|
-| `DEAUTH` | `PINEAPPLE_DEAUTH_CLIENT [bssid] [target] [channel]` | deauth + disassociation |
-| `CSA` | `PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]` | channel-switch announcements |
-| `BOTH` | `PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]` | all three |
+| Option | Command | Frames | Scope |
+|---|---|---|---|
+| `DEAUTH` | `PINEAPPLE_DEAUTH_CLIENT [bssid] [target] [channel]` | deauth + disassociation | one client (from a client row); whole BSS from an AP row |
+| `CSA` | `PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]` | channel-switch announcements | whole BSS |
+| `BOTH` | `PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]` | all three | whole BSS |
 
 An AP target is attacked broadcast (`ff:ff:ff:ff:ff:ff`); a client target is attacked through its
 own AP's BSSID on that AP's channel. An unassociated client has no BSS to announce from and is
@@ -284,12 +284,17 @@ re-read from Recon:
 | `LOCK_FAILED` | the radio would not hold the target channel; nothing was transmitted |
 | `NO_CLIENTS` | AP target with no visible clients; refused before anything was transmitted |
 
-A broadcast attempt (AP target) is measured on the AP's visible, non-randomised clients, since the AP
-itself keeps beaconing whatever happens: `responses.tsv` gets one row per client with that client as
-`target`, and the verdict shown is the aggregate (`MOVED` only when every client went quiet,
-`NO_EFFECT` when any kept transmitting, `INCONCLUSIVE` otherwise). An AP with no visible clients is
-refused. Recon's packet counter is direction-blind, so a disconnected client that keeps probing still
-reads as transmitting.
+What is measured follows the attack's **scope**, not the row you picked. A `cli`-scope attempt
+(`DEAUTH` from a client row) measures that one device. A `bss`-scope attempt (`CSA` or `BOTH` from any
+row, or anything from an AP row) is measured on the BSSID's visible, non-randomised clients, since the
+AP itself keeps beaconing whatever happens; the device you picked is always among them, even behind a
+randomised MAC. `responses.tsv` gets one row per measured subject, and the verdict shown is the
+aggregate (`MOVED` only when every subject went quiet, `NO_EFFECT` when any kept transmitting,
+`INCONCLUSIVE` otherwise). When you picked one device and more than one was measured, a second line
+`picked <mac>: <verdict>` names that device's own result, so a collateral `NO_EFFECT` cannot read as
+"my camera stayed up". A subject Recon never listed before the burst is `INCONCLUSIVE`, never `MOVED`.
+An AP with no visible clients is refused. Recon's packet counter is direction-blind, so a
+disconnected client that keeps probing still reads as transmitting.
 
 Beacon protection (WPA3, Dec-2020 onward, mandatory for AP support in Wi-Fi 7) defeats the CSA
 path outright, and CSA bursts are detectable — Kismet alerts on CSA floods and on announcements
@@ -305,7 +310,8 @@ that reuse a captured beacon's timestamp.
   `#first_seen|last_seen|run_id|mac|role|cat|vendor|label|conf|id_score|beh_score|beh_verdict|band|ssid|ap_bssid|ch|freq|rssi_best|rssi_best_ts|rssi_last|prox|n_seen|pkt_rate|signals|lan_tag|lat|lon`
   (`band` = 2/5/6 GHz, `signals` = tags, epoch seconds, `-` for empty). ~160 B per MAC.
 - `events.log`: `epoch level msg` (cycle, alert, mode, watch, locate, cfg, warn, run, resp).
-- `responses.tsv` (only once a response is fired): one `|`-separated row per attempt. Header:
+- `responses.tsv` (only once a response is fired): one `|`-separated row per measured subject, so a
+  `bss`-scope attempt against a BSSID with four visible clients writes four rows for one attempt. Header:
   `#epoch|mac|role|bssid|target|ch|band|badge|rsn_caps|beacon_prot|attack|cmd|lock|pk_before|pk_after|verdict`
   (`rsn_caps` is the raw 2-octet RSN Capabilities field, low octet first; `beacon_prot` is octet 10
   of the Extended Capabilities element, or `-` when absent).

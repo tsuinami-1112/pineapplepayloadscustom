@@ -57,8 +57,11 @@ inferred:
 | `BOTH` | `PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]` | all three | whole BSS |
 
 **Scope is not what the signatures suggest, and `attack_scope()` is the one place that decides.**
-`CSA` takes no target because it rides in a beacon and has no unicast recipient, so its breadth is
-certain from the signature — **[V]**. `BOTH` advertises a `[target]` that its handler parses and
+`CSA` takes no target: the **[V]** reading is the Go handler, `StartDeauthCsa` parses one MAC with a
+28-byte frame against `StartDeauth`'s two and 32 (CLAUDE.md §"2.0.0-stable, analysed"), and hak5cmd's
+help lists `[bssid] [channel]` — the help alone would not settle it, since this repo has caught it
+wrong three times. "Because it rides in a beacon" is the carrier question §13 still lists as not
+proven, so that explanation is **[A]**; the breadth does not depend on it. `BOTH` advertises a `[target]` that its handler parses and
 discards, so it is BSS-wide too; the readings behind that are **[V]** and the "discards it"
 conclusion is **[A]**, falsifiable by firing `BOTH` at one client among several and seeing whether
 the others stay associated (evidence in `CLAUDE.md` §"2.0.0-stable, analysed"). And because
@@ -417,7 +420,14 @@ option labelled `unknown`, fires `PINEAPPLE_DEAUTH_CLIENT_CSA` with bssid and ch
 writes loot rows with badge `?` and caps `-`, and that declining it sends nothing and writes no row;
 `noinj` (the Reolink AP moved to DFS channel 52) checks that gate 1 answers `NOINJ` with no capture
 and no lock, and that declining "Try anyway?" sends nothing. An accepted "Try anyway?" is still
-unreached by any test.
+unreached by any test. `cliscope` (2026-11-03) drives both scopes from one client-row menu: `DEAUTH`
+confirms one device and measures one subject; `BOTH` confirms "EVERY client", measures the four
+visible clients, loots all four and names the picked device's own verdict. `disrupt` now runs at the
+shipped default with no `RESPONSE` override in the saved config, and asserts the transmit. The selftest
+pins `attack_scope` on four cases, `resp_snapshot` on seven (own-BSS sweep, cli scope, bss from a client
+row, a target whose row is foreign to the BSSID in both scopes, a randomised pick kept, one Recon read
+for the sweep, and the `recon_stat` fallback adding an out-of-sweep pick for one more read), and
+`resp_verdict - - - - 0` as `INCONCLUSIVE`.
 
 Unit coverage:
 

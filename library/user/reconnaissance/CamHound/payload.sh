@@ -166,6 +166,10 @@ set_state() {
 
 # resp_clamp_lock: the EXAMINE lock must outlast lock_target's read-back (~2.5 s) + the fire + RESP_SETTLE_SECS,
 # or the post-fire Recon read happens after hopping resumed and a stalled counter reads as MOVED.
+# The +5 budgets the read-back and the fire only. When the pick is not in the bss sweep (real firmware,
+# where ap_mac is '-'), the post-fire resp_snapshot also runs recon_stat: up to two more _pineap RECON
+# reads, each under a 15 s timeout, before unlock_target. How long those take on the device decides
+# whether 5 is enough; a bench run with 'resp' lines timestamped in events.log settles it (day-one 8b).
 resp_clamp_lock() {
   local min=$(( RESP_SETTLE_SECS + 5 ))
   if (( RESP_LOCK_SECS < min )); then
@@ -2639,6 +2643,12 @@ IWFIX
   rm -f "$tmp/recon_calls"; R_TARGET=a2:71:db:00:00:14; resp_snapshot bss
   st "snapshot bss keeps a random pick"  "$(st_subjects)" "a2:71:db:00:00:14 ec:71:db:00:00:11 ec:71:db:00:00:12"
   st "snapshot bss stays at one read"    "$(wc -l <"$tmp/recon_calls" | tr -d ' ')" "1"
+  # A pick whose row is not under R_BSSID (the shape real firmware yields: ap_mac '-') is still a subject,
+  # via the recon_stat fallback: one extra read, the sweep's two clients plus the pick with its own counter.
+  rm -f "$tmp/recon_calls"; R_TARGET=ec:71:db:00:00:13; resp_snapshot bss
+  st "snapshot bss: a pick outside the sweep is added by recon_stat" "$(st_subjects)" "ec:71:db:00:00:11 ec:71:db:00:00:12 ec:71:db:00:00:13"
+  st "snapshot bss: the added pick carries its own counter"       "${RS_PK[ec:71:db:00:00:13]}" "300"
+  st "snapshot bss: the fallback costs exactly one more read"     "$(wc -l <"$tmp/recon_calls" | tr -d ' ')" "2"
   rm -f "$tmp/recon_calls"
   eval "$orig_recon"
   RS_PK=(); RS_T=(); R_BSSID=aa:00:00:00:00:10; R_TARGET=ff:ff:ff:ff:ff:ff; R_CH=6; R_BAND=2

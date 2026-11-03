@@ -79,10 +79,11 @@ s_locate() {   # Locate on the Hikvision AP: bars, tiers, clean stop
   check "locate: MONITOR started and bars drawn" "grep -q '^MONITOR MONITOR c0:56:e3' $T/log && grep -q 'dBm \[' $T/log"
   check "locate: stop logged" "grep -q 'locate stop' $LOOT/events.log"
 }
-s_disrupt() {   # RESPONSE=1: Disrupt on the Reolink AP against log-only stubs; posture, lock, loot row
-  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+s_disrupt() {   # shipped default (RESPONSE=1 from the config block, nothing written to the saved config): Disrupt on the Reolink AP against log-only stubs; posture, lock, loot row
+  reset; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   rules disrupt '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
-  answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  answers t t B; run
+  check "disrupt: fires at the shipped default, with no RESPONSE override in the saved config" "! grep -q '^RESPONSE=' $HARNESS_CFG && grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
   check "disrupt: posture read under a lock on the target channel" "grep -q 'TCPDUMP beacon ec71db000010' $T/log && grep -q 'PINEAPPLE_EXAMINE_BSSID ec:71:db:00:00:10' $T/log"
   check "disrupt: badge D+C from the synthetic beacon" "grep -q 'PICKER\[Disrupt \[D+C\]' $T/log"
   check "disrupt: regulatory probe ran against phy0, the phy the net fixture names" "grep -q '^IW phy phy0 channels' $T/log"

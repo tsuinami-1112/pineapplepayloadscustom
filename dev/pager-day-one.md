@@ -93,6 +93,12 @@ found and fixed one over-permissive defect (`dev/pager-prearrival.md` §5).
 
 **8b. Two `_pineap` answers CamHound's recon rung needs** — neither needs the receiver.
 
+- **First, on the 1.1.3 unit you have:** `_pineap RECON DEVICES format=json | head -c 2000`. The Recon
+  UI already knows which AP a selected client is on (`_RECON_SELECTED_AP_BSSID`, present since firmware
+  1.0.9 per `library/recon/client/example/payload.sh:19-31`), and `DEVICES` is the one recon verb that
+  lists devices on 1.1.3. If any key in that output carries a BSSID, the client half of CamHound is a
+  verb-and-parser change in `recon_lines`/`JQ_CLI`, with no flash needed. **[A]** that `DEVICES` carries
+  it; the 2.0.0 `HELP PARSE` device object does not, so expect no, and be pleased by yes.
 - **Where a client's association lives.** `RECON CLIENTS` is 2.0.0-only and its documented device
   object has no association field (CLAUDE.md §"2.0.0-stable, analysed"), so on a 2.0.0 unit with an
   associated client run `_pineap RECON CLIENTS format=json | jq '.[0]|keys'` and look for any key

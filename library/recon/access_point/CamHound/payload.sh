@@ -156,6 +156,10 @@ set_state() {
 
 # resp_clamp_lock: the EXAMINE lock must outlast lock_target's read-back (~2.5 s) + the fire + RESP_SETTLE_SECS,
 # or the post-fire Recon read happens after hopping resumed and a stalled counter reads as MOVED.
+# The +5 budgets the read-back and the fire only. When the pick is not in the bss sweep (real firmware,
+# where ap_mac is '-'), the post-fire resp_snapshot also runs recon_stat: up to two more _pineap RECON
+# reads, each under a 15 s timeout, before unlock_target. How long those take on the device decides
+# whether 5 is enough; a bench run with 'resp' lines timestamped in events.log settles it (day-one 8b).
 resp_clamp_lock() {
   local min=$(( RESP_SETTLE_SECS + 5 ))
   if (( RESP_LOCK_SECS < min )); then

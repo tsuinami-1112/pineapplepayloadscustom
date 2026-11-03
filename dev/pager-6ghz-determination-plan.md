@@ -103,7 +103,7 @@ This is why Hak5 shipped "CSA Deauthentication" in 1.1.1 *while leaving the 6 GH
 ```sh
 mkdir -p ~/pager-baseline && cd ~/pager-baseline
 curl -L -o pineapplepager-firmware-1.1.3-signed.bin \
-  https://downloads.hak5.org/api/devices/wifipineapplepager/firmwares/latest
+  https://downloads.hak5.org/api/devices/wifipineapplepager/firmwares/1.1.3-stable   # NOT .../latest: that serves 2.0.0 since 2026-10-29
 sha256sum pineapplepager-firmware-1.1.3-signed.bin
 curl -s https://downloads.hak5.org/api/devices/wifipineapplepager/firmwares | head -c 400
 curl -sL https://documentation.hak5.org/wifi-pineapple-pager/firmware-recovery.md -o firmware-recovery.md
