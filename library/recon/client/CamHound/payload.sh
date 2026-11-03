@@ -47,7 +47,7 @@ AUTO_WATCH=1            # * offer Watch on the top candidate / on NEW CONFIRMED-
 AUTO_LOCATE=1           # * offer Locate after a STREAM/EVENT Watch (0 = off)
 AUTO_WATCH_RSSI=-72     # minimum last RSSI to auto-offer Watch
 RSSI_MIN=0              # * optional list gate, dBm, on the best RSSI known for the MAC (0 = off, widest net)
-BAND6=0                 # * also scan 6 GHz: writes the device's bands + 6 for this run, restores them at exit (0 = leave as set)
+BAND6=0                 # * also scan 6 GHz: writes the device's bands + 6 for this run; put back at exit, by the watchdog if killed, or at the next start (0 = leave as set)
 SOUND=0                 # * RINGTONE alert on NEW CONFIRMED (0 = off)
 SHOW_MODULES=1          # modules list in the menu
 MODULE_HINT_RSSI=-55    # client RSSI at or above which a BUSY module gets the "Watch?" hint
@@ -1115,14 +1115,27 @@ run_lock() {
   ( while kill -0 "$MAIN_PID" 2>/dev/null; do sleep 3; done
     while read -r p; do [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done <"$CHILD_FILE" 2>/dev/null
     _pineap EXAMINE CANCEL; PINEAPPLE_EXAMINE_RESET
-    # Only while the lock is still this run's: a run started since has replayed the state file at its own
-    # start (bands_recover) and may have written its own, which this watchdog must not undo.
-    if [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ]; then
-      # a band write this run issued is undone too (only the user payload writes BANDS_STATE; the hooks never do)
-      # shellcheck disable=SC2046   # the file holds the band tokens
-      [ -s "$BANDS_STATE" ] && PINEAPPLE_SET_BANDS "$RECON_IF" $(tr ',' ' ' <"$BANDS_STATE") && rm -f "$BANDS_STATE"
-      rm -f "$LOCK_FILE" "$CHILD_FILE"
-    fi ) >/dev/null 2>&1 &
+    [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ] && rm -f "$LOCK_FILE" "$CHILD_FILE"
+    bands_watchdog_restore ) >/dev/null 2>&1 &
+}
+# A band write the dead run issued is undone by its own watchdog. Keyed on the record, not on the lock: the record
+# (BANDS_STATE, "<bands> <pid>") names the run that wrote it, and only that run's watchdog replays it, whoever holds
+# the lock now -- a Recon hook started since never replays (it has no bands code), a new user payload replays any
+# record at its start (bands_recover) and then writes its own under its own pid, which is left alone here. The record
+# is claimed by rename before it is acted on, so a replay racing this watchdog cannot act on it twice.
+bands_watchdog_restore() {
+  local b pid claim="$BANDS_STATE.$MAIN_PID"
+  read -r b pid <"$BANDS_STATE" 2>/dev/null || return 0
+  [ "$pid" = "$MAIN_PID" ] || return 0                               # another run's record: theirs to replay
+  mv -f "$BANDS_STATE" "$claim" 2>/dev/null || return 0               # a new run's bands_recover claimed it first
+  read -r b pid <"$claim" 2>/dev/null
+  if [ "$pid" != "$MAIN_PID" ]; then mv -f "$claim" "$BANDS_STATE" 2>/dev/null; return 0; fi   # changed hands in between: give it back
+  if [[ $b =~ ^[256](,[256])*$ ]]; then
+    # shellcheck disable=SC2086   # the tokens are the argument list
+    PINEAPPLE_SET_BANDS "$RECON_IF" ${b//,/ } >/dev/null 2>&1
+    log bands "restored $b by the watchdog (run $MAIN_PID killed)"
+  fi
+  rm -f "$claim"
 }
 # --- camhound lib end ---
 # --- watch core begin ---

@@ -44,8 +44,10 @@ not); whether the band write applies after a fresh Recon session or a pineapd re
 
 ## Loading onto the Pager
 
-Nothing of ours has run on the device yet. Everything is laptop-verified (selftest 225/0, harness 13
-scenarios 0 failures on fbfab6a). Install per the user README; first run: watch `events.log` for
+Nothing of ours has run on the device yet. Everything is laptop-verified (selftest 236/0, harness 13
+scenarios / 71 checks, 0 failures, on the commit after a17b583; `--selftest` is safe to run on the
+Pager since that commit, every device-changing command being stubbed). Install per the user README;
+first run: watch `events.log` for
 `client verb: DEVICES`, `inj probe: tx phy phy1`, the Settings pages, and inventory persistence across
 two runs. Known-inert on 1.1.3: client association (kit detection, client Watch, per-client Disrupt);
 the response rung from the user payload (refused before transmit); BAND6 (no-op). The Recon client
@@ -70,8 +72,9 @@ the other session builds on `bands_*`. What the fixes changed, so the next reade
   `{` or an escaped quote) is written beside the code. The `nojq` scenario compares both parsers
   over `RECON DEVICES` too, and `fix/devices.json` is stored with sorted keys, the measured order.
 - The docs that still called the client rung "never run" and the DEVICES verb an "untested lead" are
-  date-qualified (CLAUDE.md, RESPONSE.md §13 and its 1.1.3 row); the starred-key count is sixteen
-  everywhere it is stated.
+  date-qualified (CLAUDE.md, RESPONSE.md §13's lead paragraph; its 1.1.3 row's `where` cell now names
+  `resp_snapshot`'s sweep instead of a line number); the starred-key count is sixteen everywhere it is
+  stated.
 - Found while testing the fix, not by the review: the run_lock watchdog outlives its process by up to
   3 s, so the next run's band write could be undone (and its state file deleted) by the previous run's
   watchdog. It now acts on the bands only while the lock file still names its own pid; a run started
@@ -81,4 +84,15 @@ the other session builds on `bands_*`. What the fixes changed, so the next reade
 (`run_harness.sh all`) passed on the committed source — 70 checks, 0 failures; the one `Killed` line
 in its output is the `lock` scenario's deliberate SIGKILL. A second tiered review of the fix set
 (`git diff 033a091 ec3b548`, four finder dimensions, three lenses for device code and one sceptic
-for docs and tests) was run after it; its outcome and any fixes are in the commit that follows.
+for docs and tests) ran after it: **refuted 3 of 20** (29 raw, 20 after dedupe; 14 full-tier, 6
+light-tier), confirmed 17, all fixed in the commit after a17b583. Two mattered. The watchdog's
+lock-ownership guard assumed any run started since replays the band record, which a Recon hook does
+not, so the record now names the pid that wrote it and only that run's watchdog replays it
+(`bands_watchdog_restore`, lib), the next user-payload start replaying any record; both claim the
+file by rename first. And the selftest's new `settings_reset` case reached the real
+`PAYLOAD_DEL_CONFIG` on a Pager, so `st_stub_ui` now stubs every device-changing command whether or
+not it is present. The rest: the undo record is a precondition of the write, `bands_recover`
+validates the record and refreshes the status line, the pineapd-restart report fires on both
+outcomes, reset follows BAND6 both ways, harness arm `bands6` kills a BAND6 run and watches its
+watchdog, and six doc spots. Refuted, left alone: the once-per-run guard keyed on `BANDS_ORIG`, the
+fixture's lack of an empty-object device (the selftest covers it), the config comment's wording.

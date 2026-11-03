@@ -172,7 +172,7 @@ survive updates: `PAYLOAD_SET_CONFIG camhound CYCLE_SECS 10` (`PAYLOAD_DEL_CONFI
 removes it). Overrides are counted on the start screen and listed in `events.log`. The **Settings**
 menu item does the same from the device, on two pages. **Recon settings** holds CYCLE_SECS,
 THR_STREAM_UP, COOLDOWN_SECS, DEDUPE_H, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH, AUTO_LOCATE and BAND6
-(the tenth key, one page on behind `More...`);
+(the last two sit on the second page, behind `More...`, because `Back` takes the first slot);
 **Response settings** holds RESPONSE, RESPONSE_CONFIRM, AUTO_RESPOND, RESP_LOCK_SECS, RESP_SETTLE_SECS
 and POSTURE_TTL. Numbers go through NUMBER_PICKER, switches are On/Off. Switching RESPONSE_CONFIRM off
 asks a second time, because it is the key that keeps every transmit behind a dialog; a lock shorter
