@@ -253,12 +253,24 @@ read as "the camera I aimed at stayed up". So when the pick is a client row and 
 one subject, `resp_fire` also names that device's own verdict (`picked <mac>: <verdict>`, on screen
 and in `events.log`).
 
-**This widening depends on the association column, which does not work on real firmware yet.** The
-`bss` sweep matches a client's `ap_mac` against `R_BSSID`, and the 2.0.0 device object exposes no
-association field at all (see `/CLAUDE.md`), so on a Pager the sweep finds no clients and the
-measurement falls back to the picked target alone — one subject, as before. The honest state is that
-the *selection rule* is now correct and the *data to feed it* is not yet there. **[A]** *Falsified
-by:* `_pineap RECON CLIENTS format=json` returning a key carrying the BSSID.
+**This widening depends on the association column, which no shipped firmware supplies.** The `bss`
+sweep matches a client's `ap_mac` against `R_BSSID`; `JQ_CLI` reads that as `(.ap_mac // .bssid //
+"-")` and the 2.0.0 device object has **neither** key, so every client row carries `-`. The sweep
+then matches nothing. *Corrected 2026-11-03 — an earlier revision of this paragraph said the
+measurement "falls back to the picked target alone, one subject, as before". That is wrong on both
+row types and the error mattered, because it made the rung look merely degraded when it is in fact
+unable to fire:*
+
+- on an **AP row** the picked target is `ff:ff:ff:ff:ff:ff`, so there is no target to fall back to:
+  subjects are **0** and `resp_fire` refuses with `NO_CLIENTS` before transmitting;
+- on a **client row** it never reaches the sweep at all — `AP_OF` is `-`, so `resp_target` returns 1
+  and `disrupt_menu` aborts with "nothing to attack: no associated BSS".
+
+So the *selection rule* is correct and the *data to feed it* does not exist on either firmware. The
+honest state is that **the response rung cannot transmit on 1.1.3 or on 2.0.0**, and the blocker is
+the association column, not the firmware version — see §13. **[A]** *Falsified by:* `_pineap RECON
+CLIENTS format=json | jq '.[0]|keys'` on a 2.0.0 Pager with an associated client returning any key
+that carries the BSSID.
 
 This distinction was a real defect, not a refinement. The first version asked Recon about
 `R_TARGET` directly, and for a broadcast attempt that is `ff:ff:ff:ff:ff:ff`, which never appears in
@@ -418,17 +430,33 @@ Unit coverage:
 
 ## 13. What is unverified
 
-**First, a firmware floor: on 1.1.3 this rung cannot transmit at all.** `_pineap RECON CLIENTS` does
-not exist before 2.0.0 (`CLIENTS` occurs 0 times in 1.1.3's `_pineap`, 12 in 2.0.0's — see
-`/CLAUDE.md`), so `recon_lines CLIENTS` returns nothing. `resp_snapshot` then finds no subjects, and
-an AP row is refused with `NO_CLIENTS` before anything is sent (`resp_fire`). Client rows never
-populate `CLI_LINES` either, so no client row exists to take the other branch. Every reachable
-Disrupt target on 1.1.3 is an AP row and is refused. It fails **safe** — nothing is transmitted and
-the refusal is logged — but the rung is **inert** until the device is flashed to 2.0.0, which in turn
-voids every `pineapd` address pinned in `dev/pager-csa-primitives.md`. **[A]** — the `CLIENTS` byte
-count is `[V]` from the binaries and the refusal path was read in the payload; composing the two is
-the inference. *Falsified by:* a Disrupt on an AP row on a 1.1.3 Pager transmitting, or returning
-anything other than `NO_CLIENTS`.
+**⚠ First, the floor: this rung cannot transmit on ANY shipped firmware. Flashing does not fix it.**
+Two different mechanisms, same outcome, and the blocker is the **association column** rather than the
+firmware version:
+
+| firmware | what happens | where |
+|---|---|---|
+| **1.1.3** | `_pineap RECON CLIENTS` does not exist, so `recon_lines CLIENTS` returns nothing and no client row is ever recorded. Every row in the list is an AP row, `R_TARGET` is broadcast, subjects are 0 → `NO_CLIENTS`. | `payload.sh:1166` loop never runs; `resp_fire` refusal |
+| **2.0.0** | client rows arrive, but the device object has no association field, so `JQ_CLI`'s `(.ap_mac // .bssid // "-")` yields `-` for all of them. An **AP row** finds 0 matching clients → `NO_CLIENTS`. A **client row** never reaches the sweep: `AP_OF` is `-`, so `resp_target` returns 1 and `disrupt_menu` aborts with "nothing to attack: no associated BSS". | `payload.sh:1983-1984`; `resp_snapshot`'s `[ "$a" = "$R_BSSID" ]` |
+
+*Corrected 2026-11-03. An earlier revision of this section said the rung was "inert until the device
+is flashed to 2.0.0", which is wrong and was the more consequential half of the claim — it implied a
+flash would buy a working response rung, and it would not. The 1.1.3 half stands.* It fails **safe**
+on both: nothing is transmitted and the refusal is logged.
+
+**[A]** — the `CLIENTS` byte count and the 2.0.0 device-object shape are `[V]` from the binaries (see
+`/CLAUDE.md`); the code paths were read in the payload; composing them is the inference. *Falsified
+by:* a Disrupt transmitting on either firmware, or `_pineap RECON CLIENTS format=json | jq
+'.[0]|keys'` on a 2.0.0 Pager returning any key that carries the BSSID.
+
+**The one lead worth trying before concluding the rung is unreachable.** Two things are recorded but
+have never been put together: 1.1.3 *does* have `RECON DEVICES` and `COUNT DEVICES` (only `CLIENTS`
+is new), and CamHound calls neither — `recon_lines` only ever asks for `APS` or `CLIENTS`
+(`payload.sh:794-798`). Separately, the 2.0.0 `probe`/`beacon` objects are keyed by an opaque
+internal **SSID hash**, so a client's probe-key set and an AP's beacon-key set could in principle be
+intersected to recover an association the JSON does not state outright. Neither is tested. Both are
+one on-device command away: `_pineap RECON DEVICES format=json | head -c 2000`. **[A]**, offered as a
+direction, not a finding — a client probing for an SSID is not necessarily associated to it.
 
 Needs a Pager:
 

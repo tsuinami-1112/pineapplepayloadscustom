@@ -135,10 +135,13 @@ BSS-wide and then measured and looted exactly one device. Subjects now follow th
 the picked target is always among them (even behind a randomised MAC the `bss` sweep skips), and
 `resp_fire` names that device's own verdict when there is more than one subject so a collateral
 `NO_EFFECT` cannot read as "my camera stayed up". Harness scenario `cliscope` drives both arms.
-Caveat worth knowing before trusting the wider loot: the `bss` sweep matches `ap_mac` against
-`R_BSSID`, and the 2.0.0 device object exposes **no association field**, so on real firmware the
-sweep finds nothing and measurement degrades to the picked target alone. The selection rule is
-right; the data to feed it is not there yet.
+Caveat, and it is bigger than a loot-quality note: the `bss` sweep matches `ap_mac` against
+`R_BSSID`, and **no shipped firmware supplies an association**, so the sweep matches nothing. That
+does not "degrade measurement to the picked target" — *an earlier revision of this line said so and
+it was wrong on both row types.* An AP row has no target to fall back to (broadcast), so subjects
+are 0 and `resp_fire` refuses; a client row never reaches the sweep because `AP_OF` is `-` and
+`resp_target` returns 1 at `payload.sh:1983`. The selection rule is right and **the rung cannot fire
+on either firmware** — see the warning below and `RESPONSE.md` §13.
 
 **Selftest** — `selftest()` plus `st_*` helpers (`st_device`, `st_pcap`, `st_beacon_pcap`,
 `st_gate`, `st_hex2bin`, `st_subjects`). Runs on a laptop with no radio. Add a case for anything you change.
@@ -440,9 +443,14 @@ associated client returning a key that carries the BSSID — documented or not. 
 capture via `rsn_caps`; on 2.0.0 the recon JSON exposes it per beaconed SSID directly. Whether to
 use it is the CamHound sessions' call — recorded here only so it is not re-derived.
 
-**Fixing the payload is `clever-wozniak`'s to do, not this branch's** — it has 281 lines of
-in-flight change on that exact file, and the standing rule is not to correct another branch's work
-from here.
+**Status, 2026-11-03: `clever-wozniak` has landed (`f012922`, merged at `536de09`), so this is no
+longer somebody else's in-flight work.** Verify with `git merge-base --is-ancestor
+origin/claude/clever-wozniak-hn3xyn HEAD`. Consequences (1) and (3) above are **fixed in code**:
+`JQ_CLI` now reads `(.probe // {})[]?` (the object's values), and `parse_cli_fallback` walks the
+probe object's `ssid` values and initialises `ap="-"`. **(2) is not fixed and is not fixable by a
+parser change** — the field does not exist in the firmware's output. It is the one defect left, and
+it is what makes the response rung unable to fire on either firmware (see the warning in "Open, and
+needs the hardware").
 
 **ANSWERED 2026-11-02 — CamHound is clear, and the DuckyScript surface is narrower than feared.**
 Enumerated across `usr/bin`, `bin`, `sbin`, `usr/sbin`, `usr/libexec`: **69 commands in each
@@ -597,17 +605,29 @@ packet counters move the way `resp_verdict` assumes; whether CSA moves a real cl
 count-byte experiment (day-one step 17a). (`inj_parse_channels` is **no longer** on this list — it
 ran against a live radio on 2026-11-02 and was correct; see "First contact".)
 
-**⚠ On 1.1.3 the response rung cannot transmit at all — it is inert, not merely untested.**
-`_pineap RECON CLIENTS` does not exist before 2.0.0, so `recon_lines CLIENTS` returns nothing,
-`resp_snapshot` finds no subjects, and an AP row is refused with `NO_CLIENTS` before anything is
-sent. Client rows never populate `CLI_LINES`, so no client row exists to take the other branch —
-every reachable Disrupt target on 1.1.3 is an AP row, and every one is refused. It fails **safe**
-(nothing transmitted, refusal logged) but `RESPONSE=1` buys nothing until the device is flashed,
-and flashing to 2.0.0 voids every `pineapd` address pinned above. **[A]** — the `CLIENTS` byte
-count is `[V]` and the refusal path was read in the payload; composing them is the inference. Note
-this is a *fourth* consequence of the `CLIENTS` gap; the three recorded above are all about the
-client **parsers**, and none of them covers the response rung. *Falsified by:* a Disrupt on an AP
-row on a 1.1.3 Pager transmitting, or returning anything but `NO_CLIENTS`.
+**⚠ The response rung cannot transmit on ANY shipped firmware, and flashing does not fix it.**
+The blocker is the **association column**, not the firmware version. On **1.1.3** `_pineap RECON
+CLIENTS` does not exist, so no client row is ever recorded and every list row is an AP row:
+`R_TARGET` is broadcast, subjects are 0, `resp_fire` refuses with `NO_CLIENTS`. On **2.0.0** client
+rows arrive but the device object has no association field, so `JQ_CLI`'s `(.ap_mac // .bssid //
+"-")` gives `-` for every one; an AP row then finds 0 matching clients and refuses the same way,
+while a client row never even reaches the sweep because `AP_OF` is `-` and `resp_target` returns 1
+at `payload.sh:1983-1984`. It fails **safe** on both (nothing transmitted, refusal logged).
+
+*Corrected 2026-11-03: the first version of this warning said `RESPONSE=1` "buys nothing until the
+device is flashed", which implied a flash would buy a working rung. It would not, and that was the
+load-bearing half. The 1.1.3 half stands.* Note the determination plan's standing instruction —
+`dev/pager-6ghz-determination-plan.md:155` "never flash it to this device" — therefore costs nothing
+on this axis. **[A]** — the byte counts and object shape are `[V]`; the code paths were read; the
+composition is the inference. *Falsified by:* a Disrupt transmitting on either firmware, or
+`_pineap RECON CLIENTS format=json | jq '.[0]|keys'` on a 2.0.0 Pager returning a key with the BSSID.
+
+**Untested lead, recorded so it is not lost:** 1.1.3 *does* have `RECON DEVICES`/`COUNT DEVICES`
+(only `CLIENTS` is new) and CamHound calls neither — `recon_lines` asks only for `APS` or `CLIENTS`
+(`payload.sh:794-798`). And the `probe`/`beacon` objects are keyed by an opaque SSID hash, so
+intersecting a client's probe keys with an AP's beacon keys might recover an association the JSON
+never states. Either would be worth more than a flash. One command checks the first:
+`_pineap RECON DEVICES format=json | head -c 2000`.
 
 **Two 2.0.0 hazards in this repo's other payloads** — `wigle-toolkit` really deletes loot, and
 `wardrive_activate` is broken. Both are `[V]` from the rootfs trees and written up in full in
