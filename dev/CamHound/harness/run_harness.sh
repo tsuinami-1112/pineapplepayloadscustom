@@ -26,6 +26,7 @@ sed -e 's/^WIN_SECS=10 /WIN_SECS=5 /' -e 's/^LIVE_WINDOWS=6 /LIVE_WINDOWS=4 /' \
 grep -q "LOOT_DIR=\"$LOOT\"" "$T/payload_fast.sh" || { echo "sed on the config block failed"; exit 1; }
 grep -q "INJ_SYSFS=\"$T/phy\"" "$T/payload_fast.sh" || { echo "sed on INJ_SYSFS failed"; exit 1; }
 grep -q "NET_SYSFS=\"$T/net\"" "$T/payload_fast.sh" || { echo "sed on NET_SYSFS failed"; exit 1; }
+grep -q 'BANDS_PROBE_N=2; ' "$T/payload_fast.sh" || { echo "sed on BANDS_PROBE_N failed"; exit 1; }
 mkdir -p "$T/phy/phy0"          # fallback-merge fixture only: with the net tree below naming phy0, no scenario lists this directory
 mkdir -p "$T/net/wlan1mon/phy80211"; printf 'phy0\n' >"$T/net/wlan1mon/phy80211/name"   # RECON_IF's phy: the probe reads this one, no merge
 printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
@@ -74,6 +75,13 @@ s_nojq() {   # fallback parser gives the same mac|conf rows as jq
   cut -d'|' -f4,9 "$LOOT/inventory.tsv" | grep -v '^mac' | sort >"$T/rows_nojq"
   check "nojq: fallback parser used" "grep -q 'jq=0' $LOOT/events.log"
   check "nojq: identical mac|conf rows" "[ -s $T/rows_jq ] && cmp -s $T/rows_jq $T/rows_nojq"
+  # and the same comparison over RECON DEVICES, the path a 1.1.3 unit takes
+  reset; rules nojq3 '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 run
+  cut -d'|' -f4,9 "$LOOT/inventory.tsv" | grep -v '^mac' | sort >"$T/rows_jq_dev"
+  reset; rules nojq4 '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B
+  HARNESS_NO_CLIENTS=1 PATH="$HERE/stubs:$T/bin:$nojq${keep}" timeout 300 bash "$T/payload_fast.sh" >/dev/null 2>"$T/stderr"
+  cut -d'|' -f4,9 "$LOOT/inventory.tsv" | grep -v '^mac' | sort >"$T/rows_nojq_dev"
+  check "nojq: identical rows from RECON DEVICES on both parsers" "grep -q 'client verb: DEVICES' $LOOT/events.log && grep -q . $T/rows_jq_dev && cmp -s $T/rows_jq_dev $T/rows_nojq_dev"
 }
 s_locate() {   # Locate on the Hikvision AP: bars, tiers, clean stop
   reset; rules loc '^CamHound' 'Scan,Exit' 'Review hits' '3,Exit' '^[0-9]+ HIK' 'Locate,Back' "${COMMON[@]}"; answers t t B t t t t A; run
@@ -181,6 +189,19 @@ s_bands() {   # BAND6=1: the band write at start (trusted on read-back), the sta
   reset; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   rules bands2 '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; run
   check "bands: nothing written at the default" "! grep -q '^PINEAPPLE_SET_BANDS' $T/log && grep -q '6 GHz not scanned' $T/log"
+  # the behaviour measured on 1.1.3: the call is accepted and changes nothing -- say so, and still restore the issued write
+  reset; printf 'CYCLE_SECS=5\nBAND6=1\n' >"$HARNESS_CFG"
+  rules bands3 '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; HARNESS_BANDS_NOOP=1 run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "bands: a no-op write is reported, not claimed" "grep -q '^LOG yellow band write not applied: radio stayed on 2,5' $T/log && grep -q 'bands: write not applied' $LOOT/events.log && grep -q '6 GHz not scanned' $LOOT/report_*.txt"
+  check "bands: an issued but untrusted write is still restored at exit" "[ \"\$(grep -c '^PINEAPPLE_SET_BANDS wlan1mon 2 5$' $T/log)\" = 1 ] && grep -q 'restored 2,5 (write was never trusted' $LOOT/events.log && [ ! -e $LOOT/.bands_orig ]"
+  # switched on from Settings (BAND6 is the tenth Recon key, behind More...): applied at once, restored at exit
+  reset; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  rules bands4 '^CamHound' 'Settings,Exit' '^Settings' 'Recon settings,Back' '^Recon settings' 'BAND6 = 0,Back' '^BAND6:' 'On' "${COMMON[@]}"; answers t; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "bands: Settings toggle applies the write now and persists the key" "grep -q 'PAYLOAD_SET_CONFIG camhound BAND6 1' $T/log && grep -q '^PINEAPPLE_SET_BANDS wlan1mon 2 5 6$' $T/log && grep -q '^LOG bands: 2,5,6' $T/log && grep -q '^PINEAPPLE_SET_BANDS wlan1mon 2 5$' $T/log"
+  # a run killed mid-way leaves the state file; the next start restores from it before anything else
+  reset; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"; printf '2,5' >"$LOOT/.bands_orig"
+  rules bands5 '^CamHound' 'Exit' "${COMMON[@]}"; answers t; run
+  check "bands: a state file left by a killed run is replayed at the next start" "grep -q '^PINEAPPLE_SET_BANDS wlan1mon 2 5$' $T/log && grep -q 'restored 2,5 left by a previous run' $LOOT/events.log && [ ! -e $LOOT/.bands_orig ]"
 }
 s_devices() {   # 1.1.3: no CLIENTS verb, so clients come from RECON DEVICES (devices that neither beacon nor answer probes), with no association
   reset; rules devices '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 run

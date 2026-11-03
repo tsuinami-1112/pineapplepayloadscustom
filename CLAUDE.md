@@ -79,7 +79,7 @@ Line numbers drift; find things by name (`grep -n '^name()' payload.sh`).
 **Recon rung** — `load_signatures`, `add_sig`, `vendor_of`, `score_device`, `clean_text`,
 `is_setup_ap`, `review_list`, `main_menu`, `preflight`, `write_report`; `rssi_gate_ok` (the RSSI_MIN
 list gate, kit-aware: a kit AP passes when a kit client does) with `rssi_min_clamp`; the Settings menu
-(`SETTINGS_TABLE` rows are `KEY|kind|floor|group|label` over all fifteen starred keys; `settings_menu`
+(`SETTINGS_TABLE` rows are `KEY|kind|floor|group|label` over all sixteen starred keys; `settings_menu`
 is a short top page, `settings_group` one page per group, Recon and Response; `settings_apply` re-runs
 `resp_clamp_lock` for the two timing keys and persists a raised lock; RESPONSE_CONFIRM-off asks twice;
 `cfg_snapshot_defaults`/`settings_reset`; `cfg_note_set` keeps the override count honest);
@@ -88,7 +88,8 @@ association key), and `recon_verb_probe` picks `RECON DEVICES` (`JQ_DEVCLI`: dev
 beacon nor answer probes) where `RECON CLIENTS` is refused, as on 1.1.3; `bands_plan`/`bands_apply`/
 `bands_restore` are the opt-in 6 GHz band write (`BAND6`; `bands_live6` samples the live channel and
 the write is trusted only when 6 GHz is seen there or in uci — on bare 1.1.3 it was a no-op with
-pineapd running, day-one 8c; restored in `cleanup`, not copied into the hooks); `raw_up_rows` feeds `--replay` a `raw_<run>.txt`.
+pineapd running, day-one 8c; every issued write is restored in `cleanup`, by the watchdog, or by
+`bands_recover` at the next start from `BANDS_STATE`; not copied into the hooks); `raw_up_rows` feeds `--replay` a `raw_<run>.txt`.
 
 **Watch rung** (behaviour without identity) — `watch_menu`, `start_caps`/`stop_caps`,
 `pcap_words`/`pcap_bytes` (both have `od` fallbacks), `pcap_buckets`, `bucket_stats`,
@@ -406,15 +407,15 @@ associated; or statically, by a `target` field reachable from `_All`'s type desc
 **Whether to relabel or reorder the menu is the CamHound-deauth session's call, not this
 branch's** — only the factually wrong comment was fixed here.
 
-**⚠ `_pineap RECON CLIENTS` is new in 2.0.0 — CamHound's client rung has never actually run.**
+**⚠ `_pineap RECON CLIENTS` is new in 2.0.0 — until 2026-11-03 CamHound's client rung had never actually run.**
 Reading **[V]**: the byte string `CLIENTS` occurs **0 times** in 1.1.3's `/usr/bin/_pineap` and
 **12 times** in 2.0.0's; lowercase `clients` 0 vs 4, `client` 0 vs 5. Count them with
 `python3 -I -c "import sys;print(open(sys.argv[1],'rb').read().count(b'CLIENTS'))" <_pineap>` —
 **not** with `grep -c`, which counts matching *lines* and on a binary with few newlines returns a
 smaller, method-dependent number (an earlier revision of this line said "6 times" for exactly that
-reason). The `0` is the robust half either way: absent is absent. So `recon_lines CLIENTS` has
-returned nothing on every firmware the payload has ever run on, and starts returning rows the
-moment the Pager is flashed.
+reason). The `0` is the robust half either way: absent is absent. So `recon_lines CLIENTS` returned
+nothing on every firmware the payload ran on before 2026-11-03, when `recon_verb_probe` started
+routing a 1.1.3 unit to `RECON DEVICES` (measured below); on 2.0.0 the verb exists and answers.
 
 Corroborated by the help lines themselves — `strings -a <_pineap> | grep -E '^RECON '`, sorted:
 
@@ -685,12 +686,14 @@ composition is the inference. *Falsified by:* a Disrupt transmitting **from the 
 form of this falsifier said "on an AP row", which could not catch the hook path at all), or
 `_pineap RECON CLIENTS format=json | jq '.[0]|keys'` on a 2.0.0 Pager returning a key with the BSSID.
 
-**Untested lead, recorded so it is not lost:** 1.1.3 *does* have `RECON DEVICES`/`COUNT DEVICES`
-(only `CLIENTS` is new) and CamHound calls neither — `recon_lines` asks only for `APS` or `CLIENTS`
-(`payload.sh:794-798`). And the `probe`/`beacon` objects are keyed by an opaque SSID hash, so
-intersecting a client's probe keys with an AP's beacon keys might recover an association the JSON
-never states. Either would be worth more than a flash. One command checks the first:
-`_pineap RECON DEVICES format=json | head -c 2000`.
+**Lead, half followed 2026-11-03:** 1.1.3 *does* have `RECON DEVICES`/`COUNT DEVICES` (only
+`CLIENTS` is new), and CamHound now reads it where `CLIENTS` is refused (`recon_verb_probe`,
+`JQ_DEVCLI`), so probe-only clients are listed on 1.1.3 with their probed SSIDs — but the object
+carries no association (measured on the bench, bare 1.1.3), so that half is spent. The other half is
+untested: the `probe`/`beacon` objects are keyed by an opaque SSID hash, so intersecting a client's
+probe keys with an AP's beacon keys might recover an association the JSON never states. **[A]** — a
+client probing for an SSID is not necessarily associated to it, and the BSSID-filtered capture in
+`dev/CamHound/RESPONSE.md` §13a is the better evidence.
 
 **The association column is a chokepoint gating FIVE features, and the rung is fixable without it.**
 Verified in code: `AP_OF[mac] == "-"` disables Watch-on-a-client and Stimulus (`watchable()`,

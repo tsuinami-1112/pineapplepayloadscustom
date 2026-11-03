@@ -1,4 +1,5 @@
 #!/bin/bash
 # log the call and make the fake uci read the new bands back, as the device would
 printf 'PINEAPPLE_SET_BANDS %s\n' "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"
+[ -n "${HARNESS_BANDS_NOOP:-}" ] && exit 0   # the measured 1.1.3 behaviour: accepted, changes nothing
 shift; IFS=,; printf '%s' "$*" > "${HARNESS_BANDS:-/tmp/cs_harness_bands}"

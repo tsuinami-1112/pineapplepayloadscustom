@@ -171,12 +171,13 @@ Edit the config block at the top of `payload.sh`. Starred keys can also be set w
 survive updates: `PAYLOAD_SET_CONFIG camhound CYCLE_SECS 10` (`PAYLOAD_DEL_CONFIG camhound CYCLE_SECS`
 removes it). Overrides are counted on the start screen and listed in `events.log`. The **Settings**
 menu item does the same from the device, on two pages. **Recon settings** holds CYCLE_SECS,
-THR_STREAM_UP, COOLDOWN_SECS, DEDUPE_H, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH and AUTO_LOCATE;
+THR_STREAM_UP, COOLDOWN_SECS, DEDUPE_H, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH, AUTO_LOCATE and BAND6
+(the tenth key, one page on behind `More...`);
 **Response settings** holds RESPONSE, RESPONSE_CONFIRM, AUTO_RESPOND, RESP_LOCK_SECS, RESP_SETTLE_SECS
 and POSTURE_TTL. Numbers go through NUMBER_PICKER, switches are On/Off. Switching RESPONSE_CONFIRM off
 asks a second time, because it is the key that keeps every transmit behind a dialog; a lock shorter
 than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows what is in force.
-`Reset defaults` deletes the saved overrides of all fifteen keys. Changes apply at once and persist.
+`Reset defaults` deletes the saved overrides of all sixteen keys. Changes apply at once and persist.
 
 | Key | Default | Persist | Meaning |
 |---|---|---|---|
@@ -187,7 +188,7 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 | AUTO_WATCH / AUTO_LOCATE | 1 / 1 | * | the two-press funnel; set 0 for walk surveys |
 | AUTO_WATCH_RSSI | -72 | | minimum last RSSI to auto-offer Watch |
 | RSSI_MIN | 0 | * | optional list gate, dBm, on the best RSSI known for the MAC, carried-over best included (0 = widest net; a kit AP passes when a kit client does) |
-| BAND6 | 0 | * | also scan 6 GHz: writes the device's bands plus 6 for this run, trusted only when the radio is then seen on a 6 GHz channel (or uci reads it back), restored at exit; 2.4 GHz dwell drops to about a third. On bare 1.1.3 the write was a no-op with pineapd running (day-one 8c), and the status line says so |
+| BAND6 | 0 | * | also scan 6 GHz: writes the device's bands plus 6 for this run, trusted only when the radio is then seen on a 6 GHz channel (or uci reads it back); every issued write is put back at exit, by the watchdog if the run is killed, or at the next start; 2.4 GHz dwell drops to about a third. On bare 1.1.3 the write was a no-op with pineapd running (day-one 8c), and the status line says so |
 | SOUND | 0 | * | ringtone on CONFIRMED |
 | SHOW_MODULES | 1 | | modules list in the menu |
 | MODULE_HINT_RSSI | -55 | | one-time "module strong+busy: Watch?" hint |

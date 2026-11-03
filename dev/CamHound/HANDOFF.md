@@ -51,7 +51,36 @@ two runs. Known-inert on 1.1.3: client association (kit detection, client Watch,
 the response rung from the user payload (refused before transmit); BAND6 (no-op). The Recon client
 hook can transmit from the Pager's Recon client menu, behind the picker and the confirm.
 
-## Review in flight when this was written
+## Review of the band write and the DEVICES fallback — done, fixes landed
 
 Workflow run `wf_f3640da9-dde` (tiered, per the CLAUDE.md rules) over `git diff 7b5e8fc 4356936`;
-its template is in `dev/review/`. Findings that survive get fixed on this branch before handover.
+its template is in `dev/review/`. **Refuted 1 of 19** (11 full-tier, 8 light-tier); 18 confirmed and
+fixed in the commit after 033a091. A refutation rate that low is a warning about the verifiers as
+much as a verdict on the code — the one refuted finding (the README's needs line) was a doc claim,
+and every code finding was confirmed; a second pass by a fresh reader is cheap and worth it before
+the other session builds on `bands_*`. What the fixes changed, so the next reader does not re-derive:
+
+- A band write that is issued but never trusted is restored anyway at exit (`BANDS_WROTE` beside
+  `BANDS_ORIG`), by `settings_reset` when BAND6 goes back to 0, by the watchdog when the UI kills the
+  run, and by `bands_recover` at the next start — the pre-write bands are kept on disk in
+  `BANDS_STATE` (`$LOOT_DIR/.bands_orig`, so a reboot does not lose it). Harness arms `bands3-5`
+  drive the no-op write measured on 1.1.3, the Settings toggle, and a state file left by a killed run.
+- `parse_cli_fallback` now treats a device as an AP only when its `beacon`/`response` object is
+  non-empty, matching `JQ_DEVCLI`'s `length == 0` test; its known limit (a probed SSID containing
+  `{` or an escaped quote) is written beside the code. The `nojq` scenario compares both parsers
+  over `RECON DEVICES` too, and `fix/devices.json` is stored with sorted keys, the measured order.
+- The docs that still called the client rung "never run" and the DEVICES verb an "untested lead" are
+  date-qualified (CLAUDE.md, RESPONSE.md §13 and its 1.1.3 row); the starred-key count is sixteen
+  everywhere it is stated.
+- Found while testing the fix, not by the review: the run_lock watchdog outlives its process by up to
+  3 s, so the next run's band write could be undone (and its state file deleted) by the previous run's
+  watchdog. It now acts on the bands only while the lock file still names its own pid; a run started
+  since has already replayed the file. The harness showed it as three intermittent `bands` failures.
+
+**Pending when the usage limit hit (2026-11-03):** the full harness (`run_harness.sh all`) had passed
+every scenario except `bands` on a fast copy taken before the watchdog guard; `bands` passes on the
+final source, and a full re-run on the final source was started but not confirmed — run it first.
+A second tiered review of this fix set (run `wf_9834bba3-188`, script
+`camhound-review-fixes-review-wf_9834bba3-188.js` under the session's `workflows/scripts/`, scope
+`git diff 033a091`) was in flight and is resumable from its cache; its findings, if any survive, are
+the next fixes on this branch.

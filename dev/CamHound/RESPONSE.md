@@ -454,7 +454,7 @@ firmware version:
 
 | firmware | what happens | where |
 |---|---|---|
-| **1.1.3** | `_pineap RECON CLIENTS` does not exist (measured 2026-11-03: `Unknown recon command`, rc 255); since that day `recon_lines CLIENTS` reads `RECON DEVICES` instead, whose object carries no association, so a client row has `AP_OF` `-` and `resp_target` refuses it like 2.0.0's. Every AP row has `R_TARGET` broadcast, subjects are 0 → `NO_CLIENTS`. | `payload.sh:1166` loop never runs; `resp_fire` refusal |
+| **1.1.3** | `_pineap RECON CLIENTS` does not exist (measured 2026-11-03: `Unknown recon command`, rc 255); since that day `recon_lines CLIENTS` reads `RECON DEVICES` instead, whose object carries no association, so a client row has `AP_OF` `-` and `resp_target` refuses it like 2.0.0's. Every AP row has `R_TARGET` broadcast, subjects are 0 → `NO_CLIENTS`. | `resp_snapshot`'s `[ "$a" = "$R_BSSID" ]` sweep iterates the `RECON DEVICES` client rows and matches none, every `AP_OF` being `-` → `resp_fire` refusal; a client row is refused earlier, by `resp_target` |
 | **2.0.0** | client rows arrive, but the device object has no association field, so `JQ_CLI`'s `(.ap_mac // .bssid // "-")` yields `-` for all of them. An **AP row** finds 0 matching clients → `NO_CLIENTS`. A **client row** never reaches the sweep: `AP_OF` is `-`, so `resp_target` returns 1 and `disrupt_menu` aborts with "nothing to attack: no associated BSS". | `payload.sh:1983-1984`; `resp_snapshot`'s `[ "$a" = "$R_BSSID" ]` |
 
 *Corrected 2026-11-03. An earlier revision of this section said the rung was "inert until the device
@@ -480,14 +480,17 @@ format=json | jq '.[0]|keys'` on a 2.0.0 Pager returning any key that carries th
 form of this falsifier named AP rows only, which could not have caught the hook path — the lesson
 being that a falsifier naming one entry point does not test a claim made about the payload.)
 
-**The one lead worth trying before concluding the rung is unreachable.** Two things are recorded but
-have never been put together: 1.1.3 *does* have `RECON DEVICES` and `COUNT DEVICES` (only `CLIENTS`
-is new), and CamHound calls neither — `recon_lines` only ever asks for `APS` or `CLIENTS`
-(`payload.sh:794-798`). Separately, the 2.0.0 `probe`/`beacon` objects are keyed by an opaque
-internal **SSID hash**, so a client's probe-key set and an AP's beacon-key set could in principle be
-intersected to recover an association the JSON does not state outright. Neither is tested. Both are
-one on-device command away: `_pineap RECON DEVICES format=json | head -c 2000`. **[A]**, offered as a
-direction, not a finding — a client probing for an SSID is not necessarily associated to it.
+**The lead that was worth trying, followed 2026-11-03.** 1.1.3 *does* have `RECON DEVICES` and
+`COUNT DEVICES` (only `CLIENTS` is new), and CamHound now reads `RECON DEVICES` where `CLIENTS` is
+refused (`recon_verb_probe` at start, `JQ_DEVCLI` for the rows): probe-only clients are listed on
+1.1.3 with their probed SSIDs. What the on-device command showed is that the object carries **no
+association** — the device's own keys are `freq`, `mac`, `packets`, `signal`, `time` beside the
+hash-keyed `beacon`/`response`/`probe` objects — so that half of the lead is spent, and the rung is
+no nearer firing from the user payload. The other half is untested: the `probe`/`beacon` objects are
+keyed by an opaque internal **SSID hash**, so a client's probe-key set and an AP's beacon-key set
+could in principle be intersected to recover an association the JSON does not state outright.
+**[A]**, offered as a direction, not a finding — a client probing for an SSID is not necessarily
+associated to it, and §13a's capture route is the better evidence.
 
 ### 13a. The association column is a chokepoint, and the rung is fixable without it
 

@@ -106,6 +106,7 @@ POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
 RESP_LOCK_SECS=20       # * EXAMINE lock duration held across a response (must exceed fire + settle)
 RESP_SETTLE_SECS=6      # * wait after transmitting before re-reading the target to judge the effect
 LOOT_DIR="/root/loot/CamHound"
+BANDS_STATE="$LOOT_DIR/.bands_orig"      # the bands a run changed, on disk (survives a reboot) so a killed run is undone by the watchdog or the next start
 OUI_FILE="/lib/hak5/oui.txt"; OUI_FILE_ALT="/rom/lib/hak5/oui.txt"
 # identity weights (constants, not table columns)
 W_OUI=45; W_WEAK=20; W_MODULE=0; W_ENDPOINT=-25; W_SSID=45; W_SSID_WEAK=15
@@ -790,7 +791,8 @@ parse_cli_fallback() {   # stdout: mac|ap_mac|packets|signal|probes|freq|time|ch
   json=$(cat); json=${json//\},\{/$'\n'}
   while IFS= read -r frag; do
     [[ $frag =~ \"mac\":\"([^\"]+)\" ]] || continue
-    [[ $frag == *\"beacon\":* || $frag == *\"response\":* ]] && continue   # an AP (RECON DEVICES lists both kinds)
+    [[ $frag == *\"beacon\":\{\"* || $frag == *\"response\":\{\"* ]] && continue   # an AP: a NON-EMPTY beacon/response object, as jq's length test
+    # limit, accepted: a probed SSID containing { } or an escaped quote defeats the brace strip below (the jq path is exact)
     mac=${BASH_REMATCH[1]}; ap="-"; pk=0; sig="-"; fr=0; t=0; ch=0; probes=""
     # the device's own fields sit beside its probe object (keys are alphabetical on the device: freq, mac, packets,
     # probe, signal, time), and the probe values repeat time/signal/freq/channel -- so strip every nested {...}
@@ -1123,7 +1125,14 @@ run_lock() {
   ( while kill -0 "$MAIN_PID" 2>/dev/null; do sleep 3; done
     while read -r p; do [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done <"$CHILD_FILE" 2>/dev/null
     _pineap EXAMINE CANCEL; PINEAPPLE_EXAMINE_RESET
-    [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ] && rm -f "$LOCK_FILE" "$CHILD_FILE" ) >/dev/null 2>&1 &
+    # Only while the lock is still this run's: a run started since has replayed the state file at its own
+    # start (bands_recover) and may have written its own, which this watchdog must not undo.
+    if [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ]; then
+      # a band write this run issued is undone too (only the user payload writes BANDS_STATE; the hooks never do)
+      # shellcheck disable=SC2046   # the file holds the band tokens
+      [ -s "$BANDS_STATE" ] && PINEAPPLE_SET_BANDS "$RECON_IF" $(tr ',' ' ' <"$BANDS_STATE") && rm -f "$BANDS_STATE"
+      rm -f "$LOCK_FILE" "$CHILD_FILE"
+    fi ) >/dev/null 2>&1 &
 }
 # --- camhound lib end ---
 
@@ -1488,7 +1497,7 @@ mode_menu() {
 
 
 # ================================================================================ settings ===
-# Table-driven settings menu over all fifteen starred keys: key|kind|floor|group|label, where group
+# Table-driven settings menu over all sixteen starred keys: key|kind|floor|group|label, where group
 # is recon or response and settings_menu routes one page per group. Values are applied to the
 # running session and persisted with PAYLOAD_SET_CONFIG; Reset deletes the overrides and restores
 # the config-block defaults captured at start (cfg_snapshot_defaults runs before load_overrides).
@@ -1551,6 +1560,7 @@ settings_reset() {
     printf -v "$key" '%s' "${CFG_DEFAULT[$key]}"; cfg_note_set "$key" ""
   done <<<"$SETTINGS_TABLE"
   resp_clamp_lock; rssi_min_clamp; DEDUPE_RUN=1   # every starred key is in the table, so nothing stays overridden after this
+  [ "$BAND6" = 0 ] && bands_restore                # the reset switches BAND6 off like settings_apply would: the bands follow
   log cfg "reset defaults"; LOG "settings reset to defaults"
 }
 settings_menu() {   # one short top page, so the master switch and Reset are never behind More...
@@ -1590,12 +1600,17 @@ settings_group() {   # settings_group <group> <title>: the group's keys on one p
 
 # =================================================================================== bands ===
 # Opt-in 6 GHz for this run: PINEAPPLE_SET_BANDS <iface> <current bands> 6 once after the overrides, put
-# back in cleanup. Two argument forms are seen in the wild -- `<iface> 2 5 [6]` (Hak5 docs; PLAN_v2 row 32)
-# and `both` (nosey-neighbor) -- so a write is trusted only when uci reads the bands back with a 6, and a
-# pineapd restart (which empties Recon) is detected by pid and said out loud. Neither has run on a device
-# yet: day-one 8c. 6 GHz costs dwell on the bands cameras actually use (PLAN_v2 item 21), hence opt-in.
+# back in cleanup. The argument form is the token one, `[interface] {2} {5} {6}` (usage line read on the
+# bare 1.1.3 unit, 2026-11-03; nosey-neighbor's `both` is wrong). A write is TRUSTED only when the radio is
+# then seen on a 6 GHz channel (bands_live6) or uci reads the 6 back, because on that unit the call changed
+# neither uci nor the live hop set with pineapd running -- a no-op as issued, reported as such; what a
+# fresh Recon session or a pineapd restart does with it is day-one 8c. A pineapd restart (which empties
+# Recon) is detected by pid and said out loud. Every ISSUED write is restored, trusted or not: BANDS_WROTE
+# remembers what was there, on disk too (BANDS_STATE), so the watchdog or the next start undoes a killed
+# run. 6 GHz costs dwell on the bands cameras actually use (PLAN_v2 item 21), hence opt-in.
 # Not copied into the hooks: a hook runs inside a Recon selection and must not change what Recon scans.
-BANDS_ORIG=""     # the device's bands before this run changed them; "" = nothing to restore
+BANDS_ORIG=""     # the device's bands before a TRUSTED write; "" = not trusted (status line stays honest)
+BANDS_WROTE=""    # the device's bands before any ISSUED write; "" = nothing to restore
 bands_read() { local a; a=$(uci -q get "pineapd.$RECON_IF.bands" 2>/dev/null || uci -q get pineapd.wlan1.bands 2>/dev/null); printf '%s' "${a//[![:alnum:],]/}"; }
 bands_plan() {   # bands_plan <current, e.g. 2,5> -> the SET_BANDS band tokens with 6 added, or "" when nothing needs writing
   local cur="$1" b out=""
@@ -1624,6 +1639,7 @@ bands_apply() {   # write the device's bands + 6 for this run; BANDS_ORIG rememb
   [ -n "$want" ] || { log bands "no write: bands ${cur:-unreadable}"; return 0; }
   command -v PINEAPPLE_SET_BANDS >/dev/null 2>&1 || { log warn "bands: PINEAPPLE_SET_BANDS not present"; ui_ok && LOG yellow "band write: command not present"; return 1; }
   pid0=$(pidof pineapd 2>/dev/null)
+  BANDS_WROTE="$cur"; mkdir -p "${BANDS_STATE%/*}" 2>/dev/null; printf '%s' "$cur" >"$BANDS_STATE" 2>/dev/null   # before the write: an interrupted or latent write is still undone
   # shellcheck disable=SC2086   # the tokens are the argument list
   PINEAPPLE_SET_BANDS "$RECON_IF" $want >/dev/null 2>&1; sleep 1
   bands_live6 && live=yes; got=$(bands_read); pid1=$(pidof pineapd 2>/dev/null)
@@ -1637,12 +1653,26 @@ bands_apply() {   # write the device's bands + 6 for this run; BANDS_ORIG rememb
   fi
   return 0
 }
-bands_restore() {   # put the device's bands back; a no-op unless this run changed them
-  [ -n "$BANDS_ORIG" ] || return 0
+bands_restore() {   # put the device's bands back after any write this run issued, trusted or not; a no-op otherwise
+  local orig="${BANDS_ORIG:-$BANDS_WROTE}" note=""
+  [ -n "$orig" ] || return 0
+  [ -n "$BANDS_ORIG" ] || note=" (write was never trusted; restoring anyway)"
   # shellcheck disable=SC2086
-  PINEAPPLE_SET_BANDS "$RECON_IF" ${BANDS_ORIG//,/ } >/dev/null 2>&1
-  log bands "restored $BANDS_ORIG"; BANDS_ORIG=""
+  PINEAPPLE_SET_BANDS "$RECON_IF" ${orig//,/ } >/dev/null 2>&1
+  log bands "restored $orig$note"; BANDS_ORIG=""; BANDS_WROTE=""; rm -f "$BANDS_STATE"
   BANDS_LINE=$(bands_read); [ -n "$BANDS_LINE" ] && [[ $BANDS_LINE != *6* ]] && BANDS_LINE+=" (6 GHz not scanned)"
+  return 0
+}
+bands_recover() {   # at start: a state file means a previous run wrote the bands and never restored them (killed mid-run)
+  local orig
+  [ -s "$BANDS_STATE" ] || return 0
+  orig=$(tr -cd '0-9,' <"$BANDS_STATE")
+  if [ -n "$orig" ] && command -v PINEAPPLE_SET_BANDS >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    PINEAPPLE_SET_BANDS "$RECON_IF" ${orig//,/ } >/dev/null 2>&1
+    log bands "restored $orig left by a previous run"; ui_ok && LOG yellow "bands: restored $orig left by a previous run"
+  fi
+  rm -f "$BANDS_STATE"
   return 0
 }
 
@@ -2790,7 +2820,7 @@ IWFIX
   st "bands plan: already has 6"      "$(bands_plan 2,5,6)" ""
   st "bands plan: single band"        "$(bands_plan 5)"     "5 6"
   st "bands plan: unreadable"         "$(bands_plan "")"    ""
-  local _rif=$RECON_IF _bl=$BANDS_LINE _bn=$BANDS_PROBE_N _bw=$BANDS_PROBE_WAIT; RECON_IF=wlan9mon; BANDS_ORIG=""; : >"$tmp/bands.log"; printf '2,5' >"$tmp/bands"
+  local _rif=$RECON_IF _bl=$BANDS_LINE _bn=$BANDS_PROBE_N _bw=$BANDS_PROBE_WAIT _bs=$BANDS_STATE; RECON_IF=wlan9mon; BANDS_ORIG=""; BANDS_WROTE=""; : >"$tmp/bands.log"; printf '2,5' >"$tmp/bands"; BANDS_STATE="$tmp/bands_orig"
   BANDS_PROBE_N=2; BANDS_PROBE_WAIT=0.05
   uci() { cat "$tmp/bands"; }
   iw() { if grep -q 6 "$tmp/bands"; then echo 'channel 37 (5975 MHz), width: 20 MHz'; else echo 'channel 6 (2437 MHz), width: 20 MHz'; fi; }
@@ -2802,9 +2832,14 @@ IWFIX
   st "bands restore: status line follows"                "$BANDS_LINE" "2,5 (6 GHz not scanned)"
   PINEAPPLE_SET_BANDS() { printf '%s\n' "$*" >>"$tmp/bands.log"; }   # a write that does not take
   bands_apply; st "bands apply: not trusted unless 6 GHz is seen live or in uci" "$BANDS_ORIG:$BANDS_LINE" ":2,5 (6 GHz not scanned)"
+  st "bands apply: an issued write is remembered on disk even when untrusted" "$BANDS_WROTE:$(cat "$BANDS_STATE")" "2,5:2,5"
+  bands_restore; st "bands restore: an untrusted write is restored anyway, state file gone" "$(sed -n 4p "$tmp/bands.log"):$BANDS_WROTE:$([ -e "$BANDS_STATE" ] && echo file || echo none)" "wlan9mon 2 5::none"
+  printf '2,5' >"$BANDS_STATE"; bands_recover; st "bands recover: a state file from a killed run is replayed and removed" "$(sed -n 5p "$tmp/bands.log"):$([ -e "$BANDS_STATE" ] && echo file || echo none)" "wlan9mon 2 5:none"
+  BANDS_ORIG=""; BANDS_WROTE=""; printf '2,5' >"$tmp/bands"; bands_apply; CONFIRMATION_DIALOG() { echo 1; }; settings_reset >/dev/null 2>&1; unset -f CONFIRMATION_DIALOG
+  st "settings reset: BAND6 back at 0 restores an issued write" "$(sed -n 7p "$tmp/bands.log"):$BAND6:$BANDS_WROTE" "wlan9mon 2 5:0:"
   uci() { echo '2,5'; }; iw() { echo 'channel 37 (5975 MHz), width: 20 MHz'; }   # applied at runtime, uci untouched
   bands_apply; st "bands apply: a live 6 GHz channel is enough, uci lagging" "$BANDS_ORIG:$BANDS_LINE" "2,5:2,5,6"
-  BANDS_ORIG=""; unset -f uci iw PINEAPPLE_SET_BANDS; RECON_IF=$_rif; BANDS_LINE=$_bl; BANDS_PROBE_N=$_bn; BANDS_PROBE_WAIT=$_bw
+  BANDS_ORIG=""; BANDS_WROTE=""; unset -f uci iw PINEAPPLE_SET_BANDS; RECON_IF=$_rif; BANDS_LINE=$_bl; BANDS_PROBE_N=$_bn; BANDS_PROBE_WAIT=$_bw; BANDS_STATE=$_bs
   RESP_SETTLE_SECS=6; RESP_LOCK_SECS=20; CFG_NOTE=""; CFG_OVERRIDES=0
   settings_apply RESP_LOCK_SECS 5; st "settings: a short lock is clamped on apply and the clamp is what gets counted" "$RESP_LOCK_SECS:$CFG_NOTE" "11: RESP_LOCK_SECS=11"
   settings_apply RESP_SETTLE_SECS 20; st "settings: raising settle re-clamps the lock" "$RESP_LOCK_SECS:$CFG_NOTE" "25: RESP_SETTLE_SECS=20 RESP_LOCK_SECS=25"
@@ -2819,6 +2854,9 @@ IWFIX
   if command -v jq >/dev/null 2>&1; then
     st "cli jq via DEVICES: an AP that also probes is not a client" "$(printf '%s' "$dj" | jq -r "$JQ_DEVCLI" | tr '\n' ' ')" "AA:BB:CC:00:00:01|-|12|-57|HomeNet|2437|1700000000|0 "
   fi
+  local ej='[{"beacon":{},"freq":2437,"mac":"AA:BB:CC:00:00:02","packets":5,"probe":{"9":{"channel":6,"count":1,"freq":2437,"signal":-60,"ssid":"Net2","ssidlen":4,"time":1700000001}},"signal":-60,"time":1700000001}]'
+  if command -v jq >/dev/null 2>&1; then st "cli jq via DEVICES: an empty beacon object is still a client" "$(printf '%s' "$ej" | jq -r "$JQ_DEVCLI")" "AA:BB:CC:00:00:02|-|5|-60|Net2|2437|1700000001|0"; fi
+  st "cli fallback via DEVICES: an empty beacon object is still a client" "$(printf '%s' "$ej" | parse_cli_fallback)" "AA:BB:CC:00:00:02|-|5|-60|Net2|2437|1700000001|0"
   st "cli fallback via DEVICES: same one row" "$(printf '%s' "$dj" | parse_cli_fallback | tr '\n' ' ')" "AA:BB:CC:00:00:01|-|12|-57|HomeNet|2437|1700000000|0 "
   st "cli fallback: same rows as jq from the same shape" "$(printf '%s' "$cj" | parse_cli_fallback | tr '\n' ' ')" "AA:BB:CC:00:00:01|-|12|-57|HomeNet,Cam_Net|2437|1700000000|0 AA:BB:CC:00:00:02|-|3|-70||5180|1700000002|0 "
   # 8 marked blocks
@@ -2862,7 +2900,7 @@ preflight
 apply_mode
 cfg_snapshot_defaults
 load_overrides
-[ "$BAND6" = 1 ] && bands_apply
+bands_recover; [ "$BAND6" = 1 ] && bands_apply
 (( CFG_OVERRIDES > 0 )) && { LOG yellow "cfg: $CFG_OVERRIDES overrides"; log cfg "$CFG_NOTE"; }
 log run "start v$VERSION run=$RUN_ID sigs=$SIG_COUNT($SIG_SOURCE) jq=$HAVE_JQ tcpdump=$HAVE_TCPDUMP bands=${BANDS_LINE:-?} mode=$MODE loaded=$LOADED_ROWS dedupe_h=$DEDUPE_H"
 LOG "CamHound $VERSION [$MODE]"$'\n'"sigs: $SIG_COUNT ($SIG_SOURCE)$( [ "$HAVE_JQ" = 1 ] || printf ' no-jq')$( [ "$HAVE_TCPDUMP" = 1 ] || printf ' no-tcpdump')"$'\n'"bands: ${BANDS_LINE:-?}"$'\n'"prox: uncal"

@@ -96,6 +96,7 @@ POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
 RESP_LOCK_SECS=20       # * EXAMINE lock duration held across a response (must exceed fire + settle)
 RESP_SETTLE_SECS=6      # * wait after transmitting before re-reading the target to judge the effect
 LOOT_DIR="/root/loot/CamHound"
+BANDS_STATE="$LOOT_DIR/.bands_orig"      # the bands a run changed, on disk (survives a reboot) so a killed run is undone by the watchdog or the next start
 OUI_FILE="/lib/hak5/oui.txt"; OUI_FILE_ALT="/rom/lib/hak5/oui.txt"
 # identity weights (constants, not table columns)
 W_OUI=45; W_WEAK=20; W_MODULE=0; W_ENDPOINT=-25; W_SSID=45; W_SSID_WEAK=15
@@ -780,7 +781,8 @@ parse_cli_fallback() {   # stdout: mac|ap_mac|packets|signal|probes|freq|time|ch
   json=$(cat); json=${json//\},\{/$'\n'}
   while IFS= read -r frag; do
     [[ $frag =~ \"mac\":\"([^\"]+)\" ]] || continue
-    [[ $frag == *\"beacon\":* || $frag == *\"response\":* ]] && continue   # an AP (RECON DEVICES lists both kinds)
+    [[ $frag == *\"beacon\":\{\"* || $frag == *\"response\":\{\"* ]] && continue   # an AP: a NON-EMPTY beacon/response object, as jq's length test
+    # limit, accepted: a probed SSID containing { } or an escaped quote defeats the brace strip below (the jq path is exact)
     mac=${BASH_REMATCH[1]}; ap="-"; pk=0; sig="-"; fr=0; t=0; ch=0; probes=""
     # the device's own fields sit beside its probe object (keys are alphabetical on the device: freq, mac, packets,
     # probe, signal, time), and the probe values repeat time/signal/freq/channel -- so strip every nested {...}
@@ -1113,7 +1115,14 @@ run_lock() {
   ( while kill -0 "$MAIN_PID" 2>/dev/null; do sleep 3; done
     while read -r p; do [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done <"$CHILD_FILE" 2>/dev/null
     _pineap EXAMINE CANCEL; PINEAPPLE_EXAMINE_RESET
-    [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ] && rm -f "$LOCK_FILE" "$CHILD_FILE" ) >/dev/null 2>&1 &
+    # Only while the lock is still this run's: a run started since has replayed the state file at its own
+    # start (bands_recover) and may have written its own, which this watchdog must not undo.
+    if [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ]; then
+      # a band write this run issued is undone too (only the user payload writes BANDS_STATE; the hooks never do)
+      # shellcheck disable=SC2046   # the file holds the band tokens
+      [ -s "$BANDS_STATE" ] && PINEAPPLE_SET_BANDS "$RECON_IF" $(tr ',' ' ' <"$BANDS_STATE") && rm -f "$BANDS_STATE"
+      rm -f "$LOCK_FILE" "$CHILD_FILE"
+    fi ) >/dev/null 2>&1 &
 }
 # --- camhound lib end ---
 # --- watch core begin ---
