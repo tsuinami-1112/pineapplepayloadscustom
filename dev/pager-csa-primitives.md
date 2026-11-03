@@ -344,7 +344,7 @@ below). Categories from hostap `ieee802_11_defs.h`: Spectrum Mgmt `0`, Public `4
 | Carrier | PMF covers it? | Against an **associated** client | Against a client **connecting** |
 |---|---|---|---|
 | **Beacon** + CSA element | No — a beacon is not a robust frame | **Switches channel** (`IEEE80211_CSA_SOURCE_BEACON`) — unless the client holds a BIGTK, which drops the beacon in rx before the element is parsed. | **Denies auth and assoc, beacon protection or not.** See below. |
-| **Spectrum Management action** (cat 0) | **Only when PMF is in use** | **Switches channel.** `:7506` assigns `PROT_ACTION` from the *category*, with no check that the frame arrived protected, and the protection filter in `ieee80211_drop_unencrypted_mgmt()` sits inside `if (rx->sta && test_sta_flag(rx->sta, WLAN_STA_MFP))`. So on a **non-PMF** BSS an unprotected, unicast cat-0 CSA moves the client with no MIC and no insider access — **provided the announced chandef differs from the current one**: a same-channel announcement is ignored for an action-frame source *whatever the mode* (`mlme.c:2533-2543` at v6.12 — the condition is `chandef_identical` and either `!mode` or a non-beacon source), and a bare element 37 parses as a 20 MHz chandef (`spectmgmt.c:305-332`), so on a 20 MHz BSS naming the current channel is a no-op after one log line. `pagerinj --csa` refuses that case unless `--allow-same-chan`; `--action` cannot check it. With PMF: dropped without keys → insider only. | n/a — needs association |
+| **Spectrum Management action** (cat 0) | **Only when PMF is in use** | **Switches channel.** `:7506` assigns `PROT_ACTION` from the *category*, with no check that the frame arrived protected, and the protection filter in `ieee80211_drop_unencrypted_mgmt()` sits inside `if (rx->sta && test_sta_flag(rx->sta, WLAN_STA_MFP))`. So on a **non-PMF** BSS an unprotected, unicast cat-0 CSA moves the client with no MIC and no insider access. With PMF: dropped without keys → insider only. | n/a — needs association |
 | **Protected Dual of Public Action** (cat 9) | **Yes**, unconditionally | Insider only — an unprotected cat-9 frame is dropped outright (`RX_DROP_U_UNPROT_DUAL`), no MFP test required. | n/a |
 | **Public Action / Extended CSA** (cat 4, action 4) | **No** — Public Action is outside the robust set | **No switch.** Tagged `UNPROT_ACTION`; with the CSA mode byte set it blocks the vif's TX queues, with mode 0 it does nothing at all. **The stall is not self-healing** — see below. | n/a |
 | **Probe response** + CSA element | No | **Ignored** — `ieee80211_rx_mgmt_probe_resp()` never reaches the chanswitch path. | **Denies assoc while the client is scanning.** See below. |
@@ -452,9 +452,8 @@ there, so `variable` **must** land on the first element byte — offset 26 (24 h
 action code). Hence `chan_switch` carries exactly one fixed byte and `sizeof` is 1, giving a gate of
 **26**. If `sizeof` were 0 the parser would read the action code (`4`) as an element ID and overrun,
 so 26 is forced by the kernel's own internal consistency. A minimal correct frame is
-24 + 1 + 1 + 5 = **31 bytes**, clearing it with five to spare. **[A]** by that argument — it is a
-derivation, not a reading, and the next subsection is what makes the numbers **[V]**, from the v6.12
-header; the arithmetic is **[A]** on any particular header text.
+24 + 1 + 1 + 5 = **31 bytes**, clearing it with five to spare. **[V]** by that argument; the arithmetic
+is **[A]** on any particular header text.
 
 Also required for that frame, from `rx612.c:3713–3739`: iftype STATION, ADHOC or MESH_POINT, and
 **A3 must equal the BSSID** (`sdata->deflink.u.mgd.bssid` for a station). A wrong A3 is a `break` —
@@ -484,7 +483,7 @@ one-byte drift either way makes the element invisible, with no diagnostic anywhe
 are pinned in `pagerinj`'s selftest for exactly that reason. **[V]**
 
 **2. There is a *second* per-element discard, and nothing above mentioned it.** Immediately after
-the count check, for both elements (`mlme.c:8351` for element 37, `:8356` for the eCSA, at v6.12):
+the count check, for both elements (`mlme.c:8350`):
 
 ```c
 if (csa && !csa->mode && csa->new_ch_num == cur_channel)   csa = NULL;
@@ -566,8 +565,7 @@ alike and calls `ieee80211_mesh_process_chnswitch()`, which performs a real swit
 `mesh_matches_local()`, so it is an unsecured-mesh vector. **[V]**
 
 A beacon CSA does not always switch, either. It disconnects instead on a cross-band announcement or
-an unusable chandef, is ignored on a same-channel announcement with `mode == 0` (for a beacon; for an
-action-frame source, with any mode — `mlme.c:2533-2535` at v6.12), and disconnects on
+an unusable chandef, is ignored on a same-channel announcement with `mode == 0`, and disconnects on
 a parse failure. "Switches channel" is one of several outcomes.
 
 ## What defeats it

@@ -43,7 +43,7 @@ ALERT_DIALOG=1          # * blocking ALERT on NEW CONFIRMED when AUTO_WATCH=0 (0
 AUTO_WATCH=1            # * offer Watch on the top candidate / on NEW CONFIRMED-LIKELY (0 = off)
 AUTO_LOCATE=1           # * offer Locate after a STREAM/EVENT Watch (0 = off)
 AUTO_WATCH_RSSI=-72     # minimum last RSSI to auto-offer Watch
-RSSI_MIN=0              # * optional list gate, dBm, on the best RSSI known for the MAC (0 = off, widest net)
+RSSI_MIN=0              # * optional list gate on session rssi_best (0 = off, widest net)
 SOUND=0                 # * RINGTONE alert on NEW CONFIRMED (0 = off)
 SHOW_MODULES=1          # modules list in the menu
 MODULE_HINT_RSSI=-55    # client RSSI at or above which a BUSY module gets the "Watch?" hint
@@ -77,8 +77,6 @@ DEDUPE_H=0              # * hours: a device already in inventory.tsv within this
 INVENTORY_KEEP_DAYS=30  # inventory.tsv rows older than this are pruned at start (0 = never)
 ROW_W=22                # list row budget (spike 19; expected 36-40 on the default theme)
 RECON_IF="wlan1mon"     # PineAP monitor radio (tri-band)
-INJ_SYSFS="/sys/class/ieee80211"   # phy list for the regulatory probe (the laptop harness points this at a fixture)
-NET_SYSFS="/sys/class/net"         # netdev tree the probe resolves RECON_IF's phy from (the laptop harness points this at a fixture)
 # response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
 RESPONSE=0              # * master switch for the response rung (0 = recon only)
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
@@ -151,22 +149,6 @@ set_state() {
   esac
 } 2>/dev/null
 
-# resp_clamp_lock: the EXAMINE lock must outlast lock_target's read-back (~2.5 s) + the fire + RESP_SETTLE_SECS,
-# or the post-fire Recon read happens after hopping resumed and a stalled counter reads as MOVED.
-resp_clamp_lock() {
-  local min=$(( RESP_SETTLE_SECS + 5 ))
-  if (( RESP_LOCK_SECS < min )); then
-    RESP_LOCK_SECS=$min; log warn "RESP_LOCK_SECS raised to $min: must exceed fire + settle"; ui_ok && LOG yellow "RESP_LOCK_SECS raised to $min"
-  fi
-  return 0
-}
-# rssi_min_clamp: RSSI_MIN is a dBm threshold (negative) or 0 for off; a positive value would hide every device that has a reading
-rssi_min_clamp() {
-  if (( RSSI_MIN > 0 )); then
-    log warn "RSSI_MIN $RSSI_MIN is not a dBm value: gate off"; ui_ok && LOG yellow "RSSI_MIN $RSSI_MIN ignored: use 0 (off) or a negative dBm"; RSSI_MIN=0
-  fi
-  return 0
-}
 # cfg KEY DEFAULT [FLOOR] -> persisted integer override or the default
 cfg() {
   local v
@@ -179,25 +161,22 @@ cfg() {
 }
 CFG_OVERRIDES=0; CFG_NOTE=""
 load_overrides() {
-  if command -v PAYLOAD_GET_CONFIG >/dev/null 2>&1; then
-    CYCLE_SECS=$(cfg CYCLE_SECS "$CYCLE_SECS" 5)
-    COOLDOWN_SECS=$(cfg COOLDOWN_SECS "$COOLDOWN_SECS" 0)
-    ALERT_DIALOG=$(cfg ALERT_DIALOG "$ALERT_DIALOG" 0)
-    AUTO_WATCH=$(cfg AUTO_WATCH "$AUTO_WATCH" 0)
-    AUTO_LOCATE=$(cfg AUTO_LOCATE "$AUTO_LOCATE" 0)
-    RSSI_MIN=$(cfg RSSI_MIN "$RSSI_MIN" -100)
-    SOUND=$(cfg SOUND "$SOUND" 0)
-    THR_STREAM_UP=$(cfg THR_STREAM_UP "$THR_STREAM_UP" 1)
-    RESPONSE=$(cfg RESPONSE "$RESPONSE" 0)
-    RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
-    RESP_LOCK_SECS=$(cfg RESP_LOCK_SECS "$RESP_LOCK_SECS" 5)
-    RESP_SETTLE_SECS=$(cfg RESP_SETTLE_SECS "$RESP_SETTLE_SECS" 1)
-    AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
-    POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
-    DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
-  fi
-  # both clamps also cover a config-block edit, so they run whether or not the device offers persistence
-  resp_clamp_lock; rssi_min_clamp
+  command -v PAYLOAD_GET_CONFIG >/dev/null 2>&1 || return 0
+  CYCLE_SECS=$(cfg CYCLE_SECS "$CYCLE_SECS" 5)
+  COOLDOWN_SECS=$(cfg COOLDOWN_SECS "$COOLDOWN_SECS" 0)
+  ALERT_DIALOG=$(cfg ALERT_DIALOG "$ALERT_DIALOG" 0)
+  AUTO_WATCH=$(cfg AUTO_WATCH "$AUTO_WATCH" 0)
+  AUTO_LOCATE=$(cfg AUTO_LOCATE "$AUTO_LOCATE" 0)
+  RSSI_MIN=$(cfg RSSI_MIN "$RSSI_MIN" -100)
+  SOUND=$(cfg SOUND "$SOUND" 0)
+  THR_STREAM_UP=$(cfg THR_STREAM_UP "$THR_STREAM_UP" 1)
+  RESPONSE=$(cfg RESPONSE "$RESPONSE" 0)
+  RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
+  RESP_LOCK_SECS=$(cfg RESP_LOCK_SECS "$RESP_LOCK_SECS" 5)
+  RESP_SETTLE_SECS=$(cfg RESP_SETTLE_SECS "$RESP_SETTLE_SECS" 1)
+  AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
+  POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
+  DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
 }
 
 # install dir: the UI runs a copy from /tmp, so look for the data file where it can live
@@ -335,7 +314,7 @@ band_of() {
 #     Beacon protection is NOT in the RSNXE (ID 244) -- that element has no such bit.
 # Badges: D+C both work | D?+C deauth is per-client, CSA works | C CSA only
 #         NONE both blocked | NOINJ radio may not transmit here | ? posture unread
-declare -A POSTURE POSTURE_TS POSTURE_RSN_C POSTURE_EXT_C   # badge, read time, and the caps it was read from, per BSSID
+declare -A POSTURE POSTURE_TS
 
 hex_octet() {   # hex_octet <hexstring> <index0> -> decimal octet, nonzero rc if short
   local b="${1:$(( $2 * 2 )):2}"
@@ -362,48 +341,27 @@ PINEAPD_DFS_BLOCKED=" 52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 14
 declare -A INJ_OK        # "<band>/<channel>" -> 1 permitted by gate 2, 0 refused
 INJ_PROBED=0             # 0 not yet probed, 1 probe usable, -1 probe failed -> fallback
 INJ_PROBE_TS=0
-INJ_TXPHY=""             # phy whose table INJ_OK holds; "" = unresolved, every phy under INJ_SYSFS merged
 
 # inj_probe must run in the PARENT shell: it populates INJ_OK, and csa_injectable is
 # reached from posture_from_caps inside $( ), where writes to globals are discarded.
-# shellcheck disable=SC2120   # `force` is deliberate API for a manual re-probe; the selftest is its only caller
+# shellcheck disable=SC2120   # `force` is deliberate API for a manual re-probe; no call site yet
 inj_probe() {   # inj_probe [force] -> 0 when INJ_OK is usable
-  local phy d line freq ch dis rows="" n=0 namef="$NET_SYSFS/$RECON_IF/phy80211/name"
+  local phy d line freq ch dis rows=""
   [ "$1" = force ] || { (( INJ_PROBED != 0 && EPOCHSECONDS - INJ_PROBE_TS < POSTURE_TTL )) && return $(( INJ_PROBED == 1 ? 0 : 1 )); }
-  INJ_PROBE_TS=$EPOCHSECONDS; INJ_PROBED=-1; INJ_OK=(); INJ_TXPHY=""
+  INJ_PROBE_TS=$EPOCHSECONDS; INJ_PROBED=-1; INJ_OK=()
   command -v iw >/dev/null 2>&1 || return 1
-  # Gate 2 is applied by the phy a frame leaves from, so only THAT phy's table is read: the one
-  # behind RECON_IF, named by $NET_SYSFS/$RECON_IF/phy80211/name (the same link the determination
-  # plan's A1 step reads with readlink, plan §A1, treating its absence as the radio not having
-  # probed).  RECON_IF is that phy because pineapd injects on it -- its live cmdline carries
-  # `--inject wlan1mon` (CLAUDE.md "First contact"); falsified by
-  # `cat /proc/$(pgrep -n pineapd)/cmdline | tr "\0" " "` showing --inject on another interface,
-  # in which case RECON_IF is the wrong phy to read.
-  # Merging every phy under $INJ_SYSFS -- the old behaviour, kept only as
-  # the fallback for when that file cannot be read -- is a plain last-row-wins overwrite per
-  # band/channel key in glob order, over-permissive wherever two phys share a band and disagree:
-  # the receive-only radio0 registers 2.4 GHz as the transmitter does (FCC antenna map and UCI
-  # band '2g', dev/pager-6ghz-determination-plan.md Addendum 2c), so every 2/<ch> key is written
-  # twice and the merged verdict is whichever phy sorts last, not the injecting one.  Hence the
-  # fallback is logged, never silent.  A resolved phy whose table reads empty fails the probe
-  # (conservative set) rather than merging radios that cannot be the transmitter.
-  if phy=$(cat "$namef" 2>/dev/null) && [[ $phy =~ ^[^[:space:]/]+$ ]]; then
-    INJ_TXPHY="$phy"; rows=$(iw phy "$phy" channels 2>/dev/null)$'\n'
-    log inj "probe: tx phy $phy ($namef)"
-  else
-    for d in "$INJ_SYSFS"/*; do
-      [ -e "$d" ] || continue
-      phy=${d##*/}; n=$((n + 1))
-      rows+=$(iw phy "$phy" channels 2>/dev/null)$'\n'
-    done
-    log warn "probe: tx phy unresolved ($namef unreadable); merged $n phys under $INJ_SYSFS"
-    ui_ok && LOG yellow "regulatory probe: tx phy unresolved, merged $n phys (over-permissive where they disagree)"
-  fi
+  # Every phy is probed and merged: pineapd picks its own inject interface, and each phy
+  # registers only its own bands, so band/channel keys do not collide across them.
+  for d in /sys/class/ieee80211/*; do
+    [ -e "$d" ] || continue
+    phy=${d##*/}
+    rows+=$(iw phy "$phy" channels 2>/dev/null)$'\n'
+  done
   [ -n "${rows//[[:space:]]/}" ] || return 1
-  local band
   while IFS='|' read -r freq ch dis; do
     [[ $freq =~ ^[0-9]+$ && $ch =~ ^[0-9]+$ ]] || continue
-    if (( freq >= 5925 )); then band=6; elif (( freq >= 4900 )); then band=5; elif (( freq >= 2400 )); then band=2; else continue; fi
+    local band; band=$(band_of "$freq")
+    [ "$band" = '?' ] && continue
     if (( dis == 0 )); then INJ_OK[$band/$ch]=1; else INJ_OK[$band/$ch]=0; fi
   done < <(printf '%s' "$rows" | inj_parse_channels)
   (( ${#INJ_OK[@]} )) || return 1
@@ -416,10 +374,7 @@ inj_probe() {   # inj_probe [force] -> 0 when INJ_OK is usable
 # prohibits DISABLED and NO_IR, never RADAR).  iw spells that attribute three ways: "No IR" when
 # the kernel sets both NO_IR and the separate legacy NO_IBSS slot, otherwise "Passive scan" or
 # "No IBSS" -- all three must block, or an older kernel's NO_IR channel reads as injectable.
-# The "phy%d %d MHz [%d]:" layout that other iw subcommands print also matches the channel rule, but
-# the frequency is taken as the FIRST digit run on the line, so such a row carries the phy index as
-# its frequency ("phy1 5180 MHz [36]:" -> 1|36|0 under mawk and BusyBox awk; pinned by the selftest)
-# and inj_probe drops it at its band check (< 2400).  Only `iw phy <phy> channels` output is supported.
+# Matching "MHz [n]" loosely also covers the "phy%d %d MHz [%d]:" variant in the same binary.
 inj_parse_channels() {   # stdin: iw phy <phy> channels -> "freq|channel|blocked" rows
   awk '
       function flush() { if (ch != "") printf "%d|%d|%d\n", freq, ch, bad }
@@ -452,12 +407,6 @@ csa_injectable() {   # csa_injectable <band> <channel> -> 0 when a frame can act
   # Fallback when the probe is unavailable: only what is injectable under BOTH the US
   # and the world ("00") domain, since we cannot tell which one is live.  Under 00,
   # 5 GHz 149-165 and 2.4 GHz 12-14 carry NO_IR and 2.4 GHz 12-14 are DISABLED under US.
-  # 5 GHz 36-48 is in the set only because the SHIPPED regulatory.db drops NO-IR from 00's
-  # 5170-5250 rule -- the vendor's one edit to upstream wireless-regdb 2025.02.20
-  # (dev/pager-6ghz-determination-plan.md §C2, a reading of the shipped db).  Upstream 00 marks
-  # 36-48 NO-IR, so a db rebuilt from upstream makes this branch over-permissive on 36-48 and
-  # it must then shrink to 2.4 GHz 1-11.  Falsifier: `iw phy <txphy> channels` printing No IR
-  # on 5180 MHz while `iw reg get` says 00.
   case "$b" in
     2) (( c >= 1 && c <= 11 )) && return 0; return 1 ;;
     5) (( c >= 36 && c <= 48 )) && return 0; return 1 ;;
@@ -636,22 +585,20 @@ posture_of() {   # posture_of <bssid> <band> <channel> -> badge (stdout and POST
   local bssid="$1" band="$2" ch="$3" f b now="$EPOCHSECONDS" locked_here=0
   # Both early returns below answer without reading a beacon, so the caps globals must not keep the
   # PREVIOUS target's values -- resp_write records them as this response's rsn_caps/beacon_prot and
-  # would otherwise attribute another BSSID's posture to this row. The caps are cached per BSSID beside
-  # the badge, so a hit restores THIS target's caps instead of blanking its loot row.
+  # would otherwise attribute another BSSID's posture to this row. Only the badge itself is cached.
   POSTURE_RSN=-; POSTURE_EXT=-
   if [ -n "${POSTURE[$bssid]}" ] && (( now - ${POSTURE_TS[$bssid]:-0} < POSTURE_TTL )); then
-    POSTURE_RSN="${POSTURE_RSN_C[$bssid]:--}"; POSTURE_EXT="${POSTURE_EXT_C[$bssid]:--}"
     POSTURE_LAST="${POSTURE[$bssid]}"; printf '%s' "$POSTURE_LAST"; return 0
   fi
   # A channel we may not transmit on needs no capture: the answer is NOINJ whatever the beacon says.
   if [ "$(posture_from_caps - - "$band" "$ch")" = NOINJ ]; then
-    POSTURE[$bssid]=NOINJ; POSTURE_TS[$bssid]=$now; POSTURE_RSN_C[$bssid]=-; POSTURE_EXT_C[$bssid]=-; POSTURE_LAST=NOINJ; printf 'NOINJ'; return 0
+    POSTURE[$bssid]=NOINJ; POSTURE_TS[$bssid]=$now; POSTURE_LAST=NOINJ; printf 'NOINJ'; return 0
   fi
   # Recon hops while unlocked, so a 4 s capture on one BSSID mostly misses; hold the channel for it.
   if [ "$WATCH_LOCKED" != 1 ]; then lock_target "$bssid" $(( BCN_CAP_SECS + 5 )) "$ch" >/dev/null; locked_here=1; fi
   if f=$(capture_beacon "$bssid"); then posture_read_pcap "$f" "$band" "$ch" >/dev/null; b="$POSTURE_BADGE"; rm -f "$f"; else POSTURE_RSN=-; POSTURE_EXT=-; b='?'; fi
   (( locked_here )) && unlock_target
-  if [ "$b" != '?' ]; then POSTURE[$bssid]="$b"; POSTURE_TS[$bssid]=$now; POSTURE_RSN_C[$bssid]="$POSTURE_RSN"; POSTURE_EXT_C[$bssid]="$POSTURE_EXT"; fi   # a failed read is not cached
+  if [ "$b" != '?' ]; then POSTURE[$bssid]="$b"; POSTURE_TS[$bssid]=$now; fi   # a failed read is not cached
   POSTURE_LAST="$b"; printf '%s' "$b"
 }
 # --- response posture end ---
@@ -662,7 +609,7 @@ cleanup() {
   kill_children
   if [ "$WATCH_LOCKED" = 1 ]; then _pineap EXAMINE CANCEL >/dev/null 2>&1; PINEAPPLE_EXAMINE_RESET >/dev/null 2>&1; fi
   [ -n "$RUN_ID" ] && [ "$REPORT_DONE_AT_EXIT" != 1 ] && write_report quiet
-  rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
+  rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap /tmp/cs_*.err /tmp/cs_signal /tmp/cs_inv.new /tmp/cs_rows.tmp
   log run "exit cycles=$CYCLE"
   ui_ok && set_state FINISH
 }
@@ -703,14 +650,10 @@ JQ_APS='.[] | ([.beacon[]?, .response[]?]) as $e
  | (($e | map(.time // 0) | max) // 0) as $t
  | [.mac, (.packets // 0), ($ssid | tostring | gsub("[|;\n\r\t]"; "_") | .[0:32]), ($best.channel // 0), ($best.freq // 0), $sig, (if $hid then 1 else 0 end), $t]
  | map(tostring) | join("|")'
-# Client objects (2.0.0 `_pineap HELP PARSE`, read in CLAUDE.md s"2.0.0-stable, analysed"; the verb does not exist
-# on 1.1.3): mac, time, signal, freq, packets, and a "probe" OBJECT keyed by an opaque SSID hash whose values carry
-# the ssid -- so the probed SSIDs are the object's values, not an array. No documented key carries the association;
-# ap_mac/bssid are read when present (the harness fixture's stand-in) and "-" otherwise, until the day-one spike
-# finds a source (the Go UI's own recon API carries ap_mac; _pineap does not).
-JQ_CLI='.[] | ([ (.probe // {})[]? | if type == "object" then ((.ssid // "") | select(length > 0)) else tostring end ]) as $p
+JQ_CLI='.[] | ((.probes // .probed_ssids // .probed // []) ) as $p0
+ | (if ($p0 | type) == "array" then $p0 else [$p0] end) as $p
  | [.mac, (.ap_mac // .bssid // "-"), (.packets // 0), (.signal // .rssi // "-"),
-    ($p | map(tostring | gsub("[|;,\n\r\t]"; "_")) | join(",")),
+    ($p | map(if type == "object" then (.ssid // "") else tostring end) | map(gsub("[|;,\n\r\t]"; "_")) | join(",")),
     (.freq // 0), (.time // .last_seen // 0), (.channel // 0)]
  | map(tostring) | join("|")'
 
@@ -732,23 +675,19 @@ parse_aps_fallback() {   # stdin: JSON -> stdout: mac|packets|ssid|ch|freq|signa
   done <<<"$json"
   [ -n "$mac" ] && printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "$pk" "$ssid" "$ch" "$fr" "$sig" "$hid" "$t"
 }
-parse_cli_fallback() {   # stdout: mac|ap_mac|packets|signal|probes|freq|time|channel  (same shape rules as JQ_CLI above)
-  local json frag pre rest mac ap pk sig fr t ch probes p
+parse_cli_fallback() {   # stdout: mac|ap_mac|packets|signal|probes|freq|time|channel
+  local json frag mac ap pk sig fr t ch
   json=$(cat); json=${json//\},\{/$'\n'}
   while IFS= read -r frag; do
     [[ $frag =~ \"mac\":\"([^\"]+)\" ]] || continue
-    mac=${BASH_REMATCH[1]}; ap="-"; pk=0; sig="-"; fr=0; t=0; ch=0; probes=""
-    # the device's own fields come before its probe/beacon/response objects, whose values repeat time/signal/freq/channel
-    pre=${frag%%\"probe\":*}; pre=${pre%%\"beacon\":*}; pre=${pre%%\"response\":*}
-    [[ $pre =~ \"(ap_mac|bssid)\":\"([^\"]*)\" ]] && ap=${BASH_REMATCH[2]}
-    [[ $pre =~ \"packets\":([0-9]+) ]] && pk=${BASH_REMATCH[1]}
-    [[ $pre =~ \"signal\":(-?[0-9]+) ]] && sig=${BASH_REMATCH[1]}
-    [[ $pre =~ \"freq\":([0-9]+) ]] && fr=${BASH_REMATCH[1]}
-    [[ $pre =~ \"time\":([0-9]+) ]] && t=${BASH_REMATCH[1]}
-    [[ $pre =~ \"channel\":([0-9]+) ]] && ch=${BASH_REMATCH[1]}
-    rest=${frag#*\"probe\":}; [ "$rest" = "$frag" ] && rest=""   # every "ssid" inside the probe object is a probed SSID
-    while [[ $rest =~ \"ssid\":\"([^\"]*)\"(.*) ]]; do p=${BASH_REMATCH[1]}; rest=${BASH_REMATCH[2]}; [ -n "$p" ] || continue; p=${p//[|;,]/_}; probes+="${probes:+,}$p"; done
-    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "${ap:--}" "$pk" "$sig" "$probes" "$fr" "$t" "$ch"
+    mac=${BASH_REMATCH[1]}; ap="-"; pk=0; sig="-"; fr=0; t=0; ch=0
+    [[ $frag =~ \"ap_mac\":\"([^\"]*)\" ]] && ap=${BASH_REMATCH[1]}
+    [[ $frag =~ \"packets\":([0-9]+) ]] && pk=${BASH_REMATCH[1]}
+    [[ $frag =~ \"signal\":(-?[0-9]+) ]] && sig=${BASH_REMATCH[1]}
+    [[ $frag =~ \"freq\":([0-9]+) ]] && fr=${BASH_REMATCH[1]}
+    [[ $frag =~ \"time\":([0-9]+) ]] && t=${BASH_REMATCH[1]}
+    [[ $frag =~ \"channel\":([0-9]+) ]] && ch=${BASH_REMATCH[1]}
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "${ap:--}" "$pk" "$sig" "" "$fr" "$t" "$ch"
   done <<<"$json"
 }
 recon_lines() {   # recon_lines APS|CLIENTS -> lines on stdout
@@ -873,17 +812,6 @@ score_device() {
   shopt -u nocasematch
 }
 
-# RSSI_MIN list gate on the best reading known for the MAC -- the inventory's carried-over best included
-# (0 = off; a device with no reading passes). A kit AP also passes when any of its kit clients does: the
-# clients are NOALERT, so hiding a weak NVR behind strong cameras would lose the kit's one alert.
-rssi_gate_ok() {
-  (( RSSI_MIN == 0 )) && return 0
-  rssi_gate_own "$1" && return 0
-  [ "${KITAP[$1]}" = 1 ] || return 1
-  local c; for c in ${CLIENTS_OF[$1]}; do [ "${KITCL[$c]}" = 1 ] && rssi_gate_own "$c" && return 0; done
-  return 1
-}
-rssi_gate_own() { [[ ${RSSI_BEST[$1]:-x} =~ ^-?[0-9]+$ ]] || return 0; (( ${RSSI_BEST[$1]} >= RSSI_MIN )); }
 # proximity bucket from the best RSSI over the last 3 cycles; UNK fails open
 prox_of() {
   local mac="$1" best=-999 r near=$NEAR_DBM far=$FAR_DBM
@@ -982,7 +910,7 @@ load_inventory() {   # read inventory.tsv once at start into SEEN_*; prune rows 
     CLOCK_OK=0; log warn "clock invalid: inventory newer than now; dedupe and prune disabled"; ui_ok && LOG yellow "clock invalid: dedupe off"; return 0
   fi
   if (( cutoff > 0 )); then
-    awk -F'|' -v c="$cutoff" '/^#/ { print; next } $2 ~ /^[0-9]+$/ && $2 >= c { print }' "$f" >"$f.new" 2>/dev/null && mv "$f.new" "$f"
+    awk -F'|' -v c="$cutoff" '/^#/ { print; next } $2 ~ /^[0-9]+$/ && $2 >= c { print }' "$f" >/tmp/cs_inv.new 2>/dev/null && mv /tmp/cs_inv.new "$f"
     for mac in "${!SEEN_LAST[@]}"; do (( ${SEEN_LAST[$mac]} < cutoff )) && unset "SEEN_LAST[$mac]" "SEEN_CONF[$mac]" "SEEN_RSSI[$mac]" "SEEN_RSSI_TS[$mac]" "SEEN_FIRST[$mac]" "SEEN_N[$mac]" "SEEN_LAT[$mac]" "SEEN_LON[$mac]" "SEEN_BEH[$mac]" "SEEN_VERDICT[$mac]"; done
   fi
   return 0
@@ -1002,7 +930,7 @@ upsert_rows() {   # upsert_rows mac... -> merge these rows into inventory.tsv (r
   { for m in "$@"; do [ -n "${ROLE[$m]}" ] || continue; [ "${ROLE[$m]}" = cli ] && is_rand "$m" && continue; inv_row "$m"; done; } >/tmp/cs_rows.tmp
   [ -s /tmp/cs_rows.tmp ] || return 0
   [ -s "$f" ] || printf '%s\n' "$INV_HDR" >"$f"
-  awk -F'|' 'NR==FNR { new[$4]=$0; next } /^#/ { print; next } { if ($4 in new) { print new[$4]; delete new[$4] } else print } END { for (k in new) print new[k] }' /tmp/cs_rows.tmp "$f" >"$f.new" 2>/dev/null && mv "$f.new" "$f"
+  awk -F'|' 'NR==FNR { new[$4]=$0; next } /^#/ { print; next } { if ($4 in new) { print new[$4]; delete new[$4] } else print } END { for (k in new) print new[k] }' /tmp/cs_rows.tmp "$f" >/tmp/cs_inv.new 2>/dev/null && mv /tmp/cs_inv.new "$f"
   (( CYCLE % 5 == 0 )) && sync
   return 0
 }

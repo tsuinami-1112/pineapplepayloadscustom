@@ -91,24 +91,6 @@ found and fixed one over-permissive defect (`dev/pager-prearrival.md` §5).
 > including the 5 GHz `No IR` case the fixture lacked, and was correct. **Nothing left to diff
 > by hand here**; on a different unit, repeat it.
 
-**8b. Two `_pineap` answers CamHound's recon rung needs** — neither needs the receiver.
-
-- **Where a client's association lives.** `RECON CLIENTS` is 2.0.0-only and its documented device
-  object has no association field (CLAUDE.md §"2.0.0-stable, analysed"), so on a 2.0.0 unit with an
-  associated client run `_pineap RECON CLIENTS format=json | jq '.[0]|keys'` and look for any key
-  carrying the BSSID. If none, look at what the Go UI's recon API returns for clients — `hak5cmd`
-  reaches it over `/tmp/api.sock`, and that binary is where `ap_mac` lives — and record the route and
-  one raw object. Until this is answered CamHound treats every client as unassociated (kit detection,
-  client Watch and per-client Disrupt dormant). On the 1.1.3 unit only the negative half is testable:
-  `_pineap RECON CLIENTS format=json` should return an error, not rows.
-- **What `PINEAPPLE_RECON_NEW`'s parameter is.** The firmware session reads it as the session *name*
-  (`_pineap RECON NEW {name=} {hop=} {channel=}`, no duration), while CamHound and two upstream
-  payloads pass a number of seconds. Run `PINEAPPLE_RECON_NEW` with no argument and with `60`, then
-  `_pineap RECON COUNT DEVICES` a minute later: does a session named `60` exist, and does any session
-  end on its own? CamHound now calls it bare and logs "Recon session requested", which is right under
-  either reading; the answer decides whether a name is worth passing and whether the scan loop must
-  ever restart a session that ended on its own.
-
 **9. THE VALUE GATE — a beacon capture plus the real client, before spending effort on 6 GHz.**
 Beacon protection takes **both** an AP that enables it and a client that can enforce it, so the
 capture below settles the AP half cheaply and the client half still needs the client. Capture one
@@ -208,26 +190,14 @@ Three things about it that cost bench time, all **[V]**:
 
 **13. Inject on ch 52 and confirm at the external 5 GHz receiver.** Not `wlan0mon` — `radio0` is
 `band '2g'` and cannot hear ch 52; its silence would be silence either way. Run the negative control
-(Pager idle — pineapd stopped and no `pagerinj` running — require zero matches) and the positive
-control (ch 5180, same shell, no interface state change in between: plan B0 control 3) or the result
+(Pager idle, require zero matches) and the positive control (ch 5180, same invocation) or the result
 means nothing.
 
 ```sh
-# FIRST, every time, before any pagerinj transmit: stop pineapd (plan B0 rig control 1; this is B4's
-# exact line). It hops wlan1mon — "If the hopper moves wlan1mon before dequeue, the frame goes out on
-# another channel and the parked receiver sees nothing — which would be scored as a kernel gate."
-# Control 1's own `uci set pineapd.wlan1mon.hop=0; uci commit pineapd; /etc/init.d/pineapd restart`
-# only stops the hopping and leaves pineapd (and any CSA flood it is running) alive; use the stop.
-/etc/init.d/pineapd stop; sleep 2; ip link set wlan1mon up
-for F in 5180 5260; do                    # 5180 control first, then the test, nothing between them
-  iw dev wlan1mon set freq $F 20          # set the channel yourself; pagerinj will not
-  # nonce via busybox hexdump, not od: `od` ships in neither firmware image (CLAUDE.md §"2.0.0-stable, analysed"), so
-  # `od -An -tx1` here would substitute nothing and every run would send the constant SSID PAGERINJ-$F- --
-  # control 4's forbidden case, while the frame still looks right at the receiver
-  pagerinj -i wlan1mon --nonce PAGERINJ-$F-$(head -c4 /dev/urandom | hexdump -e '4/1 "%02x"') \
-           --chan $((F==5180?36:52)) --rate 20 --secs 15   # --chan: the nonce beacon's own DS element
-done
-# receiver, separate adapter: parked on 52 for the test, and on 36 (or a second adapter) for the control:
+iw dev wlan1mon set freq 5260 20          # set the channel yourself; pagerinj will not
+pagerinj -i wlan1mon --nonce PAGERINJ-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' ') \
+         --chan 52 --rate 20 --secs 15
+# receiver, separate adapter, already parked on 52:
 #   tshark -i wlanX -Y 'wlan.ssid contains "PAGERINJ"'
 ```
 
@@ -236,9 +206,7 @@ ways. `pagerinj`'s `sent=` counter is **not** evidence — a gate-2 drop returns
 counts calls, not transmissions. Only the receiver decides.
 
 **14. Attribute the gates** side by side on the same channel: pineapd refusing vs cfg80211 dropping
-vs it actually transmitting. Step 13 stopped pineapd, so start it again first — `/etc/init.d/pineapd
-start; sleep 5` (plan B5). When the `pagerinj` work is finished, B4's rollback is
-`iw dev wlan1mon set freq 2437 20; /etc/init.d/pineapd start`.
+vs it actually transmitting.
 
 ---
 
@@ -266,20 +234,9 @@ The Stage-B injector is already built: `dev/injector/` (`pagerinj`). Send the **
 differing only in that byte** — `count = 0`, then `count = 3`:
 
 ```sh
-/etc/init.d/pineapd stop; sleep 2; ip link set wlan1mon up; iw dev wlan1mon set freq <AP MHz> 20   # B4's line (plan B0 control 1), then park on the AP's channel: pagerinj will not, and pineapd would hop it; whether the stop leaves wlan1mon down is unmeasured, and `up` is a no-op if it does not
-pagerinj -i wlan1mon --csa --bssid <AP> --chan <N> --count 0 --rate 20 --secs 30   # control
-pagerinj -i wlan1mon --csa --bssid <AP> --chan <N> --count 3 --rate 20 --secs 30
+pagerinj -i wlan1mon --csa --bssid <AP> --chan 52 --count 0 --rate 20 --secs 30   # control
+pagerinj -i wlan1mon --csa --bssid <AP> --chan 52 --count 3 --rate 20 --secs 30
 ```
-
-`--chan` here is the CSA **New Channel Number** — where the client is told to go, not where you are —
-so `<N>` must be a channel the AP is **not** on. `pagerinj` refuses a `--csa` whose `<N>` equals the
-cloned beacon's DS Parameter Set channel (exit 2: `refusing to transmit: --chan N is the channel this
-beacon's DS Parameter Set says the BSS is already on …`) unless `--allow-same-chan` is given, because a
-same-channel CSA announces no move. **Confirm the forged beacons on the external receiver, parked on
-the AP's channel, before scoring either arm** — a flood that left on another channel is a null, not a
-result. If the capture ends `no clean beacon captured: skipped N beacon(s) from this BSSID that already
-carried a CSA (37) or eCSA (60) element`, something is already announcing a switch for that BSSID — a
-running pineapd CSA flood or an earlier `pagerinj` — stop it and retry.
 
 **Run a third arm — it is better than the pair and costs one more invocation.**
 `ieee80211_mgd_csa_present()` discards **per element**:
@@ -294,9 +251,8 @@ So a frame carrying pineapd's element 37 with count 0 **plus** an eCSA (60) with
 returns true — while leaving pineapd's own bytes untouched:
 
 ```sh
-# same preconditions as the pair: pineapd stopped, wlan1mon up and parked on the AP's channel, <N> not the AP's channel
-pagerinj -i wlan1mon --csa --bssid <AP> --chan <N> --count 0 \
-         --ecsa-count 3 --ecsa-opclass <opclass> --rate 20 --secs 30
+pagerinj -i wlan1mon --csa --bssid <AP> --chan 52 --count 0 \
+         --ecsa-count 3 --ecsa-opclass <N> --rate 20 --secs 30
 ```
 
 The two-arm version cannot distinguish **"the count value is what disqualifies it"** from
@@ -357,25 +313,15 @@ real AP's beacons. Better targeting than a beacon, and it lands on the surface C
 attacks.
 
 ```sh
-/etc/init.d/pineapd stop; sleep 2; ip link set wlan1mon up; iw dev wlan1mon set freq <AP MHz> 20   # as in 17a (B4's line): pineapd would hop wlan1mon
-pagerinj -i wlan1mon --action --bssid <AP> --client <STA> --chan <N> --count 3   # <N>: a channel the AP is NOT on, same band
+pagerinj -i wlan1mon --action --bssid <AP> --client <STA> --chan <N> --count 3
 ```
 
-Four constraints, all from the receive path, each the difference between working and a silent drop:
+Three constraints, all from the receive path, each the difference between working and a silent drop:
 
 - **A3 must equal the BSSID** — `rx612.c:3738` compares it against `sdata->deflink.u.mgd.bssid`.
   `pagerinj` sets A3 from `--bssid` for you; a wrong one is dropped with no log at all.
 - **A1 is the client**, which is the whole point.
 - **The client must be associated.** No keys are needed on a non-PMF BSS, which is why this works.
-- **`--chan` must name a channel the BSS is not on.** `ieee80211_sta_process_chanswitch()` ignores
-  an action-frame CSA whose parsed chandef is identical to the current one *whatever the mode*: the
-  condition is `chandef_identical && (!mode || source != IEEE80211_CSA_SOURCE_BEACON)`, and the cat-0
-  frame arrives as `PROT_ACTION` (upstream `mlme.c:2533-2543` and `:7493-7508` at v6.12 **[V]**;
-  `:2544-2554` / `:7521-7536` at v6.12.61, same code). A bare element 37 with no Secondary Channel
-  Offset element parses as a 20 MHz chandef (`spectmgmt.c:305-332` at v6.12 **[V]**), so on a 20 MHz
-  BSS announcing the current channel is dropped after one client log line — `tries to chanswitch to
-  same channel, ignore` — and then silently. That log line is your diagnostic that `<N>` was wrong.
-  `pagerinj` cannot check this for `--action` (it reads no beacon there); it does for `--csa`.
 
 ---
 
@@ -383,10 +329,7 @@ Four constraints, all from the receive path, each the difference between working
 
 **18. Patch pineapd's gate** (two short instruction ranges) or **replace `regulatory.db`** (unsigned
 on this build). Stop the UI first so procd cannot respawn a broken binary, and have the restore
-script from step 5 ready. The two tools the plan's C1 and C2 invoke — `tools/pineapd_gate.py` and
-`tools/regdb_build/REPRO.sh` — exist on no ref and are **to be written before Stage C**; their specs
-sit at the point of use in the plan. Until then C1 is patched by hand from its offset table, and C2's
-`regulatory.db.B` hash is not reproducible.
+script from step 5 ready.
 
 ---
 

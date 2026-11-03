@@ -15,10 +15,8 @@ With `RESPONSE=1` a fourth rung appears on the device card — **Disrupt** — w
 protection posture from its own beacon and then disconnects it with deauthentication and
 disassociation, channel-switch announcements, or all three. See [Response](#response).
 **`RESPONSE` defaults to 0**, and with it off CamHound transmits nothing and behaves exactly as
-CamScout did. `AUTO_RESPOND=1` additionally lets the funnel *offer* Disrupt by itself: after a Watch
-confirms a device is streaming, or for a newly CONFIRMED device the Watch and Locate offers did not
-take (with `AUTO_WATCH=0` that is every new CONFIRMED device). The offer is a dialog, and
-`RESPONSE_CONFIRM` still gates the transmit; it is a second key precisely because that rung transmits.
+CamScout did. `AUTO_RESPOND=1` additionally lets the funnel raise Disrupt by itself once a Watch
+confirms a device is streaming; it is a second key precisely because that rung transmits.
 
 ## What it cannot see
 
@@ -33,13 +31,6 @@ take (with `AUTO_WATCH=0` that is every new CONFIRMED device). The offer is a di
 - A battery/event camera that is asleep looks idle in Watch. Use the Stimulus test.
 - INCONCLUSIVE is about the measurement (lock, band, distance), not about the device.
 
-**Which AP a client is associated to.** `_pineap RECON CLIENTS` is new in 2.0.0 (1.1.3 has no such
-verb, so the client rung has never produced a row on it) and its device object carries probed SSIDs
-but **no association field** (CLAUDE.md §"2.0.0-stable, analysed", read from the firmware's own
-`HELP PARSE` text). Until the day-one spike finds a source — the Go UI's recon API carries `ap_mac`,
-`_pineap` does not — every client reads as unassociated: kit detection, client Watch and Stimulus,
-and per-client Disrupt stay dormant, and the `ap_bssid` column reads `-`.
-
 ## How it works: four tiers
 
 1. **Identity** (free, every device, every cycle): OUI/vendor rows, setup-mode SSIDs, hidden-SSID
@@ -48,7 +39,7 @@ and per-client Disrupt stay dormant, and the `ap_bssid` column reads `-`.
    or Apple (-25).
 2. **Behaviour** (30-120 s channel lock, one suspect at a time): header-only tcpdump captures split
    by direction in the kernel (`wlan addr2` = uplink, `wlan addr1` = downlink), parsed with
-   hexdump (or od) + awk. Live view grades STREAM / DOWN / IDLE / NONE / INCONCLUSIVE; the Stimulus test
+   hexdump+awk. Live view grades STREAM / DOWN / IDLE / NONE / INCONCLUSIVE; the Stimulus test
    grades EVENT / EVENT? by comparing a 30 s still baseline with 20 s of you moving in front of it
    plus a 20 s settle window.
 3. **Response** (opt-in, off by default): reads the target's PMF and beacon-protection posture from
@@ -66,7 +57,7 @@ and per-client Disrupt stay dormant, and the `ap_bssid` column reads `-`.
 2. If the files came through Windows: `sed -i 's/\r$//' payload.sh cam_signatures.txt; chmod +x payload.sh`.
 3. Start **Recon in continuous mode** in the Pager GUI. CamHound only reads what Recon hears.
 4. Launch CamHound from the payload menu. Needs `_pineap`, `jq` (falls back to a built-in parser),
-   `tcpdump` plus `hexdump` or `od` for Watch (without them Watch is greyed), `/lib/hak5/oui.txt`.
+   `tcpdump` + `hexdump` for Watch (without them Watch is greyed), `/lib/hak5/oui.txt`.
 
 ## Quick start, the two-button flow
 
@@ -93,8 +84,7 @@ Buttons: A = select / stop (Watch, Locate), B = back / pause, UP and DOWN scroll
 Two axes, one number. Identity `I` is the sum of identity rows; behaviour `Bh` the sum of Watch,
 stimulus and BUSY rows. `conf = I_eff + Bh_eff`, where a single identity class caps `I_eff` at 69,
 behaviour without identity caps `Bh_eff` at 69 (the yellow **STREAM lane**), and a negative
-behaviour row (DOWN, -20) never lowers a grade that identity of 45+ earns; below that it does lower
-`conf`, so a POSSIBLE row can drop out of Review hits after a DOWN Watch.
+behaviour row never lowers a grade that identity alone earns.
 
 | Band | conf | Colour | Reachable by |
 |---|---|---|---|
@@ -162,14 +152,7 @@ street survey keep a steady pace and set `GPS=1`; `inventory.tsv` keeps the stro
 
 Edit the config block at the top of `payload.sh`. Starred keys can also be set without editing and
 survive updates: `PAYLOAD_SET_CONFIG camhound CYCLE_SECS 10` (`PAYLOAD_DEL_CONFIG camhound CYCLE_SECS`
-removes it). Overrides are counted on the start screen and listed in `events.log`. The **Settings**
-menu item does the same from the device, on two pages. **Recon settings** holds CYCLE_SECS,
-THR_STREAM_UP, COOLDOWN_SECS, DEDUPE_H, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH and AUTO_LOCATE;
-**Response settings** holds RESPONSE, RESPONSE_CONFIRM, AUTO_RESPOND, RESP_LOCK_SECS, RESP_SETTLE_SECS
-and POSTURE_TTL. Numbers go through NUMBER_PICKER, switches are On/Off. Switching RESPONSE_CONFIRM off
-asks a second time, because it is the key that keeps every transmit behind a dialog; a lock shorter
-than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows what is in force.
-`Reset defaults` deletes the saved overrides of all fifteen keys. Changes apply at once and persist.
+removes it). Overrides are counted on the start screen and listed in `events.log`.
 
 | Key | Default | Persist | Meaning |
 |---|---|---|---|
@@ -179,7 +162,7 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 | ALERT_DIALOG | 1 | * | blocking ALERT on NEW CONFIRMED when AUTO_WATCH=0 |
 | AUTO_WATCH / AUTO_LOCATE | 1 / 1 | * | the two-press funnel; set 0 for walk surveys |
 | AUTO_WATCH_RSSI | -72 | | minimum last RSSI to auto-offer Watch |
-| RSSI_MIN | 0 | * | optional list gate, dBm, on the best RSSI known for the MAC, carried-over best included (0 = widest net; a kit AP passes when a kit client does) |
+| RSSI_MIN | 0 | * | optional list gate on the session's best RSSI (0 = widest net) |
 | SOUND | 0 | * | ringtone on CONFIRMED |
 | SHOW_MODULES | 1 | | modules list in the menu |
 | MODULE_HINT_RSSI | -55 | | one-time "module strong+busy: Watch?" hint |
@@ -201,12 +184,11 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 | INVENTORY_KEEP_DAYS | 30 | | inventory.tsv rows older than this are pruned at start (0 = never) |
 | ROW_W | 22 | | list row budget (36-40 expected after Phase 0 item 19) |
 | RESPONSE | 0 | * | master switch for the Disrupt rung; 0 = recon only, nothing transmits |
-| RESPONSE_CONFIRM | 1 | * | blocking confirmation before any transmit (Settings asks twice before switching it off) |
-| AUTO_RESPOND | 0 | * | let the funnel raise Disrupt by itself (needs RESPONSE=1) |
+| RESPONSE_CONFIRM | 1 | * | blocking confirmation before any transmit |
 | POSTURE_TTL | 300 | * | seconds a posture badge stays cached per BSSID |
 | RESP_SETTLE_SECS | 6 | * | wait after transmitting before re-reading the target to judge the effect |
 | BCN_CAP_SECS / BCN_CAP_COUNT | 4 / 5 | | beacon capture window and frame count for a posture read |
-| RESP_LOCK_SECS | 20 | * | EXAMINE lock duration held across a response; raised to RESP_SETTLE_SECS + 5 when set lower |
+| RESP_LOCK_SECS | 20 | * | EXAMINE lock duration held across a response; must exceed fire + settle |
 
 ## Response
 
@@ -225,15 +207,13 @@ captured under a short channel lock when no Watch lock is held, since Recon hops
 | `D?+C` | PMF optional (transition mode) | per-client | works |
 | `C` | PMF required (WPA3) | ignored | works |
 | `NONE` | PMF + beacon protection | blocked | blocked |
-| `NOINJ` | channel we cannot transmit on: DFS 5 GHz, 6 GHz, or disabled/no-IR under the live domain | cannot transmit | cannot transmit |
+| `NOINJ` | DFS 5 GHz or 6 GHz channel | cannot transmit | cannot transmit |
 | `?` | no beacon captured | unknown | unknown |
 
 `D?+C` cannot be resolved from a beacon alone, because PMF is negotiated per client — a transition
--mode BSS can hold both protected and unprotected clients at once. `NOINJ` is a gate verdict,
-not a property of the target: pineapd refuses the 16 DFS channels and 6 GHz outright, and cfg80211
-drops frames on channels the live regulatory domain marks disabled or no-IR. pineapd logs its refusal
-and returns an error; cfg80211's drop is silent (the frame is freed and `sendto` reports success), so
-CamHound refuses rather than guesses (`csa_injectable`, two gates; see `dev/pager-csa-primitives.md`).
+-mode BSS can hold both protected and unprotected clients at once. `NOINJ` is a regulatory wall,
+not a property of the target: cfg80211 marks DFS and 6 GHz channels no-initiate-radiation for a
+monitor interface, so frames are dropped before they reach the air whatever the target's posture.
 
 **2 · Attack.** All three are always offered, ordered by what the beacon says will work and
 labelled `works` / `partial` / `blocked` / `unknown`. The first in the list is preselected, so the
@@ -297,15 +277,13 @@ that reuse a captured beacon's timestamp.
   `#epoch|mac|role|bssid|ch|freq|mode|run|secs|up|down|asym|cv|delta|rec|drops|verdict|batt_start|batt_end|charging`.
 - `report_<run>.txt`: headline counts, suspects by confidence, vendor census, AP-to-client tree
   (`BASE?` marks a hidden AP with 1-4 clients on a module/mixed OUI), modules, GPS, footer.
-- `raw_<run>.txt` (KEEP_RAW=1) replays on a laptop: `bash payload.sh --replay <file>` (it keeps the
-  up-direction rows of every window and reports them as one).
+- `raw_<run>.txt` (KEEP_RAW=1) replays on a laptop: `bash payload.sh --replay <file>`.
 
 ## Laptop checks
 
-`bash payload.sh --selftest` runs the self-checks (signature lint, both oui.txt layouts, every worked
-example above, proximity, row width, pcap parser, posture, response and settings vectors; it prints its
-own count, which grows with every addition) with `LOG`/`LED` stubbed; `--replay <pcap, bucket or
-raw file>` runs the Watch parser on a saved window (a raw file's up-direction rows, every window). BusyBox `hexdump` and `awk` are enough.
+`bash payload.sh --selftest` runs 39 checks (signature lint, both oui.txt layouts, every worked
+example above, proximity, row width, pcap parser) with `LOG`/`LED` stubbed; `--replay <pcap or
+bucket file>` runs the Watch parser on a saved window. BusyBox `hexdump` and `awk` are enough.
 
 ## Test matrix (fill the Measured column on your unit)
 
@@ -342,7 +320,6 @@ weights: they are fixed per TYPE. Ship unverified rows commented out.
 
 ## Roadmap
 
-Shipped since v1: Recon-menu hooks (`library/recon/client|access_point/CamHound`), inventory
-persistence across runs, the Settings menu, the response rung. v1.1 remaining: band write
-(`PINEAPPLE_SET_BANDS`), WPS/IE peek, LAN confirm (opt-in RTSP DESCRIBE). v2: multi-channel passive
-behaviour sweep, BLE co-hit, pocket mode, external capture radio.
+v1.1: Recon-menu hooks (`library/recon/client|access_point/CamHound`), inventory persistence across
+runs, settings menu, band write (`PINEAPPLE_SET_BANDS`), WPS/IE peek, LAN confirm (opt-in RTSP
+DESCRIBE). v2: multi-channel passive behaviour sweep, BLE co-hit, pocket mode, external capture radio.
