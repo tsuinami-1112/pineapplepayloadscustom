@@ -225,7 +225,9 @@ accordingly.
    whose prompt says: default to refuted unless you can reproduce it from the artifact. When in doubt
    between tiers, take the heavier one and say why.
 2. **Cap the finder pool at four dimensions per review.** Batch verification at nine findings per
-   agent, grouped by file. Never one agent per finding per lens.
+   agent, grouped by file. Never one agent per finding per lens, unless truly warranted — a claim
+   big enough to deserve that attention (one that would redirect the bench, overturn a measured
+   fact, or change what the device transmits) can have its own agents, with the reason stated.
 3. **Report the refutation count in the first line of every review summary.** A pass that refutes
    nothing is a warning about the verifiers, not a clean bill; say so when it happens.
 4. **Name what is already settled before the finders start** — measured on hardware, verified in a
