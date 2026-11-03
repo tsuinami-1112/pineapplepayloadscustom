@@ -458,6 +458,52 @@ intersected to recover an association the JSON does not state outright. Neither 
 one on-device command away: `_pineap RECON DEVICES format=json | head -c 2000`. **[A]**, offered as a
 direction, not a finding — a client probing for an SSID is not necessarily associated to it.
 
+### 13a. The association column is a chokepoint, and the rung is fixable without it
+
+**Five separate features, one missing field.** Verified in code 2026-11-03, so this is worth more
+than any one of them: `AP_OF[mac] == "-"` disables **Watch on a client** and **Stimulus**
+(`watchable()`, `payload.sh:985-990`, and `watch_prepare`'s "no BSSID: cannot lock"), **kit
+detection** — CamHound's largest single identity signal — (`payload.sh:1186`), the **AP→client tree**
+in the report (`payload.sh:2230`), and the **response rung**. Fixing the association is therefore the
+highest-value change available to this payload, and worth more than a firmware flash.
+
+**But the response rung does not actually need it, and this reframes the whole problem.** Read what
+goes on the air (`payload.sh:2095-2096`): `CSA` is `<bssid> <ch>` and `BOTH` is `<bssid> <target>
+<ch>` with the target discarded. **Both need only a BSSID and a channel, and `RECON APS` supplies
+both on 1.1.3.** The firmware can transmit these today. What refuses is CamHound's own verification
+guard (`resp_fire`, the `NO_CLIENTS` branch): `resp_snapshot` found nobody to *measure*. So the
+blocker is the oracle, not the capability — the rung is asking the firmware a question the firmware
+cannot answer, when the answer is on the air.
+
+**The fix: derive subjects and verdict from a capture.** Every primitive already ships —
+
+| need | already in the payload |
+|---|---|
+| BSSID-filtered data capture | `payload.sh:1665`, `"type data and wlan addr1 $WATCH_BSSID and not wlan addr2 $WATCH_MAC"` |
+| pcap + radiotap + 802.11 walking | `beacon_find` — reads radiotap `it_len` at `p+2`, frame at `p+rt`, knows the 24+12 offsets |
+| octet / u16 readers | `hex_octet`, `hex_u16le` |
+| channel lock across a response | `lock_target` / `RESP_LOCK_SECS`, already held |
+
+A client's MAC is `addr2`, six octets at `p + rt + 10`. Walking the records for frames addressed to
+the BSSID yields that AP's active clients off the air — **firmware-independent, works on 1.1.3 and
+2.0.0 alike**. It is also better evidence than it replaces: Recon's `packets` is session-cumulative
+and dwell-biased (`PLAN_v2.md:206` says so), while a before/after capture counts frames in a window
+we control.
+
+Ranked options: **(1)** capture-based subjects and verdict, ~30-40 lines reusing the above plus
+`resp_snapshot`/`resp_fire` wiring, selftest cases (`st_pcap` already builds synthetic pcaps) and a
+harness scenario; **(2)** probe for a free association first (§13 above), one command, which would
+make (1) optional; **(3)** let a BSS-wide attack fire with an explicit `INCONCLUSIVE` when nothing is
+measurable — nearly free, but it discards the discipline that makes the verdict worth having, so it
+belongs *underneath* (1) as the heard-nothing fallback, not instead of it.
+
+Two unverified mechanics, both parameters rather than obstacles: whether `-s 32` clears radiotap far
+enough to reach `addr2` (`capture_beacon` uses `-s 0`, so the snap may need raising), and whether a
+second concurrent capture is safe during a response — already an open Phase 0 question in
+`PLAN_v2.md`. One real limitation: a capture sees only **active** clients, so an associated-but-idle
+camera stays invisible and a silent BSS still has nothing to measure. For a camera hunter that bias
+is mostly benign, since a streaming camera is busy by definition.
+
 Needs a Pager:
 
 - whether `tcpdump` beacon capture on `wlan1mon` works while pineapd owns and hops it

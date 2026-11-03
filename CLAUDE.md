@@ -629,6 +629,17 @@ intersecting a client's probe keys with an AP's beacon keys might recover an ass
 never states. Either would be worth more than a flash. One command checks the first:
 `_pineap RECON DEVICES format=json | head -c 2000`.
 
+**The association column is a chokepoint gating FIVE features, and the rung is fixable without it.**
+Verified in code: `AP_OF[mac] == "-"` disables Watch-on-a-client and Stimulus (`watchable()`,
+`payload.sh:985-990`), kit detection (`:1186`), the AP→client tree (`:2230`) and the response rung.
+But the *attack* never needed it — `CSA` is `<bssid> <ch>` and `BOTH`'s target is discarded, and
+`RECON APS` supplies both on 1.1.3, so the firmware can transmit today. What refuses is CamHound's
+own `NO_CLIENTS` measurement guard. The fix is to read the association off the air with a
+BSSID-filtered capture (the filter at `:1665`, the radiotap-aware frame walker in `beacon_find`,
+`addr2` at `p + rt + 10`), which is firmware-independent and better evidence than Recon's cumulative
+counters. Full working, ranked options and the two unverified mechanics are in
+`dev/CamHound/RESPONSE.md` §13a. **Not yet implemented.**
+
 **Two 2.0.0 hazards in this repo's other payloads** — `wigle-toolkit` really deletes loot, and
 `wardrive_activate` is broken. Both are `[V]` from the rootfs trees and written up in full in
 §"2.0.0-stable, analysed" above; not repeated here, so there is one copy to keep correct.
