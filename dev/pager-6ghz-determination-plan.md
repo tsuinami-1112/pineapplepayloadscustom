@@ -69,7 +69,7 @@ libwifi_create_disassoc
 libwifi_create_radiotap
 ```
 
-That is pineapd's entire frame-construction repertoire. Combined with the symbol `csa_beacon_record` and the strings `beacon-csa` / `probe-csa`, pineapd's CSA is delivered in a **spoofed beacon or probe response**, not an action frame. **[V]**
+That is pineapd's entire frame-construction repertoire — **[V]** for the listing above, and **[V]** that the symbol `csa_beacon_record` and the strings `beacon-csa` / `probe-csa` are present in the binary. Combined, those readings indicate that pineapd's CSA is delivered in a **spoofed beacon or probe response**, not an action frame — but that is a conclusion drawn from them, so it is **[A]** on the carrier, not **[V]** (the second correction below says why the import list does not establish it). *Falsified by:* a capture of a pineapd CSA arriving in any other frame type.
 
 **Correction (2026-10-23).** This said "there is no action-frame builder", which is true of *pineapd* and false of *the device*. pineapd imports 21 `libwifi_*` symbols of which four are builders; `/usr/lib/libwifi.so.0.0.10` exports **113**, including `libwifi_create_action`, `_action_no_ack`, `_add_action_detail`, `_create_probe_resp` and the `libwifi_*_tag` element API — 92 ship unreferenced. Read them with `nm -D`, `objdump -T` or `readelf --use-dynamic -sW`; the `.so` has no section headers, so `readelf -s` says "Dynamic symbol information is not available" and `readelf --dyn-syms` prints nothing, both exiting 0. **[V]** (An earlier version of this note also claimed `nm -D` fails. It does not — see `dev/pager-csa-primitives.md`.)
 
@@ -190,9 +190,9 @@ If `172.16.52.0/24` collides with a local Docker/VPN subnet, fix it on the lapto
 ssh root@172.16.52.1 'sha256sum /usr/sbin/pineapd /usr/bin/_pineap /lib/firmware/regulatory.db /pineapple/pineapple'
 ```
 
-**PASS:** `pineapd` = `adc9d36d…8493`, `_pineap` = `e1739d97…7d69`, `regulatory.db` = `30954f89…4b44`.
+**PASS:** `pineapd` = `adc9d36d…8493`, `_pineap` = `e1739d97…7d69`, `regulatory.db` = `30954f89…4b44`, `/pineapple/pineapple` = `4493c6c6…ad3e` (the Go UI; full value in CLAUDE.md §"First contact").
 
-**FAIL — any mismatch ⇒ STOP.** Every byte offset in this plan and every prebuilt artifact (patched binary, regdb variants) was computed against those exact files. Re-derive before using any of them: `pineapd_gate.py check` prints per-site bytes and will refuse a file it does not recognise. **[V]**
+**FAIL — any mismatch ⇒ STOP.** Every byte offset in this plan and every prebuilt artifact (patched binary, regdb variants) was computed against those exact files. Re-derive before using any of them — from the C1 offset table and `dev/pager-csa-primitives.md` §"Disassembling pineapd". The checker C1 invokes, `tools/pineapd_gate.py`, is **to be written before Stage C**: it exists on no ref of this repository (its three-line spec is in C1), and when it does exist its `check` is specified to print per-site bytes and refuse a file it does not recognise. **[V]** on the four hashes above (all four read on the device 2026-11-02; CLAUDE.md §"First contact").
 
 ### P0.3 [RO] Baseline state, off-device
 
@@ -512,23 +512,26 @@ The five usable observables:
    ```
    Poll `xmit-queues` **continuously**, not as two snapshots 3 s apart.
 
+   For a **`pagerinj`** run use B4's line instead — `/etc/init.d/pineapd stop; sleep 2; ip link set wlan1mon up` — because `hop=0` only stops the hopping and leaves pineapd running, including any CSA flood it is sending, which is a CSA-bearing clone source the 17a capture then has to skip. `dev/injector/README.md` §Use and day-one steps 13, 17a (both arms) and 17c carry that same line (17b has no recipe of its own: it runs as 17a's `count = 3` arm).
+
 2. **`addr2` must not match any local vif MAC.** `monitor_start_xmit` re-homes the frame to any local interface whose MAC equals `addr2`, and *that* interface's iftype is what reaches the predicate. For AP/ADHOC/MESH, `dfs_required > 0`, `check_radar` engages, and DFS channels **are** blocked. **[V]**
    ```sh
    ssh root@172.16.52.1 'ip -o link | grep -o "ether [0-9a-f:]*" | cut -d" " -f2 | tr A-F a-f'
    ```
    Confirm `02:00:5e:11:22:33` is absent from that list.
 
-3. **Paired same-run control.** `monitor_start_xmit` has **three silent drops before the regulatory check**, each producing an observable *identical* to the NO_IR drop (frame freed, `NETDEV_TX_OK`, no counter, no `head` movement, no echo, nothing on air) **[V]**:
-   - `!ieee80211_sdata_running(sdata)` → `fail`
-   - **`chanctx_conf == NULL`** after the `local->monitor_sdata` fallback → `fail_rcu`  ← *the one nobody modelled*
-   - `cfg80211_chandef_usable(…, IEEE80211_CHAN_DISABLED)` fails → `fail_rcu`
-   - and `ieee80211_parse_tx_radiotap()` failure → `fail_rcu`
+3. **Paired same-run control.** `monitor_start_xmit` has **silent drops both before and after the regulatory check** (`cfg80211_reg_can_beacon`, `tx.c:2425`), each producing an observable *identical* to the NO_IR drop (frame freed, `NETDEV_TX_OK`, no counter, no `head` movement, no echo, nothing on air) **[V]** — read from upstream `net/mac80211/tx.c` at v6.12 and v6.12.61 (function at `:2301`; the line numbers below are identical in both). *This item used to say "three before": it listed four, and the fourth is after the check.*
+   - `!ieee80211_sdata_running(sdata)` → `fail` (`:2314`)
+   - `!ieee80211_validate_radiotap_len(skb)`, or a frame shorter than its radiotap header plus 2, or than radiotap plus its 802.11 header → `fail` (`:2322`, `:2342`, `:2348`) — malformed input, so these bite only a rig that is already broken
+   - **`chanctx_conf == NULL`** after the `local->monitor_sdata` fallback → `fail_rcu` (`:2389`)  ← *the one nobody modelled*
+   - `cfg80211_chandef_usable(…, IEEE80211_CHAN_DISABLED)` fails → `fail_rcu` (`:2405`)
+   - and, **after** the regulatory check, `ieee80211_parse_tx_radiotap()` failure → `fail_rcu` (`:2445`) — so a radiotap field that leaves `it_len` or the present bitmap inconsistent (control 5) is a silent drop even on a permitted channel
 
    **`iw dev … set freq` returning 0 does not guarantee a channel context was assigned.** So: **every TX test injects the identical frame on 5180 MHz first and then on the channel under test, in one rig invocation with no interface state changes in between, and is scored only on the delta.** A failed 5180 control means *"rig broken, re-establish"* — not data. Re-run the control after **every** interface or module state change.
 
 4. **Negative control + fresh nonce.** Before each positive test, run the receiver for the same duration with the Pager **idle** and require **zero** matches. Put a **unique per-run nonce** in the test SSID (not a constant). Delete pcaps between runs rather than overwriting.
 
-5. **Explicit radiotap rate on 6 GHz frames.** An 8-byte radiotap with `present==0` specifies no rate, so rate control picks `sband->bitrates[0]` — and mt76 registers only the **OFDM subset** for 6 GHz (`mt76_init_sband_6g(phy, rates + 4, n_rates - 4)`), while 6 GHz is **HE-only by specification**. A null result would then be confounded between "a gate blocked it" and "the firmware will not transmit a legacy-OFDM preamble on band 4". Add an `IEEE80211_RADIOTAP_RATE` field, record the rate used, run the same frame on 5180 as a rate control, and capture **with radiotap** on the receiver so you report the observed PHY type. **Note: injecting a true HE frame is not possible through this stack's radiotap TX parser** — it parses only LEGACY RATE, MCS (HT) and VHT. **[V]**
+5. **Explicit radiotap rate on 6 GHz frames.** An 8-byte radiotap with `present==0` specifies no rate, so rate control picks `sband->bitrates[0]` — and mt76 registers only the **OFDM subset** for 6 GHz (`mt76_init_sband_6g(phy, rates + 4, n_rates - 4)`), while 6 GHz is **HE-only by specification**. A null result would then be confounded between "a gate blocked it" and "the firmware will not transmit a legacy-OFDM preamble on band 4". Add an `IEEE80211_RADIOTAP_RATE` field — `pagerinj --phy-rate <Mbps>` (whole Mbps, 1–127) emits exactly that and nothing else: present bit 2, one byte in 500 kbps units, `it_len` 9, and it prints `radiotap: RATE field N Mbps (2N x 500 kbps), it_len 9` so the value is on the record (`dev/injector/README.md` §`--phy-rate`). `pagerinj`'s `--rate` is **frames per second, not this** — do not record it as the PHY rate. Record the Mbps passed, run the same frame on 5180 with the same `--phy-rate` as a rate control, and capture **with radiotap** on the receiver so you report the observed PHY type. **Note: injecting a true HE frame is not possible through this stack's radiotap TX parser** — it parses only LEGACY RATE, MCS (HT) and VHT. **[V]**
 
 **Rollback:** `uci set pineapd.wlan1mon.hop=1; uci commit pineapd; /etc/init.d/pineapd restart`
 
@@ -655,6 +658,8 @@ So the primary instrument is **`pagerinj`** (`dev/injector/`): a small AF_PACKET
 # receiver (separate adapter, parked, radiotap on):
 #   ip link set wlanX down; iw dev wlanX set type monitor; ip link set wlanX up
 #   iw dev wlanX set channel 52
+#   the 5180 control below is on channel 36: park a second adapter there, or retune this one to 36
+#   for the 5180 pass and back to 52 before the 5260 pass (day-one step 13 says the same)
 #   tcpdump -i wlanX -e -s0 -w /tmp/rx_neg.pcap &   # NEGATIVE control, Pager idle
 #   ... wait, kill, require ZERO matches ...
 #   tcpdump -i wlanX -e -s0 -w /tmp/rx_ch52.pcap &
@@ -664,8 +669,9 @@ ssh root@172.16.52.1 '/etc/init.d/pineapd stop; sleep 2; ip link set wlan1mon up
     iw dev wlan1mon set freq $F 20; echo "freq $F rc=$?"
     iw dev wlan1mon info | grep -E "channel|txpower"
     cat /sys/kernel/debug/ieee80211/$(cat /tmp/phy1name)/mt76/xmit-queues
-    # the nonce-bearing frame -- pagerinj does NOT touch the channel set above, which is the point
-    /tmp/pagerinj -i wlan1mon --nonce "PAGERINJ-$F" --chan $((F==5180?36:52)) --rate 20 --secs 10
+    # the nonce-bearing frame -- pagerinj does NOT touch the channel set above, which is the point;
+    # the $(date +%s) suffix is control 4's per-run nonce (expands on the Pager; the SSID stays under 32 bytes)
+    /tmp/pagerinj -i wlan1mon --nonce "PAGERINJ-$F-$(date +%s)" --chan $((F==5180?36:52)) --rate 20 --secs 10
     cat /sys/kernel/debug/ieee80211/$(cat /tmp/phy1name)/mt76/xmit-queues
   done'
 ```
@@ -696,18 +702,24 @@ ssh root@172.16.52.1 '/etc/init.d/pineapd start; sleep 5
 
 ```sh
 # Tune the receiver FIRST — a NO-IR 6 GHz channel is passive-only, so scanning will never find it.
-ssh root@172.16.52.1 'PHY=$(cat /tmp/phy1name); /etc/init.d/pineapd stop; sleep 2
+ssh root@172.16.52.1 'PHY=$(cat /tmp/phy1name); /etc/init.d/pineapd stop; sleep 2; ip link set wlan1mon up
   iw dev wlan1mon set freq 5180 20   # paired control, same invocation
-  # ... transmit nonce frame, check head + receiver ...
+  # the nonce frame (per-run suffix: control 4), with the explicit legacy rate B0 control 5 asks for (--rate is frames/sec, not the PHY rate)
+  /tmp/pagerinj -i wlan1mon --nonce "PAGERINJ-5180-$(date +%s)" --chan 36 --phy-rate 6 --rate 20 --secs 10
+  # ... check head + receiver ...
   iw dev wlan1mon set freq 5955 20; echo "6g rc=$?"
-  # ... transmit identical nonce frame, check head + receiver ...'
+  # identical frame, identical --phy-rate; --chan is only the nonce beacon's own DS element (6 GHz ch 1 = 5955)
+  /tmp/pagerinj -i wlan1mon --nonce "PAGERINJ-5955-$(date +%s)" --chan 1 --phy-rate 6 --rate 20 --secs 10
+  # ... check head + receiver ...'
 ```
+
+`--phy-rate 6` is the OFDM base rate. Record what the receiver's radiotap reports for **both** runs (control 5). Until the 5180 run under the same `--phy-rate` is in hand, a 6 GHz null here is confounded exactly as control 5 describes and must not be scored as gate b (here) or as antenna (B7).
 
 **Predicted under US [V]:** `rc=0` (NO-IR is **not** checked at set-channel time), but `head` does **not** move, no echo, receiver silent ⇒ **gate b, cfg80211's NO_IR test, is the 6 GHz blocker**. This is the silent-success trap reproduced on purpose and caught by two independent observables.
 
 **Two-tier set-channel observable [V]:** nl80211 rejects a **DISABLED** channel *loudly* with extack `"(extension) channel is disabled"` (`-EINVAL`), whereas a **NO-IR-only** channel passes set-channel *silently* and then has its frames dropped at TX. That distinguishes the two causes for free, with no guessing.
 
-**Then re-run under AR (B2 applied)** and expect `head` to move and the receiver to capture — proving the 6 GHz block is **regulatory.db policy, reversible from userspace, with no hardware or firmware change**.
+**Then re-run under AR (B2 applied)**, same `--phy-rate`, and expect `head` to move and the receiver to capture — proving the 6 GHz block is **regulatory.db policy, reversible from userspace, with no hardware or firmware change**.
 
 **Note [V]:** `cfg80211_set_monitor_channel` returns `-EBUSY` unless the phy has monitors only. That bites on **phy0**, where the `wlan0` dummy STA is up — `ip link set wlan0 down` first if you tune `wlan0mon`.
 
@@ -734,7 +746,7 @@ Report the numbers in the verdict. Pair with the §0.2 FCC internal photos, whic
 
 ## C1 [INV, risk: medium] Patch pineapd's gate
 
-Needed only if you want pineapd's integrated CSA/recon workflow rather than a bolt-on tool. **Six same-length edits, 16 bytes, no control-flow or size change**, round-trip tested byte-exact to the stock sha256. **[V]**
+Needed only if you want pineapd's integrated CSA/recon workflow rather than a bolt-on tool. **Six same-length edits — two `6ghz`, four `dfs` — changing 16 bytes in all (2 + 14, counted as bytes that differ in the table below), no control-flow or size change**, round-trip tested byte-exact to the stock sha256. **[V]** at the time, with a tool that lived in a session scratchpad and was never committed (see the block below) — re-run the round-trip with the rebuilt tool before relying on it.
 
 | Group | file off | vaddr | stock → patched | Effect |
 |---|---|---|---|---|
@@ -747,8 +759,10 @@ Needed only if you want pineapd's integrated CSA/recon workflow rather than a bo
 
 **Patch the groups separately.** The **dfs** group rests on a fully disassembled bitmask — solid. The **6ghz** group rests on the inference that `chan_type == 8` denotes the 6 GHz type, which is **[A] probable, not verified**: the literal store of 8 into offset 28 was never traced. If that inference is wrong the two edits are simply **inert, not harmful** — but they must not be credited as "gate lifted" on that basis.
 
+> **`tools/pineapd_gate.py` is to be written before Stage C.** It exists on no ref of this repository (checked over every local and remote ref; the original lived in a session scratchpad), so the block below cannot run as written. What it must do, from the table above: (1) `check <file>` — verify the file's sha256 is the stock `adc9d36d…8493` (or a recognised patched state) and print the bytes at each of the six file offsets, refusing a file it does not recognise; (2) `patch <dfs|6ghz|all> <file>` — write the named group's patched bytes at those offsets, in place, same length; (3) patch then restore must reproduce the stock sha256 byte-exact. Until it exists the table *is* the tool: `od -An -tx1 -j $((0x6e802)) -N 2 pineapd.patched` reads a site, `printf '\377\162' | dd of=pineapd.patched bs=1 seek=$((0x6e802)) conv=notrunc` writes one — POSIX octal escapes, bytes in file order as the table shows them; **not** `printf '\xff\x72'`: `\x` is a bash/BusyBox extension, and under `sh` = dash that string emits the eight ASCII bytes `5c 78 66 66 5c 78 37 32`, overwriting six bytes of adjacent MIPS16 code (tested: `dash -c "printf '\xff\x72'" | od -An -tx1`; falsified by dash printing `ff 72` for it) — then re-read the site with the same `od` line and require exactly `ff 72` before the next write, `sha256sum` after each group.
+
 ```sh
-# off-box, with the tested tool
+# off-box, with the tool specified above
 cp ~/pager-baseline/pineapd.stock ./pineapd.patched
 python3 -I tools/pineapd_gate.py check ./pineapd.patched
 python3 -I tools/pineapd_gate.py patch dfs ./pineapd.patched     # or: 6ghz / all
@@ -776,7 +790,7 @@ ssh root@172.16.52.1 '/etc/init.d/pineapplepager start; sleep 8; pgrep pineapd; 
 
 ## C2 [INV, risk: medium] Custom regulatory.db — **only if B2 failed**
 
-Needed only if the engagement requires a US-labelled regdomain, or >30 dBm, or 6 GHz plus all 25 US DFS channels in one domain. **If B2 reached `noIR=0 disabled=0`, skip this entirely.**
+Needed only if the engagement requires a US-labelled regdomain, or >30 dBm, or 6 GHz plus all 16 US DFS channels in one domain. **If B2 reached `noIR=0 disabled=0`, skip this entirely.**
 
 The shipped `regulatory.db` is itself a **hand-modified, unsigned** database: byte-for-byte upstream wireless-regdb **2025.02.20** `db.txt` compiled with `db2fw.py` after exactly one edit (NO-IR dropped from the world domain's 5170–5250 rule). **The vendor has already done precisely what this step proposes**, which is direct evidence an unsigned replacement loads. **[V]**
 
@@ -786,10 +800,12 @@ Corrections to the brief: the build script is **`db2fw.py`** (VERSION 20 → `re
 
 Build **on the build host** (the Pager has no Python and no toolchain), and prefer **variant B** — append a bespoke `country XX` — because it is purely **additive** and touches nothing existing:
 
+> **`tools/regdb_build/REPRO.sh` is to be written before Stage C.** It exists on no ref of this repository (the original lived in a session scratchpad). What it must do, from this section: (1) fetch upstream wireless-regdb **2025.02.20** `db.txt`, apply the vendor's one edit (drop NO-IR from the world domain's 5170–5250 rule), build with `db2fw.py` into `regulatory.db.vendor`, and assert its sha256 is `30954f89…4b44`; (2) append the bespoke `country XX` rule set and build `regulatory.db.B`; (3) print both hashes. **The `country XX` rule lines are recorded nowhere in this plan**, so the `regulatory.db.B` hash below is **not re-checkable** from this document — a historical value; write the XX rules into the script *and* here when it is rebuilt.
+
 ```sh
 sh tools/regdb_build/REPRO.sh /tmp/regdb-work
 # regulatory.db.vendor must equal 30954f89…4b44  (proves the db.txt baseline is the vendor's)
-# regulatory.db.B      = 8eb6e4dfe54c73a8a80bdb3472721797ac25b85f975195e7378f0d7bd1ad041e
+# regulatory.db.B      = 8eb6e4dfe54c73a8a80bdb3472721797ac25b85f975195e7378f0d7bd1ad041e  (historical — see above)
 ```
 
 **A vendor-hash mismatch ⇒ STOP.** Shipping a db built from the wrong baseline would silently re-add NO-IR to the world domain's 5170–5250 rule.
@@ -840,11 +856,11 @@ ssh root@172.16.52.1 'df -h /overlay; sha256sum /root/regulatory.db.new
 | Kernel change needed? | No | **None** |
 | New hardware needed? | 6E receiver **and** 6E AP | **A 5 GHz receiver** — see the correction in Addendum 2c. An earlier draft claimed `wlan0mon` was a free in-enclosure receiver; it is `band '2g'` and cannot hear ch 52. |
 | Only obstacle | NO-IR + pineapd + PMF | **pineapd's hardcoded channel bitmask alone** |
-| Fix cost | B2 + 4-byte patch group | **12-byte `dfs` patch group, or `opkg install hcxdumptool`** |
+| Fix cost | B2 + the two-site `6ghz` patch group (2 bytes changed, C1) | **the four-site `dfs` patch group (14 bytes changed, C1), or a non-pineapd injector (`pagerinj`, B3)** |
 | **Does deauth actually work?** | **No** — PMF mandatory | **Yes** — ordinary WPA2 networks, PMF optional |
 | Coverage won | 59 channels nobody is on yet | **~16 widely-deployed channels** |
 
-**Sequence:** A3 (confirm no NO-IR on 5260/5500) → B0 (rig) → B3 (`hcxdumptool`) → B4 (inject ch 52, confirm on the **external 5 GHz receiver**, not `wlan0mon`) → B5 (attribute) → C1 `dfs` group only, if the integrated pineapd workflow is wanted.
+**Sequence:** A3 (confirm no NO-IR on 5260/5500) → B0 (rig) → B3 (`pagerinj`; `hcxdumptool` pinned with `-c 52b` as the cross-check) → B4 (inject ch 52, confirm on the **external 5 GHz receiver**, not `wlan0mon`) → B5 (attribute) → C1 `dfs` group only, if the integrated pineapd workflow is wanted.
 
 This needs **no kernel change and no regdb change**. It does need a 5 GHz-capable receiver (Addendum 2c), which the 6E adapter from §0.1 already satisfies — so it adds no purchase beyond what the 6 GHz branch requires anyway, and it is verifiable on day one.
 
@@ -901,7 +917,7 @@ VERDICT   fill the table below
 | **E0b** | Deliverable is a CSA **channel move**, but the target AP enables beacon protection (MMIE + Ext Cap bit 84) **and** the client can enforce it | **Beacon-CSA channel move defeated** — mac80211 drops MME-less beacons once the client holds a BIGTK. `probe-csa` does not move a station-mode client either. The remaining outside paths: an unprotected Public-Action eCSA (no switch, but a persistent uplink stall), and the **connection-denial** path, which beacon protection does not close. Decide which effect the engagement actually needs before stopping. | **[V]** for mac80211 |
 | **E1** | A2 shows no `Band 4` | **NO. Hard stop.** No software can create the band. | **[V]** |
 | **E2** | B7 shows 6 GHz RSSI ≳20 dB below 5 GHz | **NO in practice.** 6E die behind a 2.4/5 GHz antenna path. Passes every software test, fails every engagement. | measurement |
-| **E3** | P0.2 firmware hash ≠ 1.1.3 | **STOP.** Every offset and prebuilt artifact is invalid. Re-derive first. | **[V]** |
+| **E3** | P0.2 firmware hash ≠ 1.1.3 | **STOP.** Every offset and prebuilt artifact is invalid. Re-derive first — from the C1 offset table and `dev/pager-csa-primitives.md` §"Disassembling pineapd"; the C1/C2 tools do not yet exist (P0.2). | **[V]** |
 | **E4** | B4 passes but B6 fails even under AR with `noIR=0 disabled=0` | **Gate c (firmware/MCU).** Not resolvable offline and not addressable by anything in this plan. Report and stop. | **[V]** that the driver side is exhausted |
 | **E5** | P0.4 `factory` partition reads all 0xFF/0x00 | **STOP.** Calibration data already absent; raise with Hak5 before experimenting. | — |
 
@@ -923,7 +939,7 @@ VERDICT   fill the table below
 
 1. **No `Band 4`** ⇒ **NO.** Hard stop; no software can create the band. The 5 GHz DFS win (f) stands on its own.
 2. **`Band 4` present, but deliverable is deauth** ⇒ **unlockable and pointless.** Report (f) as the actual deliverable.
-3. **`Band 4` + CSA deliverable + acceptable RSSI** ⇒ **YES.** The *how* is: `iw reg set AR` (plus `uci set wireless.radio1.country=AR` so netifd does not revert it) **+** the six-byte `6ghz` pineapd patch group — **no custom regulatory.db, no kernel change, no CLC**.
+3. **`Band 4` + CSA deliverable + acceptable RSSI** ⇒ **YES.** The *how* is: `iw reg set AR` (plus `uci set wireless.radio1.country=AR` so netifd does not revert it) **+** the two-site `6ghz` pineapd patch group (C1; 2 bytes changed) — **no custom regulatory.db, no kernel change, no CLC**.
 
 ### Close out
 
@@ -1108,7 +1124,9 @@ gate at §0.3 — PMF and beacon protection, which this filing does nothing to c
 `FCC Software Security Requirements for UNII devices` are listed **Metadata only** under the
 filing's confidentiality request and cannot be downloaded.
 
-## Addendum 2b — internal photos and the software-control attestation
+## Addendum 2b — internal photos and the software-control attestation *(antenna map superseded by Addendum 2c)*
+
+**Superseded on the antenna map by Addendum 2c**, which read the same photos at full resolution: the three-label list and the "resolution is too low to tell" paragraph below are kept as written, for the record, and 2c's four-label table is the one to use. The attestation reading is unaffected.
 
 Source: FCC ID 2A52Y-MK1, internal photos report **TZ0278250701PH03**, and
 `FCC Software Configuration Control Declaration Rev1.0` (signed 2025-09-15). **[V]**
@@ -1155,6 +1173,8 @@ Four antenna positions are labelled in the case, and the annotations are unambig
 | `2.4G-1` | **"Not used for transmitting"** | radio0 chain 1 — **receive only** |
 | `2.4G-2` | **"Not used for transmitting"** | radio0 chain 2 — **receive only** |
 
+(`MT7921AU` in the Meaning column names the module family this plan assumes throughout; the exact variant is **unconfirmed** — 2b above, and item 6 of "What this plan does NOT resolve" — and nothing in the antenna map depends on it.)
+
 So **every transmission on this device — 2.4, 5 and 6 GHz alike — leaves through the MT7921AU's
 two antennas.** `radio0` (`platform/10300000.wmac`, the SoC's own mt7603e, UCI `band '2g'`) is a
 **receive-only radio**. Corroborated by its own config: every AP-mode interface it defines
@@ -1179,9 +1199,25 @@ pass/fail signal the plan's own validity rules forbid.
 
 ### Note for CamHound's injectability probe
 
-`inj_probe()` merges per-channel flags across every phy, chosen so we need not guess which
-interface pineapd picks as injector. That stays correct here, but for a reason worth writing down:
-**the only transmitting radio (phy1) covers every band the receive-only one does**, so merging
-phy0's flags in can never make the merged answer differ from phy1's. If a future revision ships a
-transmitting radio0, or a radio0 covering a band phy1 does not, that invariant breaks and the merge
-would need to select the transmitting phy instead.
+`inj_probe()` reads the **transmitting phy's** table — the phy behind `RECON_IF`, resolved from
+`/sys/class/net/<RECON_IF>/phy80211/name` (the same link A1 reads with `readlink`) — and only when
+that file cannot be read does it fall back to merging `iw phy <phy> channels` across every phy under
+`/sys/class/ieee80211`, logging that it did (`library/user/reconnaissance/CamHound/payload.sh`,
+`inj_probe`; `INJ_TXPHY` records which mode ran). An earlier revision of this note described the
+merge as the only behaviour and justified it with "phy1 covers every band phy0 does"; that premise
+does not entail the invariant it was offered for, so the note is rewritten.
+
+- **The resolved mode needs no cross-phy invariant.** Gate 2 is applied by the phy a frame leaves
+  from, so the verdict for `wlan1mon` depends on `phy1`'s flags and on nothing else; no other phy's
+  rows enter `INJ_OK`.
+- **The fallback merge is over-permissive wherever two phys share a band and disagree.** It is a
+  plain last-row-wins overwrite per `band/channel` key in glob order, and the receive-only `radio0`
+  registers 2.4 GHz exactly as the transmitter does (the antenna map above; UCI `band '2g'`), so
+  every `2/<ch>` key is written twice and the merged verdict is whichever phy sorts last — not
+  necessarily the injecting one. Band coverage only guarantees `phy0` adds no key `phy1` lacks; it
+  does not make the shared keys safe. On the Pager the two phys are expected to print identical
+  2.4 GHz flags under one regdomain — **[A]**, not checked against the shipped `.ko`; an
+  `iw phy phy0 channels` / `iw phy phy1 channels` diff of the 2.4 GHz block settles it in one
+  command. *Falsified by:* a `radio0` that sorts after the transmitter's phy with different 2.4 GHz
+  flags, or a driver that sets 2.4 GHz flags on one phy only — either makes the fallback's answer
+  differ from `phy1`'s, which is why the fallback logs rather than runs silently.

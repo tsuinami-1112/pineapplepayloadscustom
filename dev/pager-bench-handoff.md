@@ -114,7 +114,7 @@ certification gap.
 
 | Item | Why it is not optional |
 |---|---|
-| **6E-capable monitor receiver** — they ordered an EDUP AX1672 (MT7921AU, USB 3.0, tri-band) | The only way to distinguish "transmitted" from "silently dropped". Load-bearing for **both** branches: it is also the 5 GHz receiver for the DFS tests, since `wlan0mon` cannot hear 5 GHz. |
+| **6E-capable monitor receiver** — they ordered an EDUP AX1672 (vendor-listed as MT7921AU, USB 3.0, tri-band; **not** on the plan §0.1 validated list, and whether it is the right part is **not determined** — confirm on arrival that it binds `mt7921u` and registers Band 4, per `dev/pager-prearrival.md` §6, before the Pager is powered) | The only way to distinguish "transmitted" from "silently dropped". Load-bearing for **both** branches: it is also the 5 GHz receiver for the DFS tests, since `wlan0mon` cannot hear 5 GHz. |
 | **6 GHz AP** in the chamber | Beacon source for receiver proof, and the CSA target. |
 | **Real 6 GHz client** | **Required, not optional.** A beacon capture tells you the AP's beacon-protection *policy*; only a real client tells you whether a forged beacon is actually dropped, because enforcement depends on the client's own driver (§5). |
 | **5 GHz AP on a DFS channel** | The DFS branch's target. |
@@ -326,4 +326,5 @@ beacon protection is *required* on 6 GHz (WPA3 and PMF are; the Wi-Fi Alliance s
 could not be retrieved, so that leg is unverified rather than refuted, and the requirement that does
 exist was drafted for Wi-Fi 7, not for the band); whether a given client driver supports BIGTK
 installation at all; which drivers set `HANDLES_QUIET_CSA`; client behaviour on stacks other than
-mac80211; free flash space; the module part number.
+mac80211; free flash space; the module part number; whether the ordered EDUP AX1672 receiver is the
+right part (`dev/pager-prearrival.md` §6 has the one-minute `lsusb` / `dmesg` / Band-4 check).

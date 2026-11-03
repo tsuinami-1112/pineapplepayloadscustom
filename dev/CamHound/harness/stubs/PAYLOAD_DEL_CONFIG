@@ -1,0 +1,3 @@
+#!/bin/bash
+printf 'PAYLOAD_DEL_CONFIG %s %s\n' "$1" "$2" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"
+f="${HARNESS_CFG:-/tmp/cs_harness.cfg}"; grep -v "^$2=" "$f" > "$f.n" 2>/dev/null; mv "$f.n" "$f"

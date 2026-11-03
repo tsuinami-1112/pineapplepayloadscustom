@@ -55,14 +55,18 @@ moves a hash depends on which region it lands in:
 
 | Region | Markers | Hash |
 |---|---|---|
-| config block | top of file → `# ... end config block ---` | neither |
+| config block | `PAYLOAD_REL=` → `# ... end config block ---` | neither |
 | shared lib | `# --- camhound lib begin ---` → `# --- camhound lib end ---` | **lib** |
 | watch core | `# --- watch core begin ---` → `# --- watch core end ---` | **watch** |
 | everything else | — | neither |
 
 The selftest prints both hashes at the end, so a changed hash is visible without running
-`check_sync.sh`. The harness needs `jq`; it stubs DuckyScript, `_pineap`, `tcpdump`, `iwinfo` and
-`uci` from `dev/CamHound/harness/stubs/`.
+`check_sync.sh`. The harness needs `jq`; it stubs DuckyScript (`NUMBER_PICKER` and `PAYLOAD_SET/DEL_CONFIG` included),
+`_pineap`, `tcpdump`, `iwinfo`, `uci` and `iw` (a US-like channel table, answered for the fixture phy
+directory the fast copy points `INJ_SYSFS` at, so `inj_probe`'s success path runs) from
+`dev/CamHound/harness/stubs/`. Its `LIST_PICKER` answers only with items on the page it was handed: an
+answer further down the list makes it press `More...` first, as an operator would, and an answer that is
+on no page is refused (logged as `not on this page`).
 
 Starred config constants (`# *`) are overridable at runtime via
 `PAYLOAD_SET_CONFIG camhound <KEY> <value>` — if you add a starred constant, wire it into
@@ -73,7 +77,14 @@ Starred config constants (`# *`) are overridable at runtime via
 Line numbers drift; find things by name (`grep -n '^name()' payload.sh`).
 
 **Recon rung** — `load_signatures`, `add_sig`, `vendor_of`, `score_device`, `clean_text`,
-`is_setup_ap`, `review_list`, `main_menu`, `preflight`, `write_report`.
+`is_setup_ap`, `review_list`, `main_menu`, `preflight`, `write_report`; `rssi_gate_ok` (the RSSI_MIN
+list gate, kit-aware: a kit AP passes when a kit client does) with `rssi_min_clamp`; the Settings menu
+(`SETTINGS_TABLE` rows are `KEY|kind|floor|group|label` over all fifteen starred keys; `settings_menu`
+is a short top page, `settings_group` one page per group, Recon and Response; `settings_apply` re-runs
+`resp_clamp_lock` for the two timing keys and persists a raised lock; RESPONSE_CONFIRM-off asks twice;
+`cfg_snapshot_defaults`/`settings_reset`; `cfg_note_set` keeps the override count honest);
+`JQ_CLI`/`parse_cli_fallback` read the 2.0.0 client object (`probe` is a hash-keyed object, no
+association key); `raw_up_rows` feeds `--replay` a `raw_<run>.txt`.
 
 **Watch rung** (behaviour without identity) — `watch_menu`, `start_caps`/`stop_caps`,
 `pcap_words`/`pcap_bytes` (both have `od` fallbacks), `pcap_buckets`, `bucket_stats`,
@@ -85,16 +96,19 @@ Line numbers drift; find things by name (`grep -n '^name()' payload.sh`).
 - `posture_from_caps <rsn> <ext> <band> <ch>` → the badge: `D+C` (no PMF), `D?+C` (PMF capable),
   `C` (PMF required), `NONE` (PMF + beacon protection), `NOINJ` (cannot transmit here), `?` (unread)
 - `posture_of` → cached per BSSID, `POSTURE_TTL`. **Call it directly, never inside `$( )`** — it
-  sets globals in the caller's shell. It resets `POSTURE_RSN`/`POSTURE_EXT` on entry so a cache hit
-  cannot attribute a previous target's caps to this response's loot row.
+  sets globals in the caller's shell. It resets `POSTURE_RSN`/`POSTURE_EXT` on entry and caches the caps
+  per BSSID beside the badge, so a cache hit restores this target's caps and never attributes a previous
+  target's to this response's loot row.
 - `posture_opts <badge>` → the offered attacks, **best first**; `pick_list` preselects element 0, so
   the string order *is* the default. Empty means nothing is offered, and `disrupt_menu` then asks
   "Nothing is expected to work — try anyway?".
 - `posture_expect`, `posture_why` → the picker label and the one-line explanation.
 
 **Injection gates** — `csa_injectable <band> <ch>` models both gates (see below);
-`PINEAPD_DFS_BLOCKED` mirrors the firmware's hardcoded set; `inj_probe` reads live
-`iw phy <phy> channels` into `INJ_OK` and **must run in the parent shell** (`preflight` and
+`PINEAPD_DFS_BLOCKED` mirrors the firmware's hardcoded set; `inj_probe` reads the **transmitting
+phy's** live `iw phy <phy> channels` table into `INJ_OK` — the phy behind `RECON_IF`, from
+`<NET_SYSFS>/<RECON_IF>/phy80211/name`; only when that file is unreadable does it merge every phy
+under `INJ_SYSFS`, and it logs that it did — and **must run in the parent shell** (`preflight` and
 `disrupt_menu` call it). `inj_parse_channels` is its awk parser. It is validated against a fixture
 built byte-for-byte from the shipped `iw` binary's own format strings — which found and fixed one
 over-permissive defect (`iw` spells the NO_IR attribute three ways; see
@@ -578,7 +592,9 @@ have drifted twice already, so they are deliberately not restated here. It repla
 as the primary injector because **neither hcxdumptool nor aireplay-ng can build a CSA frame**, which
 step 17a needs. It now also carries 17a's third arm (`--ecsa-count`: element 37 count 0 plus a live
 eCSA, since `csa_present()` discards per element) and the unicast cat-0 Spectrum-Management CSA of
-day-one step 17c.
+day-one step 17c. Since df756c3 it also binds its capture to `-i`, skips a clone source that already
+carries a CSA or eCSA element, refuses a `--chan` equal to the cloned beacon's DS channel unless
+`--allow-same-chan`, and emits a radiotap RATE field with `--phy-rate <Mbps>`.
 
 **hcxdumptool splits by band, and the 6 GHz half is a trap** — settled against the 6.3.4 tag: it
 reads only `FREQUENCY_ATTR_FREQ`, `MAX_TX_POWER` and `DISABLED`, never `NO_IR` or `RADAR` **[V]**,
