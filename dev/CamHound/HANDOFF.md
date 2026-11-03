@@ -77,10 +77,8 @@ the other session builds on `bands_*`. What the fixes changed, so the next reade
   watchdog. It now acts on the bands only while the lock file still names its own pid; a run started
   since has already replayed the file. The harness showed it as three intermittent `bands` failures.
 
-**Pending when the usage limit hit (2026-11-03):** the full harness (`run_harness.sh all`) had passed
-every scenario except `bands` on a fast copy taken before the watchdog guard; `bands` passes on the
-final source, and a full re-run on the final source was started but not confirmed — run it first.
-A second tiered review of this fix set (run `wf_9834bba3-188`, script
-`camhound-review-fixes-review-wf_9834bba3-188.js` under the session's `workflows/scripts/`, scope
-`git diff 033a091`) was in flight and is resumable from its cache; its findings, if any survive, are
-the next fixes on this branch.
+**Verification of that commit, after the usage limit reset (2026-11-03):** the full harness
+(`run_harness.sh all`) passed on the committed source — 70 checks, 0 failures; the one `Killed` line
+in its output is the `lock` scenario's deliberate SIGKILL. A second tiered review of the fix set
+(`git diff 033a091 ec3b548`, four finder dimensions, three lenses for device code and one sceptic
+for docs and tests) was run after it; its outcome and any fixes are in the commit that follows.
