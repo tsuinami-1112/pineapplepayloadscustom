@@ -208,18 +208,22 @@ the grep, not to replace verification.
 
 ## Review workflows: the standing rules
 
-Set by the operator on 2026-11-03 for every session that runs an agent review here.
+Set by the operator on 2026-11-03 for every session that runs an agent review here. The point is
+not to ration the heavy shapes — multi-finder reviews, three-lens adversarial verification, judge
+panels, critic rounds, fix-then-reverify loops are all welcome, and are the right default for code
+the device runs, hardware-facing claims and anything novel. The point is to stop them appearing on
+trivial work: a doc edit, a comment's wording, a stale count, a renamed check. Judge the tier by what
+a wrong finding would cost if acted on and by how likely the finder is to be wrong, and spend
+accordingly.
 
 1. **Tier the verification by consequence and by likelihood of error.** A finding gets the full
    three-lens adversarial pass (trace, intent, impact) when a fix would change code the device runs,
    when it contradicts a fact measured on hardware, or when it is an inference composed from verified
    readings — the error shape this project has been bitten by twice. Freshly written code rates
    higher on likelihood of error than code that has survived a prior pass and a harness run, even at
-   equal consequence. Everything else — docs, comments, stale counts, wording, test gaps — gets one
-   sceptical verifier whose prompt says: default to refuted unless you can reproduce it from the
-   artifact. Heavier shapes (judge panels, a critic round, fix-then-reverify loops) stay available for
-   novel or hardware-facing work and for mistakes that are expensive to unwind; say why when you use
-   one.
+   equal consequence. Docs, comments, stale counts, wording and test gaps get one sceptical verifier
+   whose prompt says: default to refuted unless you can reproduce it from the artifact. When in doubt
+   between tiers, take the heavier one and say why.
 2. **Cap the finder pool at four dimensions per review.** Batch verification at nine findings per
    agent, grouped by file. Never one agent per finding per lens.
 3. **Report the refutation count in the first line of every review summary.** A pass that refutes
