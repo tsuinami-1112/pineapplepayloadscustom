@@ -93,6 +93,12 @@ found and fixed one over-permissive defect (`dev/pager-prearrival.md` §5).
 
 **8b. Two `_pineap` answers CamHound's recon rung needs** — neither needs the receiver.
 
+- **DONE 2026-11-03, on the bare 1.1.3 unit:** `_pineap RECON DEVICES format=json` lists every device
+  in the 2.0.0 object shape and carries **no association key**; `_pineap RECON CLIENTS format=json`
+  is `Unknown recon command`, rc 255. CamHound now reads clients from `DEVICES` on 1.1.3 (probe-only
+  rows, probed SSIDs, no association). The Recon UI still knows the association
+  (`_RECON_SELECTED_AP_BSSID`, since firmware 1.0.9 per `library/recon/client/example/payload.sh:19-31`),
+  so the source must be the Go UI daemon's own API — the next bullet.
 - **Where a client's association lives.** `RECON CLIENTS` is 2.0.0-only and its documented device
   object has no association field (CLAUDE.md §"2.0.0-stable, analysed"), so on a 2.0.0 unit with an
   associated client run `_pineap RECON CLIENTS format=json | jq '.[0]|keys'` and look for any key
@@ -108,6 +114,51 @@ found and fixed one over-permissive defect (`dev/pager-prearrival.md` §5).
   end on its own? CamHound now calls it bare and logs "Recon session requested", which is right under
   either reading; the answer decides whether a name is worth passing and whether the scan loop must
   ever restart a session that ended on its own.
+
+**8c. The band write, before trusting `BAND6`** — bare firmware, no receiver, reversible.
+
+```sh
+PINEAPPLE_SET_BANDS                      # no arguments: does it print a usage line, and which form -- '<iface> 2 5 6' or 'both'?
+uci get pineapd.wlan1mon.bands; pidof pineapd; _pineap RECON COUNT APS
+PINEAPPLE_SET_BANDS wlan1mon 2 5 6; sleep 2
+uci get pineapd.wlan1mon.bands; pidof pineapd; _pineap RECON COUNT APS   # did the value take, did the pid change, did the rows survive?
+PINEAPPLE_SET_BANDS wlan1mon 2 5; sleep 2; uci get pineapd.wlan1mon.bands   # put it back
+PINEAPPLE_RECON_NEW                      # no arguments: the usage line settles 8b's second question too
+```
+
+> **Run 2026-11-03 on the bare 1.1.3 unit.** The usage line is `PINEAPPLE_SET_BANDS [interface] {2} {5} {6}`
+> — the token form, so `bands_apply`'s argument list is right and nosey-neighbor's `"both"` is wrong
+> **[V]**. After `PINEAPPLE_SET_BANDS wlan1mon 2 5 6`: `uci get pineapd.wlan1mon.bands` still `2,5`,
+> `pidof pineapd` unchanged (4603), `RECON COUNT APS` unchanged (251). So the call does **not** restart
+> pineapd and does **not** touch the uci value within 2 s. What is still unknown is whether it changed
+> the *running* hop set — the uci read-back `bands_apply` trusts would call this "not applied" even if
+> it did. Next, same unit:
+>
+> ```sh
+> _pineap RECON CHANNELS                                   # the hop set as pineapd reports it, before
+> PINEAPPLE_SET_BANDS wlan1mon 2 5 6; sleep 2; _pineap RECON CHANNELS
+> for i in $(seq 1 16); do iw dev wlan1mon info | grep -o 'channel [0-9]* ([0-9]* MHz)'; sleep 0.5; done   # any 59xx-71xx MHz = 6 GHz is being hopped
+> PINEAPPLE_SET_BANDS wlan1mon 2 5; sleep 2; _pineap RECON CHANNELS
+> ```
+>
+> **Run, same day:** `_pineap RECON CHANNELS` is a per-frequency observation histogram, not the hop set
+> (24 frequencies, all 2.4/5 GHz, counts only grew). Sixteen `iw dev wlan1mon info` samples over 8 s
+> after `wlan1mon 2 5 6` showed 2.4 and 5 GHz only (1, 153, 116, 60, 9, 161, 136, 100, 44, 5, 157, 120,
+> 52, 10 — DFS channels are hopped for receive), never 6 GHz. **So with pineapd running, the call
+> changed neither uci nor the hop set within the window: a no-op as issued.** `bands_apply` now
+> verifies by sampling the live channel (`bands_live6`) and reports "band write not applied: radio
+> stayed on 2,5" in this case. Still open, and the next things to try on the bench — each reversible:
+>
+> ```sh
+> PINEAPPLE_SET_BANDS wlan1mon 2 5 6; PINEAPPLE_RECON_NEW; sleep 8      # does a NEW session pick the bands up?
+> for i in $(seq 1 16); do iw dev wlan1mon info | grep -o '([0-9]* MHz)'; sleep 0.5; done
+> PINEAPPLE_SET_BANDS wlan1mon 2 5; PINEAPPLE_RECON_NEW
+> ```
+>
+> and, only if that shows nothing, `/etc/init.d/pineapd restart` after the write (Recon rows are lost;
+> `cat /proc/$(pgrep -n pineapd)/cmdline | tr "\0" " "` then shows whether `--band wlan1mon:2,5,6`
+> is what the Go UI passes). Also look at the Recon tab's band setting in the web UI after the write:
+> if it moved there, the write reaches the UI's state and only a session restart applies it.
 
 **9. THE VALUE GATE — a beacon capture plus the real client, before spending effort on 6 GHz.**
 Beacon protection takes **both** an AP that enables it and a client that can enforce it, so the

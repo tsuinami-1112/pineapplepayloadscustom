@@ -11,11 +11,16 @@ suspect to test whether it is streaming (**Watch**), whether it reacts to moveme
 test**) or where it is (**Locate**). Identity scanning is passive and free. Watch and Locate pause
 Recon channel hopping for the length of the lock (30-120 s). CamHound never joins a network.
 
-With `RESPONSE=1` a fourth rung appears on the device card — **Disrupt** — which reads the target's
-protection posture from its own beacon and then disconnects it with deauthentication and
-disassociation, channel-switch announcements, or all three. See [Response](#response).
-**`RESPONSE` defaults to 0**, and with it off CamHound transmits nothing and behaves exactly as
-CamScout did. `AUTO_RESPOND=1` additionally lets the funnel *offer* Disrupt by itself: after a Watch
+A fourth rung sits on the device card — **Disrupt** — which reads the target's protection posture
+from its own beacon and then disconnects it with deauthentication and disassociation, channel-switch
+announcements, or all three. See [Response](#response).
+**`RESPONSE` defaults to 1**, so recon and response are both live out of the box. Set it to 0 —
+Settings → Response settings, or `PAYLOAD_SET_CONFIG camhound RESPONSE 0` — for a recon-only run
+that transmits nothing and behaves exactly as CamScout did. Only **DEAUTH on a client row** is
+aimed at one device: `CSA` has no target argument at all and `BOTH`'s is discarded, so both hit
+every client on the BSS, and an AP row resolves the target to broadcast so *everything* is BSS-wide
+there. The picker marks the broad options ` bss` and the confirm names the real blast radius.
+`AUTO_RESPOND=1` additionally lets the funnel *offer* Disrupt by itself: after a Watch
 confirms a device is streaming, or for a newly CONFIRMED device the Watch and Locate offers did not
 take (with `AUTO_WATCH=0` that is every new CONFIRMED device). The offer is a dialog, and
 `RESPONSE_CONFIRM` still gates the transmit; it is a second key precisely because that rung transmits.
@@ -24,7 +29,8 @@ take (with `AUTO_WATCH=0` that is every new CONFIRMED device). The offer is a di
 
 - A camera that is powered off, or one that only records to a card and never talks to Wi-Fi.
 - Wired (PoE) cameras. Only the NVR/base station may show up, as an AP or a client.
-- 6 GHz devices unless 6 GHz is enabled in the Recon settings (status line says `6 GHz not scanned`).
+- 6 GHz devices unless 6 GHz is enabled in the Recon settings or `BAND6=1` (Settings → Recon settings)
+  writes it for the run; the status line says `6 GHz not scanned` otherwise.
 - 5 GHz 40/80 MHz streams may be invisible to Watch if the lock parks the radio at 20 MHz (Phase 0 item 28).
 - Sub-300 kbps streams and Wi-Fi 6 UL-OFDMA uplinks under-count in Watch (frames under 1000 bytes
   are not "big"); Watch reports them as IDLE or NONE.
@@ -33,12 +39,13 @@ take (with `AUTO_WATCH=0` that is every new CONFIRMED device). The offer is a di
 - A battery/event camera that is asleep looks idle in Watch. Use the Stimulus test.
 - INCONCLUSIVE is about the measurement (lock, band, distance), not about the device.
 
-**Which AP a client is associated to.** `_pineap RECON CLIENTS` is new in 2.0.0 (1.1.3 has no such
-verb, so the client rung has never produced a row on it) and its device object carries probed SSIDs
-but **no association field** (CLAUDE.md §"2.0.0-stable, analysed", read from the firmware's own
-`HELP PARSE` text). Until the day-one spike finds a source — the Go UI's recon API carries `ap_mac`,
-`_pineap` does not — every client reads as unassociated: kit detection, client Watch and Stimulus,
-and per-client Disrupt stay dormant, and the `ap_bssid` column reads `-`.
+**Which AP a client is associated to.** `_pineap RECON CLIENTS` is new in 2.0.0; on 1.1.3 it is
+`Unknown recon command` (measured 2026-11-03), so CamHound reads clients from `RECON DEVICES` there
+(a device that neither beacons nor answers probes). Both verbs return the same object, which carries
+probed SSIDs but **no association field** (CLAUDE.md §"2.0.0-stable, analysed"). Until the day-one
+spike finds a source — the Go UI's recon API carries `ap_mac`, `_pineap` does not — every client
+reads as unassociated: kit detection, client Watch and Stimulus, and per-client Disrupt stay dormant,
+and the `ap_bssid` column reads `-`.
 
 ## How it works: four tiers
 
@@ -51,10 +58,10 @@ and per-client Disrupt stay dormant, and the `ap_bssid` column reads `-`.
    hexdump (or od) + awk. Live view grades STREAM / DOWN / IDLE / NONE / INCONCLUSIVE; the Stimulus test
    grades EVENT / EVENT? by comparing a 30 s still baseline with 20 s of you moving in front of it
    plus a 20 s settle window.
-3. **Response** (opt-in, off by default): reads the target's PMF and beacon-protection posture from
+3. **Response** (on by default): reads the target's PMF and beacon-protection posture from
    its own beacon, then disconnects it with deauth+disassoc, channel-switch announcements, or all
    three, and judges from Recon whether it actually went quiet. This is the only tier that
-   transmits, and it does nothing unless `RESPONSE=1`. See [Response](#response).
+   transmits; `RESPONSE=0` removes it and with it every transmit. See [Response](#response).
 4. **Active LAN** (opt-in, not in this version): joining the network to confirm an RTSP/ONVIF feed
    is planned as `LAN_CONFIRM=1` in v1.1b and is off by default.
 
@@ -164,12 +171,13 @@ Edit the config block at the top of `payload.sh`. Starred keys can also be set w
 survive updates: `PAYLOAD_SET_CONFIG camhound CYCLE_SECS 10` (`PAYLOAD_DEL_CONFIG camhound CYCLE_SECS`
 removes it). Overrides are counted on the start screen and listed in `events.log`. The **Settings**
 menu item does the same from the device, on two pages. **Recon settings** holds CYCLE_SECS,
-THR_STREAM_UP, COOLDOWN_SECS, DEDUPE_H, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH and AUTO_LOCATE;
+THR_STREAM_UP, COOLDOWN_SECS, DEDUPE_H, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH, AUTO_LOCATE and BAND6
+(the tenth key, one page on behind `More...`);
 **Response settings** holds RESPONSE, RESPONSE_CONFIRM, AUTO_RESPOND, RESP_LOCK_SECS, RESP_SETTLE_SECS
 and POSTURE_TTL. Numbers go through NUMBER_PICKER, switches are On/Off. Switching RESPONSE_CONFIRM off
 asks a second time, because it is the key that keeps every transmit behind a dialog; a lock shorter
 than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows what is in force.
-`Reset defaults` deletes the saved overrides of all fifteen keys. Changes apply at once and persist.
+`Reset defaults` deletes the saved overrides of all sixteen keys. Changes apply at once and persist.
 
 | Key | Default | Persist | Meaning |
 |---|---|---|---|
@@ -180,6 +188,7 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 | AUTO_WATCH / AUTO_LOCATE | 1 / 1 | * | the two-press funnel; set 0 for walk surveys |
 | AUTO_WATCH_RSSI | -72 | | minimum last RSSI to auto-offer Watch |
 | RSSI_MIN | 0 | * | optional list gate, dBm, on the best RSSI known for the MAC, carried-over best included (0 = widest net; a kit AP passes when a kit client does) |
+| BAND6 | 0 | * | also scan 6 GHz: writes the device's bands plus 6 for this run, trusted only when the radio is then seen on a 6 GHz channel (or uci reads it back); every issued write is put back at exit, by the watchdog if the run is killed, or at the next start; 2.4 GHz dwell drops to about a third. On bare 1.1.3 the write was a no-op with pineapd running (day-one 8c), and the status line says so |
 | SOUND | 0 | * | ringtone on CONFIRMED |
 | SHOW_MODULES | 1 | | modules list in the menu |
 | MODULE_HINT_RSSI | -55 | | one-time "module strong+busy: Watch?" hint |
@@ -200,7 +209,7 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 | DEDUPE_H | 0 | * | hours: a device stored in inventory.tsv within this horizon is not alerted again unless its band rose or it is 10 dB closer; `Scan (fresh)` ignores it for one run |
 | INVENTORY_KEEP_DAYS | 30 | | inventory.tsv rows older than this are pruned at start (0 = never) |
 | ROW_W | 22 | | list row budget (36-40 expected after Phase 0 item 19) |
-| RESPONSE | 0 | * | master switch for the Disrupt rung; 0 = recon only, nothing transmits |
+| RESPONSE | 1 | * | master switch for the Disrupt rung; 0 = recon only, nothing transmits |
 | RESPONSE_CONFIRM | 1 | * | blocking confirmation before any transmit (Settings asks twice before switching it off) |
 | AUTO_RESPOND | 0 | * | let the funnel raise Disrupt by itself (needs RESPONSE=1) |
 | POSTURE_TTL | 300 | * | seconds a posture badge stays cached per BSSID |
@@ -210,7 +219,18 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 
 ## Response
 
-Off by default. `PAYLOAD_SET_CONFIG camhound RESPONSE 1` adds **Disrupt** to the device card.
+On by default. `PAYLOAD_SET_CONFIG camhound RESPONSE 0`, or Settings → Response settings, removes
+**Disrupt** from the device card and with it everything that transmits.
+
+**Scope: only `DEAUTH` on a client row hits one device.** `PINEAPPLE_DEAUTH_CLIENT_CSA` takes
+`[bssid] [channel]` and has no target argument, so `CSA` is BSS-wide by its own signature;
+`PINEAPPLE_DEAUTH_CLIENT_ALL` advertises a `[target]` that its handler parses and discards, so
+`BOTH` is BSS-wide too. An AP row resolves the target to broadcast, so on one of those all three
+options are BSS-wide. `attack_scope()` is the single place that decides; the picker appends ` bss`
+to a broad option and the pre-transmit confirm reads *"on EVERY client of <bssid>"* rather than
+naming one device. `posture_opts` still orders by expected efficacy, so a BSS-wide attack is
+preselected on the common badges — deliberately, since demoting the attack most likely to work
+would make the advice worse; the marker and the confirm carry the breadth instead.
 
 **1 · Posture.** The badge comes from the target's own beacon, captured on `RECON_IF` — the only
 source that covers every band, since `radio0` is 2.4 GHz-only and `radio1` carries no managed
@@ -245,11 +265,11 @@ overridden:
 - **`?`** — the beacon could not be read, so none of the labels mean anything. CSA leads, because it
   works on every badge but `NONE`, and you are asked once ("Fire blind?") before the picker.
 
-| Option | Command | Frames |
-|---|---|---|
-| `DEAUTH` | `PINEAPPLE_DEAUTH_CLIENT [bssid] [target] [channel]` | deauth + disassociation |
-| `CSA` | `PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]` | channel-switch announcements |
-| `BOTH` | `PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]` | all three |
+| Option | Command | Frames | Scope |
+|---|---|---|---|
+| `DEAUTH` | `PINEAPPLE_DEAUTH_CLIENT [bssid] [target] [channel]` | deauth + disassociation | one client (from a client row); whole BSS from an AP row |
+| `CSA` | `PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]` | channel-switch announcements | whole BSS |
+| `BOTH` | `PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]` | all three | whole BSS |
 
 An AP target is attacked broadcast (`ff:ff:ff:ff:ff:ff`); a client target is attacked through its
 own AP's BSSID on that AP's channel. An unassociated client has no BSS to announce from and is
@@ -268,12 +288,17 @@ re-read from Recon:
 | `LOCK_FAILED` | the radio would not hold the target channel; nothing was transmitted |
 | `NO_CLIENTS` | AP target with no visible clients; refused before anything was transmitted |
 
-A broadcast attempt (AP target) is measured on the AP's visible, non-randomised clients, since the AP
-itself keeps beaconing whatever happens: `responses.tsv` gets one row per client with that client as
-`target`, and the verdict shown is the aggregate (`MOVED` only when every client went quiet,
-`NO_EFFECT` when any kept transmitting, `INCONCLUSIVE` otherwise). An AP with no visible clients is
-refused. Recon's packet counter is direction-blind, so a disconnected client that keeps probing still
-reads as transmitting.
+What is measured follows the attack's **scope**, not the row you picked. A `cli`-scope attempt
+(`DEAUTH` from a client row) measures that one device. A `bss`-scope attempt (`CSA` or `BOTH` from any
+row, or anything from an AP row) is measured on the BSSID's visible, non-randomised clients, since the
+AP itself keeps beaconing whatever happens; the device you picked is always among them, even behind a
+randomised MAC. `responses.tsv` gets one row per measured subject, and the verdict shown is the
+aggregate (`MOVED` only when every subject went quiet, `NO_EFFECT` when any kept transmitting,
+`INCONCLUSIVE` otherwise). When you picked one device and more than one was measured, a second line
+`picked <mac>: <verdict>` names that device's own result, so a collateral `NO_EFFECT` cannot read as
+"my camera stayed up". A subject Recon never listed before the burst is `INCONCLUSIVE`, never `MOVED`.
+An AP with no visible clients is refused. Recon's packet counter is direction-blind, so a
+disconnected client that keeps probing still reads as transmitting.
 
 Beacon protection (WPA3, Dec-2020 onward, mandatory for AP support in Wi-Fi 7) defeats the CSA
 path outright, and CSA bursts are detectable — Kismet alerts on CSA floods and on announcements
@@ -289,7 +314,8 @@ that reuse a captured beacon's timestamp.
   `#first_seen|last_seen|run_id|mac|role|cat|vendor|label|conf|id_score|beh_score|beh_verdict|band|ssid|ap_bssid|ch|freq|rssi_best|rssi_best_ts|rssi_last|prox|n_seen|pkt_rate|signals|lan_tag|lat|lon`
   (`band` = 2/5/6 GHz, `signals` = tags, epoch seconds, `-` for empty). ~160 B per MAC.
 - `events.log`: `epoch level msg` (cycle, alert, mode, watch, locate, cfg, warn, run, resp).
-- `responses.tsv` (only once a response is fired): one `|`-separated row per attempt. Header:
+- `responses.tsv` (only once a response is fired): one `|`-separated row per measured subject, so a
+  `bss`-scope attempt against a BSSID with four visible clients writes four rows for one attempt. Header:
   `#epoch|mac|role|bssid|target|ch|band|badge|rsn_caps|beacon_prot|attack|cmd|lock|pk_before|pk_after|verdict`
   (`rsn_caps` is the raw 2-octet RSN Capabilities field, low octet first; `beacon_prot` is octet 10
   of the Extended Capabilities element, or `-` when absent).
@@ -343,6 +369,6 @@ weights: they are fixed per TYPE. Ship unverified rows commented out.
 ## Roadmap
 
 Shipped since v1: Recon-menu hooks (`library/recon/client|access_point/CamHound`), inventory
-persistence across runs, the Settings menu, the response rung. v1.1 remaining: band write
-(`PINEAPPLE_SET_BANDS`), WPS/IE peek, LAN confirm (opt-in RTSP DESCRIBE). v2: multi-channel passive
+persistence across runs, the Settings menu, the response rung, the band write (`BAND6`). v1.1
+remaining: WPS/IE peek, LAN confirm (opt-in RTSP DESCRIBE). v2: multi-channel passive
 behaviour sweep, BLE co-hit, pocket mode, external capture radio.

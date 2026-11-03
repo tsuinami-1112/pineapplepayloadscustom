@@ -38,7 +38,7 @@ Record the version before anything else either way.
 
 ```sh
 curl -L -o pineapplepager-firmware-1.1.3-signed.bin \
-  https://downloads.hak5.org/api/devices/wifipineapplepager/firmwares/latest
+  https://downloads.hak5.org/api/devices/wifipineapplepager/firmwares/1.1.3-stable   # NOT .../latest: that serves 2.0.0 since 2026-10-29
 sha256sum pineapplepager-firmware-1.1.3-signed.bin
 ```
 

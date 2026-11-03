@@ -79,12 +79,17 @@ Line numbers drift; find things by name (`grep -n '^name()' payload.sh`).
 **Recon rung** — `load_signatures`, `add_sig`, `vendor_of`, `score_device`, `clean_text`,
 `is_setup_ap`, `review_list`, `main_menu`, `preflight`, `write_report`; `rssi_gate_ok` (the RSSI_MIN
 list gate, kit-aware: a kit AP passes when a kit client does) with `rssi_min_clamp`; the Settings menu
-(`SETTINGS_TABLE` rows are `KEY|kind|floor|group|label` over all fifteen starred keys; `settings_menu`
+(`SETTINGS_TABLE` rows are `KEY|kind|floor|group|label` over all sixteen starred keys; `settings_menu`
 is a short top page, `settings_group` one page per group, Recon and Response; `settings_apply` re-runs
 `resp_clamp_lock` for the two timing keys and persists a raised lock; RESPONSE_CONFIRM-off asks twice;
 `cfg_snapshot_defaults`/`settings_reset`; `cfg_note_set` keeps the override count honest);
 `JQ_CLI`/`parse_cli_fallback` read the 2.0.0 client object (`probe` is a hash-keyed object, no
-association key); `raw_up_rows` feeds `--replay` a `raw_<run>.txt`.
+association key), and `recon_verb_probe` picks `RECON DEVICES` (`JQ_DEVCLI`: devices that neither
+beacon nor answer probes) where `RECON CLIENTS` is refused, as on 1.1.3; `bands_plan`/`bands_apply`/
+`bands_restore` are the opt-in 6 GHz band write (`BAND6`; `bands_live6` samples the live channel and
+the write is trusted only when 6 GHz is seen there or in uci — on bare 1.1.3 it was a no-op with
+pineapd running, day-one 8c; every issued write is restored in `cleanup`, by the watchdog, or by
+`bands_recover` at the next start from `BANDS_STATE`; not copied into the hooks); `raw_up_rows` feeds `--replay` a `raw_<run>.txt`.
 
 **Watch rung** (behaviour without identity) — `watch_menu`, `start_caps`/`stop_caps`,
 `pcap_words`/`pcap_bytes` (both have `od` fallbacks), `pcap_buckets`, `bucket_stats`,
@@ -121,9 +126,30 @@ pending validation.
 counters), `resp_aggregate`, `resp_write` (→ `responses.tsv`, header `RESP_HDR`), `auto_respond_ok`.
 Timings: `RESP_LOCK_SECS`, `RESP_SETTLE_SECS` — both starred and wired; the lock must exceed
 fire + settle or it expires mid-measurement.
+`RESPONSE` **defaults to 1** — recon and response are both live out of the box; `RESPONSE=0` is the
+recon-only run. `attack_scope <key>` → `cli`|`bss` is the single place that decides blast radius:
+only `DEAUTH` on a client row is targeted, because `CSA` has no target argument and `_ALL`'s is
+parsed and discarded, and an AP row resolves `R_TARGET` to broadcast so everything is BSS-wide
+there. `disrupt_menu` reads it twice — the picker appends ` bss` to a broad option, and the
+pre-transmit confirm says "on EVERY client of <bssid>" instead of naming one device. `posture_opts`
+still orders by efficacy, so a BSS-wide attack stays preselected on the common badges; the marker
+and the confirm carry the breadth rather than the ordering.
+**`resp_snapshot <scope>` reads it too, and that was a defect until 2026-11-03**: subjects were
+selected by *row type* (`R_TARGET == ff:ff:ff:ff:ff:ff`), so a client-row `CSA`/`BOTH` transmitted
+BSS-wide and then measured and looted exactly one device. Subjects now follow the attack's scope,
+the picked target is always among them (even behind a randomised MAC the `bss` sweep skips), and
+`resp_fire` names that device's own verdict when there is more than one subject so a collateral
+`NO_EFFECT` cannot read as "my camera stayed up". Harness scenario `cliscope` drives both arms.
+Caveat, and it is bigger than a loot-quality note: the `bss` sweep matches `ap_mac` against
+`R_BSSID`, and **no shipped firmware supplies an association**, so the sweep matches nothing. That
+does not "degrade measurement to the picked target" — *an earlier revision of this line said so and
+it was wrong on both row types.* An AP row has no target to fall back to (broadcast), so subjects
+are 0 and `resp_fire` refuses; a client row never reaches the sweep because `AP_OF` is `-` and
+`resp_target` returns 1 at `payload.sh:1983`. The selection rule is right and **the rung cannot fire
+on either firmware** — see the warning below and `RESPONSE.md` §13.
 
 **Selftest** — `selftest()` plus `st_*` helpers (`st_device`, `st_pcap`, `st_beacon_pcap`,
-`st_gate`, `st_hex2bin`). Runs on a laptop with no radio. Add a case for anything you change.
+`st_gate`, `st_hex2bin`, `st_subjects`). Runs on a laptop with no radio. Add a case for anything you change.
 
 ## Where the documentation is
 
@@ -180,6 +206,34 @@ repeat themselves — and say so in the commit, rather than leaving two answers 
 session after you to adjudicate. `dev/pager-csa-primitives.md` §"Re-deriving from scratch, if you do
 not trust this file" exists for exactly this; as it says, the point of these files is to save you
 the grep, not to replace verification.
+
+## Review workflows: the standing rules
+
+Set by the operator on 2026-11-03 for every session that runs an agent review here. The point is
+not to ration the heavy shapes — multi-finder reviews, three-lens adversarial verification, judge
+panels, critic rounds, fix-then-reverify loops are all welcome, and are the right default for code
+the device runs, hardware-facing claims and anything novel. The point is to stop them appearing on
+trivial work: a doc edit, a comment's wording, a stale count, a renamed check. Judge the tier by what
+a wrong finding would cost if acted on and by how likely the finder is to be wrong, and spend
+accordingly.
+
+1. **Tier the verification by consequence and by likelihood of error.** A finding gets the full
+   three-lens adversarial pass (trace, intent, impact) when a fix would change code the device runs,
+   when it contradicts a fact measured on hardware, or when it is an inference composed from verified
+   readings — the error shape this project has been bitten by twice. Freshly written code rates
+   higher on likelihood of error than code that has survived a prior pass and a harness run, even at
+   equal consequence. Docs, comments, stale counts, wording and test gaps get one sceptical verifier
+   whose prompt says: default to refuted unless you can reproduce it from the artifact. When in doubt
+   between tiers, take the heavier one and say why.
+2. **Cap the finder pool at four dimensions per review.** Batch verification at nine findings per
+   agent, grouped by file. Never one agent per finding per lens, unless truly warranted — a claim
+   big enough to deserve that attention (one that would redirect the bench, overturn a measured
+   fact, or change what the device transmits) can have its own agents, with the reason stated.
+3. **Report the refutation count in the first line of every review summary.** A pass that refutes
+   nothing is a warning about the verifiers, not a clean bill; say so when it happens.
+4. **Name what is already settled before the finders start** — measured on hardware, verified in a
+   prior pass, or owned by another session — in the preamble every agent sees. Finders may challenge
+   it with a better artifact, but should not re-report it.
 
 ## Established so far — a snapshot, not a verdict
 
@@ -353,15 +407,15 @@ associated; or statically, by a `target` field reachable from `_All`'s type desc
 **Whether to relabel or reorder the menu is the CamHound-deauth session's call, not this
 branch's** — only the factually wrong comment was fixed here.
 
-**⚠ `_pineap RECON CLIENTS` is new in 2.0.0 — CamHound's client rung has never actually run.**
+**⚠ `_pineap RECON CLIENTS` is new in 2.0.0 — until 2026-11-03 CamHound's client rung had never actually run.**
 Reading **[V]**: the byte string `CLIENTS` occurs **0 times** in 1.1.3's `/usr/bin/_pineap` and
 **12 times** in 2.0.0's; lowercase `clients` 0 vs 4, `client` 0 vs 5. Count them with
 `python3 -I -c "import sys;print(open(sys.argv[1],'rb').read().count(b'CLIENTS'))" <_pineap>` —
 **not** with `grep -c`, which counts matching *lines* and on a binary with few newlines returns a
 smaller, method-dependent number (an earlier revision of this line said "6 times" for exactly that
-reason). The `0` is the robust half either way: absent is absent. So `recon_lines CLIENTS` has
-returned nothing on every firmware the payload has ever run on, and starts returning rows the
-moment the Pager is flashed.
+reason). The `0` is the robust half either way: absent is absent. So `recon_lines CLIENTS` returned
+nothing on every firmware the payload ran on before 2026-11-03, when `recon_verb_probe` started
+routing a 1.1.3 unit to `RECON DEVICES` (measured below); on 2.0.0 the verb exists and answers.
 
 Corroborated by the help lines themselves — `strings -a <_pineap> | grep -E '^RECON '`, sorted:
 
@@ -414,6 +468,22 @@ Three consequences for CamHound. All are **pre-existing defects that become visi
 associated client returning a key that carries the BSSID — documented or not. That would collapse
 (2) to a one-word fix.
 
+**Measured on the 1.1.3 unit, 2026-11-03 (bare firmware, nothing of ours installed):**
+`_pineap RECON CLIENTS format=json` prints `Unknown recon command` and exits **255**, so the absence
+is now **[V]** by measurement, not only by byte count. `_pineap RECON DEVICES format=json` and
+`RECON APS format=json` both return the device object in exactly the shape the 2.0.0 `HELP PARSE`
+text describes — `beacon` / `response` / `probe` as hash-keyed objects whose values carry `ssid`,
+`ssidlen`, `count`, `time`, `signal`, `freq`, `channel`, beacon values also `hidden` (a JSON
+boolean), the device's own keys in alphabetical order (`freq`, `mac`, `packets`, `signal`, `time`)
+beside them — and **no association key**. So the 1.1.3 object is the 2.0.0 object; the parsers
+written for 2.0.0 read it unchanged (the fallback parser needed one fix: the device's own `signal`
+and `time` sit *after* its `probe` object, not before). Consequence: CamHound now takes its client
+rows from `RECON DEVICES` where `CLIENTS` is refused (`recon_verb_probe`, one call at start; a
+client is a device that neither beacons nor answers probes), so **probe-only clients are listed on
+1.1.3 today**, with probed SSIDs — still without association, which is what kit detection, client
+Watch and per-client Disrupt wait on. The remaining source to check is the Go UI's recon API
+(day-one 8b).
+
 **Also newly available, and relevant to the posture rung:** the `mfp_supported`, `mfp_required`,
 `encryption` and `encryption_str` fields on beacon values are **2.0.0-only** — byte-string counts
 1.1.3 → 2.0.0 are `mfp_supported` 0 → 2, `mfp_required` 0 → 3, `encryption_str` 0 → 4 (bare
@@ -422,9 +492,14 @@ associated client returning a key that carries the BSSID — documented or not. 
 capture via `rsn_caps`; on 2.0.0 the recon JSON exposes it per beaconed SSID directly. Whether to
 use it is the CamHound sessions' call — recorded here only so it is not re-derived.
 
-**Fixing the payload is `clever-wozniak`'s to do, not this branch's** — it has 281 lines of
-in-flight change on that exact file, and the standing rule is not to correct another branch's work
-from here.
+**Status, 2026-11-03: `clever-wozniak` has landed (`f012922`, merged at `536de09`), so this is no
+longer somebody else's in-flight work.** Verify with `git merge-base --is-ancestor
+origin/claude/clever-wozniak-hn3xyn HEAD`. Consequences (1) and (3) above are **fixed in code**:
+`JQ_CLI` now reads `(.probe // {})[]?` (the object's values), and `parse_cli_fallback` walks the
+probe object's `ssid` values and initialises `ap="-"`. **(2) is not fixed and is not fixable by a
+parser change** — the field does not exist in the firmware's output. It is the one defect left, and
+it is what makes the response rung unable to fire on either firmware (see the warning in "Open, and
+needs the hardware").
 
 **ANSWERED 2026-11-02 — CamHound is clear, and the DuckyScript surface is narrower than feared.**
 Enumerated across `usr/bin`, `bin`, `sbin`, `usr/sbin`, `usr/libexec`: **69 commands in each
@@ -578,6 +653,58 @@ closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowi
 packet counters move the way `resp_verdict` assumes; whether CSA moves a real client at all; and the
 count-byte experiment (day-one step 17a). (`inj_parse_channels` is **no longer** on this list — it
 ran against a live radio on 2026-11-02 and was correct; see "First contact".)
+
+**⚠ The response rung cannot transmit from the USER PAYLOAD on any shipped firmware, and flashing
+does not fix that. The Recon hooks are a different story — see the exception below.**
+The blocker is the **association column**, not the firmware version. On **1.1.3** `_pineap RECON
+CLIENTS` does not exist; since 2026-11-03 client rows come from `RECON DEVICES` instead, but that
+object carries no association either, so every client row has `AP_OF` `-` and `resp_target` refuses
+it exactly as on 2.0.0 (below), while every AP row has `R_TARGET` broadcast, 0 subjects, and
+`resp_fire` refuses with `NO_CLIENTS`. On **2.0.0** client
+rows arrive but the device object has no association field, so `JQ_CLI`'s `(.ap_mac // .bssid //
+"-")` gives `-` for every one; an AP row then finds 0 matching clients and refuses the same way,
+while a client row never even reaches the sweep because `AP_OF` is `-` and `resp_target` returns 1
+at `payload.sh:1983-1984`. On both, the user payload transmits nothing and logs the refusal.
+
+**⚠ The Recon client hook is the exception, and it transmits on 1.1.3 today.** Everything above is
+about the **user payload**, whose association comes from `recon_lines CLIENTS`. The two Recon hooks do
+not use it: `hook_target` (`dev/CamHound/hook_main.sh:20-37`) builds its one row from the
+`_RECON_SELECTED_*` variables the Recon UI exports, setting `AP_OF[$HOOK_MAC]` from
+`_RECON_SELECTED_AP_BSSID` and the channel from `_RECON_SELECTED_{CLIENT,AP}_CHANNEL`, with **no
+`_pineap RECON` call at all**. So a hook client row has a real association and a real channel,
+`resp_target`'s client branch passes, and `resp_fire` transmits behind the usual picker and confirm —
+on 1.1.3, on 2.0.0, regardless of what `RECON CLIENTS` returns. *Found by the recon-side session's
+review; verified here at `hook_main.sh:35` and `payload.sh:1982-1988`.* So "the rung cannot
+transmit" is true of the user payload only, and the rung is **not** inert on the device as a whole.
+
+*Corrected 2026-11-03: the first version of this warning said `RESPONSE=1` "buys nothing until the
+device is flashed", which implied a flash would buy a working rung. It would not, and that was the
+load-bearing half. The 1.1.3 half stands.* Note the determination plan's standing instruction —
+`dev/pager-6ghz-determination-plan.md:155` "never flash it to this device" — therefore costs nothing
+on this axis. **[A]** — the byte counts and object shape are `[V]`; the code paths were read; the
+composition is the inference. *Falsified by:* a Disrupt transmitting **from the user payload** on either firmware (the earlier
+form of this falsifier said "on an AP row", which could not catch the hook path at all), or
+`_pineap RECON CLIENTS format=json | jq '.[0]|keys'` on a 2.0.0 Pager returning a key with the BSSID.
+
+**Lead, half followed 2026-11-03:** 1.1.3 *does* have `RECON DEVICES`/`COUNT DEVICES` (only
+`CLIENTS` is new), and CamHound now reads it where `CLIENTS` is refused (`recon_verb_probe`,
+`JQ_DEVCLI`), so probe-only clients are listed on 1.1.3 with their probed SSIDs — but the object
+carries no association (measured on the bench, bare 1.1.3), so that half is spent. The other half is
+untested: the `probe`/`beacon` objects are keyed by an opaque SSID hash, so intersecting a client's
+probe keys with an AP's beacon keys might recover an association the JSON never states. **[A]** — a
+client probing for an SSID is not necessarily associated to it, and the BSSID-filtered capture in
+`dev/CamHound/RESPONSE.md` §13a is the better evidence.
+
+**The association column is a chokepoint gating FIVE features, and the rung is fixable without it.**
+Verified in code: `AP_OF[mac] == "-"` disables Watch-on-a-client and Stimulus (`watchable()`,
+`payload.sh:985-990`), kit detection (`:1186`), the AP→client tree (`:2230`) and the response rung.
+But the *attack* never needed it — `CSA` is `<bssid> <ch>` and `BOTH`'s target is discarded, and
+`RECON APS` supplies both on 1.1.3, so the firmware can transmit today. What refuses is CamHound's
+own `NO_CLIENTS` measurement guard. The fix is to read the association off the air with a
+BSSID-filtered capture (the filter at `:1665`, the radiotap-aware frame walker in `beacon_find`,
+`addr2` at `p + rt + 10`), which is firmware-independent and better evidence than Recon's cumulative
+counters. Full working, ranked options and the two unverified mechanics are in
+`dev/CamHound/RESPONSE.md` §13a. **Not yet implemented.**
 
 **Two 2.0.0 hazards in this repo's other payloads** — `wigle-toolkit` really deletes loot, and
 `wardrive_activate` is broken. Both are `[V]` from the rootfs trees and written up in full in

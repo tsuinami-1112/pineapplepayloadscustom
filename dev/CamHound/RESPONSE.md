@@ -50,13 +50,29 @@ and the injection.
 Three DuckyScript commands expose it. Signatures confirmed from `hak5cmd`'s own help text, not
 inferred:
 
-| Key | Command | Frames |
-|---|---|---|
-| `DEAUTH` | `PINEAPPLE_DEAUTH_CLIENT [bssid] [target] [channel]` | deauth + disassociation |
-| `CSA` | `PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]` | channel-switch announcements |
-| `BOTH` | `PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]` | all three |
+| Key | Command | Frames | Scope |
+|---|---|---|---|
+| `DEAUTH` | `PINEAPPLE_DEAUTH_CLIENT [bssid] [target] [channel]` | deauth + disassociation | one client |
+| `CSA` | `PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]` | channel-switch announcements | whole BSS |
+| `BOTH` | `PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]` | all three | whole BSS |
 
-`CSA` takes no target because it rides in a beacon and has no unicast recipient. There is also a
+**Scope is not what the signatures suggest, and `attack_scope()` is the one place that decides.**
+`CSA` takes no target: the **[V]** reading is the Go handler, `StartDeauthCsa` parses one MAC with a
+28-byte frame against `StartDeauth`'s two and 32 (CLAUDE.md §"2.0.0-stable, analysed"), and hak5cmd's
+help lists `[bssid] [channel]` — the help alone would not settle it, since this repo has caught it
+wrong three times. "Because it rides in a beacon" is the carrier question §13 still lists as not
+proven, so that explanation is **[A]**; the breadth does not depend on it. `BOTH` advertises a `[target]` that its handler parses and
+discards, so it is BSS-wide too; the readings behind that are **[V]** and the "discards it"
+conclusion is **[A]**, falsifiable by firing `BOTH` at one client among several and seeing whether
+the others stay associated (evidence in `CLAUDE.md` §"2.0.0-stable, analysed"). And because
+`resp_target` resolves an **AP row** to a broadcast target, every attack on one is BSS-wide
+regardless of the key. The picker appends ` bss` to a broad option and the pre-transmit confirm
+reads "on EVERY client of <bssid>", because "`CSA` on <one client>" would be a lie. `posture_opts`
+is unchanged and still orders by efficacy, so a BSS-wide attack is preselected on the common
+badges — the marker and the confirm carry that, not a reordering that would demote the attack most
+likely to work.
+
+There is also a
 `_pineap` layer (`DEAUTH`, `DEAUTHCSA`, `DEAUTHALL`) and an HTTP layer (`/api/pineap/deauth`,
 `/deauth_csa`, `/deauth_all`); the DuckyScript wrappers are what payloads should use.
 
@@ -214,15 +230,50 @@ Every kernel-side drop path on an injected frame returns `NETDEV_TX_OK` — no c
 interface that is not running: all of them reach userspace as success. So the send call is not
 evidence. Only the target's subsequent behaviour is.
 
-**What gets measured: subjects, not the target.** `resp_snapshot()` collects a packet counter and
-last-seen time per *subject* from one Recon read:
+**What gets measured: subjects, not the target.** `resp_snapshot <scope>` collects a packet counter
+and last-seen time per *subject* from one Recon read. The scope comes from `attack_scope` — what the
+chosen command can actually reach — **not** from which row the operator picked:
 
-- **client target** → the client itself.
-- **broadcast target** (an AP) → the AP's **visible, non-randomised clients**. The AP's own counter
-  is deliberately never used: it keeps beaconing whatever happens to its clients, so it carries no
-  signal. Randomised MACs are excluded via `is_rand` because they rotate and would read as `MOVED`
-  for free.
+- **`cli` scope** (only `DEAUTH` on a client row) → the client itself.
+- **`bss` scope** (everything else, including `CSA`/`BOTH` picked from a *client* row) → the BSSID's
+  **visible, non-randomised clients**. The AP's own counter is deliberately never used: it keeps
+  beaconing whatever happens to its clients, so it carries no signal. Randomised MACs are excluded
+  via `is_rand` because they rotate and would read as `MOVED` for free — except the picked target
+  itself, which is always a subject even behind a randomised MAC, so an explicit pick is never
+  dropped from its own loot.
 - A client row that Recon happens to list as an AP falls back to `recon_stat`.
+
+**Why scope and not row type.** `CSA` takes no target argument at all and `_ALL`'s is parsed and
+discarded, so both transmit BSS-wide even when the operator picked one client. Selecting subjects by
+row type therefore measured a single camera and wrote a single loot row for a transmit that hit the
+whole BSS: `MOVED: 1/1 quiet` was a claim about one device presented as the outcome of a BSS-wide
+action, and the other devices knocked off left no record. Fixed 2026-11-03; the harness `cliscope`
+scenario drives both arms from the same menu (`scope=cli subjects=1` for `DEAUTH`, `scope=bss
+subjects=4` for `BOTH`).
+
+Because the aggregate now covers the whole blast radius, a collateral `NO_EFFECT` would otherwise
+read as "the camera I aimed at stayed up". So when the pick is a client row and there is more than
+one subject, `resp_fire` also names that device's own verdict (`picked <mac>: <verdict>`, on screen
+and in `events.log`).
+
+**This widening depends on the association column, which no shipped firmware supplies.** The `bss`
+sweep matches a client's `ap_mac` against `R_BSSID`; `JQ_CLI` reads that as `(.ap_mac // .bssid //
+"-")` and the 2.0.0 device object has **neither** key, so every client row carries `-`. The sweep
+then matches nothing. *Corrected 2026-11-03 — an earlier revision of this paragraph said the
+measurement "falls back to the picked target alone, one subject, as before". That is wrong on both
+row types and the error mattered, because it made the rung look merely degraded when it is in fact
+unable to fire:*
+
+- on an **AP row** the picked target is `ff:ff:ff:ff:ff:ff`, so there is no target to fall back to:
+  subjects are **0** and `resp_fire` refuses with `NO_CLIENTS` before transmitting;
+- on a **client row** it never reaches the sweep at all — `AP_OF` is `-`, so `resp_target` returns 1
+  and `disrupt_menu` aborts with "nothing to attack: no associated BSS".
+
+So the *selection rule* is correct and the *data to feed it* does not exist on either firmware. The
+honest state is that **the response rung cannot transmit on 1.1.3 or on 2.0.0**, and the blocker is
+the association column, not the firmware version — see §13. **[A]** *Falsified by:* `_pineap RECON
+CLIENTS format=json | jq '.[0]|keys'` on a 2.0.0 Pager with an associated client returning any key
+that carries the BSSID.
 
 This distinction was a real defect, not a refinement. The first version asked Recon about
 `R_TARGET` directly, and for a broadcast attempt that is `ff:ff:ff:ff:ff:ff`, which never appears in
@@ -282,7 +333,7 @@ harness.
 
 ## 9. Entry points
 
-Five ways to reach Disrupt, all gated on `RESPONSE=1`:
+Five ways to reach Disrupt, all gated on `RESPONSE`, which defaults to 1:
 
 1. **Device card** (`detail_card`) — the manual path, beside Watch and Locate. Shows a cached badge
    in the row when one is fresh; an uncached badge is not worth a capture just to render a menu.
@@ -306,7 +357,7 @@ Five ways to reach Disrupt, all gated on `RESPONSE=1`:
 
 | Key | Default | Persist | Meaning |
 |---|---|---|---|
-| `RESPONSE` | 0 | `*` | master switch; 0 = recon only, nothing transmits |
+| `RESPONSE` | 1 | `*` | master switch; 0 = recon only, nothing transmits |
 | `RESPONSE_CONFIRM` | 1 | `*` | blocking confirmation before any transmit |
 | `AUTO_RESPOND` | 0 | `*` | let the funnel raise Disrupt by itself (needs `RESPONSE=1`) |
 | `POSTURE_TTL` | 300 | `*` | seconds a badge stays cached per BSSID |
@@ -321,13 +372,22 @@ on apply and saved as raised (`settings_apply` re-runs `resp_clamp_lock`), so th
 in force. `Reset defaults` clears these overrides along with the recon ones.
 
 **Two keys, not one.** `RESPONSE` opens the manual rung; `AUTO_RESPOND` additionally lets CamHound
-raise it unprompted. Both default off, so enabling response capability does not by itself create an
-unprompted transmit path.
+raise the *offer* by itself. Since 2026-11-03 `RESPONSE` ships at **1**, so the rung is present out of
+the box, and `RESPONSE_CONFIRM` (also 1, and now failing closed on any non-zero value) gates every
+individual transmit. The separation is what makes "the rung exists" and "CamHound may raise it by
+itself" independent choices.
+
+*Corrected: an earlier revision said `AUTO_RESPOND=0` was "the only thing keeping the shipped default
+free of an unprompted transmit path", which undersells the design — **there is no unprompted transmit
+path at any setting.** `AUTO_RESPOND` only raises a dialog; the picker still has to be answered and
+the confirm cleared, and with `RESPONSE_CONFIRM=0` the picker's accept is itself an operator action.
+No combination of the three keys reaches the air without a dialog.*
 
 ## 11. Loot
 
-`responses.tsv`, `|`-separated with a `#` header, **one row per measured subject** (so a broadcast
-attempt against an AP with four clients writes four rows, one attempt):
+`responses.tsv`, `|`-separated with a `#` header, **one row per measured subject** (so an attempt
+whose scope is `bss` against a BSSID with four clients writes four rows, one attempt — including when
+the operator picked a single client row and chose `CSA` or `BOTH`):
 
 ```
 #epoch|mac|role|bssid|target|ch|band|badge|rsn_caps|beacon_prot|attack|cmd|lock|pk_before|pk_after|verdict
@@ -360,7 +420,14 @@ option labelled `unknown`, fires `PINEAPPLE_DEAUTH_CLIENT_CSA` with bssid and ch
 writes loot rows with badge `?` and caps `-`, and that declining it sends nothing and writes no row;
 `noinj` (the Reolink AP moved to DFS channel 52) checks that gate 1 answers `NOINJ` with no capture
 and no lock, and that declining "Try anyway?" sends nothing. An accepted "Try anyway?" is still
-unreached by any test.
+unreached by any test. `cliscope` (2026-11-03) drives both scopes from one client-row menu: `DEAUTH`
+confirms one device and measures one subject; `BOTH` confirms "EVERY client", measures the four
+visible clients, loots all four and names the picked device's own verdict. `disrupt` now runs at the
+shipped default with no `RESPONSE` override in the saved config, and asserts the transmit. The selftest
+pins `attack_scope` on four cases, `resp_snapshot` on seven (own-BSS sweep, cli scope, bss from a client
+row, a target whose row is foreign to the BSSID in both scopes, a randomised pick kept, one Recon read
+for the sweep, and the `recon_stat` fallback adding an out-of-sweep pick for one more read), and
+`resp_verdict - - - - 0` as `INCONCLUSIVE`.
 
 Unit coverage:
 
@@ -378,6 +445,98 @@ Unit coverage:
 `check_sync.sh` clean, all three payloads parse, `shellcheck` clean.
 
 ## 13. What is unverified
+
+**⚠ First, the floor — and it applies to the USER PAYLOAD only.** From the user payload this rung
+cannot transmit on any shipped firmware, and flashing does not fix that. The Recon hooks reach the
+air by another route entirely; the exception at the end of this section is the important part.
+Two different mechanisms, same outcome, and the blocker is the **association column** rather than the
+firmware version:
+
+| firmware | what happens | where |
+|---|---|---|
+| **1.1.3** | `_pineap RECON CLIENTS` does not exist (measured 2026-11-03: `Unknown recon command`, rc 255); since that day `recon_lines CLIENTS` reads `RECON DEVICES` instead, whose object carries no association, so a client row has `AP_OF` `-` and `resp_target` refuses it like 2.0.0's. Every AP row has `R_TARGET` broadcast, subjects are 0 → `NO_CLIENTS`. | `resp_snapshot`'s `[ "$a" = "$R_BSSID" ]` sweep iterates the `RECON DEVICES` client rows and matches none, every `AP_OF` being `-` → `resp_fire` refusal; a client row is refused earlier, by `resp_target` |
+| **2.0.0** | client rows arrive, but the device object has no association field, so `JQ_CLI`'s `(.ap_mac // .bssid // "-")` yields `-` for all of them. An **AP row** finds 0 matching clients → `NO_CLIENTS`. A **client row** never reaches the sweep: `AP_OF` is `-`, so `resp_target` returns 1 and `disrupt_menu` aborts with "nothing to attack: no associated BSS". | `payload.sh:1983-1984`; `resp_snapshot`'s `[ "$a" = "$R_BSSID" ]` |
+
+*Corrected 2026-11-03. An earlier revision of this section said the rung was "inert until the device
+is flashed to 2.0.0", which is wrong and was the more consequential half of the claim — it implied a
+flash would buy a working response rung, and it would not. The 1.1.3 half stands.* From the user
+payload, nothing is transmitted on either firmware and the refusal is logged.
+
+**⚠ The Recon client hook is the exception, and it transmits on 1.1.3 today.** Everything above is
+about the **user payload**, whose association comes from `recon_lines CLIENTS`. The two Recon hooks do
+not use it: `hook_target` (`dev/CamHound/hook_main.sh:20-37`) builds its one row from the
+`_RECON_SELECTED_*` variables the Recon UI exports, setting `AP_OF[$HOOK_MAC]` from
+`_RECON_SELECTED_AP_BSSID` and the channel from `_RECON_SELECTED_{CLIENT,AP}_CHANNEL`, with **no
+`_pineap RECON` call at all**. So a hook client row has a real association and a real channel,
+`resp_target`'s client branch passes, and `resp_fire` transmits behind the usual picker and confirm —
+on 1.1.3, on 2.0.0, regardless of what `RECON CLIENTS` returns. *Found by the recon-side session's
+review; verified here at `hook_main.sh:35` and `payload.sh:1982-1988`.* So "the rung cannot
+transmit" is true of the user payload only, and the rung is **not** inert on the device as a whole.
+
+**[A]** — the `CLIENTS` byte count and the 2.0.0 device-object shape are `[V]` from the binaries (see
+`/CLAUDE.md`); the code paths were read in the payload; composing them is the inference. *Falsified
+by:* a Disrupt transmitting **from the user payload** on either firmware, or `_pineap RECON CLIENTS
+format=json | jq '.[0]|keys'` on a 2.0.0 Pager returning any key that carries the BSSID. (An earlier
+form of this falsifier named AP rows only, which could not have caught the hook path — the lesson
+being that a falsifier naming one entry point does not test a claim made about the payload.)
+
+**The lead that was worth trying, followed 2026-11-03.** 1.1.3 *does* have `RECON DEVICES` and
+`COUNT DEVICES` (only `CLIENTS` is new), and CamHound now reads `RECON DEVICES` where `CLIENTS` is
+refused (`recon_verb_probe` at start, `JQ_DEVCLI` for the rows): probe-only clients are listed on
+1.1.3 with their probed SSIDs. What the on-device command showed is that the object carries **no
+association** — the device's own keys are `freq`, `mac`, `packets`, `signal`, `time` beside the
+hash-keyed `beacon`/`response`/`probe` objects — so that half of the lead is spent, and the rung is
+no nearer firing from the user payload. The other half is untested: the `probe`/`beacon` objects are
+keyed by an opaque internal **SSID hash**, so a client's probe-key set and an AP's beacon-key set
+could in principle be intersected to recover an association the JSON does not state outright.
+**[A]**, offered as a direction, not a finding — a client probing for an SSID is not necessarily
+associated to it, and §13a's capture route is the better evidence.
+
+### 13a. The association column is a chokepoint, and the rung is fixable without it
+
+**Five separate features, one missing field.** Verified in code 2026-11-03, so this is worth more
+than any one of them: `AP_OF[mac] == "-"` disables **Watch on a client** and **Stimulus**
+(`watchable()`, `payload.sh:985-990`, and `watch_prepare`'s "no BSSID: cannot lock"), **kit
+detection** — CamHound's largest single identity signal — (`payload.sh:1186`), the **AP→client tree**
+in the report (`payload.sh:2230`), and the **response rung**. Fixing the association is therefore the
+highest-value change available to this payload, and worth more than a firmware flash.
+
+**But the response rung does not actually need it, and this reframes the whole problem.** Read what
+goes on the air (`payload.sh:2095-2096`): `CSA` is `<bssid> <ch>` and `BOTH` is `<bssid> <target>
+<ch>` with the target discarded. **Both need only a BSSID and a channel, and `RECON APS` supplies
+both on 1.1.3.** The firmware can transmit these today. What refuses is CamHound's own verification
+guard (`resp_fire`, the `NO_CLIENTS` branch): `resp_snapshot` found nobody to *measure*. So the
+blocker is the oracle, not the capability — the rung is asking the firmware a question the firmware
+cannot answer, when the answer is on the air.
+
+**The fix: derive subjects and verdict from a capture.** Every primitive already ships —
+
+| need | already in the payload |
+|---|---|
+| BSSID-filtered data capture | `payload.sh:1665`, `"type data and wlan addr1 $WATCH_BSSID and not wlan addr2 $WATCH_MAC"` |
+| pcap + radiotap + 802.11 walking | `beacon_find` — reads radiotap `it_len` at `p+2`, frame at `p+rt`, knows the 24+12 offsets |
+| octet / u16 readers | `hex_octet`, `hex_u16le` |
+| channel lock across a response | `lock_target` / `RESP_LOCK_SECS`, already held |
+
+A client's MAC is `addr2`, six octets at `p + rt + 10`. Walking the records for frames addressed to
+the BSSID yields that AP's active clients off the air — **firmware-independent, works on 1.1.3 and
+2.0.0 alike**. It is also better evidence than it replaces: Recon's `packets` is session-cumulative
+and dwell-biased (`PLAN_v2.md:206` says so), while a before/after capture counts frames in a window
+we control.
+
+Ranked options: **(1)** capture-based subjects and verdict, ~30-40 lines reusing the above plus
+`resp_snapshot`/`resp_fire` wiring, selftest cases (`st_pcap` already builds synthetic pcaps) and a
+harness scenario; **(2)** probe for a free association first (§13 above), one command, which would
+make (1) optional; **(3)** let a BSS-wide attack fire with an explicit `INCONCLUSIVE` when nothing is
+measurable — nearly free, but it discards the discipline that makes the verdict worth having, so it
+belongs *underneath* (1) as the heard-nothing fallback, not instead of it.
+
+Two unverified mechanics, both parameters rather than obstacles: whether `-s 32` clears radiotap far
+enough to reach `addr2` (`capture_beacon` uses `-s 0`, so the snap may need raising), and whether a
+second concurrent capture is safe during a response — already an open Phase 0 question in
+`PLAN_v2.md`. One real limitation: a capture sees only **active** clients, so an associated-but-idle
+camera stays invisible and a silent BSS still has nothing to measure. For a camera hunter that bias
+is mostly benign, since a streaming camera is busy by definition.
 
 Needs a Pager:
 

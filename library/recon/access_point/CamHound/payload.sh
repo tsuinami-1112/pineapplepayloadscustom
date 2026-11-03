@@ -4,10 +4,13 @@
 # Description: Run CamHound's Watch (live view), Stimulus test, Locate or Disrupt on the AP or
 #              client that is selected in the Recon menu. The same file is installed as
 #              recon/client/CamHound and recon/access_point/CamHound; it branches at run time on
-#              the selected-client variable. Disrupt appears only when RESPONSE=1, reads the
-#              target's protection posture from its beacon and then disconnects it with
-#              deauth+disassoc, channel-switch announcements, or all three; with RESPONSE=0 (the
-#              default) the hook transmits nothing.
+#              the selected-client variable. Disrupt reads the target's protection posture from its
+#              beacon and then disconnects it with deauth+disassoc, channel-switch announcements,
+#              or all three. RESPONSE defaults to 1, so Disrupt is present. The hook has no Settings
+#              menu of its own: set the key in the CamHound user payload's Settings -> Response
+#              settings, or run PAYLOAD_SET_CONFIG camhound RESPONSE 0 -- the hook reads the same
+#              saved key. Every transmit sits behind a confirm by default, and only DEAUTH on a
+#              client row is targeted -- CSA and BOTH hit the whole BSS.
 #              GENERATED FILE: dev/CamHound/gen_hooks.sh copies the config block, the lib block and
 #              the watch-core block verbatim from library/user/reconnaissance/CamHound/payload.sh.
 #              Edit the user payload and regenerate; dev/CamHound/check_sync.sh verifies the copies.
@@ -44,6 +47,7 @@ AUTO_WATCH=1            # * offer Watch on the top candidate / on NEW CONFIRMED-
 AUTO_LOCATE=1           # * offer Locate after a STREAM/EVENT Watch (0 = off)
 AUTO_WATCH_RSSI=-72     # minimum last RSSI to auto-offer Watch
 RSSI_MIN=0              # * optional list gate, dBm, on the best RSSI known for the MAC (0 = off, widest net)
+BAND6=0                 # * also scan 6 GHz: writes the device's bands + 6 for this run, restores them at exit (0 = leave as set)
 SOUND=0                 # * RINGTONE alert on NEW CONFIRMED (0 = off)
 SHOW_MODULES=1          # modules list in the menu
 MODULE_HINT_RSSI=-55    # client RSSI at or above which a BUSY module gets the "Watch?" hint
@@ -79,8 +83,9 @@ ROW_W=22                # list row budget (spike 19; expected 36-40 on the defau
 RECON_IF="wlan1mon"     # PineAP monitor radio (tri-band)
 INJ_SYSFS="/sys/class/ieee80211"   # phy list for the regulatory probe (the laptop harness points this at a fixture)
 NET_SYSFS="/sys/class/net"         # netdev tree the probe resolves RECON_IF's phy from (the laptop harness points this at a fixture)
+BANDS_PROBE_N=12; BANDS_PROBE_WAIT=0.5   # band write check: samples of the live channel, and the gap between them (~6 s)
 # response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
-RESPONSE=0              # * master switch for the response rung (0 = recon only)
+RESPONSE=1              # * master switch for the response rung (0 = recon only, transmits nothing)
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
 AUTO_RESPOND=0          # * let the funnel offer Disrupt by itself (needs RESPONSE=1; 0 = manual only)
 # shellcheck disable=SC2034
@@ -91,6 +96,7 @@ POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
 RESP_LOCK_SECS=20       # * EXAMINE lock duration held across a response (must exceed fire + settle)
 RESP_SETTLE_SECS=6      # * wait after transmitting before re-reading the target to judge the effect
 LOOT_DIR="/root/loot/CamHound"
+BANDS_STATE="$LOOT_DIR/.bands_orig"      # the bands a run changed, on disk (survives a reboot) so a killed run is undone by the watchdog or the next start
 OUI_FILE="/lib/hak5/oui.txt"; OUI_FILE_ALT="/rom/lib/hak5/oui.txt"
 # identity weights (constants, not table columns)
 W_OUI=45; W_WEAK=20; W_MODULE=0; W_ENDPOINT=-25; W_SSID=45; W_SSID_WEAK=15
@@ -153,6 +159,10 @@ set_state() {
 
 # resp_clamp_lock: the EXAMINE lock must outlast lock_target's read-back (~2.5 s) + the fire + RESP_SETTLE_SECS,
 # or the post-fire Recon read happens after hopping resumed and a stalled counter reads as MOVED.
+# The +5 budgets the read-back and the fire only. When the pick is not in the bss sweep (real firmware,
+# where ap_mac is '-'), the post-fire resp_snapshot also runs recon_stat: up to two more _pineap RECON
+# reads, each under a 15 s timeout, before unlock_target. How long those take on the device decides
+# whether 5 is enough; a bench run with 'resp' lines timestamped in events.log settles it (day-one 8b).
 resp_clamp_lock() {
   local min=$(( RESP_SETTLE_SECS + 5 ))
   if (( RESP_LOCK_SECS < min )); then
@@ -187,6 +197,7 @@ load_overrides() {
     AUTO_LOCATE=$(cfg AUTO_LOCATE "$AUTO_LOCATE" 0)
     RSSI_MIN=$(cfg RSSI_MIN "$RSSI_MIN" -100)
     SOUND=$(cfg SOUND "$SOUND" 0)
+    BAND6=$(cfg BAND6 "$BAND6" 0)
     THR_STREAM_UP=$(cfg THR_STREAM_UP "$THR_STREAM_UP" 1)
     RESPONSE=$(cfg RESPONSE "$RESPONSE" 0)
     RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
@@ -483,26 +494,54 @@ posture_from_caps() {   # posture_from_caps <rsncaps_hex|-> <extcap_hex|-> <band
 }
 
 # The three operator-selectable attacks. The badge advises; it never decides.
-#   DEAUTH  PINEAPPLE_DEAUTH_CLIENT     [bssid] [target] [channel]  deauth + disassoc, TARGETED
-#   CSA     PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]           channel-switch announcements
-#   BOTH    PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]  all three frame types
+#   DEAUTH  PINEAPPLE_DEAUTH_CLIENT     [bssid] [target] [channel]  deauth + disassoc, one client
+#   CSA     PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]           channel switch, WHOLE BSS
+#   BOTH    PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]  all three types, WHOLE BSS
 #
-# BOTH IS NOT TARGETED, despite the [target] in its documented signature above -- that signature
-# is hak5cmd's help text, and the help text is wrong. The handler behind it, pineAPdDeauthAll,
-# parses ONE MAC where pineAPdDeauth parses two, and its request struct carries no target field
-# (same arg frame, alloc size class and handler size as the CSA handler, not the deauth one).
-# resp_fire still passes three positionals; Go's json.Unmarshal drops the unknown one silently.
-# So BOTH hits EVERY client on the BSSID while DEAUTH beside it in the same menu hits one.
-# Note posture_opts lists BOTH first on the common badges and pick_list preselects element 0,
-# so the broad attack is the default.  Readings [V] from the 1.1.3 and 2.0.0 daemons; the
-# "parses the bssid, discards the target" conclusion is [A] -- falsify by firing BOTH at one
-# client among several and seeing whether the others stay associated.
+# ONLY DEAUTH IS TARGETED, and only on a client row. attack_scope() below is the one place that
+# decides; the picker's ' bss' marker and the pre-transmit confirm both read it, so the breadth is
+# stated where the operator chooses and again before anything is sent.
+#   CSA has no [target] argument at all, so its breadth is certain from the signature.  [V]
+#   BOTH has one in hak5cmd's help text, and the help text is wrong: pineAPdDeauthAll parses ONE
+#        MAC where pineAPdDeauth parses two, and its request struct carries no target field. The
+#        discriminating measurements are in CLAUDE.md "2.0.0-stable, analysed"; the frame split
+#        that carries them is StartDeauth 32 against StartDeauthAll/StartDeauthCsa 28.  Readings
+#        [V] from the 1.1.3 and 2.0.0 daemons; "parses the bssid, discards the target" is [A] --
+#        falsify by firing BOTH at one client among several and seeing whether the others stay
+#        associated. resp_fire still passes three positionals; json.Unmarshal drops the extra.
+#   NB the three pineAPd* HTTP handlers share one 16-byte http.HandlerFunc frame, so the frame
+#      does NOT discriminate among them -- an earlier revision of this comment said it did, and
+#      attributed the 32-vs-28 split to the wrong trio.
+# posture_opts still orders by efficacy (best first), and pick_list preselects element 0, so a
+# BSS-wide attack is the default on the common badges. That is deliberate: the marker and the
+# confirm carry the breadth, rather than demoting the attack most likely to work.
 response_cmd() {
   case "$1" in
     DEAUTH) printf 'PINEAPPLE_DEAUTH_CLIENT' ;;
     CSA)    printf 'PINEAPPLE_DEAUTH_CLIENT_CSA' ;;
     BOTH)   printf 'PINEAPPLE_DEAUTH_CLIENT_ALL' ;;
     *)      printf '' ;;
+  esac
+}
+
+# attack_scope <attack key> -> cli | bss.  Reads R_TARGET, so call it after resp_target.
+# Read from the signatures (response_cmd above): CSA takes <bssid> <ch> and has no target argument
+# at all, so it is BSS-wide by construction; _ALL advertises [target] but parses one MAC, so its
+# target is accepted and discarded; only DEAUTH parses two and can aim.
+# [A] An AP row resolves R_TARGET to ff:ff:ff:ff:ff:ff and this reports that as BSS-wide. Nothing
+# in the repo records pineapd honouring a broadcast [target] rather than rejecting it. Note the
+# failure is NOT self-announcing: an earlier version of this comment claimed a rejected attack
+# would leave "every subject reading NO_EFFECT, the safe direction", which is wrong -- resp_verdict
+# returns MOVED for a subject that goes absent, and for a stalled counter whose last-seen did not
+# advance, so an idle camera reads MOVED whether or not anything was transmitted. Only NO_EFFECT is
+# strong evidence here; MOVED on a quiet device is weak, and a rejected broadcast target would be
+# indistinguishable from a successful one.
+# Falsified by: PINEAPPLE_DEAUTH_CLIENT <bssid> ff:ff:ff:ff:ff:ff <ch> disconnecting one client, or
+# none, with several associated.
+attack_scope() {
+  case "$1" in
+    DEAUTH) [ "$R_TARGET" = 'ff:ff:ff:ff:ff:ff' ] && printf 'bss' || printf 'cli' ;;
+    *)      printf 'bss' ;;
   esac
 }
 
@@ -662,6 +701,7 @@ cleanup() {
   kill_children
   if [ "$WATCH_LOCKED" = 1 ]; then _pineap EXAMINE CANCEL >/dev/null 2>&1; PINEAPPLE_EXAMINE_RESET >/dev/null 2>&1; fi
   [ -n "$RUN_ID" ] && [ "$REPORT_DONE_AT_EXIT" != 1 ] && write_report quiet
+  command -v bands_restore >/dev/null 2>&1 && bands_restore         # user payload only; the hooks never change bands
   rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
   log run "exit cycles=$CYCLE"
   ui_ok && set_state FINISH
@@ -708,11 +748,15 @@ JQ_APS='.[] | ([.beacon[]?, .response[]?]) as $e
 # the ssid -- so the probed SSIDs are the object's values, not an array. No documented key carries the association;
 # ap_mac/bssid are read when present (the harness fixture's stand-in) and "-" otherwise, until the day-one spike
 # finds a source (the Go UI's own recon API carries ap_mac; _pineap does not).
-JQ_CLI='.[] | ([ (.probe // {})[]? | if type == "object" then ((.ssid // "") | select(length > 0)) else tostring end ]) as $p
+JQ_CLI_ROW='([ (.probe // {})[]? | if type == "object" then ((.ssid // "") | select(length > 0)) else tostring end ]) as $p
  | [.mac, (.ap_mac // .bssid // "-"), (.packets // 0), (.signal // .rssi // "-"),
     ($p | map(tostring | gsub("[|;,\n\r\t]"; "_")) | join(",")),
     (.freq // 0), (.time // .last_seen // 0), (.channel // 0)]
  | map(tostring) | join("|")'
+JQ_CLI='.[] | '"$JQ_CLI_ROW"
+# 1.1.3 has no RECON CLIENTS verb (measured 2026-11-03: "Unknown recon command", rc 255) but RECON DEVICES lists every
+# device in the same object shape, so a client there is a device that neither beacons nor answers probes.
+JQ_DEVCLI='.[] | select(((.beacon // {}) | length) == 0 and ((.response // {}) | length) == 0) | '"$JQ_CLI_ROW"
 
 # fallback parser (no jq): split the JSON on "},{" and read fields with bash regex. Reduced fidelity.
 parse_aps_fallback() {   # stdin: JSON -> stdout: mac|packets|ssid|ch|freq|signal|hidden|time
@@ -733,33 +777,45 @@ parse_aps_fallback() {   # stdin: JSON -> stdout: mac|packets|ssid|ch|freq|signa
   [ -n "$mac" ] && printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "$pk" "$ssid" "$ch" "$fr" "$sig" "$hid" "$t"
 }
 parse_cli_fallback() {   # stdout: mac|ap_mac|packets|signal|probes|freq|time|channel  (same shape rules as JQ_CLI above)
-  local json frag pre rest mac ap pk sig fr t ch probes p
+  local json frag top rest mac ap pk sig fr t ch probes p
   json=$(cat); json=${json//\},\{/$'\n'}
   while IFS= read -r frag; do
     [[ $frag =~ \"mac\":\"([^\"]+)\" ]] || continue
+    [[ $frag == *\"beacon\":\{\"* || $frag == *\"response\":\{\"* ]] && continue   # an AP: a NON-EMPTY beacon/response object, as jq's length test
+    # limit, accepted: a probed SSID containing { } or an escaped quote defeats the brace strip below (the jq path is exact)
     mac=${BASH_REMATCH[1]}; ap="-"; pk=0; sig="-"; fr=0; t=0; ch=0; probes=""
-    # the device's own fields come before its probe/beacon/response objects, whose values repeat time/signal/freq/channel
-    pre=${frag%%\"probe\":*}; pre=${pre%%\"beacon\":*}; pre=${pre%%\"response\":*}
-    [[ $pre =~ \"(ap_mac|bssid)\":\"([^\"]*)\" ]] && ap=${BASH_REMATCH[2]}
-    [[ $pre =~ \"packets\":([0-9]+) ]] && pk=${BASH_REMATCH[1]}
-    [[ $pre =~ \"signal\":(-?[0-9]+) ]] && sig=${BASH_REMATCH[1]}
-    [[ $pre =~ \"freq\":([0-9]+) ]] && fr=${BASH_REMATCH[1]}
-    [[ $pre =~ \"time\":([0-9]+) ]] && t=${BASH_REMATCH[1]}
-    [[ $pre =~ \"channel\":([0-9]+) ]] && ch=${BASH_REMATCH[1]}
+    # the device's own fields sit beside its probe object (keys are alphabetical on the device: freq, mac, packets,
+    # probe, signal, time), and the probe values repeat time/signal/freq/channel -- so strip every nested {...}
+    # group, innermost first, and read the top-level fields from what is left
+    top=$frag; while [[ $top =~ (.*:)\{[^{}]*\}(.*) ]]; do top="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"; done   # only groups that are a key's value: the object's own braces stay
+    [[ $top =~ \"(ap_mac|bssid)\":\"([^\"]*)\" ]] && ap=${BASH_REMATCH[2]}
+    [[ $top =~ \"packets\":([0-9]+) ]] && pk=${BASH_REMATCH[1]}
+    [[ $top =~ \"signal\":(-?[0-9]+) ]] && sig=${BASH_REMATCH[1]}
+    [[ $top =~ \"freq\":([0-9]+) ]] && fr=${BASH_REMATCH[1]}
+    [[ $top =~ \"time\":([0-9]+) ]] && t=${BASH_REMATCH[1]}
+    [[ $top =~ \"channel\":([0-9]+) ]] && ch=${BASH_REMATCH[1]}
     rest=${frag#*\"probe\":}; [ "$rest" = "$frag" ] && rest=""   # every "ssid" inside the probe object is a probed SSID
     while [[ $rest =~ \"ssid\":\"([^\"]*)\"(.*) ]]; do p=${BASH_REMATCH[1]}; rest=${BASH_REMATCH[2]}; [ -n "$p" ] || continue; p=${p//[|;,]/_}; probes+="${probes:+,}$p"; done
     printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "${ap:--}" "$pk" "$sig" "$probes" "$fr" "$t" "$ch"
   done <<<"$json"
 }
+RECON_CLI_VERB=CLIENTS   # CLIENTS on 2.0.0; DEVICES on 1.1.3, where CLIENTS is "Unknown recon command" (recon_verb_probe)
+recon_verb_probe() {   # one call at start: pick the client verb this firmware has. rc 255 = unknown verb; a timeout keeps CLIENTS
+  timeout 15 _pineap RECON CLIENTS format=json >/dev/null 2>&1
+  [ $? = 255 ] && RECON_CLI_VERB=DEVICES
+  log recon "client verb: $RECON_CLI_VERB"
+}
 recon_lines() {   # recon_lines APS|CLIENTS -> lines on stdout
-  local what="$1" prog
-  [ "$what" = APS ] && prog="$JQ_APS" || prog="$JQ_CLI"
+  local what="$1" prog verb
+  if [ "$what" = APS ]; then prog="$JQ_APS"; verb=APS
+  elif [ "$RECON_CLI_VERB" = DEVICES ]; then prog="$JQ_DEVCLI"; verb=DEVICES
+  else prog="$JQ_CLI"; verb=CLIENTS; fi
   if [ "$HAVE_JQ" = 1 ]; then
-    timeout 15 _pineap RECON "$what" format=json 2>/dev/null | jq -r "$prog" 2>/dev/null
+    timeout 15 _pineap RECON "$verb" format=json 2>/dev/null | jq -r "$prog" 2>/dev/null
   elif [ "$what" = APS ]; then
     timeout 15 _pineap RECON APS format=json 2>/dev/null | parse_aps_fallback
   else
-    timeout 15 _pineap RECON CLIENTS format=json 2>/dev/null | parse_cli_fallback
+    timeout 15 _pineap RECON "$verb" format=json 2>/dev/null | parse_cli_fallback
   fi
 }
 
@@ -1032,6 +1088,7 @@ preflight() {
   printf -v RUN_ID '%(%Y%m%d_%H%M%S)T' -1; RUN_T0=$EPOCHSECONDS
   if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamHound: _pineap not found" 2>/dev/null; exit 0; fi
   command -v jq >/dev/null 2>&1 && HAVE_JQ=1
+  recon_verb_probe
   capture_ready && HAVE_TCPDUMP=1
   [ -r "$OUI_FILE" ] || OUI_FILE="$OUI_FILE_ALT"
   [ -r "$OUI_FILE" ] || LOG yellow "no oui.txt: vendor rows disabled, OUI rows only"
@@ -1058,7 +1115,14 @@ run_lock() {
   ( while kill -0 "$MAIN_PID" 2>/dev/null; do sleep 3; done
     while read -r p; do [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done <"$CHILD_FILE" 2>/dev/null
     _pineap EXAMINE CANCEL; PINEAPPLE_EXAMINE_RESET
-    [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ] && rm -f "$LOCK_FILE" "$CHILD_FILE" ) >/dev/null 2>&1 &
+    # Only while the lock is still this run's: a run started since has replayed the state file at its own
+    # start (bands_recover) and may have written its own, which this watchdog must not undo.
+    if [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ]; then
+      # a band write this run issued is undone too (only the user payload writes BANDS_STATE; the hooks never do)
+      # shellcheck disable=SC2046   # the file holds the band tokens
+      [ -s "$BANDS_STATE" ] && PINEAPPLE_SET_BANDS "$RECON_IF" $(tr ',' ' ' <"$BANDS_STATE") && rm -f "$BANDS_STATE"
+      rm -f "$LOCK_FILE" "$CHILD_FILE"
+    fi ) >/dev/null 2>&1 &
 }
 # --- camhound lib end ---
 # --- watch core begin ---
@@ -1430,8 +1494,9 @@ locate_target() {
   return 0
 }
 # --- response rung begin ---
-# Operator-driven disconnect. Nothing transmits unless RESPONSE=1 AND the operator picks an attack
-# from the device card; there is no automatic path from a detection to the air.
+# Operator-driven disconnect. RESPONSE defaults to 1, so the rung is present; nothing transmits
+# until the operator picks an attack and clears the confirm. There is no path from a detection to
+# the air that does not pass through a dialog -- AUTO_RESPOND only raises the offer, never fires it.
 RESP_HDR='#epoch|mac|role|bssid|target|ch|band|badge|rsn_caps|beacon_prot|attack|cmd|lock|pk_before|pk_after|verdict'
 R_BSSID=""; R_TARGET=""; R_CH=0; R_BAND='?'
 
@@ -1471,10 +1536,15 @@ recon_stat() {   # recon_stat <mac> -> "packets last_seen", rc 1 when recon has 
 # own behaviour afterwards does, and a stalled packet counter is the strongest signal recon gives.
 resp_verdict() {
   local p0="$1" t0="$2" p1="$3" t1="$4" present="$5"
-  [ "$present" = 0 ] && { printf 'MOVED'; return 0; }           # dropped out of recon entirely
-  [ -z "$p0" ] || [ "$p0" = - ] && { printf 'INCONCLUSIVE'; return 0; }
-  [ -z "$p1" ] || [ "$p1" = - ] && { printf 'INCONCLUSIVE'; return 0; }
-  [[ $p0 =~ ^[0-9]+$ && $p1 =~ ^[0-9]+$ ]] || { printf 'INCONCLUSIVE'; return 0; }
+  # The baseline is tested FIRST, and this order is load-bearing. present=0 means "dropped out of
+  # recon", which only means anything if the subject was in recon to begin with. A client Recon
+  # never listed has p0 '-' and present 0, and judging presence first scored that MOVED -- a green
+  # RESPOND_HIT, with 'pk_before=- pk_after=-' in the loot, for a device we never measured. The
+  # client-row path in resp_fire synthesizes exactly that subject, so on firmware with no usable
+  # association it was the common case, not an edge one.
+  [[ $p0 =~ ^[0-9]+$ ]] || { printf 'INCONCLUSIVE'; return 0; }  # no usable baseline: nothing to compare
+  [ "$present" = 0 ] && { printf 'MOVED'; return 0; }            # was measured before, gone now
+  [[ $p1 =~ ^[0-9]+$ ]] || { printf 'INCONCLUSIVE'; return 0; }
   (( p1 > p0 )) && { printf 'NO_EFFECT'; return 0; }            # still transmitting
   [ "$t1" = "$t0" ] && { printf 'MOVED'; return 0; }            # counter stalled, nothing newer seen
   printf 'INCONCLUSIVE'
@@ -1489,16 +1559,23 @@ resp_write() {   # resp_write <mac> <badge> <attack> <cmd> <lock> <pk0> <pk1> <v
     "$2" "${POSTURE_RSN:--}" "$bp" "$3" "$4" "$5" "$6" "$7" "$8" >>"$f" 2>/dev/null
 }
 
-# resp_snapshot -> RS_PK/RS_T (packets, last-seen) for the subjects of the attempt, from one Recon read:
-# a client target measures itself; a broadcast (AP) target measures the AP's visible, non-random clients.
+# resp_snapshot <scope> -> RS_PK/RS_T (packets, last-seen) for the subjects of the attempt, from one
+# Recon read. The subjects are whatever the chosen attack reaches, which is NOT what the picked row
+# implies: CSA and BOTH transmit BSS-wide even from a client row (see attack_scope), so measuring
+# only the picked device would report a one-camera result as the outcome of a BSS-wide transmit and
+# leave the rest of the BSS out of the loot. scope cli measures the one target; scope bss measures
+# the BSSID's visible, non-random clients.
+# The picked target is always a subject, even behind a randomised MAC the bss sweep otherwise skips.
 # The AP's own counter is never the subject: it keeps beaconing whatever happens to its clients.
 declare -A RS_PK RS_T
 resp_snapshot() {
-  local m a pk sig pr fr t ch s
+  local scope="${1:-cli}" m a pk sig pr fr t ch s
   RS_PK=(); RS_T=()
   while IFS='|' read -r m a pk sig pr fr t ch; do
     m=${m,,}; a=${a,,}
-    if [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ]; then [ "$a" = "$R_BSSID" ] || continue; is_rand "$m" && continue
+    if [ "$scope" = bss ]; then
+      [ "$a" = "$R_BSSID" ] || continue
+      [ "$m" != "$R_TARGET" ] && is_rand "$m" && continue
     else [ "$m" = "$R_TARGET" ] || continue; fi
     RS_PK[$m]="${pk:-0}"; RS_T[$m]="${t:-0}"
   done < <(recon_lines CLIENTS)
@@ -1515,13 +1592,15 @@ resp_aggregate() {
 
 resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was reached
   local mac="$1" k="$2" badge="$3" cmd lock rc m p0 t0 p1 t1 present verdict nmv=0 nne=0 ninc=0 n
+  local scope tgt_verdict=-
   local -a subjects=(); local -A P0=() T0=()
   cmd=$(response_cmd "$k")
   [ -n "$cmd" ] || return 1
   if ! command -v "$cmd" >/dev/null 2>&1; then
     LOG red "$cmd not present in this firmware"; log resp "missing $cmd"; return 1
   fi
-  resp_snapshot
+  scope=$(attack_scope "$k")      # what the command can reach, which is not what the row implies
+  resp_snapshot "$scope"
   for m in "${!RS_PK[@]}"; do subjects+=("$m"); P0[$m]="${RS_PK[$m]}"; T0[$m]="${RS_T[$m]}"; done
   if [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ]; then
     if (( ${#subjects[@]} == 0 )); then                        # nothing to disconnect, nothing to measure
@@ -1543,27 +1622,34 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   fi
   set_state RESPOND
   LOG "$k -> ${R_BSSID:9} ch $R_CH"$'\n'"lock: $lock, $n subject(s)"
-  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock subjects=$n"
+  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock scope=$scope subjects=$n"
   if [ "$k" = CSA ]; then "$cmd" "$R_BSSID" "$R_CH" >/dev/null 2>&1
   else "$cmd" "$R_BSSID" "$R_TARGET" "$R_CH" >/dev/null 2>&1; fi
   sleep "$RESP_SETTLE_SECS"
-  resp_snapshot
+  resp_snapshot "$scope"
   unlock_target
   for m in "${subjects[@]}"; do
     p0="${P0[$m]}"; t0="${T0[$m]}"; present=1; p1=-; t1=-
     if [ -n "${RS_PK[$m]+x}" ]; then p1="${RS_PK[$m]}"; t1="${RS_T[$m]}"; else present=0; fi
     verdict=$(resp_verdict "$p0" "$t0" "$p1" "$t1" "$present")
     case "$verdict" in MOVED) nmv=$((nmv + 1)) ;; NO_EFFECT) nne=$((nne + 1)) ;; *) ninc=$((ninc + 1)) ;; esac
+    [ "$m" = "$R_TARGET" ] && tgt_verdict="$verdict"
     resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "$p0" "$p1" "$verdict" "$m"
     log resp "subject $m $verdict pk $p0 -> $p1 present=$present"
   done
   verdict=$(resp_aggregate "$nmv" "$nne" "$ninc")
-  log resp "verdict $verdict $R_TARGET moved=$nmv no_effect=$nne inconclusive=$ninc of $n"
+  log resp "verdict $verdict $R_TARGET scope=$scope moved=$nmv no_effect=$nne inconclusive=$ninc of $n"
   case "$verdict" in
     MOVED)     set_state RESPOND_HIT; LOG green "$verdict: $nmv/$n quiet" ;;
     NO_EFFECT) set_state RESPOND_NIL; LOG yellow "$verdict: $nne/$n still transmitting" ;;
     *)         set_state INCONCLUSIVE; LOG yellow "$verdict: $ninc/$n unsettled, $nmv quiet" ;;
   esac
+  # The aggregate word covers the whole blast radius, which is the honest summary of a BSS-wide
+  # transmit. The operator still picked one device, so name that device's own verdict too, or a
+  # collateral NO_EFFECT reads as "the camera I aimed at stayed up".
+  if [ "$R_TARGET" != ff:ff:ff:ff:ff:ff ] && (( n > 1 )); then
+    LOG "picked ${R_TARGET:9}: $tgt_verdict"; log resp "picked $R_TARGET $tgt_verdict of $n subjects"
+  fi
   return 0
 }
 
@@ -1589,7 +1675,7 @@ disrupt_row() {   # a cached badge is free to show; an uncached one is not worth
 }
 
 disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon says will work
-  local mac="$1" badge opts k exp items=() pickmap=() i=0 choice
+  local mac="$1" badge opts k exp scope items=() pickmap=() i=0 choice
   if ! resp_target "$mac"; then
     LOG red "nothing to attack: no associated BSS or no channel for $mac"; return 0
   fi
@@ -1608,15 +1694,21 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
   fi
   for k in $opts; do
     exp=$(posture_expect "$badge" "$k")
-    items+=("$(printf '%s (%s)' "$k" "$exp")"); pickmap+=("$k"); i=$((i + 1))
+    [ "$(attack_scope "$k")" = bss ] && scope=' bss' || scope=''
+    items+=("$(printf '%s%s (%s)' "$k" "$scope" "$exp")"); pickmap+=("$k"); i=$((i + 1))
   done
   pick_list "Disrupt [$badge] ${R_TARGET:9}" "${items[0]}" "${items[@]}" "Back" || return 0
   [ "$PICK" = Back ] && return 0
   choice=""
   for ((i = 0; i < ${#items[@]}; i++)); do [ "$PICK" = "${items[$i]}" ] && choice="${pickmap[$i]}"; done
   [ -n "$choice" ] || return 0
-  if [ "$RESPONSE_CONFIRM" = 1 ]; then
-    confirm "$choice on ${R_TARGET:9} via ${R_BSSID:9} ch $R_CH?" || { LOG "cancelled"; return 0; }
+  if [ "$RESPONSE_CONFIRM" != 0 ]; then    # fail closed: only an explicit 0 removes the confirm
+    # Name the real blast radius: "CSA on <one client>" would be a lie, the command has no target.
+    if [ "$(attack_scope "$choice")" = bss ]; then
+      confirm "$choice on EVERY client of ${R_BSSID:9} ch $R_CH?" || { LOG "cancelled"; return 0; }
+    else
+      confirm "$choice on ${R_TARGET:9} via ${R_BSSID:9} ch $R_CH?" || { LOG "cancelled"; return 0; }
+    fi
   fi
   resp_fire "$mac" "$choice" "$badge"
 }

@@ -16,7 +16,7 @@ facts that are settled so they do not get re-derived.
 | `gen_hooks.sh` | regenerates `library/recon/{client,access_point}/CamHound/` from the user payload (header + config + lib block + watch-core block + `hook_main.sh`) |
 | `check_sync.sh` | fails when the shared blocks differ between the user payload and the hooks |
 | `hook_header.sh`, `hook_main.sh` | the hook-only parts |
-| `harness/run_harness.sh` | laptop harness: stub DuckyScript commands, fake `_pineap`/`tcpdump`/`iwinfo`/`iw` (US-like channel table for a fixture phy dir), stub `NUMBER_PICKER`/`PAYLOAD_SET_CONFIG`/`PAYLOAD_DEL_CONFIG`, RECON fixtures (the client fixture is in the 2.0.0 `probe`-object shape, with `ap_mac` kept as a stand-in for the association the firmware does not expose; a net tree under `NET_SYSFS` names phy0 as wlan1mon's phy; `HARNESS_NO_BEACON=1` makes the fake tcpdump capture nothing); scenarios live, stimulus, lock, nojq, locate, disrupt, blind, noinj, persist, settings |
+| `harness/run_harness.sh` | laptop harness: stub DuckyScript commands, fake `_pineap`/`tcpdump`/`iwinfo`/`iw` (US-like channel table for a fixture phy dir), stub `NUMBER_PICKER`/`PAYLOAD_SET_CONFIG`/`PAYLOAD_DEL_CONFIG`, RECON fixtures (the client fixture is in the 2.0.0 `probe`-object shape, with `ap_mac` kept as a stand-in for the association the firmware does not expose; a net tree under `NET_SYSFS` names phy0 as wlan1mon's phy; `HARNESS_NO_BEACON=1` makes the fake tcpdump capture nothing); scenarios live, stimulus, lock, nojq, locate, disrupt, cliscope (the client-row Disrupt: both scopes in one menu), blind, noinj, persist, settings |
 
 Rule: edit the user payload, then `gen_hooks.sh`, then `check_sync.sh`, then `payload.sh --selftest`
 and `harness/run_harness.sh`. The lib block (`# --- camhound lib begin/end ---`) and the watch-core
@@ -30,8 +30,8 @@ clean). The v1.1 Recon hooks are generated and checked the same way. **No Pager 
 
 The payload is recon **and response**: it was renamed from CamScout when the Disrupt rung landed.
 The recon tiers are unchanged and still passive; the response tier is the only part that transmits
-and is off by default (`RESPONSE=0`). Its design, the firmware primitives it calls and the list of
-what remains unverified are in `RESPONSE.md`.
+and is **on by default** (`RESPONSE=1`), with `RESPONSE=0` restoring a recon-only run. Its design,
+the firmware primitives it calls and the list of what remains unverified are in `RESPONSE.md`.
 
 ## Roadmap
 
@@ -58,9 +58,13 @@ what remains unverified are in `RESPONSE.md`.
    still owed: Recon hooks (generated here; the hook spike -- Recon keeps growing while the hook
    runs, Cancel runs the trap -- is the device check); inventory persistence across runs
    (`DEDUPE_H`, clock guard, 30-day prune); settings menu (Recon and Response pages over all
-   fifteen starred keys; RESPONSE_CONFIRM-off asks twice; the lock clamp re-runs on apply; Reset via
-   `PAYLOAD_DEL_CONFIG`). Remaining: band write (`PINEAPPLE_SET_BANDS wlan1mon 2 5 [6]`, restored at exit,
-   gate: no pineapd restart); WPS/IE peek (`tcpdump -xx -s 1024 -c 12` on beacons and probe
+   sixteen starred keys; RESPONSE_CONFIRM-off asks twice; the lock clamp re-runs on apply; Reset via
+   `PAYLOAD_DEL_CONFIG`); band write (`BAND6`: `PINEAPPLE_SET_BANDS wlan1mon <bands> 6` once after the
+   overrides, trusted only when the radio is then seen on a 6 GHz channel or uci reads the 6 back, every
+   issued write restored in cleanup and, via a state file, by the watchdog or the next start; on bare 1.1.3
+   the call changed nothing with pineapd running — no restart, no uci change, no 6 GHz hop, day-one 8c —
+   and the payload says so); clients from
+   `RECON DEVICES` where `CLIENTS` is refused (1.1.3, measured). Remaining: WPS/IE peek (`tcpdump -xx -s 1024 -c 12` on beacons and probe
    responses, WPSMODEL +45/+40 as a new identity class, `ie_sig` column); retry percentage via
    BPF `wlan[1] & 0x08`; LAN confirm v1.1b (`LAN_CONFIRM=1`, 2.4 GHz join on wlan0cli, ARP
    candidates that are scored rows, port precheck, RTSP OPTIONS/DESCRIBE over `/dev/tcp`, ONVIF
@@ -76,6 +80,7 @@ tables, per-row weights, BLE-only lists, `iw set channel` while PineAP hops, rec
 cycle, SSDP/active mDNS/nmap auto-install, `exec "$0"`.
 
 Disconnection is now **in** scope: the payload was renamed from CamScout to CamHound when the
-response side landed, and `RESPONSE=1` adds a Disrupt rung offering deauth+disassoc, channel-switch
-announcements, or all three. It is off by default, so with `RESPONSE=0` the payload transmits
-nothing and behaves exactly as the recon-only build did. See `RESPONSE.md`.
+response side landed, and the Disrupt rung offers deauth+disassoc, channel-switch announcements, or
+all three. It is **on by default** (`RESPONSE=1`); `RESPONSE=0` makes the payload transmit nothing
+and behave exactly as the recon-only build did. Only `DEAUTH` on a client row is targeted — see
+`RESPONSE.md` §2 for why, and `attack_scope()` for the one place that decides.

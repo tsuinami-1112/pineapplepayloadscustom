@@ -1,2 +1,4 @@
 #!/bin/bash
-echo "2,5"
+# the only uci key the payload reads is pineapd.<if>.bands; the SET_BANDS stub updates it
+f="${HARNESS_BANDS:-/tmp/cs_harness_bands}"
+if [ -f "$f" ]; then cat "$f"; else echo "2,5"; fi
