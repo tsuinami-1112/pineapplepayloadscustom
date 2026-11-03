@@ -121,6 +121,14 @@ pending validation.
 counters), `resp_aggregate`, `resp_write` (→ `responses.tsv`, header `RESP_HDR`), `auto_respond_ok`.
 Timings: `RESP_LOCK_SECS`, `RESP_SETTLE_SECS` — both starred and wired; the lock must exceed
 fire + settle or it expires mid-measurement.
+`RESPONSE` **defaults to 1** — recon and response are both live out of the box; `RESPONSE=0` is the
+recon-only run. `attack_scope <key>` → `cli`|`bss` is the single place that decides blast radius:
+only `DEAUTH` on a client row is targeted, because `CSA` has no target argument and `_ALL`'s is
+parsed and discarded, and an AP row resolves `R_TARGET` to broadcast so everything is BSS-wide
+there. `disrupt_menu` reads it twice — the picker appends ` bss` to a broad option, and the
+pre-transmit confirm says "on EVERY client of <bssid>" instead of naming one device. `posture_opts`
+still orders by efficacy, so a BSS-wide attack stays preselected on the common badges; the marker
+and the confirm carry the breadth rather than the ordering.
 
 **Selftest** — `selftest()` plus `st_*` helpers (`st_device`, `st_pcap`, `st_beacon_pcap`,
 `st_gate`, `st_hex2bin`). Runs on a laptop with no radio. Add a case for anything you change.

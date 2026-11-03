@@ -50,13 +50,26 @@ and the injection.
 Three DuckyScript commands expose it. Signatures confirmed from `hak5cmd`'s own help text, not
 inferred:
 
-| Key | Command | Frames |
-|---|---|---|
-| `DEAUTH` | `PINEAPPLE_DEAUTH_CLIENT [bssid] [target] [channel]` | deauth + disassociation |
-| `CSA` | `PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]` | channel-switch announcements |
-| `BOTH` | `PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]` | all three |
+| Key | Command | Frames | Scope |
+|---|---|---|---|
+| `DEAUTH` | `PINEAPPLE_DEAUTH_CLIENT [bssid] [target] [channel]` | deauth + disassociation | one client |
+| `CSA` | `PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]` | channel-switch announcements | whole BSS |
+| `BOTH` | `PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]` | all three | whole BSS |
 
-`CSA` takes no target because it rides in a beacon and has no unicast recipient. There is also a
+**Scope is not what the signatures suggest, and `attack_scope()` is the one place that decides.**
+`CSA` takes no target because it rides in a beacon and has no unicast recipient, so its breadth is
+certain from the signature — **[V]**. `BOTH` advertises a `[target]` that its handler parses and
+discards, so it is BSS-wide too; the readings behind that are **[V]** and the "discards it"
+conclusion is **[A]**, falsifiable by firing `BOTH` at one client among several and seeing whether
+the others stay associated (evidence in `CLAUDE.md` §"2.0.0-stable, analysed"). And because
+`resp_target` resolves an **AP row** to a broadcast target, every attack on one is BSS-wide
+regardless of the key. The picker appends ` bss` to a broad option and the pre-transmit confirm
+reads "on EVERY client of <bssid>", because "`CSA` on <one client>" would be a lie. `posture_opts`
+is unchanged and still orders by efficacy, so a BSS-wide attack is preselected on the common
+badges — the marker and the confirm carry that, not a reordering that would demote the attack most
+likely to work.
+
+There is also a
 `_pineap` layer (`DEAUTH`, `DEAUTHCSA`, `DEAUTHALL`) and an HTTP layer (`/api/pineap/deauth`,
 `/deauth_csa`, `/deauth_all`); the DuckyScript wrappers are what payloads should use.
 
@@ -282,7 +295,7 @@ harness.
 
 ## 9. Entry points
 
-Five ways to reach Disrupt, all gated on `RESPONSE=1`:
+Five ways to reach Disrupt, all gated on `RESPONSE`, which defaults to 1:
 
 1. **Device card** (`detail_card`) — the manual path, beside Watch and Locate. Shows a cached badge
    in the row when one is fresh; an uncached badge is not worth a capture just to render a menu.
@@ -306,7 +319,7 @@ Five ways to reach Disrupt, all gated on `RESPONSE=1`:
 
 | Key | Default | Persist | Meaning |
 |---|---|---|---|
-| `RESPONSE` | 0 | `*` | master switch; 0 = recon only, nothing transmits |
+| `RESPONSE` | 1 | `*` | master switch; 0 = recon only, nothing transmits |
 | `RESPONSE_CONFIRM` | 1 | `*` | blocking confirmation before any transmit |
 | `AUTO_RESPOND` | 0 | `*` | let the funnel raise Disrupt by itself (needs `RESPONSE=1`) |
 | `POSTURE_TTL` | 300 | `*` | seconds a badge stays cached per BSSID |

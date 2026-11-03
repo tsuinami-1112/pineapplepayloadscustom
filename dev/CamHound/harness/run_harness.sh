@@ -81,7 +81,7 @@ s_locate() {   # Locate on the Hikvision AP: bars, tiers, clean stop
 }
 s_disrupt() {   # RESPONSE=1: Disrupt on the Reolink AP against log-only stubs; posture, lock, loot row
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
-  rules disrupt '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '1' ' via ' '1' "${COMMON[@]}"
+  rules disrupt '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
   answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   check "disrupt: posture read under a lock on the target channel" "grep -q 'TCPDUMP beacon ec71db000010' $T/log && grep -q 'PINEAPPLE_EXAMINE_BSSID ec:71:db:00:00:10' $T/log"
   check "disrupt: badge D+C from the synthetic beacon" "grep -q 'PICKER\[Disrupt \[D+C\]' $T/log"
@@ -94,7 +94,7 @@ s_disrupt() {   # RESPONSE=1: Disrupt on the Reolink AP against log-only stubs; 
   check "disrupt: aggregate verdict over both clients" "grep -q 'verdict MOVED ff:ff:ff:ff:ff:ff moved=2 no_effect=0 inconclusive=0 of 2' $LOOT/events.log"
   # guard: an AP with no visible clients (the Hikvision setup AP) is refused before anything is sent
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
-  rules disrupt2 '^CamHound' 'Scan,Exit' 'Review hits' '3,Exit' '^[0-9]+ HIK' 'Disrupt,Back' '^Disrupt \[' '1' ' via ' '1' "${COMMON[@]}"
+  rules disrupt2 '^CamHound' 'Scan,Exit' 'Review hits' '3,Exit' '^[0-9]+ HIK' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
   answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   check "disrupt: AP without clients refused, nothing sent" "grep -q 'no visible clients' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log && grep -q '|NO_CLIENTS$' $LOOT/responses.tsv"
   check "disrupt: cached badge shown on the card afterwards" "grep -q 'items=.*Disrupt \[D+C\]' $T/log"
@@ -102,15 +102,16 @@ s_disrupt() {   # RESPONSE=1: Disrupt on the Reolink AP against log-only stubs; 
 }
 s_blind() {   # RESPONSE=1 with no beacon capturable: the ? badge asks before firing blind; accepted leads CSA, declined sends nothing
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
-  rules blind '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' 'Fire blind' '1' '^Disrupt \[' '1' ' via ' '1' "${COMMON[@]}"
+  rules blind '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' 'Fire blind' '1' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
   answers t t B; HARNESS_NO_BEACON=1 run
   check "blind: capture attempted under a lock, nothing captured, badge ?" "grep -q 'TCPDUMP beacon suppressed ec71db000010' $T/log && grep -q 'PINEAPPLE_EXAMINE_BSSID ec:71:db:00:00:10' $T/log && grep -q '^LOG \[[?]\] 00:00:10 ch36 5GHz' $T/log"
   check "blind: Fire blind confirm shown and accepted" "grep -q 'CONFIRM\[Posture unread on 00:00:10: no beacon captured. Fire blind[?]\] -> 1' $T/log"
-  check "blind: picker leads with CSA, every option labelled unknown" "grep -q 'PICKER\[Disrupt \[[?]\] ff:ff:ff\] items=CSA (unknown);BOTH (unknown);DEAUTH (unknown);' $T/log"
+  check "blind: picker leads with CSA, every option unknown and marked bss-wide" "grep -q 'PICKER\[Disrupt \[[?]\] ff:ff:ff\] items=CSA bss (unknown);BOTH bss (unknown);DEAUTH bss (unknown);' $T/log"
+  check "blind: the confirm names every client, not the broadcast target" "grep -q 'CONFIRM\[CSA on EVERY client of 00:00:10 ch 36[?]\] -> 1' $T/log"
   check "blind: CSA fired with bssid and channel only, badge ? in the event" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_CSA ec:71:db:00:00:10 36$' $T/log && grep -q 'fire CSA ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff ch36 badge=? ' $LOOT/events.log"
   check "blind: loot rows carry badge ? and caps -" "grep -q '|ec:71:db:00:00:11|36|5|?|-|-|CSA|PINEAPPLE_DEAUTH_CLIENT_CSA|ok|' $LOOT/responses.tsv && grep -q '|ec:71:db:00:00:12|36|5|?|-|-|CSA|' $LOOT/responses.tsv"
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
-  rules blind2 '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' 'Fire blind' '0' '^Disrupt \[' '1' ' via ' '1' "${COMMON[@]}"
+  rules blind2 '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' 'Fire blind' '0' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
   answers t t B; HARNESS_NO_BEACON=1 run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   check "blind: declined -> no picker, nothing sent, no loot row" "grep -q 'Fire blind[?]\] -> 0' $T/log && ! grep -q 'PICKER\[Disrupt \[' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log && [ ! -e $LOOT/responses.tsv ]"
 }
@@ -118,7 +119,7 @@ s_noinj() {   # the Reolink AP moved to DFS channel 52: gate 1 refuses before an
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"; mkdir -p "$T/fix_noinj"
   for f in "$HERE"/fix/*; do sed 's/"channel":36,"hidden":0,"freq":5180/"channel":52,"hidden":0,"freq":5260/' "$f" >"$T/fix_noinj/$(basename "$f")"; done
   grep -q '"channel":52' "$T/fix_noinj/aps.json" || { echo "sed on the noinj fixture failed"; FAIL=$((FAIL + 1)); }
-  rules noinj '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' 'Nothing is expected' '0' '^Disrupt \[' '1' ' via ' '1' "${COMMON[@]}"
+  rules noinj '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' 'Nothing is expected' '0' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
   answers t t B; HARNESS_FIX="$T/fix_noinj" run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   check "noinj: NOINJ decided without a capture or a lock" "grep -q '^LOG \[NOINJ\] 00:00:10 ch52 5GHz' $T/log && ! grep -q 'TCPDUMP beacon' $T/log && ! grep -q 'PINEAPPLE_EXAMINE_BSSID' $T/log"
   check "noinj: try-anyway confirm shown, declined, nothing sent" "grep -q 'CONFIRM\[Nothing is expected to work (NOINJ). Try anyway[?]\] -> 0' $T/log && ! grep -q 'PICKER\[Disrupt \[' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"

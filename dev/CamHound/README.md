@@ -30,8 +30,8 @@ clean). The v1.1 Recon hooks are generated and checked the same way. **No Pager 
 
 The payload is recon **and response**: it was renamed from CamScout when the Disrupt rung landed.
 The recon tiers are unchanged and still passive; the response tier is the only part that transmits
-and is off by default (`RESPONSE=0`). Its design, the firmware primitives it calls and the list of
-what remains unverified are in `RESPONSE.md`.
+and is **on by default** (`RESPONSE=1`), with `RESPONSE=0` restoring a recon-only run. Its design,
+the firmware primitives it calls and the list of what remains unverified are in `RESPONSE.md`.
 
 ## Roadmap
 
@@ -76,6 +76,7 @@ tables, per-row weights, BLE-only lists, `iw set channel` while PineAP hops, rec
 cycle, SSDP/active mDNS/nmap auto-install, `exec "$0"`.
 
 Disconnection is now **in** scope: the payload was renamed from CamScout to CamHound when the
-response side landed, and `RESPONSE=1` adds a Disrupt rung offering deauth+disassoc, channel-switch
-announcements, or all three. It is off by default, so with `RESPONSE=0` the payload transmits
-nothing and behaves exactly as the recon-only build did. See `RESPONSE.md`.
+response side landed, and the Disrupt rung offers deauth+disassoc, channel-switch announcements, or
+all three. It is **on by default** (`RESPONSE=1`); `RESPONSE=0` makes the payload transmit nothing
+and behave exactly as the recon-only build did. Only `DEAUTH` on a client row is targeted — see
+`RESPONSE.md` §2 for why, and `attack_scope()` for the one place that decides.

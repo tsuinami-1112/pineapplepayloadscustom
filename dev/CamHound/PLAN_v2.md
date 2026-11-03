@@ -5,8 +5,9 @@ Status: PLAN ONLY. Nothing under /home/user/pineapplepayloadscustom has been mod
 > **Partly superseded — read this first.** This plan was written for a recon-only payload, then
 > called CamScout. The payload is now **CamHound: recon and response.** A fourth tier was added
 > that reads a target's PMF and beacon-protection posture from its beacon and then disconnects it
-> with deauth+disassoc, channel-switch announcements, or all three. It is off by default
-> (`RESPONSE=0`), and the recon tiers below are unchanged and still passive.
+> with deauth+disassoc, channel-switch announcements, or all three. It is **on by default**
+> (`RESPONSE=1`, since 2026-11-03; it shipped off and was flipped at the operator's request), and
+> the recon tiers below are unchanged and still passive. `RESPONSE=0` restores the recon-only run.
 >
 > Three statements in this document are therefore no longer true, and are marked inline where they
 > appear: that the tool is "passive by default" with no transmit tier (§1), that "deauth-based tiers

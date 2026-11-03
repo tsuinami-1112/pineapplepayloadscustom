@@ -11,11 +11,16 @@ suspect to test whether it is streaming (**Watch**), whether it reacts to moveme
 test**) or where it is (**Locate**). Identity scanning is passive and free. Watch and Locate pause
 Recon channel hopping for the length of the lock (30-120 s). CamHound never joins a network.
 
-With `RESPONSE=1` a fourth rung appears on the device card — **Disrupt** — which reads the target's
-protection posture from its own beacon and then disconnects it with deauthentication and
-disassociation, channel-switch announcements, or all three. See [Response](#response).
-**`RESPONSE` defaults to 0**, and with it off CamHound transmits nothing and behaves exactly as
-CamScout did. `AUTO_RESPOND=1` additionally lets the funnel *offer* Disrupt by itself: after a Watch
+A fourth rung sits on the device card — **Disrupt** — which reads the target's protection posture
+from its own beacon and then disconnects it with deauthentication and disassociation, channel-switch
+announcements, or all three. See [Response](#response).
+**`RESPONSE` defaults to 1**, so recon and response are both live out of the box. Set it to 0 —
+Settings → Response settings, or `PAYLOAD_SET_CONFIG camhound RESPONSE 0` — for a recon-only run
+that transmits nothing and behaves exactly as CamScout did. Only **DEAUTH on a client row** is
+aimed at one device: `CSA` has no target argument at all and `BOTH`'s is discarded, so both hit
+every client on the BSS, and an AP row resolves the target to broadcast so *everything* is BSS-wide
+there. The picker marks the broad options ` bss` and the confirm names the real blast radius.
+`AUTO_RESPOND=1` additionally lets the funnel *offer* Disrupt by itself: after a Watch
 confirms a device is streaming, or for a newly CONFIRMED device the Watch and Locate offers did not
 take (with `AUTO_WATCH=0` that is every new CONFIRMED device). The offer is a dialog, and
 `RESPONSE_CONFIRM` still gates the transmit; it is a second key precisely because that rung transmits.
@@ -51,10 +56,10 @@ and per-client Disrupt stay dormant, and the `ap_bssid` column reads `-`.
    hexdump (or od) + awk. Live view grades STREAM / DOWN / IDLE / NONE / INCONCLUSIVE; the Stimulus test
    grades EVENT / EVENT? by comparing a 30 s still baseline with 20 s of you moving in front of it
    plus a 20 s settle window.
-3. **Response** (opt-in, off by default): reads the target's PMF and beacon-protection posture from
+3. **Response** (on by default): reads the target's PMF and beacon-protection posture from
    its own beacon, then disconnects it with deauth+disassoc, channel-switch announcements, or all
    three, and judges from Recon whether it actually went quiet. This is the only tier that
-   transmits, and it does nothing unless `RESPONSE=1`. See [Response](#response).
+   transmits; `RESPONSE=0` removes it and with it every transmit. See [Response](#response).
 4. **Active LAN** (opt-in, not in this version): joining the network to confirm an RTSP/ONVIF feed
    is planned as `LAN_CONFIRM=1` in v1.1b and is off by default.
 
@@ -200,7 +205,7 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 | DEDUPE_H | 0 | * | hours: a device stored in inventory.tsv within this horizon is not alerted again unless its band rose or it is 10 dB closer; `Scan (fresh)` ignores it for one run |
 | INVENTORY_KEEP_DAYS | 30 | | inventory.tsv rows older than this are pruned at start (0 = never) |
 | ROW_W | 22 | | list row budget (36-40 expected after Phase 0 item 19) |
-| RESPONSE | 0 | * | master switch for the Disrupt rung; 0 = recon only, nothing transmits |
+| RESPONSE | 1 | * | master switch for the Disrupt rung; 0 = recon only, nothing transmits |
 | RESPONSE_CONFIRM | 1 | * | blocking confirmation before any transmit (Settings asks twice before switching it off) |
 | AUTO_RESPOND | 0 | * | let the funnel raise Disrupt by itself (needs RESPONSE=1) |
 | POSTURE_TTL | 300 | * | seconds a posture badge stays cached per BSSID |
@@ -210,7 +215,18 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 
 ## Response
 
-Off by default. `PAYLOAD_SET_CONFIG camhound RESPONSE 1` adds **Disrupt** to the device card.
+On by default. `PAYLOAD_SET_CONFIG camhound RESPONSE 0`, or Settings → Response settings, removes
+**Disrupt** from the device card and with it everything that transmits.
+
+**Scope: only `DEAUTH` on a client row hits one device.** `PINEAPPLE_DEAUTH_CLIENT_CSA` takes
+`[bssid] [channel]` and has no target argument, so `CSA` is BSS-wide by its own signature;
+`PINEAPPLE_DEAUTH_CLIENT_ALL` advertises a `[target]` that its handler parses and discards, so
+`BOTH` is BSS-wide too. An AP row resolves the target to broadcast, so on one of those all three
+options are BSS-wide. `attack_scope()` is the single place that decides; the picker appends ` bss`
+to a broad option and the pre-transmit confirm reads *"on EVERY client of <bssid>"* rather than
+naming one device. `posture_opts` still orders by expected efficacy, so a BSS-wide attack is
+preselected on the common badges — deliberately, since demoting the attack most likely to work
+would make the advice worse; the marker and the confirm carry the breadth instead.
 
 **1 · Posture.** The badge comes from the target's own beacon, captured on `RECON_IF` — the only
 source that covers every band, since `radio0` is 2.4 GHz-only and `radio1` carries no managed
