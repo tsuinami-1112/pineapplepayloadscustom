@@ -2012,10 +2012,15 @@ recon_stat() {   # recon_stat <mac> -> "packets last_seen", rc 1 when recon has 
 # own behaviour afterwards does, and a stalled packet counter is the strongest signal recon gives.
 resp_verdict() {
   local p0="$1" t0="$2" p1="$3" t1="$4" present="$5"
-  [ "$present" = 0 ] && { printf 'MOVED'; return 0; }           # dropped out of recon entirely
-  [ -z "$p0" ] || [ "$p0" = - ] && { printf 'INCONCLUSIVE'; return 0; }
-  [ -z "$p1" ] || [ "$p1" = - ] && { printf 'INCONCLUSIVE'; return 0; }
-  [[ $p0 =~ ^[0-9]+$ && $p1 =~ ^[0-9]+$ ]] || { printf 'INCONCLUSIVE'; return 0; }
+  # The baseline is tested FIRST, and this order is load-bearing. present=0 means "dropped out of
+  # recon", which only means anything if the subject was in recon to begin with. A client Recon
+  # never listed has p0 '-' and present 0, and judging presence first scored that MOVED -- a green
+  # RESPOND_HIT, with 'pk_before=- pk_after=-' in the loot, for a device we never measured. The
+  # client-row path in resp_fire synthesizes exactly that subject, so on firmware with no usable
+  # association it was the common case, not an edge one.
+  [[ $p0 =~ ^[0-9]+$ ]] || { printf 'INCONCLUSIVE'; return 0; }  # no usable baseline: nothing to compare
+  [ "$present" = 0 ] && { printf 'MOVED'; return 0; }            # was measured before, gone now
+  [[ $p1 =~ ^[0-9]+$ ]] || { printf 'INCONCLUSIVE'; return 0; }
   (( p1 > p0 )) && { printf 'NO_EFFECT'; return 0; }            # still transmitting
   [ "$t1" = "$t0" ] && { printf 'MOVED'; return 0; }            # counter stalled, nothing newer seen
   printf 'INCONCLUSIVE'
@@ -2173,7 +2178,7 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
   choice=""
   for ((i = 0; i < ${#items[@]}; i++)); do [ "$PICK" = "${items[$i]}" ] && choice="${pickmap[$i]}"; done
   [ -n "$choice" ] || return 0
-  if [ "$RESPONSE_CONFIRM" = 1 ]; then
+  if [ "$RESPONSE_CONFIRM" != 0 ]; then    # fail closed: only an explicit 0 removes the confirm
     # Name the real blast radius: "CSA on <one client>" would be a lie, the command has no target.
     if [ "$(attack_scope "$choice")" = bss ]; then
       confirm "$choice on EVERY client of ${R_BSSID:9} ch $R_CH?" || { LOG "cancelled"; return 0; }
@@ -2569,6 +2574,10 @@ IWFIX
   st "verdict counter stalled"  "$(resp_verdict 100 50 100 50 1)"  "MOVED"
   st "verdict stalled but seen" "$(resp_verdict 100 50 100 60 1)"  "INCONCLUSIVE"
   st "verdict no baseline"      "$(resp_verdict - - 140 60 1)"     "INCONCLUSIVE"
+  # A subject Recon never listed: absent before AND after. Judging presence before the baseline
+  # scored this MOVED and showed a green hit for a device that was never measured.
+  st "verdict never measured"   "$(resp_verdict - - - - 0)"        "INCONCLUSIVE"
+  st "verdict absent, no baseline, seen after" "$(resp_verdict - - 10 20 1)" "INCONCLUSIVE"
   st "verdict no follow-up"     "$(resp_verdict 100 50 - - 1)"     "INCONCLUSIVE"
   st "verdict non-numeric"      "$(resp_verdict x 50 y 60 1)"      "INCONCLUSIVE"
   POSTURE[aa:00:00:00:00:10]=C; POSTURE_TS[aa:00:00:00:00:10]=$EPOCHSECONDS
