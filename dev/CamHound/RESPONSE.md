@@ -369,10 +369,16 @@ on apply and saved as raised (`settings_apply` re-runs `resp_clamp_lock`), so th
 in force. `Reset defaults` clears these overrides along with the recon ones.
 
 **Two keys, not one.** `RESPONSE` opens the manual rung; `AUTO_RESPOND` additionally lets CamHound
-raise it unprompted. Since 2026-11-03 `RESPONSE` ships at **1**, so the rung is present out of the
-box; `AUTO_RESPOND=0` is now the only thing keeping the shipped default free of an unprompted
-transmit path, and `RESPONSE_CONFIRM=1` still gates every individual transmit. The separation is
-what makes "the rung exists" and "CamHound may raise it by itself" independent choices.
+raise the *offer* by itself. Since 2026-11-03 `RESPONSE` ships at **1**, so the rung is present out of
+the box, and `RESPONSE_CONFIRM` (also 1, and now failing closed on any non-zero value) gates every
+individual transmit. The separation is what makes "the rung exists" and "CamHound may raise it by
+itself" independent choices.
+
+*Corrected: an earlier revision said `AUTO_RESPOND=0` was "the only thing keeping the shipped default
+free of an unprompted transmit path", which undersells the design — **there is no unprompted transmit
+path at any setting.** `AUTO_RESPOND` only raises a dialog; the picker still has to be answered and
+the confirm cleared, and with `RESPONSE_CONFIRM=0` the picker's accept is itself an operator action.
+No combination of the three keys reaches the air without a dialog.*
 
 ## 11. Loot
 
@@ -430,7 +436,9 @@ Unit coverage:
 
 ## 13. What is unverified
 
-**⚠ First, the floor: this rung cannot transmit on ANY shipped firmware. Flashing does not fix it.**
+**⚠ First, the floor — and it applies to the USER PAYLOAD only.** From the user payload this rung
+cannot transmit on any shipped firmware, and flashing does not fix that. The Recon hooks reach the
+air by another route entirely; the exception at the end of this section is the important part.
 Two different mechanisms, same outcome, and the blocker is the **association column** rather than the
 firmware version:
 
@@ -441,13 +449,26 @@ firmware version:
 
 *Corrected 2026-11-03. An earlier revision of this section said the rung was "inert until the device
 is flashed to 2.0.0", which is wrong and was the more consequential half of the claim — it implied a
-flash would buy a working response rung, and it would not. The 1.1.3 half stands.* It fails **safe**
-on both: nothing is transmitted and the refusal is logged.
+flash would buy a working response rung, and it would not. The 1.1.3 half stands.* From the user
+payload, nothing is transmitted on either firmware and the refusal is logged.
+
+**⚠ The Recon client hook is the exception, and it transmits on 1.1.3 today.** Everything above is
+about the **user payload**, whose association comes from `recon_lines CLIENTS`. The two Recon hooks do
+not use it: `hook_target` (`dev/CamHound/hook_main.sh:20-37`) builds its one row from the
+`_RECON_SELECTED_*` variables the Recon UI exports, setting `AP_OF[$HOOK_MAC]` from
+`_RECON_SELECTED_AP_BSSID` and the channel from `_RECON_SELECTED_{CLIENT,AP}_CHANNEL`, with **no
+`_pineap RECON` call at all**. So a hook client row has a real association and a real channel,
+`resp_target`'s client branch passes, and `resp_fire` transmits behind the usual picker and confirm —
+on 1.1.3, on 2.0.0, regardless of what `RECON CLIENTS` returns. *Found by the recon-side session's
+review; verified here at `hook_main.sh:35` and `payload.sh:1982-1988`.* So "the rung cannot
+transmit" is true of the user payload only, and the rung is **not** inert on the device as a whole.
 
 **[A]** — the `CLIENTS` byte count and the 2.0.0 device-object shape are `[V]` from the binaries (see
 `/CLAUDE.md`); the code paths were read in the payload; composing them is the inference. *Falsified
-by:* a Disrupt transmitting on either firmware, or `_pineap RECON CLIENTS format=json | jq
-'.[0]|keys'` on a 2.0.0 Pager returning any key that carries the BSSID.
+by:* a Disrupt transmitting **from the user payload** on either firmware, or `_pineap RECON CLIENTS
+format=json | jq '.[0]|keys'` on a 2.0.0 Pager returning any key that carries the BSSID. (An earlier
+form of this falsifier named AP rows only, which could not have caught the hook path — the lesson
+being that a falsifier naming one entry point does not test a claim made about the payload.)
 
 **The one lead worth trying before concluding the rung is unreachable.** Two things are recorded but
 have never been put together: 1.1.3 *does* have `RECON DEVICES` and `COUNT DEVICES` (only `CLIENTS`

@@ -531,8 +531,13 @@ response_cmd() {
 # at all, so it is BSS-wide by construction; _ALL advertises [target] but parses one MAC, so its
 # target is accepted and discarded; only DEAUTH parses two and can aim.
 # [A] An AP row resolves R_TARGET to ff:ff:ff:ff:ff:ff and this reports that as BSS-wide. Nothing
-# in the repo records pineapd honouring a broadcast [target] rather than rejecting it. If it
-# rejects, the attack does nothing and every subject reads NO_EFFECT, which is the safe direction.
+# in the repo records pineapd honouring a broadcast [target] rather than rejecting it. Note the
+# failure is NOT self-announcing: an earlier version of this comment claimed a rejected attack
+# would leave "every subject reading NO_EFFECT, the safe direction", which is wrong -- resp_verdict
+# returns MOVED for a subject that goes absent, and for a stalled counter whose last-seen did not
+# advance, so an idle camera reads MOVED whether or not anything was transmitted. Only NO_EFFECT is
+# strong evidence here; MOVED on a quiet device is weak, and a rejected broadcast target would be
+# indistinguishable from a successful one.
 # Falsified by: PINEAPPLE_DEAUTH_CLIENT <bssid> ff:ff:ff:ff:ff:ff <ch> disconnecting one client, or
 # none, with several associated.
 attack_scope() {

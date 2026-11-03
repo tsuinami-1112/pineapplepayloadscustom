@@ -6,10 +6,11 @@
 #              recon/client/CamHound and recon/access_point/CamHound; it branches at run time on
 #              the selected-client variable. Disrupt reads the target's protection posture from its
 #              beacon and then disconnects it with deauth+disassoc, channel-switch announcements,
-#              or all three. RESPONSE defaults to 1, so Disrupt is present; set it to 0 (Settings
-#              -> Response settings) and the hook transmits nothing. Every transmit sits behind a
-#              confirm by default, and only DEAUTH on a client row is targeted -- CSA and BOTH hit
-#              the whole BSS.
+#              or all three. RESPONSE defaults to 1, so Disrupt is present. The hook has no Settings
+#              menu of its own: set the key in the CamHound user payload's Settings -> Response
+#              settings, or run PAYLOAD_SET_CONFIG camhound RESPONSE 0 -- the hook reads the same
+#              saved key. Every transmit sits behind a confirm by default, and only DEAUTH on a
+#              client row is targeted -- CSA and BOTH hit the whole BSS.
 #              GENERATED FILE: dev/CamHound/gen_hooks.sh copies the config block, the lib block and
 #              the watch-core block verbatim from library/user/reconnaissance/CamHound/payload.sh.
 #              Edit the user payload and regenerate; dev/CamHound/check_sync.sh verifies the copies.

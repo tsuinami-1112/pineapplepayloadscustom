@@ -605,21 +605,34 @@ packet counters move the way `resp_verdict` assumes; whether CSA moves a real cl
 count-byte experiment (day-one step 17a). (`inj_parse_channels` is **no longer** on this list — it
 ran against a live radio on 2026-11-02 and was correct; see "First contact".)
 
-**⚠ The response rung cannot transmit on ANY shipped firmware, and flashing does not fix it.**
+**⚠ The response rung cannot transmit from the USER PAYLOAD on any shipped firmware, and flashing
+does not fix that. The Recon hooks are a different story — see the exception below.**
 The blocker is the **association column**, not the firmware version. On **1.1.3** `_pineap RECON
 CLIENTS` does not exist, so no client row is ever recorded and every list row is an AP row:
 `R_TARGET` is broadcast, subjects are 0, `resp_fire` refuses with `NO_CLIENTS`. On **2.0.0** client
 rows arrive but the device object has no association field, so `JQ_CLI`'s `(.ap_mac // .bssid //
 "-")` gives `-` for every one; an AP row then finds 0 matching clients and refuses the same way,
 while a client row never even reaches the sweep because `AP_OF` is `-` and `resp_target` returns 1
-at `payload.sh:1983-1984`. It fails **safe** on both (nothing transmitted, refusal logged).
+at `payload.sh:1983-1984`. On both, the user payload transmits nothing and logs the refusal.
+
+**⚠ The Recon client hook is the exception, and it transmits on 1.1.3 today.** Everything above is
+about the **user payload**, whose association comes from `recon_lines CLIENTS`. The two Recon hooks do
+not use it: `hook_target` (`dev/CamHound/hook_main.sh:20-37`) builds its one row from the
+`_RECON_SELECTED_*` variables the Recon UI exports, setting `AP_OF[$HOOK_MAC]` from
+`_RECON_SELECTED_AP_BSSID` and the channel from `_RECON_SELECTED_{CLIENT,AP}_CHANNEL`, with **no
+`_pineap RECON` call at all**. So a hook client row has a real association and a real channel,
+`resp_target`'s client branch passes, and `resp_fire` transmits behind the usual picker and confirm —
+on 1.1.3, on 2.0.0, regardless of what `RECON CLIENTS` returns. *Found by the recon-side session's
+review; verified here at `hook_main.sh:35` and `payload.sh:1982-1988`.* So "the rung cannot
+transmit" is true of the user payload only, and the rung is **not** inert on the device as a whole.
 
 *Corrected 2026-11-03: the first version of this warning said `RESPONSE=1` "buys nothing until the
 device is flashed", which implied a flash would buy a working rung. It would not, and that was the
 load-bearing half. The 1.1.3 half stands.* Note the determination plan's standing instruction —
 `dev/pager-6ghz-determination-plan.md:155` "never flash it to this device" — therefore costs nothing
 on this axis. **[A]** — the byte counts and object shape are `[V]`; the code paths were read; the
-composition is the inference. *Falsified by:* a Disrupt transmitting on either firmware, or
+composition is the inference. *Falsified by:* a Disrupt transmitting **from the user payload** on either firmware (the earlier
+form of this falsifier said "on an AP row", which could not catch the hook path at all), or
 `_pineap RECON CLIENTS format=json | jq '.[0]|keys'` on a 2.0.0 Pager returning a key with the BSSID.
 
 **Untested lead, recorded so it is not lost:** 1.1.3 *does* have `RECON DEVICES`/`COUNT DEVICES`
