@@ -26,7 +26,14 @@ lives inside them.
 ## Status
 
 Coded and verified on a laptop only (selftest ends `0 failed` and prints its own count, harness scenarios green, shellcheck
-clean). The v1.1 Recon hooks are generated and checked the same way. **No Pager has run any of it.**
+clean). The v1.1 Recon hooks are generated and checked the same way.
+
+**First device run, 2026-11-04: `--selftest` passes on the operator's 1.1.3 Pager — 259 checks, 0
+failed.** That is the first CamHound code to execute on hardware, and it is a narrow slice: the
+selftest stubs every device-changing command, so it exercises the parsers, the pcap walkers and the
+scoring against the device's real `jq`, `hexdump`, `awk`, `bash` and busybox, and **nothing about the
+radio**. It earned its keep immediately: the first attempt was 255 checks / **4 failed**, which is
+how the `gsub` defect below was found. No live scan, Watch, Locate or Disrupt has run yet.
 
 **Status of the response rung, 2026-11-04:** it fires from a user-payload **AP** row and from both
 Recon hooks, with the subject set recovered from a BSSID-filtered capture, because no shipped
@@ -44,7 +51,8 @@ the firmware primitives it calls and the list of what remains unverified are in 
 **Everything described here is on `master`** as of PR #21 (2026-11-04); take it from there rather
 than from a feature branch, and check `git log --oneline -1` against the tip before copying, because
 a half-updated device is the one failure mode none of the gates can see. Nothing in CamHound has
-run on a device yet; everything is laptop-verified.
+run on a device beyond `--selftest`, which passed on 2026-11-04 (259/0, after it caught the `gsub`
+defect at 255/4); everything else is laptop-verified.
 
 **Three directories, nine files.** Each needs `payload.sh` and `cam_signatures.txt` beside it; the
 signature file is byte-identical in all three, and so are the two hooks (`cmp` them — that is the
@@ -82,6 +90,10 @@ that branch and `od` is what the Pager actually has.
 
 Then start **Recon in continuous mode** in the GUI, run CamHound, and watch
 `/root/loot/CamHound/events.log` for these, in order:
+
+**Confirmed on the device, 2026-11-04:** the `gsub` row below is why `jq_works()` exists — jq is
+present on a Pager but has no Oniguruma, so the parsers compiled to nothing and `HAVE_JQ` lied.
+`--selftest` now reports 259/0 there.
 
 | marker | means |
 |---|---|

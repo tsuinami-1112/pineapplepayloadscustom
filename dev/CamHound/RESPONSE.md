@@ -3,7 +3,9 @@
 Developer reference for the **Disrupt** rung: the part of CamHound that turns a detection into a
 disconnection. `PLAN_v2.md` covers the recon side; this covers everything downstream of it.
 
-Status: coded and verified on a laptop only. **No Pager has run any of it.** Section
+Status: coded and laptop-verified; `--selftest` passes on a real 1.1.3 Pager as of 2026-11-04
+(259/0), but **no part of this rung has transmitted, or even been reached, on hardware** — the
+selftest stubs every device-changing command. Section
 [What is unverified](#what-is-unverified) is the honest list.
 
 ---
