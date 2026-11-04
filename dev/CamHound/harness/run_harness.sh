@@ -8,7 +8,7 @@
 # was handed: for an answer further down the list it presses 'More...' first, as an operator would,
 # and it refuses (exit 1, logged 'not on this page') an answer that is on no page.
 # Needs bash 5 and jq; uses busybox hexdump/awk when busybox is installed (closer to the Pager).
-# Usage: dev/CamHound/harness/run_harness.sh [live|stimulus|lock|nojq|locate|disrupt|cliscope|blind|noinj|persist|settings|bands|devices|all]
+# Usage: dev/CamHound/harness/run_harness.sh [live|stimulus|lock|nojq|locate|disrupt|members|cliscope|blind|noinj|persist|settings|bands|devices|all]
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
 SRC="$ROOT/library/user/reconnaissance/CamHound/payload.sh"
@@ -19,7 +19,7 @@ mkdir -p "$T/bin"; if command -v busybox >/dev/null 2>&1; then for a in hexdump 
 sed -e 's/^WIN_SECS=10 /WIN_SECS=5 /' -e 's/^LIVE_WINDOWS=6 /LIVE_WINDOWS=4 /' \
     -e 's/^WIN_BASE_S=30; WIN_STIM_S=20; WIN_POST_S=20 /WIN_BASE_S=6; WIN_STIM_S=5; WIN_POST_S=5 /' -e 's/^QUIET_SECS=15 /QUIET_SECS=3 /' \
     -e "s|^OUI_FILE=\"/lib/hak5/oui.txt\"; OUI_FILE_ALT=\"/rom/lib/hak5/oui.txt\"|OUI_FILE=\"$HERE/fix/oui.txt\"; OUI_FILE_ALT=\"$HERE/fix/oui.txt\"|" \
-    -e 's/^RESP_SETTLE_SECS=6 /RESP_SETTLE_SECS=1 /' -e 's/^BCN_CAP_SECS=4 /BCN_CAP_SECS=2 /' \
+    -e 's/^RESP_SETTLE_SECS=6 /RESP_SETTLE_SECS=1 /' -e 's/^CLI_CAP_SECS=4 /CLI_CAP_SECS=2 /' -e 's/^BCN_CAP_SECS=4 /BCN_CAP_SECS=2 /' \
     -e "s|^INJ_SYSFS=\"/sys/class/ieee80211\"|INJ_SYSFS=\"$T/phy\"|" -e "s|^NET_SYSFS=\"/sys/class/net\"|NET_SYSFS=\"$T/net\"|" \
     -e 's/^BANDS_PROBE_N=12; BANDS_PROBE_WAIT=0.5 /BANDS_PROBE_N=2; BANDS_PROBE_WAIT=0.1 /' \
     -e "s|^LOOT_DIR=\"/root/loot/CamHound\"|LOOT_DIR=\"$LOOT\"|" "$SRC" >"$T/payload_fast.sh"
@@ -106,7 +106,7 @@ s_disrupt() {   # shipped default (RESPONSE=1 from the config block, nothing wri
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules disrupt2 '^CamHound' 'Scan,Exit' 'Review hits' '3,Exit' '^[0-9]+ HIK' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
   answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
-  check "disrupt: AP without clients refused, nothing sent" "grep -q 'no visible clients' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log && grep -q '|NO_CLIENTS$' $LOOT/responses.tsv"
+  check "disrupt: AP without clients refused, nothing sent" "grep -qE 'no visible clients|no clients heard' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log && grep -q '|NO_CLIENTS$' $LOOT/responses.tsv"
   check "disrupt: cached badge shown on the card afterwards" "grep -q 'items=.*Disrupt \[D+C\]' $T/log"
   check "disrupt: EXAMINE released, no lock file" "grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log && [ ! -e /tmp/cs_run.pid ]"
 }
@@ -217,10 +217,74 @@ s_devices() {   # 1.1.3: no CLIENTS verb, so clients come from RECON DEVICES (de
   check "devices: client rows exist, role cli, no association" "awk -F'|' '\$4==\"a4:da:22:20:00:01\" && \$5==\"cli\" && \$15==\"-\"' $LOOT/inventory.tsv | grep -q ."
   check "devices: APs are not duplicated as clients" "! grep -q '|9c:3d:cf:11:22:33|cli|' $LOOT/inventory.tsv && grep -q '|9c:3d:cf:11:22:33|ap|' $LOOT/inventory.tsv"
 }
+s_members() {   # the real-firmware shape: clients with NO association, membership read off the air
+  # Every other disrupt scenario drives fixtures whose ap_mac column no shipped firmware emits, so
+  # the NO_CLIENTS refusal that this work exists to fix had no coverage at all. HARNESS_NO_CLIENTS=1
+  # forces the 1.1.3 path (RECON DEVICES, ap_mac "-"), which is what the operator's unit returns.
+  # Index 6, not 4: under the DEVICES shape the review list orders differently and 4 is the
+  # "-- LIKELY --" divider. The checks below pin the BSSID the capture ran against, so if this
+  # index ever drifts again the scenario fails loudly instead of quietly testing another row.
+  local R=('^CamHound' 'Scan,Exit' 'Review hits' '6,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1')
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules mem1 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 run
+  check "members: capture armed with the OR filter, snap 128, frame cap 800" \
+    "grep -qE '^TCPDUMP members ec71db000010 snap=128 count=800 or=1' $T/log"
+  check "members: two stations recovered from the air" "grep -q 'members ec:71:db:00:00:10 n=2 ' $LOOT/events.log"
+  check "members: they became the subjects, with no association in the JSON" \
+    "grep -q 'scope=bss subjects=2' $LOOT/events.log && grep -q 'client verb: DEVICES' $LOOT/events.log"
+  check "members: the attack was sent" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_ALL ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log"
+  check "members: one loot row per recovered station" \
+    "[ \"\$(grep -c '^[0-9]' $LOOT/responses.tsv)\" = 2 ] && grep -q '|ec:71:db:00:00:11|' $LOOT/responses.tsv && grep -q '|ec:71:db:00:00:12|' $LOOT/responses.tsv"
+  check "members: the dwell and lock figures are logged for resp_clamp_lock" \
+    "grep -qE 'members .* dwell=[0-9]+s lock=[0-9]+s' $LOOT/events.log"
+  check "members: the measurement lock was re-armed, not stretched" \
+    "grep -qE 're-armed ec:71:db:00:00:10 [0-9]+s for the measurement' $LOOT/events.log"
+  check "members: EXAMINE released and no lock file left" "grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log && [ ! -e /tmp/cs_run.pid ]"
+  # armed, heard nobody -> NO_CLIENTS. This is the arm that used to be the whole bug.
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules mem2 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_NO_MEMBERS=1 run
+  check "members: silent BSS refuses NO_CLIENTS and sends nothing" \
+    "grep -q 'no clients heard on 00:00:10' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log && grep -q '|NO_CLIENTS\$' $LOOT/responses.tsv"
+  check "members: resp_fire itself released the lock on that refusal" \
+    "grep -q 'unlocked after refusal' $LOOT/events.log && grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log"
+  # tcpdump refuses the filter -> NO_CAPTURE, a different answer from an empty BSS
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules mem3 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_NO_ARM=1 run
+  check "members: a capture that cannot arm refuses NO_CAPTURE, not NO_CLIENTS" \
+    "grep -q '|NO_CAPTURE\$' $LOOT/responses.tsv && ! grep -q '|NO_CLIENTS\$' $LOOT/responses.tsv && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
+  # records arrive but are cut below rt+16 -> SNAP_SHORT, and the message names the fix
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules mem4 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_SHORT_SNAP=1 run
+  check "members: truncated records refuse SNAP_SHORT and name the constant" \
+    "grep -q '|SNAP_SHORT\$' $LOOT/responses.tsv && grep -q 'raise CLI_CAP_SNAP' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
+  check "members: the short capture is reported with its radiotap length" \
+    "grep -qE 'refused .* SNAP_SHORT members=0 itmax=18 recs=[0-9]+ short=[1-9]' $LOOT/events.log && grep -qE 'members .* trunc=[1-9]' $LOOT/events.log"
+  # a file exists but is not a pcap -> NO_CAPTURE. Without this arm, resp_members discarding
+  # bss_clients' exit status is invisible: the selftest cannot see it, because it covers
+  # bss_clients directly and never goes through resp_members.
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules mem6 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_BAD_PCAP=1 run
+  check "members: an unreadable capture is NO_CAPTURE, not an empty BSS" \
+    "grep -q '|NO_CAPTURE\$' $LOOT/responses.tsv && grep -q 'not a readable pcap' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
+  # heard stations, but Recon has no row for them -> NO_MATCH, a fourth answer. Saying NO_CLIENTS
+  # here would describe a BSS we demonstrably heard traffic on as dead.
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules mem7 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_ALIEN_MEMBERS=1 run
+  check "members: heard but unmeasurable is NO_MATCH, not NO_CLIENTS" \
+    "grep -q '|NO_MATCH\$' $LOOT/responses.tsv && ! grep -q '|NO_CLIENTS\$' $LOOT/responses.tsv && grep -q 'none is measurable' $T/log"
+  check "members: NO_MATCH records how many were heard" \
+    "grep -qE 'refused .* NO_MATCH members=2' $LOOT/events.log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
+  # the OR filter refused, the uplink-only fallback arms and still finds everyone
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules mem5 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_NO_OR=1 run
+  printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "members: the OR filter failing falls back to uplink-only and still fires" \
+    "grep -q 'OR filter did not arm' $LOOT/events.log && grep -qE '^TCPDUMP members ec71db000010 snap=128 count=800 or=2' $T/log && grep -q 'scope=bss subjects=2' $LOOT/events.log"
+}
 case "${1:-all}" in
-  live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; cliscope) s_cliscope ;; blind) s_blind ;; noinj) s_noinj ;; persist) s_persist ;; settings) s_settings ;; bands) s_bands ;; devices) s_devices ;;
-  all) s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_cliscope; s_blind; s_noinj; s_persist; s_settings; s_bands; s_devices ;;
-  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|cliscope|blind|noinj|persist|settings|bands|devices|all]"; exit 2 ;;
+  live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; members) s_members ;; cliscope) s_cliscope ;; blind) s_blind ;; noinj) s_noinj ;; persist) s_persist ;; settings) s_settings ;; bands) s_bands ;; devices) s_devices ;;
+  all) s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_members; s_cliscope; s_blind; s_noinj; s_persist; s_settings; s_bands; s_devices ;;
+  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|members|cliscope|blind|noinj|persist|settings|bands|devices|all]"; exit 2 ;;
 esac
 printf '== harness: %s failure(s); temp dir %s ==\n' "$FAIL" "$T"
 exit $(( FAIL > 0 ))

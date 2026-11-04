@@ -92,7 +92,10 @@ pineapd running, day-one 8c; every issued write is restored in `cleanup`, by the
 `bands_recover` at the next start from `BANDS_STATE`; not copied into the hooks); `raw_up_rows` feeds `--replay` a `raw_<run>.txt`.
 
 **Watch rung** (behaviour without identity) — `watch_menu`, `start_caps`/`stop_caps`,
-`pcap_words`/`pcap_bytes` (both have `od` fallbacks), `pcap_buckets`, `bucket_stats`,
+`pcap_words`/`pcap_bytes` (both have `od` fallbacks), `pcap_buckets`, `bucket_stats`
+(**`PCAP_AWK` aborts the whole file on `incl_len % 4 != 0`, so it only parses the `-s 32`
+captures it ships with — raising any Watch snap to reach addresses breaks it; verified
+2026-11-04, see `dev/CamHound/PLAN_v2.md` item 1**),
 `capture_ready` (gates `HAVE_TCPDUMP` on tcpdump + *either* hex dumper), `lock_target`/
 `unlock_target` (EXAMINE channel lock), `capture_beacon`, `beacon_find`, `ie_find`, `rsn_caps`.
 
@@ -140,13 +143,22 @@ BSS-wide and then measured and looted exactly one device. Subjects now follow th
 the picked target is always among them (even behind a randomised MAC the `bss` sweep skips), and
 `resp_fire` names that device's own verdict when there is more than one subject so a collateral
 `NO_EFFECT` cannot read as "my camera stayed up". Harness scenario `cliscope` drives both arms.
-Caveat, and it is bigger than a loot-quality note: the `bss` sweep matches `ap_mac` against
-`R_BSSID`, and **no shipped firmware supplies an association**, so the sweep matches nothing. That
-does not "degrade measurement to the picked target" — *an earlier revision of this line said so and
-it was wrong on both row types.* An AP row has no target to fall back to (broadcast), so subjects
-are 0 and `resp_fire` refuses; a client row never reaches the sweep because `AP_OF` is `-` and
-`resp_target` returns 1 at `payload.sh:1983`. The selection rule is right and **the rung cannot fire
-on either firmware** — see the warning below and `RESPONSE.md` §13.
+**Membership comes off the air (since 2026-11-04), because no shipped firmware supplies an
+association.** `bss_clients`/`capture_bss`/`CLI_AWK`/`pcap_stream` (lib block, so the hooks get them)
+read a BSSID-filtered data capture and report which stations talked to it; `resp_snapshot` **unions**
+that set with the `ap_mac` test rather than replacing it, and ignores a set gathered for a different
+BSSID. `resp_members` turns a failed capture into one of four answers — `NO_CAPTURE`, `SNAP_SHORT`,
+`NO_MATCH`, `NO_CLIENTS` — instead of one silence. `resp_fire` takes the lock **first**, captures,
+**re-arms** for the measurement, then fires; the re-arm exists because the walker's parse is
+2.5-9.1 s on the device and no constant covers it honestly. The `resp` line logs the measured dwell.
+Read `RESPONSE.md` §13a-i before changing any of it: three mechanics that look obvious are wrong
+there (`addr2` is the client only on a ToDS frame; `-s 32` cannot reach `addr2` at all; the bash
+substring walker is O(records x filesize)).
+**The honest bound — one fix did not buy five.** This recovers membership *without* populating
+`AP_OF`, so client Watch, Stimulus, kit detection and the AP→client tree stay inert, and a
+user-payload **client** row still aborts in `resp_target`'s client branch. What now fires: a
+user-payload **AP** row, the Recon **access_point** hook, and the Recon **client** hook's
+subject set. See `RESPONSE.md` §13a-i's bound table.
 
 **Selftest** — `selftest()` plus `st_*` helpers (`st_device`, `st_pcap`, `st_beacon_pcap`,
 `st_gate`, `st_hex2bin`, `st_subjects`). Runs on a laptop with no radio. Add a case for anything you change.
@@ -655,8 +667,14 @@ packet counters move the way `resp_verdict` assumes; whether CSA moves a real cl
 count-byte experiment (day-one step 17a). (`inj_parse_channels` is **no longer** on this list — it
 ran against a live radio on 2026-11-02 and was correct; see "First contact".)
 
-**⚠ The response rung cannot transmit from the USER PAYLOAD on any shipped firmware, and flashing
-does not fix that. The Recon hooks are a different story — see the exception below.**
+**⚠ FIXED 2026-11-04 for AP rows — read this as history plus a live remainder.** The block below
+described the state before `bss_clients` existed. What it says about the *cause* still holds and is
+measured: no shipped firmware supplies a client→AP association. What no longer holds is the
+conclusion that nothing can fire: an AP row, and both Recon hooks, now recover the subject set from
+a capture (`RESPONSE.md` §13a-i). **Still true:** a user-payload **client** row aborts in
+`resp_target`'s client branch, and client Watch, Stimulus, kit detection and the AP→client tree
+remain inert, all for the same missing `AP_OF`. The inverse lookup that would fix those is the
+recon side's and is worth more than the membership work.
 The blocker is the **association column**, not the firmware version. On **1.1.3** `_pineap RECON
 CLIENTS` does not exist; since 2026-11-03 client rows come from `RECON DEVICES` instead, but that
 object carries no association either, so every client row has `AP_OF` `-` and `resp_target` refuses
@@ -665,7 +683,8 @@ it exactly as on 2.0.0 (below), while every AP row has `R_TARGET` broadcast, 0 s
 rows arrive but the device object has no association field, so `JQ_CLI`'s `(.ap_mac // .bssid //
 "-")` gives `-` for every one; an AP row then finds 0 matching clients and refuses the same way,
 while a client row never even reaches the sweep because `AP_OF` is `-` and `resp_target` returns 1
-at `payload.sh:1983-1984`. On both, the user payload transmits nothing and logs the refusal.
+in its client branch. On both, the user payload transmitted nothing and logged the refusal — until
+the membership capture landed, which is what changed the AP-row half.
 
 **⚠ The Recon client hook is the exception, and it transmits on 1.1.3 today.** Everything above is
 about the **user payload**, whose association comes from `recon_lines CLIENTS`. The two Recon hooks do
@@ -675,8 +694,8 @@ not use it: `hook_target` (`dev/CamHound/hook_main.sh:20-37`) builds its one row
 `_pineap RECON` call at all**. So a hook client row has a real association and a real channel,
 `resp_target`'s client branch passes, and `resp_fire` transmits behind the usual picker and confirm —
 on 1.1.3, on 2.0.0, regardless of what `RECON CLIENTS` returns. *Found by the recon-side session's
-review; verified here at `hook_main.sh:35` and `payload.sh:1982-1988`.* So "the rung cannot
-transmit" is true of the user payload only, and the rung is **not** inert on the device as a whole.
+review; verified at `hook_main.sh`'s `hook_target` and `resp_target`.* So "the rung cannot
+transmit" was true of the user payload only, and is now untrue of its AP rows as well.
 
 *Corrected 2026-11-03: the first version of this warning said `RESPONSE=1` "buys nothing until the
 device is flashed", which implied a flash would buy a working rung. It would not, and that was the
@@ -697,15 +716,21 @@ client probing for an SSID is not necessarily associated to it, and the BSSID-fi
 `dev/CamHound/RESPONSE.md` §13a is the better evidence.
 
 **The association column is a chokepoint gating FIVE features, and the rung is fixable without it.**
-Verified in code: `AP_OF[mac] == "-"` disables Watch-on-a-client and Stimulus (`watchable()`,
-`payload.sh:985-990`), kit detection (`:1186`), the AP→client tree (`:2230`) and the response rung.
+Verified in code: `AP_OF[mac] == "-"` disables Watch-on-a-client and Stimulus (`watchable()`), kit
+detection (`kit_eval`), the AP→client tree (`write_report`) and, for client rows only, the response
+rung (`resp_target`). **Cited by name on purpose** — these four line numbers were exact on
+2026-11-04 and all four pointed into unrelated functions one commit later.
 But the *attack* never needed it — `CSA` is `<bssid> <ch>` and `BOTH`'s target is discarded, and
 `RECON APS` supplies both on 1.1.3, so the firmware can transmit today. What refuses is CamHound's
 own `NO_CLIENTS` measurement guard. The fix is to read the association off the air with a
-BSSID-filtered capture (the filter at `:1665`, the radiotap-aware frame walker in `beacon_find`,
-`addr2` at `p + rt + 10`), which is firmware-independent and better evidence than Recon's cumulative
-counters. Full working, ranked options and the two unverified mechanics are in
-`dev/CamHound/RESPONSE.md` §13a. **Not yet implemented.**
+BSSID-filtered capture (the filter shape at `:1804`, the radiotap-aware frame walker in
+`beacon_find`), which is firmware-independent and better evidence than Recon's cumulative counters.
+Full working, ranked options and the resolved mechanics are in `dev/CamHound/RESPONSE.md` §13a
+and §13a-i. **Not yet implemented.** ⚠ Three mechanics stated in §13a's first draft are
+**wrong** and are corrected in §13a-i, which is the build decision of record: `addr2` is the
+client only on a **ToDS** frame, `-s 32` cannot reach `addr2` at all, and the bash
+`pcap_bytes`/`hex_octet` walker beacon_find uses is **O(n²)** and cannot be reused at this
+file size.
 
 **Two 2.0.0 hazards in this repo's other payloads** — `wigle-toolkit` really deletes loot, and
 `wardrive_activate` is broken. Both are `[V]` from the rootfs trees and written up in full in
