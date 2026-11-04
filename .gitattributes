@@ -1,0 +1,11 @@
+# The Pager executes these directly, and bash on the device fails on CRLF with
+# "$'\r': command not found" / "not a valid identifier" — which is exactly how a Windows
+# clone broke a device install on 2026-11-04. Git for Windows defaults core.autocrlf=true,
+# so without this file a Windows checkout gets CRLF even though the repo stores LF, and
+# nothing in the repo or the harness can detect it: the gates all run on the checkout that
+# was committed from, never on the one that was copied to the device.
+*.sh    text eol=lf
+*.txt   text eol=lf
+*.py    text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf

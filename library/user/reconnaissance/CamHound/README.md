@@ -79,7 +79,22 @@ and the `ap_bssid` column reads `-`.
    `_pineap`'s output does, so a client row in CamHound's own Review list has no BSSID to aim from
    (see "Which AP a client is associated to"). Skipping this step is not a partial install — it
    removes a whole capability.
-3. If the files came through Windows: `sed -i 's/\r$//' payload.sh cam_signatures.txt; chmod +x payload.sh`.
+3. **If you cloned on Windows, fix the line endings — this one bites.** Git for Windows defaults
+   `core.autocrlf=true`, so your working tree gets CRLF even though the repo stores LF, and the
+   device then fails with `$'\r': command not found` and `not a valid identifier`. The repo carries
+   a `.gitattributes` pinning `*.sh`/`*.txt` to LF, so the durable fix is
+   `git config core.autocrlf false`, then re-checkout (`git rm -r --cached . && git reset --hard`).
+   To repair a device that already has CRLF copies, on the Pager — using `tr` with an octal escape,
+   because this BusyBox build's `sed` does not reliably read `\r` in a pattern:
+   ```sh
+   for f in /root/payloads/user/reconnaissance/CamHound/payload.sh \
+            /root/payloads/recon/client/CamHound/payload.sh \
+            /root/payloads/recon/access_point/CamHound/payload.sh; do
+     tr -d '\015' < "$f" > "$f.lf" && mv "$f.lf" "$f" && chmod +x "$f"
+   done
+   ```
+   Note that **no gate in this repo can catch this**: `check_sync.sh`, the selftest and the harness
+   all run against the checkout that was committed from, never against the copy on the device.
 4. **Decide whether you want the Disrupt rung armed.** `RESPONSE` ships at `1`, so a fresh install
    can transmit — behind the attack picker and a confirm, but present. For a recon-only run:
    `PAYLOAD_SET_CONFIG camhound RESPONSE 0`, or Settings → Response settings on the device.
