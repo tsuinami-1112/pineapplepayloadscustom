@@ -1,3 +1,7 @@
 #!/bin/bash
 a=$(_pop); printf 'WAIT[%s] -> %s\n' "$*" "$a" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"
-case "$a" in B|A) exit 0 ;; *) exec sleep 1000 ;; esac
+# The real command PRINTS THE BUTTON NAME on stdout and exits 0 (measured on the device: a press
+# of B emitted "B" with no newline, rc 0). It also exits 0 on `ERROR: unknown button` and on its
+# usage dump, so callers must read stdout rather than trusting rc - and this stub printed nothing,
+# which meant a caller doing that correct thing saw an empty string and looped for ever.
+case "$a" in B|A) printf '%s' "$a"; exit 0 ;; *) exec sleep 1000 ;; esac

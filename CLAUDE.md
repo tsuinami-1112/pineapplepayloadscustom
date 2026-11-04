@@ -85,7 +85,7 @@ Line numbers drift; find things by name (`grep -n '^name()' payload.sh`).
 **Recon rung** — `load_signatures`, `add_sig`, `vendor_of`, `score_device`, `clean_text`,
 `is_setup_ap`, `review_list`, `main_menu`, `preflight`, `write_report`; `rssi_gate_ok` (the RSSI_MIN
 list gate, kit-aware: a kit AP passes when a kit client does) with `rssi_min_clamp`; the Settings menu
-(`SETTINGS_TABLE` rows are `KEY|kind|floor|group|label` over all sixteen starred keys; `settings_menu`
+(`SETTINGS_TABLE` rows are `KEY|kind|floor|group|label` over all eighteen starred keys; `settings_menu`
 is a short top page, `settings_group` one page per group, Recon and Response; `settings_apply` re-runs
 `resp_clamp_lock` for the two timing keys and persists a raised lock; RESPONSE_CONFIRM-off asks twice;
 `cfg_snapshot_defaults`/`settings_reset`; `cfg_note_set` keeps the override count honest);
@@ -136,7 +136,14 @@ counters), `resp_aggregate`, `resp_write` (→ `responses.tsv`, header `RESP_HDR
 Timings: `RESP_LOCK_SECS`, `RESP_SETTLE_SECS` — both starred and wired; the lock must exceed
 fire + settle or it expires mid-measurement.
 `RESPONSE` **defaults to 1** — recon and response are both live out of the box; `RESPONSE=0` is the
-recon-only run. `attack_scope <key>` → `cli`|`bss` is the single place that decides blast radius:
+recon-only run. `SWEEP_TARGETED` **defaults to 1**: after a BSS-wide attack, `resp_fire` also sends
+one **targeted** `PINEAPPLE_DEAUTH_CLIENT` per recovered member, because on the bench a targeted
+deauth dropped a client that ignored both broadcast forms. It ADDS to the broadcast frame rather
+than replacing it (the two are complementary: broadcast reaches members the capture never
+enumerated and survives a stale randomised MAC), is guarded on `attack_scope`, not on `R_TARGET`,
+and never runs for `CSA`, which takes no target argument. `RECON_FRESH` **defaults to 1** and starts
+a fresh Recon session at launch, so a run reports what is transmitting now; it wipes the Recon
+session for anything else using it, which is why it is starred. `attack_scope <key>` → `cli`|`bss` is the single place that decides blast radius:
 only `DEAUTH` on a client row is targeted, because `CSA` has no target argument and `_ALL`'s is
 parsed and discarded, and an AP row resolves `R_TARGET` to broadcast so everything is BSS-wide
 there. `disrupt_menu` reads it twice — the picker appends ` bss` to a broad option, and the

@@ -97,6 +97,7 @@ BANDS_PROBE_N=12; BANDS_PROBE_WAIT=0.5   # band write check: samples of the live
 # response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
 RESPONSE=1              # * master switch for the response rung (0 = recon only, transmits nothing)
 SWEEP_TARGETED=1        # * after a BSS-wide deauth, also send ONE TARGETED deauth per recovered member
+RECON_FRESH=1           # * start a fresh Recon session at launch, so a run shows what is transmitting NOW
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
 AUTO_RESPOND=0          # * let the funnel offer Disrupt by itself (needs RESPONSE=1; 0 = manual only)
 # shellcheck disable=SC2034
@@ -225,6 +226,7 @@ load_overrides() {
     RESP_SETTLE_SECS=$(cfg RESP_SETTLE_SECS "$RESP_SETTLE_SECS" 1)
     AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
     SWEEP_TARGETED=$(cfg SWEEP_TARGETED "$SWEEP_TARGETED" 0)
+    RECON_FRESH=$(cfg RECON_FRESH "$RECON_FRESH" 0)
     POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
     DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
   fi
@@ -1260,6 +1262,7 @@ upsert_rows() {   # upsert_rows mac... -> merge these rows into inventory.tsv (r
   [ -s /tmp/cs_rows.tmp ] || return 0
   [ -s "$f" ] || printf '%s\n' "$INV_HDR" >"$f"
   awk -F'|' 'NR==FNR { new[$4]=$0; next } /^#/ { print; next } { if ($4 in new) { print new[$4]; delete new[$4] } else print } END { for (k in new) print new[k] }' /tmp/cs_rows.tmp "$f" >"$f.new" 2>/dev/null && mv "$f.new" "$f"
+  rm -f /tmp/cs_rows.tmp
   (( CYCLE % 5 == 0 )) && sync
   return 0
 }
@@ -1590,19 +1593,26 @@ ROW=""
 row_for() {
   local mac="$1" t tags="" budget glyph="A" r
   [ "${ROLE[$mac]}" = cli ] && glyph="c"
-  r="${RSSI_LAST[$mac]:-}"; [ -n "$r" ] && r=$(printf '%d' "$r" 2>/dev/null)
-  budget=$((ROW_W - 3 - 1 - 1 - 1 - ${#r} - 1))   # "NN " + " " + prox + glyph + rssi
+  # printf -v, not $( ): row_for runs once per listed row and each $( ) was a fork. Two per row.
+  r="${RSSI_LAST[$mac]:-}"; [ -n "$r" ] && printf -v r '%d' "$r" 2>/dev/null
+  budget=$((ROW_W - 7 - ${#r}))   # "A " + "NN " + tags + " " + prox + rssi
   for t in ${TAGS[$mac]}; do
     [ "$t" = BUSY ] && continue
     if (( ${#tags} + ${#t} + (${#tags} > 0 ? 1 : 0) <= budget )); then tags+="${tags:+ }$t"; fi
   done
   [ -z "$tags" ] && tags="${TAGS[$mac]%% *}"
-  ROW=$(printf '%2d %s %s%s%s' "$(( ${CONF[$mac]} > 99 ? 99 : ${CONF[$mac]} ))" "$tags" "${PROX[$mac]:-?}" "$glyph" "$r")
+  # Glyph FIRST. It used to sit between the proximity letter and the RSSI with no separators -
+  # "NA-52" - which is unreadable, and it is the one field that decides whether Disrupt works at
+  # all. Leading column, same place on every row, so the list can be scanned down.
+  printf -v ROW '%s %2d %s %s%s' "$glyph" "$(( ${CONF[$mac]} > 99 ? 99 : ${CONF[$mac]} ))" "$tags" "${PROX[$mac]:-?}" "$r"
   [ "${BUSY[$mac]}" = 1 ] && ROW+=" busy"
   ROW=${ROW:0:$ROW_W}
 }
 
-# sort_macs KIND -> SORTED (bash insertion into buckets; zero fork)
+# sort_macs KIND -> SORTED. One `sort` for the whole list, not an O(h^2) bash insertion sort, and
+# band_rank sets a global rather than being called in $( ) once per row. The old comment here
+# claimed "zero fork" and was wrong about exactly that call. LC_ALL=C so the byte order is the
+# device's and does not shift with the host locale.
 declare -a SORTED
 sort_macs() {   # by band rank desc, then prox N>M>F>?, then conf desc
   local kind="$1" mac key; local -a keyed=()
@@ -1623,22 +1633,24 @@ sort_macs() {   # by band rank desc, then prox N>M>F>?, then conf desc
     keyed+=("$key $mac")
   done
   SORTED=()
-  local -a tmp; local i j item
-  tmp=("${keyed[@]}")
-  for ((i = 1; i < ${#tmp[@]}; i++)); do item="${tmp[i]}"; j=$((i - 1)); while (( j >= 0 )) && [[ "${tmp[j]}" > "$item" ]]; do tmp[j + 1]="${tmp[j]}"; j=$((j - 1)); done; tmp[j + 1]="$item"; done
-  for item in "${tmp[@]}"; do SORTED+=("${item#* }"); done
+  (( ${#keyed[@]} )) || return 0
+  local item
+  while read -r item; do SORTED+=("${item#* }"); done < <(printf '%s\n' "${keyed[@]}" | LC_ALL=C sort)
 }
 
 review_list() {
-  local mac last_band="" i
+  local mac last_band="" i; local -A rowseen=()
   while :; do
     sort_macs hits
     ROW_TEXT=("Resume scan"); ROW_MAC=("")
-    last_band=""
+    last_band=""; rowseen=()
     for mac in "${SORTED[@]}"; do
       if [ "${BANDNAME[$mac]}" != "$last_band" ]; then last_band="${BANDNAME[$mac]}"; ROW_TEXT+=("-- $last_band --"); ROW_MAC+=(""); fi
       row_for "$mac"
-      for i in "${ROW_TEXT[@]}"; do [ "$i" = "$ROW" ] && { ROW="${ROW:0:$((ROW_W - 5))} ${mac:13}"; break; }; done
+      # O(1) against a seen-set. This was a rescan of every previous row, so the list build was
+      # O(h^2) on top of sort_macs' own, and it is what made backing out of a card take seconds.
+      [ -n "${rowseen[$ROW]}" ] && ROW="${ROW:0:$((ROW_W - 5))} ${mac:13}"
+      rowseen[$ROW]=1
       ROW_TEXT+=("$ROW"); ROW_MAC+=("$mac")
     done
     ROW_TEXT+=("Exit"); ROW_MAC+=("")
@@ -1692,6 +1704,7 @@ detail_card() {
     drow=""; [ "$RESPONSE" = 1 ] && drow=$(disrupt_row "$mac")
     pick_list "${CONF[$mac]} ${ID_LABEL[$mac]:-${TAGS[$mac]%% *}} ${mac:9}" "$def" "$wrow" ${drow:+"$drow"} "Locate" "Ignore for session" "Back" || return 0
     case "$PICK" in
+      "Disrupt n/a"*) LOG yellow "no associated BSS or no channel for ${mac:9}: nothing to attack from this row" ;;
       "Disrupt"*) disrupt_menu "$mac" ;;
       "Watch") watch_menu "$mac" ;;
       "Watch n/a"*) LOG "probe-only: identity + Locate only; Locate updates on probe bursts (15-60 s) and the MAC may rotate" ;;
@@ -1711,7 +1724,7 @@ mode_menu() {
 
 
 # ================================================================================ settings ===
-# Table-driven settings menu over all seventeen starred keys: key|kind|floor|group|label, where group
+# Table-driven settings menu over all eighteen starred keys: key|kind|floor|group|label, where group
 # is recon or response and settings_menu routes one page per group. Values are applied to the
 # running session and persisted with PAYLOAD_SET_CONFIG; Reset deletes the overrides and restores
 # the config-block defaults captured at start (cfg_snapshot_defaults runs before load_overrides).
@@ -1720,6 +1733,7 @@ SETTINGS_TABLE='CYCLE_SECS|int|5|recon|scan period, s
 THR_STREAM_UP|int|1|recon|STREAM big uplink fr/s
 COOLDOWN_SECS|int|0|recon|re-alert suppression, s
 DEDUPE_H|int|0|recon|dedupe horizon, h (0 off)
+RECON_FRESH|bool|0|recon|fresh Recon session at start
 RSSI_MIN|int|-100|recon|list gate dBm (0 off)
 ALERT_DIALOG|bool|0|recon|ALERT on new CONFIRMED
 SOUND|bool|0|recon|ringtone on CONFIRMED
@@ -1900,9 +1914,9 @@ bands_recover() {   # at start: a record means a previous run wrote the bands an
 
 # scan_loop: cycles until B opens Review and the operator picks Exit
 scan_loop() {
-  local rc
+  local rc btn
   set_state SCAN
-  LOG "[$MODE] scanning. B = review/pause"
+  LOG "[$MODE] scanning"
   while :; do
     run_cycle; emit_cycle
     if (( RECON_EMPTY >= 3 )); then
@@ -1914,12 +1928,24 @@ scan_loop() {
     fi
     offer_dialogs
     set_state SCAN
-    timeout "$CYCLE_SECS" WAIT_FOR_BUTTON_PRESS B >/dev/null 2>&1; rc=$?
-    if (( rc == 0 )); then
+    # The wait below is the ONLY window in which B reaches this payload; outside it the firmware
+    # owns the button and answers with "stop the payload?". The banner used to promise "B =
+    # review/pause" for the whole run, which was false whenever a cycle overran CYCLE_SECS - and
+    # while the OUI scan took minutes per cycle the window was under a tenth of the time, so B
+    # looked broken. Announce the window instead of claiming the button.
+    LOG green "press B now to review (${CYCLE_SECS}s)"
+    # Read stdout, not just rc. WAIT_FOR_BUTTON_PRESS prints the button name and exits 0 on a
+    # press - but it ALSO exits 0 on `ERROR: unknown button` and on its usage dump (both measured
+    # on the device). So rc alone cannot tell a press from a bad argument, and a mistyped button
+    # name would read as a press on every iteration and spin review_list open.
+    btn=$(timeout "$CYCLE_SECS" WAIT_FOR_BUTTON_PRESS B 2>/dev/null); rc=$?
+    if (( rc == 0 )) && [ "$btn" = B ]; then
       local t0=$EPOCHSECONDS
       review_list || return 1
       PAUSED_SECS=$((PAUSED_SECS + EPOCHSECONDS - t0))
       set_state SCAN
+    elif (( rc == 0 )); then
+      log warn "button: rc 0 but stdout was [${btn:0:40}], not B"; sleep 1
     elif (( rc != 124 )); then sleep 1; fi
   done
 }
@@ -1970,7 +1996,11 @@ bucket_stats() {
        END { cv = -1
          if (n >= 8) { for (i = 2; i < n; i++) { s += v[i]; k++ } m = s / k; for (i = 2; i < n; i++) ss += (v[i] - m) * (v[i] - m)
            if (m > 0) cv = int(isqrt(int(ss / (k - 1) * 100)) / m + 0.5) }
-         printf "%d %d %d %d %d %d\n", n, f, b, g, mx, cv }' "$1"
+         # %.0f, not %d: BusyBox awk casts through (int) for d/i/o/u/x/X (editors/awk.c:2418), so a
+         # byte accumulator past 2^31 is corrupted - wrapped on x86, saturated on a soft-float
+         # mipsel target. Bare print and %.0f take the long path and are exact.
+         # (No apostrophes in here: this is a single-quoted awk program and one would close it.)
+         printf "%.0f %.0f %.0f %.0f %.0f %.0f\n", n, f, b, g, mx, cv }' "$1"
 }
 
 WATCH_MAC=""; WATCH_BSSID=""; WATCH_CH=0; WATCH_ROLE=""; CAP_PIDS=""; CUR=A
@@ -2590,7 +2620,11 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   # the capture never enumerated and is immune to a stale address, while targeted reaches members
   # that filter broadcast. Doing both is better than either, and costs n frames instead of one.
   # Not for CSA: that command takes no target (<bssid> <channel>, arity measured on the device).
-  if [ "$SWEEP_TARGETED" = 1 ] && [ "$k" != CSA ] && [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ] && (( n > 0 )); then
+  # Guarded on SCOPE, not on R_TARGET being broadcast. attack_scope is the single place blast radius
+  # is decided, and a CLIENT row firing BOTH is scope=bss with R_TARGET set to the client - _ALL
+  # discards that target and goes BSS-wide regardless - so an R_TARGET test would skip the sweep in
+  # exactly the case it is most needed. Unreachable until the inverse lookup lands; wrong now.
+  if [ "$SWEEP_TARGETED" = 1 ] && [ "$k" != CSA ] && [ "$scope" = bss ] && (( n > 0 )); then
     local sw_cmd sw_ok=0 sw_rc sw_err
     sw_cmd=$(response_cmd DEAUTH)
     if [ -n "$sw_cmd" ] && command -v "$sw_cmd" >/dev/null 2>&1; then
@@ -2648,6 +2682,14 @@ auto_respond_ok() {
 
 disrupt_row() {   # a cached badge is free to show; an uncached one is not worth a capture to render
   local mac="$1" ap bss
+  # Mirrors "Watch n/a (not associated)" two lines up in detail_card. Without this the operator
+  # presses Disrupt, resp_target refuses, the red line lands on the log pane BEHIND the card, and
+  # the card redraws unchanged - which reads as a dead button. Safe to call resp_target here:
+  # disrupt_row always runs inside $( ), so the globals it sets die with the subshell.
+  if [ "${ROLE[$mac]}" = cli ] && { [ -z "${AP_OF[$mac]}" ] || [ "${AP_OF[$mac]}" = - ]; }; then
+    printf 'Disrupt n/a (not associated)'; return 0     # no BSS to announce from
+  fi
+  resp_target "$mac" || { printf 'Disrupt n/a (no channel)'; return 0; }
   [ "${ROLE[$mac]}" = cli ] && bss="${AP_OF[$mac]:--}" || bss="$mac"
   if [ -n "${POSTURE[$bss]}" ] && (( EPOCHSECONDS - ${POSTURE_TS[$bss]:-0} < POSTURE_TTL )); then
     printf 'Disrupt [%s]' "${POSTURE[$bss]}"
@@ -3003,7 +3045,7 @@ selftest() {
   MODE=SITE; apply_mode; prox_of aa:00:00:00:00:01; st "prox SITE -79 = M" "${PROX[aa:00:00:00:00:01]}" M; MODE=ROOM; apply_mode
   # 6 rows / status / inventory
   RSSI_LAST[aa:00:00:00:00:01]=-58; PROX[aa:00:00:00:00:01]=N; row_for aa:00:00:00:00:01; st "row fits ROW_W" "$(( ${#ROW} <= ROW_W ))" 1
-  st "row text" "$ROW" "90 HIK-OUI NA-58"
+  st "row text: role glyph leads, so the column is scannable" "$ROW" "A 90 HIK-OUI N-58"
   n=$(inv_row aa:00:00:00:00:01 | awk -F'|' '{print NF}'); st "inventory row field count = header" "$n" "$(printf '%s\n' "$INV_HDR" | awk -F'|' '{print NF}')"
   # 7 pcap parser
   st_pcap "$tmp/t.pcap" 1200 20 1700000000; st "pcap buckets (10 s x 2 big frames)" "$(pcap_buckets "$tmp/t.pcap" | wc -l | tr -d ' ')" 10
@@ -3228,7 +3270,12 @@ IWFIX
   st "lock_target: and it says the lock is unverified" "$(printf '%s' "$LOCK_TEXT" | grep -c unverified)" "1"
   unset -f iwinfo iw; PINEAPPLE_EXAMINE_BSSID() { :; }; PINEAPPLE_EXAMINE_CHANNEL() { :; }   # restore the base stubs; unsetting them would expose the real ones
   st "disrupt row shows cached badge" "$(disrupt_row aa:00:00:00:00:10)" "Disrupt [C]"
-  st "disrupt row bare when uncached" "$(disrupt_row aa:00:00:00:00:13)" "Disrupt"
+  # :13 is the CH=0 fixture the line above asserts resp_target refuses. It used to render a plain
+  # inviting "Disrupt" that dead-ends: the refusal is logged to the pane BEHIND the card, so the
+  # card redraws unchanged and the button looks broken. The row now says which reason applies.
+  st "disrupt row says no channel, not a dead Disrupt" "$(disrupt_row aa:00:00:00:00:13)" "Disrupt n/a (no channel)"
+  st_device aa:00:00:00:00:14 cli "Wyze Labs Inc" "" 0 -; CH[aa:00:00:00:00:14]=6; BAND[aa:00:00:00:00:14]=2
+  st "disrupt row says not associated on an unassociated client" "$(disrupt_row aa:00:00:00:00:14)" "Disrupt n/a (not associated)"
   R_BSSID=aa:00:00:00:00:10; R_TARGET=ff:ff:ff:ff:ff:ff; R_CH=6; R_BAND=2
   POSTURE_RSN=cc00; POSTURE_EXT=-; rm -f "$tmp/responses.tsv"
   resp_write aa:00:00:00:00:10 C CSA PINEAPPLE_DEAUTH_CLIENT_CSA ok 10 10 MOVED
@@ -3517,6 +3564,15 @@ apply_mode
 cfg_snapshot_defaults
 load_overrides
 bands_recover; [ "$BAND6" = 1 ] && bands_apply
+# A fresh Recon session, so a run reports what is transmitting NOW rather than everything the
+# daemon has accumulated since boot. It also keeps the device count low, which matters because the
+# per-cycle cost scales with it. Side effect worth being loud about: this wipes the Recon session
+# for anything ELSE using it, so it is starred and can be turned off in Settings -> Recon.
+if [ "$RECON_FRESH" = 1 ] && command -v PINEAPPLE_RECON_NEW >/dev/null 2>&1; then
+  PINEAPPLE_RECON_NEW >/dev/null 2>&1
+  log recon "RECON_FRESH: new session requested at start (previous recon list discarded)"
+  ui_ok && LOG yellow "fresh Recon session: this run shows what is transmitting now"
+fi
 (( CFG_OVERRIDES > 0 )) && { LOG yellow "cfg: $CFG_OVERRIDES overrides"; log cfg "$CFG_NOTE"; }
 log run "start v$VERSION run=$RUN_ID sigs=$SIG_COUNT($SIG_SOURCE) jq=$HAVE_JQ tcpdump=$HAVE_TCPDUMP bands=${BANDS_LINE:-?} mode=$MODE loaded=$LOADED_ROWS dedupe_h=$DEDUPE_H"
 LOG "CamHound $VERSION [$MODE]"$'\n'"sigs: $SIG_COUNT ($SIG_SOURCE)$( [ "$HAVE_JQ" = 1 ] || printf ' no-jq')$( [ "$HAVE_TCPDUMP" = 1 ] || printf ' no-tcpdump')"$'\n'"bands: ${BANDS_LINE:-?}"$'\n'"prox: uncal"

@@ -87,6 +87,7 @@ BANDS_PROBE_N=12; BANDS_PROBE_WAIT=0.5   # band write check: samples of the live
 # response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
 RESPONSE=1              # * master switch for the response rung (0 = recon only, transmits nothing)
 SWEEP_TARGETED=1        # * after a BSS-wide deauth, also send ONE TARGETED deauth per recovered member
+RECON_FRESH=1           # * start a fresh Recon session at launch, so a run shows what is transmitting NOW
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
 AUTO_RESPOND=0          # * let the funnel offer Disrupt by itself (needs RESPONSE=1; 0 = manual only)
 # shellcheck disable=SC2034
@@ -215,6 +216,7 @@ load_overrides() {
     RESP_SETTLE_SECS=$(cfg RESP_SETTLE_SECS "$RESP_SETTLE_SECS" 1)
     AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
     SWEEP_TARGETED=$(cfg SWEEP_TARGETED "$SWEEP_TARGETED" 0)
+    RECON_FRESH=$(cfg RECON_FRESH "$RECON_FRESH" 0)
     POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
     DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
   fi
@@ -1250,6 +1252,7 @@ upsert_rows() {   # upsert_rows mac... -> merge these rows into inventory.tsv (r
   [ -s /tmp/cs_rows.tmp ] || return 0
   [ -s "$f" ] || printf '%s\n' "$INV_HDR" >"$f"
   awk -F'|' 'NR==FNR { new[$4]=$0; next } /^#/ { print; next } { if ($4 in new) { print new[$4]; delete new[$4] } else print } END { for (k in new) print new[k] }' /tmp/cs_rows.tmp "$f" >"$f.new" 2>/dev/null && mv "$f.new" "$f"
+  rm -f /tmp/cs_rows.tmp
   (( CYCLE % 5 == 0 )) && sync
   return 0
 }
@@ -1361,7 +1364,11 @@ bucket_stats() {
        END { cv = -1
          if (n >= 8) { for (i = 2; i < n; i++) { s += v[i]; k++ } m = s / k; for (i = 2; i < n; i++) ss += (v[i] - m) * (v[i] - m)
            if (m > 0) cv = int(isqrt(int(ss / (k - 1) * 100)) / m + 0.5) }
-         printf "%d %d %d %d %d %d\n", n, f, b, g, mx, cv }' "$1"
+         # %.0f, not %d: BusyBox awk casts through (int) for d/i/o/u/x/X (editors/awk.c:2418), so a
+         # byte accumulator past 2^31 is corrupted - wrapped on x86, saturated on a soft-float
+         # mipsel target. Bare print and %.0f take the long path and are exact.
+         # (No apostrophes in here: this is a single-quoted awk program and one would close it.)
+         printf "%.0f %.0f %.0f %.0f %.0f %.0f\n", n, f, b, g, mx, cv }' "$1"
 }
 
 WATCH_MAC=""; WATCH_BSSID=""; WATCH_CH=0; WATCH_ROLE=""; CAP_PIDS=""; CUR=A
@@ -1981,7 +1988,11 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   # the capture never enumerated and is immune to a stale address, while targeted reaches members
   # that filter broadcast. Doing both is better than either, and costs n frames instead of one.
   # Not for CSA: that command takes no target (<bssid> <channel>, arity measured on the device).
-  if [ "$SWEEP_TARGETED" = 1 ] && [ "$k" != CSA ] && [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ] && (( n > 0 )); then
+  # Guarded on SCOPE, not on R_TARGET being broadcast. attack_scope is the single place blast radius
+  # is decided, and a CLIENT row firing BOTH is scope=bss with R_TARGET set to the client - _ALL
+  # discards that target and goes BSS-wide regardless - so an R_TARGET test would skip the sweep in
+  # exactly the case it is most needed. Unreachable until the inverse lookup lands; wrong now.
+  if [ "$SWEEP_TARGETED" = 1 ] && [ "$k" != CSA ] && [ "$scope" = bss ] && (( n > 0 )); then
     local sw_cmd sw_ok=0 sw_rc sw_err
     sw_cmd=$(response_cmd DEAUTH)
     if [ -n "$sw_cmd" ] && command -v "$sw_cmd" >/dev/null 2>&1; then
@@ -2039,6 +2050,14 @@ auto_respond_ok() {
 
 disrupt_row() {   # a cached badge is free to show; an uncached one is not worth a capture to render
   local mac="$1" ap bss
+  # Mirrors "Watch n/a (not associated)" two lines up in detail_card. Without this the operator
+  # presses Disrupt, resp_target refuses, the red line lands on the log pane BEHIND the card, and
+  # the card redraws unchanged - which reads as a dead button. Safe to call resp_target here:
+  # disrupt_row always runs inside $( ), so the globals it sets die with the subshell.
+  if [ "${ROLE[$mac]}" = cli ] && { [ -z "${AP_OF[$mac]}" ] || [ "${AP_OF[$mac]}" = - ]; }; then
+    printf 'Disrupt n/a (not associated)'; return 0     # no BSS to announce from
+  fi
+  resp_target "$mac" || { printf 'Disrupt n/a (no channel)'; return 0; }
   [ "${ROLE[$mac]}" = cli ] && bss="${AP_OF[$mac]:--}" || bss="$mac"
   if [ -n "${POSTURE[$bss]}" ] && (( EPOCHSECONDS - ${POSTURE_TS[$bss]:-0} < POSTURE_TTL )); then
     printf 'Disrupt [%s]' "${POSTURE[$bss]}"

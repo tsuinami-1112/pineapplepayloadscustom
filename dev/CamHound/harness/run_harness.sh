@@ -10,6 +10,16 @@
 # Needs bash 5 and jq; uses busybox hexdump/awk when busybox is installed (closer to the Pager).
 # Usage: dev/CamHound/harness/run_harness.sh [live|stimulus|lock|nojq|locate|disrupt|members|cliscope|blind|noinj|persist|settings|bands|devices|all]
 set -u
+# ONE RUN AT A TIME. Scenarios share /tmp/cs_run.pid, /tmp/cs_children, /tmp/cs_harness_* and the
+# payload's own fixed temp paths, so two concurrent runs corrupt each other - and the failures
+# surface in whichever scenario was unlucky, NOT the one you changed, which is the most misleading
+# symptom available. On 2026-11-05 that produced two phantom `live` failures while the real change
+# was in resp_fire. Refuse instead of racing.
+exec 9>/tmp/cs_harness.lock
+if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+  echo "== harness: another run holds /tmp/cs_harness.lock; refusing (concurrent runs corrupt each other) =="
+  exit 2
+fi
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
 SRC="$ROOT/library/user/reconnaissance/CamHound/payload.sh"
 T=$(mktemp -d); LOOT="$T/loot"; FAIL=0
