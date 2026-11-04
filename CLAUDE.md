@@ -338,6 +338,65 @@ firmware version lives at **`/etc/pineapplepager/version`** (two lines, `1.1.3` 
 build has **no `cat` options at all and no `sed l`**, so command blocks written for a future bench
 session must not use `cat -A` or `sed -n l` to inspect whitespace — use targeted `grep -c` instead.
 
+### Second contact — the response rung fires, and five open questions close, 2026-11-05
+
+Live bench session on the 1.1.3 unit with CamHound installed. Everything here is measured, with the
+command or the log line that produced it.
+
+- **⭐ A Disrupt transmitted FROM THE USER PAYLOAD.** This is the named falsifier for "the response
+  rung cannot transmit", and it is now spent. Loot row: `74:fe:ce:8e:58:1d|ap|…|ch 9|D+C|0c00|BOTH|
+  PINEAPPLE_DEAUTH_CLIENT_ALL|ok|3|4|NO_EFFECT`. The whole chain ran: lock, membership capture,
+  re-arm, fire, settle, measure, write.
+- **Membership really does come off the air.** `resp members 74:fe:ce:8e:58:1d n=1 why=ok itmax=56
+  recs=12 short=0 trunc=0 runt=0 dwell=4s lock=26s` — one station recovered from a BSS whose JSON
+  carries no association field, with zero short, truncated or runt records. `bss_clients`,
+  `capture_bss` and `CLI_AWK` had only ever run against harness fixtures.
+- **Phase 0 13a is ANSWERED: data frames do appear on `wlan1mon` under a held EXAMINE lock.** This
+  gated Watch entirely and was a shared dependency with the 6 GHz branch. Confirmed twice, the
+  second time by hand: `PINEAPPLE_EXAMINE_BSSID …; PINEAPPLE_EXAMINE_CHANNEL 8; tcpdump -i wlan1mon
+  -e type data and wlan addr1 …` returns a steady stream of ToDS frames.
+- **`itmax=56`** is the radiotap header length this hardware emits. So a record needs `56 + 16 = 72`
+  bytes to reach `addr2`, `-s 32` could never have worked (RESPONSE.md §13a-i's arithmetic, now with
+  a real number), and `CLI_CAP_SNAP=128` has comfortable margin.
+- **`lock=ok` on this unit**, on both the initial lock and the re-arm, so `cur_channel` reads the
+  channel back. The `lock=unverified` path added in `32af613` is correct to exist but does not fire
+  here. *Falsified by:* a unit with neither `iwinfo` nor a numeric `iw dev info` read-back.
+- **⭐ Targeted deauth works; both broadcast forms do not — against ONE client.** On AP
+  `FC:58:5A:08:42:15` ch 8, `PINEAPPLE_DEAUTH_CLIENT <bssid> 4e:42:dc:3b:d1:33 8` dropped the phone
+  immediately, while `PINEAPPLE_DEAUTH_CLIENT_ALL <bssid> ff:ff:ff:ff:ff:ff 8` and
+  `PINEAPPLE_DEAUTH_CLIENT_CSA <bssid> 8` were both accepted (rc 0, empty stderr) and did nothing.
+  **[A] on any generalisation.** The decision is made by the RECEIVING station's stack, not by the
+  Pager or the AP, so this is a property of that phone. Modern clients commonly ignore broadcast
+  deauth because it is trivially spoofable; cheap cameras run old vendor-SDK stacks and are *more*
+  likely to honour it, so this result may not transfer to CamHound's actual target class — a phone
+  is the least representative client available. *Falsified by:* a camera, laptop or IoT device that
+  does drop on a broadcast deauth. **Consequence taken anyway:** `resp_fire` now sends the broadcast
+  frame AND one targeted deauth per recovered member (`SWEEP_TARGETED`, starred, default 1), because
+  the two are complementary rather than ordered — broadcast reaches members the capture never
+  enumerated and survives a stale randomised MAC, targeted reaches members that filter broadcast.
+- **The CSA question is NOT answered by that.** CSA is inherently broadcast (a beacon element; no
+  targeted CSA exists), so `_CSA` doing nothing is equally consistent with the count-0 discard and
+  with broadcast-ness, and no firmware command can separate them. The count-0 claim stands as `[A]`.
+  Note `_ALL` includes a CSA by its own description, so a count-0 CSA HAS now been on the air.
+- **6 GHz is genuinely in the hop set** after the GUI toggle: 22 distinct 6 GHz centres in a
+  40-sample window (6015 … 7115 MHz), plus seven 5 GHz DFS channels. **But nothing was heard there**
+  — every frequency in `inventory.tsv` is ≤ 5805. Receive is permitted on both (NO-IR and RADAR are
+  transmit restrictions), so this corroborates the two-gate model rather than challenging it.
+- **The OUI table is why the scan hung.** `/lib/hak5/oui.txt` is 1,258,802 B / 38,959 lines and ONE
+  failed `grep -i -m1` over it costs **5.05 s wall, 2.08 s CPU** on the device. At 960 devices in
+  recon that is 33–81 minutes for a single cycle, and `events.log` showed `run start` with no
+  `emit_cycle` line after ten minutes. Fixed; see the scan-path commit.
+- **Scaling factors, because the wrong one was used twice.** Device ÷ same-algorithm BusyBox in the
+  container is **~44× wall** (5050 ms ÷ 113 ms) and **~15–18× CPU** (2.08 s ÷ 0.136 s); the gap is
+  cold I/O. The ~800× figure is device-BusyBox ÷ container-GNU-grep and is an *implementation*
+  comparison — never use it to scale a BusyBox measurement to the device.
+- **`WAIT_FOR_BUTTON_PRESS` works and prints the button name**, returning 0 on a press and 124 on a
+  timeout — but **0 on its error paths too** (`ERROR: unknown button`, and the usage dump). So
+  `rc == 0` alone cannot distinguish a press from a bad argument; check the printed name.
+  PLAN_v2 item 16 G's "scan-view button map" is answered. A scan whose cycle overruns `CYCLE_SECS`
+  never reaches the wait, so the firmware keeps the button and B appears dead — that was the hang,
+  not a button bug.
+
 **`2.0.0-stable` was released 2026-10-29** and is now what `latest` serves. Everything here remains
 pinned to 1.1.3; versioned downloads still work
 (`…/firmwares/1.1.3-stable`, 303 → signed .bin, sha256 `3073d6b8…cd33`).
@@ -536,9 +595,27 @@ CamHound uses.** All six uppercase commands it calls (`GPS_GET`, `LED`, `PAYLOAD
 `PAYLOAD_SET_CONFIG`, `RINGTONE`, `VIBRATE`) are byte-identical, as are `tcpdump`, `uci`, `jq`,
 `hexdump`, `iw`, `libpcap.so.1.10.5` and `libwifi.so.0.0.10`.
 
-- **The three `PINEAPPLE_DEAUTH_CLIENT*` commands survive with identical arity**, confirmed **from
-  the parser** (`cmd_deauth` still does `cmpi a2,3`) rather than from help text. 46 `PINEAPPLE_*`
-  commands, zero added, zero removed.
+- ~~**The three `PINEAPPLE_DEAUTH_CLIENT*` commands survive with identical arity**, confirmed from
+  the parser (`cmd_deauth` still does `cmpi a2,3`).~~ **REFUTED on hardware 2026-11-05.**
+  `PINEAPPLE_DEAUTH_CLIENT_CSA` takes **two** arguments, not three: with `<bssid> <channel>` it
+  reaches MAC parsing (`ERROR: invalid MAC address`), and with a third argument it prints usage and
+  does nothing. Reproduce, transmitting nothing, with an unparseable MAC:
+  `PINEAPPLE_DEAUTH_CLIENT_CSA ZZ:ZZ:ZZ:ZZ:ZZ:ZZ 9` vs the same plus a third argument.
+  The disassembly reading may well be right for whichever function was read; the step from "this
+  function checks for 3" to "all three commands take 3" is the part that failed, and it is the same
+  reading-then-wrong-inference shape this file warns about twice. `resp_fire` was already correct
+  (`CSA` passes two, the others three) - by luck, since no test or measurement covered it until now.
+  46 `PINEAPPLE_*` commands, zero added, zero removed, still stands.
+- **All three deauth commands are symlinks to `/usr/bin/hak5cmd`** (`readlink -f`, 2026-11-05), so
+  the GUI button and a payload's command are the same code path below `/tmp/api.sock`. Their own
+  usage text describes the split: `DEAUTH` = "a Wi-Fi client" (deauth + disassoc), `_ALL` = "all
+  Wi-Fi clients on an AP" (deauth + disassoc + **CSA**), `_CSA` = "all clients" (CSA only). That
+  independently corroborates the `[A]` inference below that `_ALL` is untargeted - weakly, since
+  this binary's help has been wrong three times, but it points the same way.
+- **`hak5cmd` exits 0 on every path, including its error paths**, and writes errors to **stderr**
+  (measured 2026-11-05: `2>/dev/null` swallows the message, `1>/dev/null` does not). So an exit
+  status from any `PINEAPPLE_*` command is worthless as a success signal and the stderr capture is
+  load-bearing. `resp_fire` checks both; anything new must check stderr, not `$?`.
 - **`hak5cmd` is a provable pure relink** — identical token and string sets, strings at a uniform
   −4 offset, the only real change being the version literal. **`_pineap` is a genuine recompile**
   (85.69% of bytes differ, 43 verbs retained, 13 added, 0 removed). *Both keep their exact size,
@@ -717,8 +794,12 @@ device is flashed", which implied a flash would buy a working rung. It would not
 load-bearing half. The 1.1.3 half stands.* Note the determination plan's standing instruction —
 `dev/pager-6ghz-determination-plan.md:155` "never flash it to this device" — therefore costs nothing
 on this axis. **[A]** — the byte counts and object shape are `[V]`; the code paths were read; the
-composition is the inference. *Falsified by:* a Disrupt transmitting **from the user payload** on either firmware (the earlier
-form of this falsifier said "on an AP row", which could not catch the hook path at all), or
+composition is the inference. ~~*Falsified by:* a Disrupt transmitting **from the user payload** on
+either firmware.~~ **SPENT 2026-11-05 — that Disrupt happened.** See "Second contact" above for the
+loot row and the log. What the block above still describes correctly is the CAUSE (no firmware
+supplies an association) and the remainder (a user-payload **client** row still aborts in
+`resp_target`'s client branch, and client Watch, Stimulus, kit detection and the AP-to-client tree
+stay inert). The second falsifier is untouched and still live:
 `_pineap RECON CLIENTS format=json | jq '.[0]|keys'` on a 2.0.0 Pager returning a key with the BSSID.
 
 **Lead, half followed 2026-11-03:** 1.1.3 *does* have `RECON DEVICES`/`COUNT DEVICES` (only

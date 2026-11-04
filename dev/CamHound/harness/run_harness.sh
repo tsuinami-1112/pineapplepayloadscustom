@@ -118,6 +118,7 @@ s_blind() {   # RESPONSE=1 with no beacon capturable: the ? badge asks before fi
   check "blind: Fire blind confirm shown and accepted" "grep -q 'CONFIRM\[Posture unread on 00:00:10: no beacon captured. Fire blind[?]\] -> 1' $T/log"
   check "blind: picker leads with CSA, every option unknown and marked bss-wide" "grep -q 'PICKER\[Disrupt \[[?]\] ff:ff:ff\] items=CSA bss (unknown);BOTH bss (unknown);DEAUTH bss (unknown);' $T/log"
   check "blind: the confirm names every client, not the broadcast target" "grep -q 'CONFIRM\[CSA on EVERY client of 00:00:10 ch 36[?]\] -> 1' $T/log"
+  check "blind: CSA does not sweep, because the command takes no target" "! grep -qE '^PINEAPPLE_DEAUTH_CLIENT ' $T/log"
   check "blind: CSA fired with bssid and channel only, badge ? in the event" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_CSA ec:71:db:00:00:10 36$' $T/log && grep -q 'fire CSA ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff ch36 badge=? ' $LOOT/events.log"
   check "blind: loot rows carry badge ? and caps -" "grep -q '|ec:71:db:00:00:11|36|5|?|-|-|CSA|PINEAPPLE_DEAUTH_CLIENT_CSA|ok|' $LOOT/responses.tsv && grep -q '|ec:71:db:00:00:12|36|5|?|-|-|CSA|' $LOOT/responses.tsv"
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
@@ -155,7 +156,7 @@ s_settings() {   # Settings: Recon page sets and persists a key; Response page's
   answers t; run
   check "settings: value applied and persisted" "grep -q '^LOG CYCLE_SECS -> 7 (saved)' $T/log && grep -q 'cfg set CYCLE_SECS=7' $LOOT/events.log && grep -q 'PAYLOAD_SET_CONFIG camhound CYCLE_SECS 7' $T/log"
   check "settings: top page is Back, Recon, Response, Reset" "grep -q 'PICKER\[Settings (saved on device)\] items=Back;Recon settings;Response settings;Reset defaults;' $T/log"
-  check "settings: response page lists the six response keys with live values" "grep -q 'PICKER\[Response settings\] items=Back;RESPONSE = 1;RESPONSE_CONFIRM = 1;AUTO_RESPOND = 0;RESP_LOCK_SECS = [0-9]*;RESP_SETTLE_SECS = [0-9]*;POSTURE_TTL = [0-9]*;' $T/log"
+  check "settings: response page lists the seven response keys with live values" "grep -q 'PICKER\[Response settings\] items=Back;RESPONSE = 1;RESPONSE_CONFIRM = 1;AUTO_RESPOND = 0;SWEEP_TARGETED = 1;RESP_LOCK_SECS = [0-9]*;RESP_SETTLE_SECS = [0-9]*;POSTURE_TTL = [0-9]*;' $T/log"
   check "settings: switching the pre-transmit confirm off asks first; declined keeps it on" "grep -q 'CONFIRM\[Switch off the confirmation before every transmit[?]\] -> 0' $T/log && ! grep -q 'PAYLOAD_SET_CONFIG camhound RESPONSE_CONFIRM' $T/log"
   check "settings: reset deletes the recon override and the response override" "grep -q 'cfg reset defaults' $LOOT/events.log && ! grep -q '^CYCLE_SECS=' $HARNESS_CFG && ! grep -q '^RESPONSE=' $HARNESS_CFG && grep -q 'PAYLOAD_DEL_CONFIG camhound RESPONSE$' $T/log"
   check "settings: recon page shows the live value after reset" "grep -q 'PICKER\[Recon settings\] items=Back;CYCLE_SECS = 20;' $T/log"
@@ -233,6 +234,13 @@ s_members() {   # the real-firmware shape: clients with NO association, membersh
   check "members: they became the subjects, with no association in the JSON" \
     "grep -q 'scope=bss subjects=2' $LOOT/events.log && grep -q 'client verb: DEVICES' $LOOT/events.log"
   check "members: the attack was sent" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_ALL ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log"
+  # The targeted sweep. The broadcast frame above is kept AND one targeted deauth goes to each
+  # recovered member, because on the bench a targeted deauth dropped a phone that ignored both
+  # broadcast forms. Asserted per member, so a sweep that fires once and stops is caught.
+  check "members: a targeted deauth follows the broadcast, one per recovered station" \
+    "grep -q '^PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 ec:71:db:00:00:11 36$' $T/log && grep -q '^PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 ec:71:db:00:00:12 36$' $T/log"
+  check "members: the sweep count is logged against the subject count" \
+    "grep -qE 'sweep PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 targeted=2 of 2' $LOOT/events.log"
   check "members: one loot row per recovered station" \
     "[ \"\$(grep -c '^[0-9]' $LOOT/responses.tsv)\" = 2 ] && grep -q '|ec:71:db:00:00:11|' $LOOT/responses.tsv && grep -q '|ec:71:db:00:00:12|' $LOOT/responses.tsv"
   check "members: the dwell and lock figures are logged for resp_clamp_lock" \

