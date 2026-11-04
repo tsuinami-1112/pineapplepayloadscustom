@@ -407,15 +407,16 @@ associated; or statically, by a `target` field reachable from `_All`'s type desc
 **Whether to relabel or reorder the menu is the CamHound-deauth session's call, not this
 branch's** — only the factually wrong comment was fixed here.
 
-**⚠ `_pineap RECON CLIENTS` is new in 2.0.0 — until 2026-11-03 CamHound's client rung had never actually run.**
+**⚠ `_pineap RECON CLIENTS` is new in 2.0.0 — CamHound's client rung has never run on a Pager, and on 1.1.3 it could not have listed a client before the `RECON DEVICES` fallback of 2026-11-03.**
 Reading **[V]**: the byte string `CLIENTS` occurs **0 times** in 1.1.3's `/usr/bin/_pineap` and
 **12 times** in 2.0.0's; lowercase `clients` 0 vs 4, `client` 0 vs 5. Count them with
 `python3 -I -c "import sys;print(open(sys.argv[1],'rb').read().count(b'CLIENTS'))" <_pineap>` —
 **not** with `grep -c`, which counts matching *lines* and on a binary with few newlines returns a
 smaller, method-dependent number (an earlier revision of this line said "6 times" for exactly that
-reason). The `0` is the robust half either way: absent is absent. So `recon_lines CLIENTS` returned
-nothing on every firmware the payload ran on before 2026-11-03, when `recon_verb_probe` started
-routing a 1.1.3 unit to `RECON DEVICES` (measured below); on 2.0.0 the verb exists and answers.
+reason). The `0` is the robust half either way: absent is absent. So on 1.1.3 `recon_lines CLIENTS`
+could never have returned a row before 2026-11-03, when `recon_verb_probe` started routing a 1.1.3
+unit to `RECON DEVICES` (whose output was measured below, by hand on the bare unit — the first device
+run of that path is still owed); on 2.0.0 the verb exists and answers.
 
 Corroborated by the help lines themselves — `strings -a <_pineap> | grep -E '^RECON '`, sorted:
 

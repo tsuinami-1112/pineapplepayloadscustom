@@ -526,8 +526,10 @@ we control.
 
 Ranked options: **(1)** capture-based subjects and verdict, ~30-40 lines reusing the above plus
 `resp_snapshot`/`resp_fire` wiring, selftest cases (`st_pcap` already builds synthetic pcaps) and a
-harness scenario; **(2)** probe for a free association first (§13 above), one command, which would
-make (1) optional; **(3)** let a BSS-wide attack fire with an explicit `INCONCLUSIVE` when nothing is
+harness scenario; **(2)** the §13 lead, half followed 2026-11-03: the one-command probe is spent
+(`RECON DEVICES` carries no association), and what remains is intersecting a client's probe-hash keys
+with an AP's beacon-hash keys, **[A]** and weaker than (1) because probing for an SSID is not
+association; **(3)** let a BSS-wide attack fire with an explicit `INCONCLUSIVE` when nothing is
 measurable — nearly free, but it discards the discipline that makes the verdict worth having, so it
 belongs *underneath* (1) as the heard-nothing fallback, not instead of it.
 

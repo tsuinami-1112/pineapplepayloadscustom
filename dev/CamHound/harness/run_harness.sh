@@ -26,7 +26,7 @@ sed -e 's/^WIN_SECS=10 /WIN_SECS=5 /' -e 's/^LIVE_WINDOWS=6 /LIVE_WINDOWS=4 /' \
 grep -q "LOOT_DIR=\"$LOOT\"" "$T/payload_fast.sh" || { echo "sed on the config block failed"; exit 1; }
 grep -q "INJ_SYSFS=\"$T/phy\"" "$T/payload_fast.sh" || { echo "sed on INJ_SYSFS failed"; exit 1; }
 grep -q "NET_SYSFS=\"$T/net\"" "$T/payload_fast.sh" || { echo "sed on NET_SYSFS failed"; exit 1; }
-grep -q 'BANDS_PROBE_N=2; ' "$T/payload_fast.sh" || { echo "sed on BANDS_PROBE_N failed"; exit 1; }
+grep -q '^BANDS_PROBE_N=2; BANDS_PROBE_WAIT=0.1 ' "$T/payload_fast.sh" || { echo "sed on BANDS_PROBE_N failed"; exit 1; }
 mkdir -p "$T/phy/phy0"          # fallback-merge fixture only: with the net tree below naming phy0, no scenario lists this directory
 mkdir -p "$T/net/wlan1mon/phy80211"; printf 'phy0\n' >"$T/net/wlan1mon/phy80211/name"   # RECON_IF's phy: the probe reads this one, no merge
 printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
@@ -202,6 +202,14 @@ s_bands() {   # BAND6=1: the band write at start (trusted on read-back), the sta
   reset; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"; printf '2,5' >"$LOOT/.bands_orig"
   rules bands5 '^CamHound' 'Exit' "${COMMON[@]}"; answers t; run
   check "bands: a state file left by a killed run is replayed at the next start" "grep -q '^PINEAPPLE_SET_BANDS wlan1mon 2 5$' $T/log && grep -q 'restored 2,5 left by a previous run' $LOOT/events.log && [ ! -e $LOOT/.bands_orig ]"
+  # a BAND6 run killed from the UI (SIGKILL): its own watchdog puts the bands back, keyed on the record's pid
+  reset; printf 'CYCLE_SECS=5\nBAND6=1\n' >"$HARNESS_CFG"
+  rules bands6 '^CamHound' 'Scan' "${COMMON[@]}"; answers t t t t t t t t t t t t
+  PATH="$PATHX" bash "$T/payload_fast.sh" >/dev/null 2>&1 & local p6=$!
+  for _ in $(seq 1 40); do grep -q '^PINEAPPLE_SET_BANDS wlan1mon 2 5 6$' "$T/log" 2>/dev/null && break; sleep 0.5; done
+  sleep 2; kill -9 $p6 2>/dev/null; sleep 6; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "bands: the killed run's own watchdog puts the bands back and drops the record" "[ \"\$(grep -c '^PINEAPPLE_SET_BANDS wlan1mon 2 5$' $T/log)\" = 1 ] && grep -q 'restored 2,5 by the watchdog' $LOOT/events.log && [ ! -e $LOOT/.bands_orig ] && [ ! -e /tmp/cs_run.pid ] && [ \"\$(cat /tmp/cs_harness_bands)\" = 2,5 ]"
+  for p in $(pgrep -x sleep); do tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q ' 1000' && kill "$p" 2>/dev/null; done; true
 }
 s_devices() {   # 1.1.3: no CLIENTS verb, so clients come from RECON DEVICES (devices that neither beacon nor answer probes), with no association
   reset; rules devices '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 run
