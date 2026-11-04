@@ -74,6 +74,18 @@ its own signature file despite all three copies carrying the same `PAYLOAD_REL`.
 checkout: `sed -i 's/\r$//' payload.sh cam_signatures.txt` (the repo copies are LF; `file` will tell
 you).
 
+**Driving the device from PowerShell: single quotes outside, and no `"` character anywhere inside.**
+PowerShell's escape character is a backtick, not a backslash, so `\$x` and `\"` do not mean what a
+POSIX habit expects. Worse, a `"` inside a single-quoted string is stripped when PowerShell builds
+the command line for a native program such as `ssh.exe`, and the remote shell then receives the
+command unquoted: `ssh host 'sed -n "s/.*(\([0-9]*\) MHz).*/\1/p"'` arrives at the Pager with the
+quotes gone and dies with `ash: syntax error: unexpected "("`. Three commands in one session were
+lost to this, twice after the rule had already been stated. Prefer a form that needs no quotes —
+`grep MHz` over a quoted regex, `cut -d\| -f17` over `awk -F"[|]"`. Where a quote is genuinely
+needed, send the script on **stdin**, where it never touches a command line at all:
+`'awk -F"[|]" "\$17>5925" file' | ssh root@172.16.52.1 sh` — ssh still prompts for the password,
+which it reads from `/dev/tty` rather than stdin.
+
 **Re-uploading after either session lands more work: copy all three again.** `check_sync.sh` compares
 the three copies *in the repo*, so a stale hook left on the device is invisible to every gate we
 have. The hooks change whenever the lib or watch-core block does — which is most response-rung and
@@ -83,10 +95,20 @@ most parser work — so "I only edited the user payload" is not a reason to skip
 and `RESPONSE_CONFIRM`). For a recon-only first run:
 `PAYLOAD_SET_CONFIG camhound RESPONSE 0`.
 
-`--selftest` is safe to run on the device — every device-changing command is stubbed — so the
-cheapest first step is `bash payload.sh --selftest` on the Pager itself. It is also the only way to
+`--selftest` is safe to run on the device — every device-changing command is stubbed, and since
+2026-11-04 so is every display and dialog command, so it no longer paints the Pager's screen nor can
+it block on a button press. The cheapest first step is `bash payload.sh --selftest` on the Pager
+itself. Expect `== 267 checks, 0 failed ==` and the two block hashes; a lower count means the copy
+on the device is older than the repo's.
+
+*Corrected 2026-11-04. An earlier version of this paragraph called the device run "the only way to
 exercise the `od` fallback in `pcap_stream`/`pcap_words`, since a laptop with `hexdump` never takes
-that branch and `od` is what the Pager actually has.
+that branch and `od` is what the Pager actually has". **Both halves are backwards.** All three
+dumpers are `if hexdump; then hexdump; else od; fi` (`payload.sh:636`, `:694`, `:1894`); `hexdump`
+is in the measured device inventory and `od` ships in neither firmware image, so a Pager always
+takes the **hexdump** branch and a device run exercises the fallback less, not more. The `od` branch
+is for a host that lacks hexdump — which is what the cloud container running the gates is, so the
+two machines take opposite branches and neither alone covers both.*
 
 Then start **Recon in continuous mode** in the GUI, run CamHound, and watch
 `/root/loot/CamHound/events.log` for these, in order:
