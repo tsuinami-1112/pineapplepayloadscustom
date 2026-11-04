@@ -41,17 +41,44 @@ the firmware primitives it calls and the list of what remains unverified are in 
 
 ## Loading it onto a Pager, and what to watch on the first run
 
-Nothing in CamHound has run on a device yet; everything is laptop-verified. Install per
-`library/user/reconnaissance/CamHound/README.md` — the user payload to
-`/root/payloads/user/reconnaissance/CamHound/` and, for the Recon-menu entries, the two generated
-hooks to `/root/payloads/recon/client/CamHound/` and `/root/payloads/recon/access_point/CamHound/`,
-each with `cam_signatures.txt` beside its `payload.sh` (`/sd/payloads/...` or `/mmc/root/payloads/...`
-work too; `find_install_dir` probes `_PAYLOAD_HOME`, then the script's own directory, then those
-roots). Windows checkout: `sed -i 's/\r$//' payload.sh cam_signatures.txt`.
+**Everything described here is on `master`** as of PR #21 (2026-11-04); take it from there rather
+than from a feature branch, and check `git log --oneline -1` against the tip before copying, because
+a half-updated device is the one failure mode none of the gates can see. Nothing in CamHound has
+run on a device yet; everything is laptop-verified.
+
+**Three directories, nine files.** Each needs `payload.sh` and `cam_signatures.txt` beside it; the
+signature file is byte-identical in all three, and so are the two hooks (`cmp` them — that is the
+edit contract, not a mistake).
+
+```sh
+ssh root@172.16.52.1 'mkdir -p /root/payloads/user/reconnaissance/CamHound \
+  /root/payloads/recon/client/CamHound /root/payloads/recon/access_point/CamHound'
+for d in user/reconnaissance recon/client recon/access_point; do
+  scp library/$d/CamHound/payload.sh library/$d/CamHound/cam_signatures.txt \
+      root@172.16.52.1:/root/payloads/$d/CamHound/
+done
+ssh root@172.16.52.1 'chmod +x /root/payloads/*/*/CamHound/payload.sh'
+```
+
+`/sd/payloads/...` and `/mmc/root/payloads/...` work equally — `find_install_dir` probes
+`_PAYLOAD_HOME`, then the script's own directory, then all three roots, which is why each hook finds
+its own signature file despite all three copies carrying the same `PAYLOAD_REL`. From a Windows
+checkout: `sed -i 's/\r$//' payload.sh cam_signatures.txt` (the repo copies are LF; `file` will tell
+you).
+
+**Re-uploading after either session lands more work: copy all three again.** `check_sync.sh` compares
+the three copies *in the repo*, so a stale hook left on the device is invisible to every gate we
+have. The hooks change whenever the lib or watch-core block does — which is most response-rung and
+most parser work — so "I only edited the user payload" is not a reason to skip them.
+
+**`RESPONSE` ships at 1**, so a fresh install arms the Disrupt rung (still behind the attack picker
+and `RESPONSE_CONFIRM`). For a recon-only first run:
+`PAYLOAD_SET_CONFIG camhound RESPONSE 0`.
 
 `--selftest` is safe to run on the device — every device-changing command is stubbed — so the
-cheapest first step is `bash payload.sh --selftest` on the Pager itself, which exercises the `od`
-fallback path that a laptop with `hexdump` never takes.
+cheapest first step is `bash payload.sh --selftest` on the Pager itself. It is also the only way to
+exercise the `od` fallback in `pcap_stream`/`pcap_words`, since a laptop with `hexdump` never takes
+that branch and `od` is what the Pager actually has.
 
 Then start **Recon in continuous mode** in the GUI, run CamHound, and watch
 `/root/loot/CamHound/events.log` for these, in order:
