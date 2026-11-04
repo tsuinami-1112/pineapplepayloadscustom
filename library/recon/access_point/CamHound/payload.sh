@@ -92,6 +92,13 @@ AUTO_RESPOND=0          # * let the funnel offer Disrupt by itself (needs RESPON
 SCAN_IF="wlan0"         # reserved: posture cross-check iface, the enabled dummy sta on radio0 (2.4 GHz only)
 BCN_CAP_SECS=4          # seconds to wait for a beacon when reading a target's posture
 BCN_CAP_COUNT=5         # beacons to capture per posture read (first usable one is parsed)
+# Client-membership capture, for a BSS-wide response. No shipped firmware carries a client->AP
+# association, so the subject set is read off the air instead (RESPONSE.md 13a-i). Deliberately
+# NOT starred: the star contract requires a SETTINGS_TABLE row, and that menu is the recon-side
+# session's lane -- an unwired star would be a lie (see CLAUDE.md).
+CLI_CAP_SECS=4          # listen this long for who is talking to the target BSS
+CLI_CAP_COUNT=800       # frame cap for that capture (bounds the parse; the window bounds the dwell)
+CLI_CAP_SNAP=128        # MUST clear radiotap it_len + 16 to reach addr2: -s 32 cannot (18+16=34)
 POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
 RESP_LOCK_SECS=20       # * EXAMINE lock duration held across a response (must exceed fire + settle)
 RESP_SETTLE_SECS=6      # * wait after transmitting before re-reading the target to judge the effect
@@ -669,6 +676,112 @@ capture_beacon() {   # capture_beacon <bssid> -> pcap path on stdout, rc 1 on fa
   printf '%s' "$out"
 }
 
+# pcap_stream file -> one unsigned byte per line. The byte-oriented twin of pcap_words, and the
+# reason this walker is not written with pcap_bytes + ${h:off:2} like beacon_find: bash substring
+# extraction costs O(whole string), so that shape is O(records x filesize) and overruns the EXAMINE
+# lock on anything bigger than a beacon. Measured, with the method and numbers, in RESPONSE.md 13a-i.
+pcap_stream() { if command -v hexdump >/dev/null 2>&1; then hexdump -v -e '1/1 "%u\n"' "$1" 2>/dev/null; else od -An -v -tu1 -w1 "$1" 2>/dev/null | tr -d ' '; fi; }
+
+# CLI_AWK: walk a pcap of data frames and report which stations talked to one BSSID.
+# Reads the frame itself rather than trusting the capture filter, because a filter cannot tell us
+# WHICH address is the client: addr2 is always the transmitter, so on a ToDS (uplink) frame addr2 is
+# the client, but on a FromDS (downlink) frame addr2 is the AP. Harvesting addr2 unconditionally
+# would enter the AP as its own client and break resp_snapshot's invariant that the AP is never a
+# subject -- and one AP subject reading NO_EFFECT drags the whole attempt to NO_EFFECT.
+# Emits keyed lines for the caller to read IN THE PARENT SHELL: ITMAX/RECS/SHORT/CLI.
+CLI_AWK='
+function mac(o) { return sprintf("%02x:%02x:%02x:%02x:%02x:%02x", p[o], p[o+1], p[o+2], p[o+3], p[o+4], p[o+5]) }
+function u16(a, b) { return be ? a * 256 + b : b * 256 + a }
+function le16(a, b) { return b * 256 + a }   # radiotap is little-endian by spec, whatever the pcap is
+function u32(a, b, c, d) { return be ? ((a * 256 + b) * 256 + c) * 256 + d : ((d * 256 + c) * 256 + b) * 256 + a }
+BEGIN { st = 0; i = 0; itmax = 0; recs = 0; short = 0 }
+{ v = $1 + 0
+  if (st == 0) { g[i++] = v
+    if (i == 24) { m = sprintf("%02x%02x%02x%02x", g[0], g[1], g[2], g[3])
+      if (m == "d4c3b2a1" || m == "4d3cb2a1") be = 0
+      else if (m == "a1b2c3d4" || m == "a1b23c4d") be = 1
+      else { print "ERR magic " m; bad = 1; exit 1 }
+      snap = u32(g[16], g[17], g[18], g[19])   # snaplen from the header, to tell truncation apart
+      st = 1; i = 0 }
+    next }
+  if (st == 1) { h[i++] = v
+    if (i == 16) { incl = u32(h[8], h[9], h[10], h[11]); i = 0
+      if (incl <= 0) { print "ERR incl " incl; bad = 1; exit 1 }
+      want = incl; np = 0; split("", p); st = 2 }
+    next }
+  if (np < 256) p[np] = v
+  np++
+  if (np < want) next
+  recs++
+  do {
+    if (want < 4) break
+    rt = le16(p[2], p[3])         # NOT u16: the radiotap header is little-endian regardless
+    if (rt > itmax) itmax = rt
+    if (rt < 8) break
+    if (rt + 16 > want) {
+      # Two different causes, and blaming the snap for both sends the operator to the wrong knob:
+      # a record at the snaplen was CUT (raise CLI_CAP_SNAP), a shorter one is simply a small
+      # frame -- an ACK-sized or Null frame that never held addr2 to begin with.
+      if (snap > 0 && want >= snap) trunc++; else runt++
+      short++; break }
+    if (int(p[rt] / 4) % 4 != 2) break
+    ds = p[rt + 1] % 4
+    if (ds == 1) { bo = rt + 4; co = rt + 10 }
+    else if (ds == 2) { bo = rt + 10; co = rt + 4 }
+    else break
+    if (mac(bo) != bss) break
+    c = mac(co)
+    if (c == bss) break
+    if (p[co] % 2 == 1) break
+    if (index(own, " " c " ") > 0) break
+    seen[c]++
+  } while (0)
+  st = 1; i = 0
+}
+END { if (bad) exit 1
+  if (st == 0) { print "ERR truncated header"; exit 1 }   # never reached the magic: not a pcap at all
+  print "ITMAX " itmax; print "RECS " recs; print "SHORT " short
+  print "TRUNC " trunc + 0; print "RUNT " runt + 0; print "SNAP " snap + 0
+  for (c in seen) if (seen[c] >= 2) print "CLI " c }'
+
+# bss_clients <pcap> <bssid> -> keyed lines on stdout; rc 1 when the file is unreadable or not a pcap.
+# PARSE IT IN THE PARENT SHELL: the counts have to reach the caller, and a pipe or < <(...) would
+# set them in a subshell -- the same trap posture_of documents for its caps globals.
+# A station must be seen at least TWICE to be admitted: a monitor interface delivers FCS-corrupt
+# frames whose addresses are garbage, and one such frame would otherwise invent a subject. The cost
+# is that a station sending exactly one frame in the window is missed.
+bss_clients() {
+  local f="$1" bss="${2,,}"
+  [ -s "$f" ] || return 1
+  pcap_stream "$f" | awk -v bss="$bss" -v own="$OWN_MACS" "$CLI_AWK"
+}
+
+# capture_bss <bssid> -> pcap path on stdout, rc 1 on failure.
+# The OR filter wants both directions; PLAN_v2 item 13b records "OR filter fails -> two instances"
+# as an open risk on this libpcap, so one fallback to the uplink-only shape is built in rather than
+# booked as a bench step. tcpdump writes the 24-byte global header as soon as it arms, so an absent
+# or empty file after a second means it refused the filter; exactly 24 bytes means it armed and
+# heard nothing. Those are different answers and the caller reports them differently.
+capture_bss() {
+  local bss="$1" out="/tmp/cs_mem_$$.pcap" p w=0 filt
+  [ "$HAVE_TCPDUMP" = 1 ] || return 1
+  rm -f "$out"
+  filt="type data and (wlan addr1 $bss or wlan addr2 $bss)"
+  tcpdump -i "$RECON_IF" -nn -s "$CLI_CAP_SNAP" -c "$CLI_CAP_COUNT" -w "$out" "$filt" >/dev/null 2>&1 & p=$!
+  child_add "$p"; sleep 1; w=1
+  if [ ! -s "$out" ] && ! kill -0 "$p" 2>/dev/null; then
+    child_del "$p"
+    log resp "member capture: OR filter did not arm, retrying uplink-only"
+    filt="type data and wlan addr1 $bss"
+    tcpdump -i "$RECON_IF" -nn -s "$CLI_CAP_SNAP" -c "$CLI_CAP_COUNT" -w "$out" "$filt" >/dev/null 2>&1 & p=$!
+    child_add "$p"; sleep 1; w=1
+  fi
+  while (( w < CLI_CAP_SECS )); do kill -0 "$p" 2>/dev/null || break; sleep 1; w=$(( w + 1 )); done
+  kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null; child_del "$p"
+  [ -s "$out" ] || { rm -f "$out"; return 1; }
+  printf '%s' "$out"
+}
+
 POSTURE_LAST='?'
 posture_of() {   # posture_of <bssid> <band> <channel> -> badge (stdout and POSTURE_LAST), cached per BSSID
   # Call it directly, not in $(...): the cache, POSTURE_RSN and POSTURE_EXT are set in the caller's shell.
@@ -702,7 +815,7 @@ cleanup() {
   if [ "$WATCH_LOCKED" = 1 ]; then _pineap EXAMINE CANCEL >/dev/null 2>&1; PINEAPPLE_EXAMINE_RESET >/dev/null 2>&1; fi
   [ -n "$RUN_ID" ] && [ "$REPORT_DONE_AT_EXIT" != 1 ] && write_report quiet
   command -v bands_restore >/dev/null 2>&1 && bands_restore         # user payload only; the hooks never change bands
-  rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
+  rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap "/tmp/cs_mem_$$.pcap" "/tmp/cs_bcn_$$.pcap" /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
   log run "exit cycles=$CYCLE"
   ui_ok && set_state FINISH
 }
@@ -1581,13 +1694,63 @@ resp_write() {   # resp_write <mac> <badge> <attack> <cmd> <lock> <pk0> <pk1> <v
 # The picked target is always a subject, even behind a randomised MAC the bss sweep otherwise skips.
 # The AP's own counter is never the subject: it keeps beaconing whatever happens to its clients.
 declare -A RS_PK RS_T
+# The membership set for the attempt, and the BSSID it was gathered for. Paired on purpose: a set
+# left over from a previous target must never be applied to this one, which is the bug posture_of
+# documents for its caps globals.
+declare -A RESP_MEMBERS; RESP_MEMBERS_BSS=''
+BSS_ITMAX=0; BSS_RECS=0; BSS_SHORT=0; BSS_TRUNC=0; BSS_RUNT=0; MEMBERS_TEXT=''; MEMBERS_WHY=''
+
+# resp_members <bssid> -> 0 with RESP_MEMBERS filled, or 1 with MEMBERS_WHY set to one of
+# NO_CAPTURE (no tcpdump, or tcpdump refused the filter), SNAP_SHORT (frames arrived but every
+# record was too short to hold addr2 -- raise CLI_CAP_SNAP) or NO_CLIENTS (armed, listened, nobody
+# there). Three different answers: "we could not look", "we looked through too small a window" and
+# "the BSS is empty" are not the same finding, and before this existed they were all one silence.
+resp_members() {
+  local bss="${1,,}" f out rc kk vv
+  RESP_MEMBERS=(); RESP_MEMBERS_BSS=''; MEMBERS_TEXT=''; MEMBERS_WHY=''
+  BSS_ITMAX=0; BSS_RECS=0; BSS_SHORT=0; BSS_TRUNC=0; BSS_RUNT=0
+  if [ "$HAVE_TCPDUMP" != 1 ]; then
+    MEMBERS_WHY=NO_CAPTURE; MEMBERS_TEXT="no tcpdump: cannot read who is on ${bss:9}"; return 1
+  fi
+  if ! f=$(capture_bss "$bss"); then
+    MEMBERS_WHY=NO_CAPTURE; MEMBERS_TEXT="capture did not arm on ${bss:9}"; return 1
+  fi
+  out=$(bss_clients "$f" "$bss"); rc=$?; rm -f "$f"
+  if (( rc != 0 )); then         # bad magic, or too short to be a pcap: we could not look, which is
+    MEMBERS_WHY=NO_CAPTURE       # not the same answer as looking and finding nobody
+    MEMBERS_TEXT="capture on ${bss:9} is not a readable pcap"; return 1
+  fi
+  while read -r kk vv; do        # a here-string, so these land in THIS shell, not a subshell
+    case "$kk" in
+      ITMAX) BSS_ITMAX="$vv" ;; RECS) BSS_RECS="$vv" ;; SHORT) BSS_SHORT="$vv" ;;
+      TRUNC) BSS_TRUNC="$vv" ;; RUNT) BSS_RUNT="$vv" ;;
+      CLI)   [ -n "$vv" ] && RESP_MEMBERS[$vv]=1 ;;
+    esac
+  done <<<"$out"
+  if (( ${#RESP_MEMBERS[@]} == 0 )); then
+    if (( BSS_TRUNC > 0 )); then     # a record AT the snaplen was cut: the snap is the knob
+      MEMBERS_WHY=SNAP_SHORT
+      MEMBERS_TEXT="snap $CLI_CAP_SNAP too small for radiotap $BSS_ITMAX: raise CLI_CAP_SNAP"
+    else
+      MEMBERS_WHY=NO_CLIENTS; MEMBERS_TEXT="no clients heard on ${bss:9} in ${CLI_CAP_SECS}s"
+    fi
+    return 1
+  fi
+  RESP_MEMBERS_BSS="$bss"
+  return 0
+}
 resp_snapshot() {
   local scope="${1:-cli}" m a pk sig pr fr t ch s
   RS_PK=(); RS_T=()
   while IFS='|' read -r m a pk sig pr fr t ch; do
     m=${m,,}; a=${a,,}
     if [ "$scope" = bss ]; then
-      [ "$a" = "$R_BSSID" ] || continue
+      # UNION, not replacement. The ap_mac test is the identity transform on real firmware (where
+      # $a is always "-") and still the right answer if a firmware ever supplies association; the
+      # membership set is what makes the sweep work today. Replacing it breaks 5 of the 9 snapshot
+      # selftest cases, whose fixtures carry an ap_mac column no shipped firmware emits.
+      # The set is ignored unless it was gathered for THIS BSSID.
+      [ "$a" = "$R_BSSID" ] || { [ "$RESP_MEMBERS_BSS" = "$R_BSSID" ] && [ -n "${RESP_MEMBERS[$m]+x}" ]; } || continue
       [ "$m" != "$R_TARGET" ] && is_rand "$m" && continue
     else [ "$m" = "$R_TARGET" ] || continue; fi
     RS_PK[$m]="${pk:-0}"; RS_T[$m]="${t:-0}"
@@ -1605,34 +1768,87 @@ resp_aggregate() {
 
 resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was reached
   local mac="$1" k="$2" badge="$3" cmd lock rc m p0 t0 p1 t1 present verdict nmv=0 nne=0 ninc=0 n
-  local scope tgt_verdict=-
+  local scope tgt_verdict=- cap_secs lock_secs t_cap why
   local -a subjects=(); local -A P0=() T0=()
+  RESP_MEMBERS=(); RESP_MEMBERS_BSS=''      # never inherit a previous target's set
   cmd=$(response_cmd "$k")
   [ -n "$cmd" ] || return 1
   if ! command -v "$cmd" >/dev/null 2>&1; then
     LOG red "$cmd not present in this firmware"; log resp "missing $cmd"; return 1
   fi
   scope=$(attack_scope "$k")      # what the command can reach, which is not what the row implies
+  # The lock is taken FIRST, before any reading. One episode now covers lock -> membership capture
+  # -> pre-read -> fire -> settle -> post-read -> unlock. Forced, because the capture has to happen
+  # on the target's channel and the pre-read has to see the members it found. It also removes an
+  # asymmetry that was quietly biasing the oracle: the pre-read used to run unlocked while the
+  # post-read ran locked, and an unlocked read sees a hopping radio's thinner counters.
+  cap_secs=0; [ "$scope" = bss ] && cap_secs=$(( CLI_CAP_SECS + 2 ))
+  lock_secs=$(( RESP_LOCK_SECS + cap_secs ))   # additive: resp_clamp_lock's floor is not ours to move
+  lock_target "$R_BSSID" "$lock_secs" "$R_CH"; rc=$?
+  case $rc in 0) lock=ok ;; 1) lock=by-channel ;; *) lock=failed ;; esac
+  if (( rc == 2 )); then
+    unlock_target
+    LOG red "lock failed: $LOCK_TEXT"; log resp "lock-failed $R_BSSID $LOCK_TEXT"
+    resp_write "$mac" "$badge" "$k" "$cmd" "$lock" - - LOCK_FAILED
+    set_state INCONCLUSIVE; return 1
+  fi
+  if [ "$scope" = bss ]; then
+    t_cap=$EPOCHSECONDS
+    # A capture that hears nothing is a REASON, never a verdict on its own. Returning here would
+    # REPLACE the ap_mac path rather than add to it -- the same mistake as replacing resp_snapshot's
+    # ap_mac test instead of unioning with it, one level up in the control flow. So the reason is
+    # recorded and the Recon read still happens; only a subject set that is empty AFTER both
+    # sources refuses, and it refuses with whichever reason the capture gave.
+    resp_members "$R_BSSID" || true
+    # The dwell figure the recon-side session needs for resp_clamp_lock's floor, handed over as a
+    # measurement rather than a unilateral change to their function. dev/CamHound/README.md lists it
+    # among the first-run markers to watch.
+    log resp "members $R_BSSID n=${#RESP_MEMBERS[@]} why=${MEMBERS_WHY:-ok} itmax=$BSS_ITMAX recs=$BSS_RECS short=$BSS_SHORT trunc=$BSS_TRUNC runt=$BSS_RUNT dwell=$(( EPOCHSECONDS - t_cap ))s lock=${lock_secs}s"
+    # Re-arm before the measurement, rather than sizing cap_secs to cover the parse.
+    # The capture does not need a guaranteed lock: if the radio resumes hopping mid-capture we
+    # simply hear fewer stations, and the member set honestly reports what it heard. The
+    # MEASUREMENT does need one -- a lock expiring between the pre-read and the post-read lets the
+    # post-read land on a hopping radio, whose cumulative Recon counter looks stalled, and
+    # resp_verdict scores a stalled counter MOVED. That is the exact false green this rung exists
+    # to prevent. Sizing a constant instead cannot be done honestly: the walker takes 2.5-9.1 s on
+    # the device for a full CLI_CAP_COUNT buffer (RESPONSE.md 13a-i), so any fixed number either
+    # over-locks every quiet BSS or under-locks a busy one. Re-arming costs lock_target's channel
+    # read-back and is exact. Measured on the air, the dwell line above is what tells us which.
+    lock_target "$R_BSSID" "$RESP_LOCK_SECS" "$R_CH"; rc=$?
+    case $rc in 0) lock=ok ;; 1) lock=by-channel ;; *) lock=failed ;; esac
+    if (( rc == 2 )); then
+      unlock_target
+      LOG red "lock lost after the capture: $LOCK_TEXT"; log resp "lock-failed-rearm $R_BSSID $LOCK_TEXT"
+      resp_write "$mac" "$badge" "$k" "$cmd" "$lock" - - LOCK_FAILED
+      set_state INCONCLUSIVE; return 1
+    fi
+    log resp "re-armed $R_BSSID ${RESP_LOCK_SECS}s for the measurement lock=$lock"
+  fi
   resp_snapshot "$scope"
   for m in "${!RS_PK[@]}"; do subjects+=("$m"); P0[$m]="${RS_PK[$m]}"; T0[$m]="${RS_T[$m]}"; done
   if [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ]; then
     if (( ${#subjects[@]} == 0 )); then                        # nothing to disconnect, nothing to measure
-      LOG red "no visible clients on ${R_BSSID:9}: nothing to disconnect"; log resp "refused $R_BSSID no clients"
-      resp_write "$mac" "$badge" "$k" "$cmd" - - - NO_CLIENTS
+      unlock_target                      # every refusal past the lock must release it, or a leaked
+      log resp "unlocked after refusal"  # EXAMINE pins the radio off its hop cycle for the run
+      if [ -n "$MEMBERS_WHY" ]; then
+        why="$MEMBERS_WHY"; LOG red "$MEMBERS_TEXT"
+      elif (( ${#RESP_MEMBERS[@]} > 0 )); then
+        # Heard stations, but not one survived Recon and the randomised-MAC gate. Saying "no
+        # clients" here would be a lie about a BSS we demonstrably heard traffic on, and it would
+        # send the operator to look for a dead AP instead of at the gate that dropped them.
+        why=NO_MATCH
+        LOG red "heard ${#RESP_MEMBERS[@]} on ${R_BSSID:9} but none is measurable: no Recon row, or randomised"
+      else
+        why=NO_CLIENTS; LOG red "no visible clients on ${R_BSSID:9}: nothing to disconnect"
+      fi
+      log resp "refused $R_BSSID $why members=${#RESP_MEMBERS[@]} itmax=$BSS_ITMAX recs=$BSS_RECS short=$BSS_SHORT"
+      resp_write "$mac" "$badge" "$k" "$cmd" "$lock" - - "$why"
       set_state RESPOND_NIL; return 1
     fi
   else
     (( ${#subjects[@]} == 0 )) && { subjects=("$R_TARGET"); P0[$R_TARGET]=-; T0[$R_TARGET]=-; }
   fi
   n=${#subjects[@]}
-  lock_target "$R_BSSID" "$RESP_LOCK_SECS" "$R_CH"; rc=$?
-  case $rc in 0) lock=ok ;; 1) lock=by-channel ;; *) lock=failed ;; esac
-  if (( rc == 2 )); then
-    unlock_target
-    LOG red "lock failed: $LOCK_TEXT"; log resp "lock-failed $R_BSSID $LOCK_TEXT"
-    for m in "${subjects[@]}"; do resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "${P0[$m]}" - LOCK_FAILED "$m"; done
-    set_state INCONCLUSIVE; return 1
-  fi
   set_state RESPOND
   LOG "$k -> ${R_BSSID:9} ch $R_CH"$'\n'"lock: $lock, $n subject(s)"
   log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock scope=$scope subjects=$n"

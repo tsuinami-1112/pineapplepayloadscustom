@@ -215,7 +215,10 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 | POSTURE_TTL | 300 | * | seconds a posture badge stays cached per BSSID |
 | RESP_SETTLE_SECS | 6 | * | wait after transmitting before re-reading the target to judge the effect |
 | BCN_CAP_SECS / BCN_CAP_COUNT | 4 / 5 | | beacon capture window and frame count for a posture read |
-| RESP_LOCK_SECS | 20 | * | EXAMINE lock duration held across a response; raised to RESP_SETTLE_SECS + 5 when set lower |
+| RESP_LOCK_SECS | 20 | * | EXAMINE lock held across a response; raised to RESP_SETTLE_SECS + 5 when set lower, and re-armed after the client capture |
+| CLI_CAP_SECS | 4 | | seconds spent listening for who is on the target BSS (`bss` scope only) |
+| CLI_CAP_COUNT | 800 | | frame cap for that capture |
+| CLI_CAP_SNAP | 128 | | capture snap; must clear the radiotap header + 16 to reach the client address |
 
 ## Response
 
@@ -286,7 +289,10 @@ re-read from Recon:
 | `NO_EFFECT` | packet counter still advancing — it never left |
 | `INCONCLUSIVE` | no baseline, no follow-up reading, or the counter stalled but it was seen again |
 | `LOCK_FAILED` | the radio would not hold the target channel; nothing was transmitted |
-| `NO_CLIENTS` | AP target with no visible clients; refused before anything was transmitted |
+| `NO_CLIENTS` | listened on the channel and heard no station; refused before anything was transmitted |
+| `NO_MATCH` | stations were heard, but none has a Recon row or all were randomised; nothing transmitted |
+| `SNAP_SHORT` | the capture was cut before the client address; raise `CLI_CAP_SNAP`; nothing transmitted |
+| `NO_CAPTURE` | no `tcpdump`, the capture would not start, or what came back was not a readable pcap |
 
 What is measured follows the attack's **scope**, not the row you picked. A `cli`-scope attempt
 (`DEAUTH` from a client row) measures that one device. A `bss`-scope attempt (`CSA` or `BOTH` from any
@@ -297,8 +303,16 @@ aggregate (`MOVED` only when every subject went quiet, `NO_EFFECT` when any kept
 `INCONCLUSIVE` otherwise). When you picked one device and more than one was measured, a second line
 `picked <mac>: <verdict>` names that device's own result, so a collateral `NO_EFFECT` cannot read as
 "my camera stayed up". A subject Recon never listed before the burst is `INCONCLUSIVE`, never `MOVED`.
-An AP with no visible clients is refused. Recon's packet counter is direction-blind, so a
-disconnected client that keeps probing still reads as transmitting.
+**Where the client list comes from.** No Pager firmware tells a payload which AP a client belongs
+to, so for a `bss`-scope attempt CamHound listens for a few seconds on the target's channel and takes
+the stations it hears talking to that BSSID. A station has to be heard at least twice to count, so a
+camera that sends nothing in the window is missed — and an AP whose clients are all silent is
+refused rather than attacked blind. That listening happens under the channel lock, which is
+therefore held for `RESP_LOCK_SECS + CLI_CAP_SECS + 2` and then **re-armed** for the measurement
+itself, so a slow parse cannot eat the window the verdict depends on.
+
+Recon's packet counter is direction-blind, so a disconnected client that keeps probing still reads
+as transmitting.
 
 Beacon protection (WPA3, Dec-2020 onward, mandatory for AP support in Wi-Fi 7) defeats the CSA
 path outright, and CSA bursts are detectable — Kismet alerts on CSA floods and on announcements
