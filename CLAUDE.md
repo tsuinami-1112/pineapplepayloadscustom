@@ -227,13 +227,13 @@ the grep, not to replace verification.
 
 ## Review workflows: the standing rules
 
-Set by the operator on 2026-11-03 for every session that runs an agent review here. The point is
-not to ration the heavy shapes — multi-finder reviews, three-lens adversarial verification, judge
-panels, critic rounds, fix-then-reverify loops are all welcome, and are the right default for code
-the device runs, hardware-facing claims and anything novel. The point is to stop them appearing on
-trivial work: a doc edit, a comment's wording, a stale count, a renamed check. Judge the tier by what
-a wrong finding would cost if acted on and by how likely the finder is to be wrong, and spend
-accordingly.
+Set by the operator on 2026-11-03, rule 2 amended by the operator on 2026-11-04. For every session
+that runs an agent review here. The point is not to ration the heavy shapes — multi-finder reviews,
+three-lens adversarial verification, judge panels, critic rounds, fix-then-reverify loops are all
+welcome, and are the right default for code the device runs, hardware-facing claims and anything
+novel. The point is to stop them appearing on trivial work: a doc edit, a comment's wording, a
+stale count, a renamed check. Judge the tier by what a wrong finding would cost if acted on and by
+how likely the finder is to be wrong, and spend accordingly.
 
 1. **Tier the verification by consequence and by likelihood of error.** A finding gets the full
    three-lens adversarial pass (trace, intent, impact) when a fix would change code the device runs,
@@ -243,10 +243,19 @@ accordingly.
    equal consequence. Docs, comments, stale counts, wording and test gaps get one sceptical verifier
    whose prompt says: default to refuted unless you can reproduce it from the artifact. When in doubt
    between tiers, take the heavier one and say why.
-2. **Cap the finder pool at four dimensions per review.** Batch verification at nine findings per
-   agent, grouped by file. Never one agent per finding per lens, unless truly warranted — a claim
-   big enough to deserve that attention (one that would redirect the bench, overturn a measured
-   fact, or change what the device transmits) can have its own agents, with the reason stated.
+2. **No cap on the finder pool, and no batching ceiling — except for `Fable` and `Mythos`.**
+   Scale the review to the question. If it warrants twelve finder dimensions, or one agent per
+   finding per lens, run it; rule 1 is what keeps heavy shapes off trivial work, not a fixed
+   ceiling. Say in the summary why you went wide, so the next session can judge whether it paid.
+   **The exception, matched on the agent's model name: `Fable` and `Mythos` keep the old limits**
+   — at most four finder dimensions per review, verification batched at nine findings per agent
+   grouped by file, and never one agent per finding per lens unless the claim would redirect the
+   bench, overturn a measured fact, or change what the device transmits, with the reason stated.
+   *Amended 2026-11-04. The cap previously applied to every model. It was dropped because the
+   constraint it encoded — spend proportionate to consequence — is rule 1's job, and a hard
+   ceiling was also costing real findings: the review that produced this amendment's sibling
+   commit refuted two blockers in a proposal its own author had already gated, and did so by
+   fetching a primary source no single-dimension pass would have reached.*
 3. **Report the refutation count in the first line of every review summary.** A pass that refutes
    nothing is a warning about the verifiers, not a clean bill; say so when it happens.
 4. **Name what is already settled before the finders start** — measured on hardware, verified in a
