@@ -92,7 +92,10 @@ pineapd running, day-one 8c; every issued write is restored in `cleanup`, by the
 `bands_recover` at the next start from `BANDS_STATE`; not copied into the hooks); `raw_up_rows` feeds `--replay` a `raw_<run>.txt`.
 
 **Watch rung** (behaviour without identity) — `watch_menu`, `start_caps`/`stop_caps`,
-`pcap_words`/`pcap_bytes` (both have `od` fallbacks), `pcap_buckets`, `bucket_stats`,
+`pcap_words`/`pcap_bytes` (both have `od` fallbacks), `pcap_buckets`, `bucket_stats`
+(**`PCAP_AWK` aborts the whole file on `incl_len % 4 != 0`, so it only parses the `-s 32`
+captures it ships with — raising any Watch snap to reach addresses breaks it; verified
+2026-11-04, see `dev/CamHound/PLAN_v2.md` item 1**),
 `capture_ready` (gates `HAVE_TCPDUMP` on tcpdump + *either* hex dumper), `lock_target`/
 `unlock_target` (EXAMINE channel lock), `capture_beacon`, `beacon_find`, `ie_find`, `rsn_caps`.
 
@@ -145,7 +148,7 @@ Caveat, and it is bigger than a loot-quality note: the `bss` sweep matches `ap_m
 does not "degrade measurement to the picked target" — *an earlier revision of this line said so and
 it was wrong on both row types.* An AP row has no target to fall back to (broadcast), so subjects
 are 0 and `resp_fire` refuses; a client row never reaches the sweep because `AP_OF` is `-` and
-`resp_target` returns 1 at `payload.sh:1983`. The selection rule is right and **the rung cannot fire
+`resp_target` returns 1 at `payload.sh:2123`. The selection rule is right and **the rung cannot fire
 on either firmware** — see the warning below and `RESPONSE.md` §13.
 
 **Selftest** — `selftest()` plus `st_*` helpers (`st_device`, `st_pcap`, `st_beacon_pcap`,
@@ -665,7 +668,7 @@ it exactly as on 2.0.0 (below), while every AP row has `R_TARGET` broadcast, 0 s
 rows arrive but the device object has no association field, so `JQ_CLI`'s `(.ap_mac // .bssid //
 "-")` gives `-` for every one; an AP row then finds 0 matching clients and refuses the same way,
 while a client row never even reaches the sweep because `AP_OF` is `-` and `resp_target` returns 1
-at `payload.sh:1983-1984`. On both, the user payload transmits nothing and logs the refusal.
+at `payload.sh:2122-2123`. On both, the user payload transmits nothing and logs the refusal.
 
 **⚠ The Recon client hook is the exception, and it transmits on 1.1.3 today.** Everything above is
 about the **user payload**, whose association comes from `recon_lines CLIENTS`. The two Recon hooks do
@@ -697,15 +700,20 @@ client probing for an SSID is not necessarily associated to it, and the BSSID-fi
 `dev/CamHound/RESPONSE.md` §13a is the better evidence.
 
 **The association column is a chokepoint gating FIVE features, and the rung is fixable without it.**
-Verified in code: `AP_OF[mac] == "-"` disables Watch-on-a-client and Stimulus (`watchable()`,
-`payload.sh:985-990`), kit detection (`:1186`), the AP→client tree (`:2230`) and the response rung.
+Verified in code 2026-11-04: `AP_OF[mac] == "-"` disables Watch-on-a-client and Stimulus
+(`watchable()`, `payload.sh:1018`), kit detection (`kit_eval`, `:1237`), the AP→client tree
+(`:2374`) and the response rung (`resp_target`, `:2122-2123`).
 But the *attack* never needed it — `CSA` is `<bssid> <ch>` and `BOTH`'s target is discarded, and
 `RECON APS` supplies both on 1.1.3, so the firmware can transmit today. What refuses is CamHound's
 own `NO_CLIENTS` measurement guard. The fix is to read the association off the air with a
-BSSID-filtered capture (the filter at `:1665`, the radiotap-aware frame walker in `beacon_find`,
-`addr2` at `p + rt + 10`), which is firmware-independent and better evidence than Recon's cumulative
-counters. Full working, ranked options and the two unverified mechanics are in
-`dev/CamHound/RESPONSE.md` §13a. **Not yet implemented.**
+BSSID-filtered capture (the filter shape at `:1804`, the radiotap-aware frame walker in
+`beacon_find`), which is firmware-independent and better evidence than Recon's cumulative counters.
+Full working, ranked options and the resolved mechanics are in `dev/CamHound/RESPONSE.md` §13a
+and §13a-i. **Not yet implemented.** ⚠ Three mechanics stated in §13a's first draft are
+**wrong** and are corrected in §13a-i, which is the build decision of record: `addr2` is the
+client only on a **ToDS** frame, `-s 32` cannot reach `addr2` at all, and the bash
+`pcap_bytes`/`hex_octet` walker beacon_find uses is **O(n²)** and cannot be reused at this
+file size.
 
 **Two 2.0.0 hazards in this repo's other payloads** — `wigle-toolkit` really deletes loot, and
 `wardrive_activate` is broken. Both are `[V]` from the rootfs trees and written up in full in

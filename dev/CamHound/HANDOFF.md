@@ -27,6 +27,20 @@ measured by the operator on the bare 1.1.3 unit today; nothing is from memory.
 - `_pineap RECON CHANNELS` is a per-frequency observation histogram, not the hop set.
 - `PINEAPPLE_RECON_NEW` with no argument printed nothing; name-vs-duration still open (day-one 8b).
 
+## Capture-based subject path: decided 2026-11-04, not yet built
+
+The operator greenlit it (see the division of labour below). The **build decision of record is
+`dev/CamHound/RESPONSE.md` §13a-i** — read that, not §13a, whose option (1) is a
+different and larger design, and three of whose stated mechanics are wrong. Adopted: the capture
+supplies **membership**, Recon still supplies the **counters**; `resp_verdict`/`resp_aggregate`/
+`resp_write` are untouched. The `ap_mac` test in `resp_snapshot` is **unioned**, never replaced
+(replacement breaks 5 of 9 snapshot selftest cases; measured). Known before writing a line: no
+harness scenario drives Disrupt on the real-firmware shape, and `harness/fix/cli.json` carries
+`ap_mac` values no firmware emits — so a Disrupt-under-`HARNESS_NO_CLIENTS` arm is part of the
+work, not a nicety. `resp_clamp_lock`'s floor is **not** moved: the extra lock seconds are additive
+at the `lock_target` call site in `resp_fire`, and the `resp` line logs the computed figure and the
+measured elapsed time — that is the dwell number this handoff promised you.
+
 ## Division of labour with the response-rung session (session_01HfHn2Fym5eRJnEQyvHVu7C)
 
 Theirs: attack_scope, disrupt_menu, resp_target/fire/snapshot/verdict/aggregate/write, posture_*,
