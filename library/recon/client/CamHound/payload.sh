@@ -854,7 +854,7 @@ JQ_APS='.[] | ([.beacon[]?, .response[]?]) as $e
  | (($e | map(select(((.ssid // "") | length) > 0)) | .[0].ssid) // "") as $ssid
  | ([.beacon[]? | .hidden] | any(. == 1 or . == true)) as $hid
  | (($e | map(.time // 0) | max) // 0) as $t
- | [.mac, (.packets // 0), ($ssid | tostring | gsub("[|;\n\r\t]"; "_") | .[0:32]), ($best.channel // 0), ($best.freq // 0), $sig, (if $hid then 1 else 0 end), $t]
+ | [.mac, (.packets // 0), ($ssid | tostring | reduce ("|",";","\n","\r","\t") as $c (.; split($c) | join("_")) | .[0:32]), ($best.channel // 0), ($best.freq // 0), $sig, (if $hid then 1 else 0 end), $t]
  | map(tostring) | join("|")'
 # Client objects (2.0.0 `_pineap HELP PARSE`, read in CLAUDE.md s"2.0.0-stable, analysed"; the verb does not exist
 # on 1.1.3): mac, time, signal, freq, packets, and a "probe" OBJECT keyed by an opaque SSID hash whose values carry
@@ -863,10 +863,25 @@ JQ_APS='.[] | ([.beacon[]?, .response[]?]) as $e
 # finds a source (the Go UI's own recon API carries ap_mac; _pineap does not).
 JQ_CLI_ROW='([ (.probe // {})[]? | if type == "object" then ((.ssid // "") | select(length > 0)) else tostring end ]) as $p
  | [.mac, (.ap_mac // .bssid // "-"), (.packets // 0), (.signal // .rssi // "-"),
-    ($p | map(tostring | gsub("[|;,\n\r\t]"; "_")) | join(",")),
+    ($p | map(tostring | reduce ("|",";",",","\n","\r","\t") as $c (.; split($c) | join("_"))) | join(",")),
     (.freq // 0), (.time // .last_seen // 0), (.channel // 0)]
  | map(tostring) | join("|")'
 JQ_CLI='.[] | '"$JQ_CLI_ROW"
+# jq_works: jq must not merely EXIST, it must run the programs we actually use.
+# Measured on the operator's 1.1.3 Pager, 2026-11-04: jq was present, so HAVE_JQ was 1, and both
+# JQ_APS and JQ_CLI_ROW produced NOTHING -- a jq without Oniguruma has no gsub, so the programs
+# failed at compile time, wrote their error to stderr, and emitted no rows. The regex fallbacks that
+# would have worked were never reached, because they are gated on HAVE_JQ. CamHound reported an empty
+# airspace and offered "Recon list empty. Start a Recon session?" -- the right message for the wrong
+# reason, and no gate here could see it: this container's jq is 1.7 with regex support.
+# The gsub uses are gone now, but the probe stays: it tests whatever the programs currently need,
+# so the next unavailable builtin degrades to the fallback instead of to silence.
+jq_works() {
+  command -v jq >/dev/null 2>&1 || return 1
+  [ "$(printf '%s' '[{"mac":"aa","probe":{"1":{"ssid":"c,d"}}}]' | jq -r "$JQ_CLI" 2>/dev/null)" \
+    = 'aa|-|0|-|c_d|0|0|0' ] || return 1
+  return 0
+}
 # 1.1.3 has no RECON CLIENTS verb (measured 2026-11-03: "Unknown recon command", rc 255) but RECON DEVICES lists every
 # device in the same object shape, so a client there is a device that neither beacons nor answers probes.
 JQ_DEVCLI='.[] | select(((.beacon // {}) | length) == 0 and ((.response // {}) | length) == 0) | '"$JQ_CLI_ROW"
@@ -1200,7 +1215,11 @@ preflight() {
   mkdir -p "$LOOT_DIR" 2>/dev/null
   printf -v RUN_ID '%(%Y%m%d_%H%M%S)T' -1; RUN_T0=$EPOCHSECONDS
   if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamHound: _pineap not found" 2>/dev/null; exit 0; fi
-  command -v jq >/dev/null 2>&1 && HAVE_JQ=1
+  if jq_works; then HAVE_JQ=1
+  elif command -v jq >/dev/null 2>&1; then          # present but unusable: say so, do not go silent
+    log warn "jq present but cannot run our programs: using the fallback parsers"
+    ui_ok && LOG yellow "jq unusable: fallback parser"
+  fi
   recon_verb_probe
   capture_ready && HAVE_TCPDUMP=1
   [ -r "$OUI_FILE" ] || OUI_FILE="$OUI_FILE_ALT"
