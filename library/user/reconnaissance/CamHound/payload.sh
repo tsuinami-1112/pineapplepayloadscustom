@@ -109,6 +109,7 @@ BCN_CAP_COUNT=5         # beacons to capture per posture read (first usable one 
 CLI_CAP_SECS=4          # listen this long for who is talking to the target BSS
 CLI_CAP_COUNT=800       # frame cap for that capture (bounds the parse; the window bounds the dwell)
 CLI_CAP_SNAP=128        # MUST clear radiotap it_len + 16 to reach addr2: -s 32 cannot (18+16=34)
+FIRE_ERR="/tmp/cs_fire_$$.err"   # the attack command's stderr: a refusal must not read as a measurement
 POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
 RESP_LOCK_SECS=20       # * EXAMINE lock duration held across a response (must exceed fire + settle)
 RESP_SETTLE_SECS=6      # * wait after transmitting before re-reading the target to judge the effect
@@ -825,7 +826,7 @@ cleanup() {
   if [ "$WATCH_LOCKED" = 1 ]; then _pineap EXAMINE CANCEL >/dev/null 2>&1; PINEAPPLE_EXAMINE_RESET >/dev/null 2>&1; fi
   [ -n "$RUN_ID" ] && [ "$REPORT_DONE_AT_EXIT" != 1 ] && write_report quiet
   command -v bands_restore >/dev/null 2>&1 && bands_restore         # user payload only; the hooks never change bands
-  rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap "/tmp/cs_mem_$$.pcap" "/tmp/cs_bcn_$$.pcap" /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
+  rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap "/tmp/cs_mem_$$.pcap" "/tmp/cs_bcn_$$.pcap" "$FIRE_ERR" /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
   log run "exit cycles=$CYCLE"
   ui_ok && set_state FINISH
 }
@@ -1913,7 +1914,11 @@ lock_target() {   # lock_target <bssid> <secs> [channel]; the channel defaults t
   PINEAPPLE_EXAMINE_BSSID "$bssid" "$secs" >/dev/null 2>&1; WATCH_LOCKED=1; LAST_LOCK_TS=$EPOCHSECONDS
   sleep 0.5; c1=$(cur_channel); sleep 0.5; c2=$(cur_channel); sleep 0.5; c3=$(cur_channel)
   LOCK_TEXT="$RECON_IF ch ${c3:-?}, target ch $want"
-  [ -z "$c3" ] && { LOCK_TEXT="$RECON_IF: no channel read-back"; return 0; }   # cannot verify: proceed
+  # rc 3, not 0: we could not read the channel back, so we do not know whether the lock took.
+  # Returning 0 here recorded lock=ok for a lock that was never verified, and LOCK_TEXT never
+  # reached the operator. Proceeding is still right -- the alternative is refusing every response
+  # on a device whose channel cannot be read -- but it must be labelled honestly in the loot.
+  [ -z "$c3" ] && { LOCK_TEXT="$RECON_IF: no channel read-back, lock unverified"; return 3; }
   if [ "$c1" = "$c2" ] && [ "$c2" = "$c3" ]; then
     [ "$c3" = "$want" ] || [ "$want" = 0 ] && return 0
     PINEAPPLE_EXAMINE_CHANNEL "$want" "$secs" >/dev/null 2>&1; sleep 1; c3=$(cur_channel)
@@ -1923,7 +1928,18 @@ lock_target() {   # lock_target <bssid> <secs> [channel]; the channel defaults t
   fi
   LOCK_TEXT="$RECON_IF still hopping ($c1/$c2/$c3): lock failed"; return 2
 }
-cur_channel() { iwinfo "$RECON_IF" info 2>/dev/null | sed -n 's/.*Channel: \([0-9]*\).*/\1/p' | head -1; }
+# cur_channel: iwinfo first, then iw. iwinfo is a declared dependency but is NOT in the measured
+# device inventory (CLAUDE.md "First contact" lists tcpdump/iw/hak5cmd/scp present and does not
+# mention iwinfo); iw IS measured present. Without a fallback, an absent iwinfo or a non-numeric
+# read-back ("Channel: unknown" on a monitor interface) makes lock_target fail OPEN and report an
+# unverified lock as lock=ok -- the false-green guard this rung is built around, inert while
+# reporting healthy. The iw form is the one bands_live6 already uses.
+cur_channel() {
+  local c
+  c=$(iwinfo "$RECON_IF" info 2>/dev/null | sed -n 's/.*Channel: \([0-9]*\).*/\1/p' | head -1)
+  [ -n "$c" ] && { printf '%s' "$c"; return 0; }
+  iw dev "$RECON_IF" info 2>/dev/null | sed -n 's/.*channel \([0-9]*\) .*/\1/p' | head -1
+}
 unlock_target() { _pineap EXAMINE CANCEL >/dev/null 2>&1; PINEAPPLE_EXAMINE_RESET >/dev/null 2>&1; WATCH_LOCKED=0; LAST_LOCK_TS=$EPOCHSECONDS; }
 
 # captures: start_caps X -> three header-only pcaps (/tmp/cs_up_X.pcap ...); stop_caps X -> TERM + wait by PID
@@ -1994,6 +2010,7 @@ watch_prepare() {
   lock_target "$WATCH_BSSID" "$secs"; rc=$?
   if (( rc == 2 )); then LOG yellow "$LOCK_TEXT"; unlock_target; set_state SCAN; return 1; fi
   (( rc == 1 )) && LOG "$LOCK_TEXT"
+  (( rc == 3 )) && LOG yellow "$LOCK_TEXT"      # proceeding, but the lock was never verified
   return 0
 }
 
@@ -2125,7 +2142,7 @@ WATCH_AGAIN=0
 
 # stimulus_test mac -> quiet gate, PROMPT, baseline/stimulus/post windows, EVENT scoring, repeats
 stimulus_test() {
-  local mac="$1" n secs ub us up delta10 asym_s rec10 i
+  local mac="$1" n secs ub us up delta10 asym_s rec10 i rc
   RUNS_N[$mac]=$(( ${RUNS_N[$mac]:-0} + 1 )); n=${RUNS_N[$mac]}
   if (( n > MAX_RUNS )); then RUNS_N[$mac]=$MAX_RUNS; LOG "max runs; move closer or try Live view"; return 0; fi
   secs=$(( WIN_BASE_S + 10 ))
@@ -2139,7 +2156,9 @@ stimulus_test() {
   done
   unlock_target
   PROMPT "Baseline ${WIN_BASE_S}s. Keep still." 2>/dev/null
-  lock_target "$WATCH_BSSID" "$secs" >/dev/null; (( $? == 2 )) && { LOG yellow "$LOCK_TEXT"; unlock_target; set_state SCAN; return 1; }
+  lock_target "$WATCH_BSSID" "$secs" >/dev/null; rc=$?
+  (( rc == 2 )) && { LOG yellow "$LOCK_TEXT"; unlock_target; set_state SCAN; return 1; }
+  (( rc == 3 )) && LOG yellow "$LOCK_TEXT"
   start_caps A; sleep "$WIN_BASE_S"; stop_caps A; window_metrics A; ub=$WM_UPRATE10; local ub_f=$WM_UF
   VIBRATE 100 2>/dev/null
   ALERT "Now move ${WIN_STIM_S}s" "walk, wave, lights" 2>/dev/null
@@ -2389,7 +2408,7 @@ resp_aggregate() {
 
 resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was reached
   local mac="$1" k="$2" badge="$3" cmd lock rc m p0 t0 p1 t1 present verdict nmv=0 nne=0 ninc=0 n
-  local scope tgt_verdict=- cap_secs lock_secs t_cap why
+  local scope tgt_verdict=- cap_secs lock_secs t_cap why frc ferr
   local -a subjects=(); local -A P0=() T0=()
   RESP_MEMBERS=(); RESP_MEMBERS_BSS=''      # never inherit a previous target's set
   cmd=$(response_cmd "$k")
@@ -2406,7 +2425,7 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   cap_secs=0; [ "$scope" = bss ] && cap_secs=$(( CLI_CAP_SECS + 2 ))
   lock_secs=$(( RESP_LOCK_SECS + cap_secs ))   # additive: resp_clamp_lock's floor is not ours to move
   lock_target "$R_BSSID" "$lock_secs" "$R_CH"; rc=$?
-  case $rc in 0) lock=ok ;; 1) lock=by-channel ;; *) lock=failed ;; esac
+  case $rc in 0) lock=ok ;; 1) lock=by-channel ;; 3) lock=unverified ;; *) lock=failed ;; esac
   if (( rc == 2 )); then
     unlock_target
     LOG red "lock failed: $LOCK_TEXT"; log resp "lock-failed $R_BSSID $LOCK_TEXT"
@@ -2436,7 +2455,7 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
     # over-locks every quiet BSS or under-locks a busy one. Re-arming costs lock_target's channel
     # read-back and is exact. Measured on the air, the dwell line above is what tells us which.
     lock_target "$R_BSSID" "$RESP_LOCK_SECS" "$R_CH"; rc=$?
-    case $rc in 0) lock=ok ;; 1) lock=by-channel ;; *) lock=failed ;; esac
+    case $rc in 0) lock=ok ;; 1) lock=by-channel ;; 3) lock=unverified ;; *) lock=failed ;; esac
     if (( rc == 2 )); then
       unlock_target
       LOG red "lock lost after the capture: $LOCK_TEXT"; log resp "lock-failed-rearm $R_BSSID $LOCK_TEXT"
@@ -2470,11 +2489,29 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
     (( ${#subjects[@]} == 0 )) && { subjects=("$R_TARGET"); P0[$R_TARGET]=-; T0[$R_TARGET]=-; }
   fi
   n=${#subjects[@]}
+  [ "$lock" = unverified ] && LOG yellow "$LOCK_TEXT"
   set_state RESPOND
   LOG "$k -> ${R_BSSID:9} ch $R_CH"$'\n'"lock: $lock, $n subject(s)"
   log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock scope=$scope subjects=$n"
-  if [ "$k" = CSA ]; then "$cmd" "$R_BSSID" "$R_CH" >/dev/null 2>&1
-  else "$cmd" "$R_BSSID" "$R_TARGET" "$R_CH" >/dev/null 2>&1; fi
+  # Capture the command's rc AND its stderr. Discarding both was a real defect: if the firmware
+  # refuses the command nothing leaves the radio, yet the loot row still read NO_EFFECT (subjects
+  # kept transmitting) or MOVED (a counter happened to stall) -- indistinguishable from a real
+  # measurement. NO_EFFECT in particular reads as the firmware fact "CSA does not move this
+  # camera", which is one of the open questions this rung exists to ANSWER (CLAUDE.md, day-one
+  # 17a). A swallowed refusal does not merely lose information, it files a fabricated answer.
+  # CMD_REFUSED is deliberately NOT in the MOVED/NO_EFFECT/INCONCLUSIVE vocabulary, so a refusal
+  # can never be mistaken for a measurement by a reader of responses.tsv.
+  : >"$FIRE_ERR"
+  if [ "$k" = CSA ]; then "$cmd" "$R_BSSID" "$R_CH" >/dev/null 2>"$FIRE_ERR"
+  else "$cmd" "$R_BSSID" "$R_TARGET" "$R_CH" >/dev/null 2>"$FIRE_ERR"; fi
+  frc=$?; ferr=$(tr '\n' ' ' <"$FIRE_ERR" 2>/dev/null); ferr=${ferr:0:200}; rm -f "$FIRE_ERR"
+  log resp "cmd $cmd rc=$frc${ferr:+ err=$ferr}"
+  if (( frc != 0 )) || [ -n "$ferr" ]; then
+    unlock_target; log resp "unlocked after refusal"
+    LOG red "$cmd refused (rc $frc): nothing was transmitted"${ferr:+$'\n'"$ferr"}
+    for m in "${subjects[@]}"; do resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "${P0[$m]}" - CMD_REFUSED "$m"; done
+    set_state RESPOND_NIL; return 1
+  fi
   sleep "$RESP_SETTLE_SECS"
   resp_snapshot "$scope"
   unlock_target
@@ -3004,6 +3041,19 @@ IWFIX
   st "verdict no follow-up"     "$(resp_verdict 100 50 - - 1)"     "INCONCLUSIVE"
   st "verdict non-numeric"      "$(resp_verdict x 50 y 60 1)"      "INCONCLUSIVE"
   POSTURE[aa:00:00:00:00:10]=C; POSTURE_TS[aa:00:00:00:00:10]=$EPOCHSECONDS
+  # cur_channel must not depend on iwinfo alone: it is a declared dependency that the measured
+  # device inventory does not list, and without the iw fallback lock_target failed OPEN and wrote
+  # lock=ok for a lock it never verified.
+  iwinfo() { :; }; iw() { echo 'channel 52 (5260 MHz), width: 20 MHz'; }
+  st "cur_channel: falls back to iw when iwinfo says nothing" "$(cur_channel)" "52"
+  iwinfo() { echo "          Channel: 11 (2.462 GHz)"; }
+  st "cur_channel: prefers iwinfo when it answers"            "$(cur_channel)" "11"
+  iwinfo() { :; }; iw() { :; }
+  PINEAPPLE_EXAMINE_BSSID() { :; }; PINEAPPLE_EXAMINE_CHANNEL() { :; }
+  lock_target aa:00:00:00:00:10 5 6 >/dev/null
+  st "lock_target: no read-back is rc 3, not a verified lock"  "$?" 3
+  st "lock_target: and it says the lock is unverified" "$(printf '%s' "$LOCK_TEXT" | grep -c unverified)" "1"
+  unset -f iwinfo iw PINEAPPLE_EXAMINE_BSSID PINEAPPLE_EXAMINE_CHANNEL
   st "disrupt row shows cached badge" "$(disrupt_row aa:00:00:00:00:10)" "Disrupt [C]"
   st "disrupt row bare when uncached" "$(disrupt_row aa:00:00:00:00:13)" "Disrupt"
   R_BSSID=aa:00:00:00:00:10; R_TARGET=ff:ff:ff:ff:ff:ff; R_CH=6; R_BAND=2
@@ -3028,6 +3078,12 @@ IWFIX
   st "aggregate: any still active"   "$(resp_aggregate 1 1 0)" "NO_EFFECT"
   st "aggregate: mixed"              "$(resp_aggregate 1 0 1)" "INCONCLUSIVE"
   st "aggregate: nothing measured"   "$(resp_aggregate 0 0 0)" "INCONCLUSIVE"
+  # CMD_REFUSED is deliberately outside the measurement vocabulary: a command the firmware refused
+  # transmitted nothing, so it must never be summarised as MOVED or NO_EFFECT. resp_aggregate only
+  # ever counts measured subjects, so it can never produce it -- pin that.
+  st "aggregate: never invents CMD_REFUSED" "$(resp_aggregate 1 1 1 | grep -c CMD_REFUSED)" "0"
+  rm -f "$tmp/responses.tsv"; resp_write aa:00:00:00:00:10 C CSA PINEAPPLE_DEAUTH_CLIENT_CSA ok 10 - CMD_REFUSED
+  st "response row: a refusal is recorded as CMD_REFUSED" "$(sed -n 2p "$tmp/responses.tsv" | awk -F'|' '{print $NF}')" "CMD_REFUSED"
   rm -f "$tmp/responses.tsv"; resp_write aa:00:00:00:00:10 C CSA PINEAPPLE_DEAUTH_CLIENT_CSA ok 10 10 MOVED aa:00:00:00:00:11
   st "response row: measured target override" "$(sed -n 2p "$tmp/responses.tsv" | cut -d'|' -f5)" "aa:00:00:00:00:11"
   # resp_snapshot picks subjects by the attack's scope, not by the picked row. A client-row CSA/BOTH

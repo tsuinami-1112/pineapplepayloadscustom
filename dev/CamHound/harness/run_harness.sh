@@ -274,6 +274,18 @@ s_members() {   # the real-firmware shape: clients with NO association, membersh
     "grep -q '|NO_MATCH\$' $LOOT/responses.tsv && ! grep -q '|NO_CLIENTS\$' $LOOT/responses.tsv && grep -q 'none is measurable' $T/log"
   check "members: NO_MATCH records how many were heard" \
     "grep -qE 'refused .* NO_MATCH members=2' $LOOT/events.log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
+  # the firmware refuses the attack command -> CMD_REFUSED, never a measurement verdict.
+  # Before this existed, a refusal was written to responses.tsv as NO_EFFECT or MOVED, which reads
+  # as the firmware fact "CSA does not move this camera" -- an open question this rung is meant to
+  # answer, so a swallowed refusal filed a fabricated answer to it.
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules mem8 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_FIRE_REFUSE=1 run
+  check "members: a refused command is CMD_REFUSED, not a verdict" \
+    "grep -q '|CMD_REFUSED\$' $LOOT/responses.tsv && ! grep -qE '\|(MOVED|NO_EFFECT)\$' $LOOT/responses.tsv"
+  check "members: the refusal is reported with the command rc and its stderr" \
+    "grep -qE 'cmd PINEAPPLE_DEAUTH_CLIENT_ALL rc=1 err=.*not permitted' $LOOT/events.log && grep -q 'refused (rc 1)' $T/log"
+  check "members: the lock is released and no verdict is logged on a refusal" \
+    "grep -q 'unlocked after refusal' $LOOT/events.log && ! grep -qE '^.*resp verdict ' $LOOT/events.log"
   # the OR filter refused, the uplink-only fallback arms and still finds everyone
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules mem5 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_NO_OR=1 run
