@@ -270,8 +270,10 @@ unable to fire:*
   and `disrupt_menu` aborts with "nothing to attack: no associated BSS".
 
 So the *selection rule* is correct and the *data to feed it* does not exist on either firmware. The
-honest state is that **the response rung cannot transmit on 1.1.3 or on 2.0.0**, and the blocker is
-the association column, not the firmware version — see §13. **[A]** *Falsified by:* `_pineap RECON
+honest state as of 2026-11-03 was that **the response rung could not transmit on 1.1.3 or on
+2.0.0**, and the blocker was the association column rather than the firmware version. **§13a-i
+closed that for AP rows on 2026-11-04** by reading the association off the air; a user-payload
+client row still aborts in `resp_target`. See §13 and §13a-i. **[A]** *Falsified by:* `_pineap RECON
 CLIENTS format=json | jq '.[0]|keys'` on a 2.0.0 Pager with an associated client returning any key
 that carries the BSSID.
 
@@ -282,9 +284,27 @@ Recon. `recon_stat` therefore failed, `present` was 0, and **every broadcast att
 `resp_verdict`'s branches in isolation and never the composition that fed it, so they passed while
 the result was wrong.
 
-**A broadcast target with no visible clients is refused** before the lock is taken and before
-anything is transmitted, and records a `NO_CLIENTS` row. There is nothing to disconnect and nothing
-to measure, so sending would be unverifiable noise.
+**A broadcast target with no measurable subjects is refused** before anything is transmitted, and
+records a row whose verdict column says which of four reasons applied. There is nothing to
+disconnect and nothing to measure, so sending would be unverifiable noise.
+
+*Corrected 2026-11-04: this used to read "refused **before the lock is taken**", which is now the
+opposite of the code.* The lock is taken first, because the membership capture has to run on the
+target's channel and the pre-read has to see what it found. Every refusal path past the lock
+therefore calls `unlock_target` and logs `unlocked after refusal` — a leaked EXAMINE would pin the
+radio off its hop cycle for the rest of the run.
+
+| verdict | meaning | the knob |
+|---|---|---|
+| `NO_CAPTURE` | no `tcpdump`, the filter would not arm, or what came back is not a readable pcap | fix the tool or the filter |
+| `SNAP_SHORT` | records arrived but a record **at the snaplen** was cut before `addr2` | raise `CLI_CAP_SNAP` |
+| `NO_MATCH` | stations were heard, but none has a Recon row or all were randomised | nothing is wrong with the capture |
+| `NO_CLIENTS` | armed, listened, nobody there | the BSS really is empty |
+
+Before this split they were one silence, and "we could not look" was indistinguishable from "the BSS
+is empty". `NO_MATCH` matters most of the four: reporting it as `NO_CLIENTS` would describe a BSS we
+demonstrably heard traffic on as dead, and send the operator to look for a dead AP instead of at the
+gate that dropped the stations.
 
 `resp_fire` then snapshots, transmits, waits `RESP_SETTLE_SECS`, re-snapshots, and judges **each
 subject** with `resp_verdict`:
@@ -470,8 +490,8 @@ not use it: `hook_target` (`dev/CamHound/hook_main.sh:20-37`) builds its one row
 `_pineap RECON` call at all**. So a hook client row has a real association and a real channel,
 `resp_target`'s client branch passes, and `resp_fire` transmits behind the usual picker and confirm —
 on 1.1.3, on 2.0.0, regardless of what `RECON CLIENTS` returns. *Found by the recon-side session's
-review; verified here at `hook_main.sh:35` and `payload.sh:1982-1988`.* So "the rung cannot
-transmit" is true of the user payload only, and the rung is **not** inert on the device as a whole.
+review; verified at `hook_main.sh`'s `hook_target` and `resp_target`.* So "the rung cannot
+transmit" was true of the user payload only, and §13a-i has since made it untrue of its AP rows too.
 
 **[A]** — the `CLIENTS` byte count and the 2.0.0 device-object shape are `[V]` from the binaries (see
 `/CLAUDE.md`); the code paths were read in the payload; composing them is the inference. *Falsified
@@ -496,13 +516,14 @@ associated to it, and §13a's capture route is the better evidence.
 
 **Five separate features, one missing field.** Verified in code 2026-11-03, so this is worth more
 than any one of them: `AP_OF[mac] == "-"` disables **Watch on a client** and **Stimulus**
-(`watchable()`, `payload.sh:985-990`, and `watch_prepare`'s "no BSSID: cannot lock"), **kit
-detection** — CamHound's largest single identity signal — (`payload.sh:1186`), the **AP→client tree**
-in the report (`payload.sh:2230`), and the **response rung**. Fixing the association is therefore the
+(`watchable()`, and `watch_prepare`'s "no BSSID: cannot lock"), **kit detection** — CamHound's
+largest single identity signal — (`kit_eval`), the **AP→client tree** in the report
+(`write_report`), and the **response rung** for client rows (`resp_target`). Cited by name: every
+one of those four line numbers went stale within a commit. Fixing the association is therefore the
 highest-value change available to this payload, and worth more than a firmware flash.
 
 **But the response rung does not actually need it, and this reframes the whole problem.** Read what
-goes on the air (`payload.sh:2095-2096`): `CSA` is `<bssid> <ch>` and `BOTH` is `<bssid> <target>
+goes on the air (`resp_fire`'s transmit): `CSA` is `<bssid> <ch>` and `BOTH` is `<bssid> <target>
 <ch>` with the target discarded. **Both need only a BSSID and a channel, and `RECON APS` supplies
 both on 1.1.3.** The firmware can transmit these today. What refuses is CamHound's own verification
 guard (`resp_fire`, the `NO_CLIENTS` branch): `resp_snapshot` found nobody to *measure*. So the
@@ -513,7 +534,7 @@ cannot answer, when the answer is on the air.
 
 | need | already in the payload |
 |---|---|
-| BSSID-filtered data capture | `payload.sh:1804`, `"type data and wlan addr1 $WATCH_BSSID and not wlan addr2 $WATCH_MAC"` — shape only: its `-s 32` is **too short to reach `addr2`**, see §13a-i |
+| BSSID-filtered data capture | `start_caps`, `"type data and wlan addr1 $WATCH_BSSID and not wlan addr2 $WATCH_MAC"` — shape only: its `-s 32` is **too short to reach `addr2`**, see §13a-i |
 | pcap + radiotap + 802.11 walking | `beacon_find` — reads radiotap `it_len` at `p+2`, frame at `p+rt`, knows the 24+12 offsets |
 | octet / u16 readers | `hex_octet`, `hex_u16le` |
 | channel lock across a response | `lock_target` / `RESP_LOCK_SECS`, already held |
@@ -576,7 +597,7 @@ widened, mistaken or stubbed filter — which matters here because the harness t
 1. *"whether `-s 32` clears radiotap"* — answered above: no, by arithmetic. Not a parameter.
 2. *"whether a second concurrent capture is safe during a response"* — **it does not arise.** Every
    path into `disrupt_menu` is reached after `stop_caps` and `unlock_target` have already run:
-   `live_view` unlocks at `payload.sh:1945` before `summary_card`, `stimulus_test` at `:2019`, and
+   `live_view` unlocks before `summary_card`, as does `stimulus_test`, and
    `review_list` / `detail_card` / `hook_menu` are outside Watch entirely. `CAP_PIDS` is empty at
    `resp_fire` time. Phase 0 item 13c (CPU under concurrent captures) is therefore **not** a
    precondition for this work. *Falsified by:* a `disrupt_menu` call site reachable with
@@ -589,9 +610,19 @@ max + 16 > snap` says "measured wrong", where silence would say "nobody there". 
 **before** trusting any other result from the rung; if it comes back above 112 the snap needs raising
 and every other result is confounded by an empty subject set.
 
-**Union, never replacement.** The new test is `[ "$a" = "$R_BSSID" ] || [ -n
-"${RESP_MEMBERS[$m]+x}" ] || continue`. Measured on this host: replacing the `ap_mac` test breaks
-**5 of the 9** `snapshot` selftest cases (236 checks / 5 failed), unioning breaks **none** (236 / 0).
+**Union, never replacement.** The test **as shipped** is
+
+```sh
+[ "$a" = "$R_BSSID" ] || { [ "$RESP_MEMBERS_BSS" = "$R_BSSID" ] && [ -n "${RESP_MEMBERS[$m]+x}" ]; } || continue
+```
+
+*An earlier revision of this section quoted it without the `RESP_MEMBERS_BSS` guard. That guard is
+not decoration: without it a set gathered for one BSSID is applied to the next target, which is the
+staleness bug `posture_of` documents for its caps globals, and the selftest case "a set gathered for
+another BSSID is ignored" fails when it is removed.* Measured on this host at the time of the
+decision: replacing the `ap_mac` test breaks **5 of the 9** `snapshot` selftest cases (236 checks /
+5 failed), unioning breaks **none** (236 / 0). Those counts are pre-implementation; the suite is
+larger now.
 The decisive failure is *"snapshot bss stays at one read: got [2] want [1]"* — under replacement the
 picked target falls out of the sweep and fires the `recon_stat` fallback, destroying the
 single-Recon-read property. Note **why** the five fail, because it is not what it looks like: the
@@ -612,7 +643,7 @@ testing fiction.
 **Honest bound.** This unblocks **AP-row** Disrupt in the user payload and the **Recon
 access_point hook**, which is refused 100% of the time today on both firmwares. It does **not**
 populate `AP_OF`, so the other four chokepoint features stay inert, and a user-payload **client**
-row still aborts at `resp_target` (`payload.sh:2122-2123`) — on real firmware such a row is not even
+row still aborts in `resp_target`'s client branch — on real firmware such a row is not even
 `watchable` (`:1018`), so the detect→Watch→confirmed→Disrupt funnel reaches `summary_card` only for
 AP rows anyway. The inverse lookup that would fix the client row — `type data and wlan addr2 <mac>`,
 BSSID from `addr1` on a ToDS frame, the same walker with the two addresses swapped — is worth more

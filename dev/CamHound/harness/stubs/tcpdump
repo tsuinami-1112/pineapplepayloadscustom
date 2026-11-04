@@ -13,20 +13,29 @@ case "$filt" in *"subtype beacon"*)
   printf 'TCPDUMP beacon %s -> %s\n' "$bss" "$out" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; exit 0 ;;
 esac
 mem=0
-case "$filt" in
-  *"(wlan addr1"*) mem=1 ;;
-  *"type data and wlan addr1"*) case "$filt" in *"not wlan addr2"*) ;; *) mem=2 ;; esac ;;
-esac
+if [ "${cnt:-0}" -gt 0 ]; then      # only capture_bss passes -c here; the Watch captures never do
+  case "$filt" in
+    *"(wlan addr1"*) mem=1 ;;       # the OR form
+    *"type data"*)   mem=2 ;;       # the uplink-only fallback
+  esac
+fi
 if [ "$mem" != 0 ]; then
   L="${HARNESS_LOG:-/tmp/cs_harness.log}"
   bss=$(printf '%s' "$filt" | sed -n 's/.*addr1 \([0-9a-fA-F:]*\).*/\1/p' | tr -d ':' | tr 'A-F' 'a-f')
   printf 'TCPDUMP members %s snap=%s count=%s or=%s\n' "$bss" "$snap" "$cnt" "$mem" >> "$L"
   # HARNESS_NO_ARM=1: tcpdump refuses the filter outright -> capture_bss fails -> NO_CAPTURE
   [ -n "${HARNESS_NO_ARM:-}" ] && { printf 'TCPDUMP members refused to arm\n' >> "$L"; exit 1; }
+  # HARNESS_BAD_PCAP=1: a file exists but is not a pcap -> bss_clients rc 1 -> NO_CAPTURE
+  [ -n "${HARNESS_BAD_PCAP:-}" ] && { printf 'not a pcap at all' > "$out"; printf 'TCPDUMP members wrote garbage\n' >> "$L"; exit 0; }
   # HARNESS_NO_OR=1: only the OR form is refused, so the uplink-only fallback is exercised
   [ -n "${HARNESS_NO_OR:-}" ] && [ "$mem" = 1 ] && { printf 'TCPDUMP members OR form refused\n' >> "$L"; exit 1; }
   le32h() { printf '%02x%02x%02x%02x' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 )); }
-  hex="d4c3b2a1020004000000000000000000$(le32h 65535)$(le32h "${snap:-128}")"
+  hsnap="${snap:-128}"
+  [ -n "${HARNESS_SHORT_SNAP:-}" ] && hsnap=20      # as tcpdump -s 20 would record it
+  # slots: magic, version, thiszone+sigfigs, SNAPLEN, LINKTYPE. 127 = radiotap, as the beacon
+  # arm above writes. An earlier revision put the snap in the linktype slot, so the header snaplen
+  # stayed 65535 and a truncated record could never be told from a short frame.
+  hex="d4c3b2a1020004000000000000000000$(le32h "$hsnap")$(le32h 127)"
   # HARNESS_NO_MEMBERS=1: armed and heard nobody. tcpdump leaves exactly the 24-byte global header,
   # which is the artifact that tells NO_CLIENTS apart from NO_CAPTURE.
   # Only the Reolink NVR AP has clients in these fixtures; every other BSSID must hear nobody, or
@@ -34,7 +43,10 @@ if [ "$mem" != 0 ]; then
   [ "$bss" != ec71db000010 ] && HARNESS_NO_MEMBERS=1
   if [ -z "${HARNESS_NO_MEMBERS:-}" ]; then
     rt="000012000000000000000000000000000000"          # radiotap it_len 18, not a multiple of 4
-    for c in ec71db000011 ec71db000012; do
+    # HARNESS_ALIEN_MEMBERS=1: stations Recon has no row for -> heard, but none measurable
+    mlist="ec71db000011 ec71db000012"
+    [ -n "${HARNESS_ALIEN_MEMBERS:-}" ] && mlist="ec71dbaa0001 ec71dbaa0002"
+    for c in $mlist; do
       for _ in 1 2; do                                  # twice each: bss_clients needs >= 2 sightings
         fr="${rt}08010000${bss}${c}${bss}0000"          # ToDS: addr1 BSSID, addr2 client
         fl=$(( ${#fr} / 2 )); il=$fl

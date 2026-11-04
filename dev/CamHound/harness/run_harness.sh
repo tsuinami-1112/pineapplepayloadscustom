@@ -237,13 +237,16 @@ s_members() {   # the real-firmware shape: clients with NO association, membersh
     "[ \"\$(grep -c '^[0-9]' $LOOT/responses.tsv)\" = 2 ] && grep -q '|ec:71:db:00:00:11|' $LOOT/responses.tsv && grep -q '|ec:71:db:00:00:12|' $LOOT/responses.tsv"
   check "members: the dwell and lock figures are logged for resp_clamp_lock" \
     "grep -qE 'members .* dwell=[0-9]+s lock=[0-9]+s' $LOOT/events.log"
-  check "members: EXAMINE released" "grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log && [ ! -e /tmp/cs_run.pid ]"
+  check "members: the measurement lock was re-armed, not stretched" \
+    "grep -qE 're-armed ec:71:db:00:00:10 [0-9]+s for the measurement' $LOOT/events.log"
+  check "members: EXAMINE released and no lock file left" "grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log && [ ! -e /tmp/cs_run.pid ]"
   # armed, heard nobody -> NO_CLIENTS. This is the arm that used to be the whole bug.
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules mem2 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_NO_MEMBERS=1 run
   check "members: silent BSS refuses NO_CLIENTS and sends nothing" \
     "grep -q 'no clients heard on 00:00:10' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log && grep -q '|NO_CLIENTS\$' $LOOT/responses.tsv"
-  check "members: the lock is released on that refusal" "grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log"
+  check "members: resp_fire itself released the lock on that refusal" \
+    "grep -q 'unlocked after refusal' $LOOT/events.log && grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log"
   # tcpdump refuses the filter -> NO_CAPTURE, a different answer from an empty BSS
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules mem3 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_NO_ARM=1 run
@@ -255,7 +258,22 @@ s_members() {   # the real-firmware shape: clients with NO association, membersh
   check "members: truncated records refuse SNAP_SHORT and name the constant" \
     "grep -q '|SNAP_SHORT\$' $LOOT/responses.tsv && grep -q 'raise CLI_CAP_SNAP' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
   check "members: the short capture is reported with its radiotap length" \
-    "grep -qE 'refused .* SNAP_SHORT itmax=18 recs=[0-9]+ short=[1-9]' $LOOT/events.log"
+    "grep -qE 'refused .* SNAP_SHORT members=0 itmax=18 recs=[0-9]+ short=[1-9]' $LOOT/events.log && grep -qE 'members .* trunc=[1-9]' $LOOT/events.log"
+  # a file exists but is not a pcap -> NO_CAPTURE. Without this arm, resp_members discarding
+  # bss_clients' exit status is invisible: the selftest cannot see it, because it covers
+  # bss_clients directly and never goes through resp_members.
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules mem6 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_BAD_PCAP=1 run
+  check "members: an unreadable capture is NO_CAPTURE, not an empty BSS" \
+    "grep -q '|NO_CAPTURE\$' $LOOT/responses.tsv && grep -q 'not a readable pcap' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
+  # heard stations, but Recon has no row for them -> NO_MATCH, a fourth answer. Saying NO_CLIENTS
+  # here would describe a BSS we demonstrably heard traffic on as dead.
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules mem7 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_ALIEN_MEMBERS=1 run
+  check "members: heard but unmeasurable is NO_MATCH, not NO_CLIENTS" \
+    "grep -q '|NO_MATCH\$' $LOOT/responses.tsv && ! grep -q '|NO_CLIENTS\$' $LOOT/responses.tsv && grep -q 'none is measurable' $T/log"
+  check "members: NO_MATCH records how many were heard" \
+    "grep -qE 'refused .* NO_MATCH members=2' $LOOT/events.log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
   # the OR filter refused, the uplink-only fallback arms and still finds everyone
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules mem5 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_NO_OR=1 run

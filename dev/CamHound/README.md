@@ -16,7 +16,7 @@ facts that are settled so they do not get re-derived.
 | `gen_hooks.sh` | regenerates `library/recon/{client,access_point}/CamHound/` from the user payload (header + config + lib block + watch-core block + `hook_main.sh`) |
 | `check_sync.sh` | fails when the shared blocks differ between the user payload and the hooks |
 | `hook_header.sh`, `hook_main.sh` | the hook-only parts |
-| `harness/run_harness.sh` | laptop harness: stub DuckyScript commands, fake `_pineap`/`tcpdump`/`iwinfo`/`iw` (US-like channel table for a fixture phy dir), stub `NUMBER_PICKER`/`PAYLOAD_SET_CONFIG`/`PAYLOAD_DEL_CONFIG`, RECON fixtures (the client fixture is in the 2.0.0 `probe`-object shape, with `ap_mac` kept as a stand-in for the association the firmware does not expose; a net tree under `NET_SYSFS` names phy0 as wlan1mon's phy; `HARNESS_NO_BEACON=1` makes the fake tcpdump capture nothing, `HARNESS_NO_CLIENTS=1` refuses `RECON CLIENTS` as 1.1.3 does and serves `fix/devices.json`, the measured `RECON DEVICES` shape with sorted keys, and `HARNESS_BANDS_NOOP=1` makes the band write change nothing, as measured); scenarios live, stimulus, lock, nojq (both parsers, over CLIENTS and over DEVICES), locate, disrupt, cliscope (the client-row Disrupt: both scopes in one menu), blind, noinj, persist, settings, bands (the write, the measured no-op, the Settings toggle, a record left by a killed run, the killed run's own watchdog), devices |
+| `harness/run_harness.sh` | laptop harness: stub DuckyScript commands, fake `_pineap`/`tcpdump`/`iwinfo`/`iw` (US-like channel table for a fixture phy dir), stub `NUMBER_PICKER`/`PAYLOAD_SET_CONFIG`/`PAYLOAD_DEL_CONFIG`, RECON fixtures (the client fixture is in the 2.0.0 `probe`-object shape, with `ap_mac` kept as a stand-in for the association the firmware does not expose; a net tree under `NET_SYSFS` names phy0 as wlan1mon's phy; `HARNESS_NO_BEACON=1` makes the fake tcpdump capture nothing, `HARNESS_NO_CLIENTS=1` refuses `RECON CLIENTS` as 1.1.3 does and serves `fix/devices.json`, the measured `RECON DEVICES` shape with sorted keys, and `HARNESS_BANDS_NOOP=1` makes the band write change nothing, as measured); scenarios live, stimulus, lock, nojq (both parsers, over CLIENTS and over DEVICES), locate, disrupt, members (the real-firmware shape -- no association at all, membership read off the air; `HARNESS_NO_MEMBERS` / `HARNESS_NO_ARM` / `HARNESS_NO_OR` / `HARNESS_SHORT_SNAP` / `HARNESS_BAD_PCAP` / `HARNESS_ALIEN_MEMBERS` drive the four refusal tokens and the uplink-only fallback filter), cliscope (the client-row Disrupt: both scopes in one menu), blind, noinj, persist, settings, bands (the write, the measured no-op, the Settings toggle, a record left by a killed run, the killed run's own watchdog), devices |
 
 Rule: edit the user payload, then `gen_hooks.sh`, then `check_sync.sh`, then `payload.sh --selftest`
 and `harness/run_harness.sh`. The lib block (`# --- camhound lib begin/end ---`) and the watch-core
@@ -28,10 +28,49 @@ lives inside them.
 Coded and verified on a laptop only (selftest ends `0 failed` and prints its own count, harness scenarios green, shellcheck
 clean). The v1.1 Recon hooks are generated and checked the same way. **No Pager has run any of it.**
 
+**Status of the response rung, 2026-11-04:** it fires from a user-payload **AP** row and from both
+Recon hooks, with the subject set recovered from a BSSID-filtered capture, because no shipped
+firmware supplies a client→AP association (`RESPONSE.md` §13a-i). A user-payload **client** row
+still aborts in `resp_target`, and client Watch, Stimulus, kit detection and the AP→client tree are
+still inert, all for the same missing `AP_OF` — one fix did not buy five.
+
 The payload is recon **and response**: it was renamed from CamScout when the Disrupt rung landed.
 The recon tiers are unchanged and still passive; the response tier is the only part that transmits
 and is **on by default** (`RESPONSE=1`), with `RESPONSE=0` restoring a recon-only run. Its design,
 the firmware primitives it calls and the list of what remains unverified are in `RESPONSE.md`.
+
+## Loading it onto a Pager, and what to watch on the first run
+
+Nothing in CamHound has run on a device yet; everything is laptop-verified. Install per
+`library/user/reconnaissance/CamHound/README.md` — the user payload to
+`/root/payloads/user/reconnaissance/CamHound/` and, for the Recon-menu entries, the two generated
+hooks to `/root/payloads/recon/client/CamHound/` and `/root/payloads/recon/access_point/CamHound/`,
+each with `cam_signatures.txt` beside its `payload.sh` (`/sd/payloads/...` or `/mmc/root/payloads/...`
+work too; `find_install_dir` probes `_PAYLOAD_HOME`, then the script's own directory, then those
+roots). Windows checkout: `sed -i 's/\r$//' payload.sh cam_signatures.txt`.
+
+`--selftest` is safe to run on the device — every device-changing command is stubbed — so the
+cheapest first step is `bash payload.sh --selftest` on the Pager itself, which exercises the `od`
+fallback path that a laptop with `hexdump` never takes.
+
+Then start **Recon in continuous mode** in the GUI, run CamHound, and watch
+`/root/loot/CamHound/events.log` for these, in order:
+
+| marker | means |
+|---|---|
+| `client verb: DEVICES` | the `RECON CLIENTS` probe got rc 255 and fell back, as 1.1.3 requires |
+| `inj probe: tx phy phy1` | the injection gate read the transmitting phy, not a merge of all of them |
+| `members <bssid> n=N ... dwell=Ns lock=Ns` | a `bss`-scope Disrupt recovered N stations off the air; **this is the dwell figure `resp_clamp_lock`'s floor needs** |
+| `re-armed <bssid> Ns for the measurement` | the lock was re-armed after the capture, so the parse cannot eat the verdict window |
+| `NO_CAPTURE` / `SNAP_SHORT` / `NO_MATCH` / `NO_CLIENTS` in `responses.tsv` | a refusal, and which of the four reasons — `SNAP_SHORT` names `CLI_CAP_SNAP` as the knob |
+
+Known-inert on 1.1.3, so do not read these as faults: client association (kit detection, client
+Watch and Stimulus, the AP→client tree, and per-client Disrupt from the user payload), and `BAND6`
+(the band write is a measured no-op as issued — `dev/pager-day-one.md` 8c). Two measurements worth
+taking before trusting any response-rung result: the radiotap `it_len` on `phy1` (if it exceeds 112,
+`CLI_CAP_SNAP` is too small and every capture reads as `SNAP_SHORT`), and Phase 0 13a — whether data
+frames appear on `wlan1mon` at all under a held EXAMINE lock, since if they do not the membership
+capture returns an empty set for a reason that has nothing to do with the BSS.
 
 ## Roadmap
 

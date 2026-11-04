@@ -702,6 +702,7 @@ pcap_stream() { if command -v hexdump >/dev/null 2>&1; then hexdump -v -e '1/1 "
 CLI_AWK='
 function mac(o) { return sprintf("%02x:%02x:%02x:%02x:%02x:%02x", p[o], p[o+1], p[o+2], p[o+3], p[o+4], p[o+5]) }
 function u16(a, b) { return be ? a * 256 + b : b * 256 + a }
+function le16(a, b) { return b * 256 + a }   # radiotap is little-endian by spec, whatever the pcap is
 function u32(a, b, c, d) { return be ? ((a * 256 + b) * 256 + c) * 256 + d : ((d * 256 + c) * 256 + b) * 256 + a }
 BEGIN { st = 0; i = 0; itmax = 0; recs = 0; short = 0 }
 { v = $1 + 0
@@ -710,6 +711,7 @@ BEGIN { st = 0; i = 0; itmax = 0; recs = 0; short = 0 }
       if (m == "d4c3b2a1" || m == "4d3cb2a1") be = 0
       else if (m == "a1b2c3d4" || m == "a1b23c4d") be = 1
       else { print "ERR magic " m; bad = 1; exit 1 }
+      snap = u32(g[16], g[17], g[18], g[19])   # snaplen from the header, to tell truncation apart
       st = 1; i = 0 }
     next }
   if (st == 1) { h[i++] = v
@@ -723,10 +725,15 @@ BEGIN { st = 0; i = 0; itmax = 0; recs = 0; short = 0 }
   recs++
   do {
     if (want < 4) break
-    rt = u16(p[2], p[3])
+    rt = le16(p[2], p[3])         # NOT u16: the radiotap header is little-endian regardless
     if (rt > itmax) itmax = rt
     if (rt < 8) break
-    if (rt + 16 > want) { short++; break }
+    if (rt + 16 > want) {
+      # Two different causes, and blaming the snap for both sends the operator to the wrong knob:
+      # a record at the snaplen was CUT (raise CLI_CAP_SNAP), a shorter one is simply a small
+      # frame -- an ACK-sized or Null frame that never held addr2 to begin with.
+      if (snap > 0 && want >= snap) trunc++; else runt++
+      short++; break }
     if (int(p[rt] / 4) % 4 != 2) break
     ds = p[rt + 1] % 4
     if (ds == 1) { bo = rt + 4; co = rt + 10 }
@@ -744,6 +751,7 @@ BEGIN { st = 0; i = 0; itmax = 0; recs = 0; short = 0 }
 END { if (bad) exit 1
   if (st == 0) { print "ERR truncated header"; exit 1 }   # never reached the magic: not a pcap at all
   print "ITMAX " itmax; print "RECS " recs; print "SHORT " short
+  print "TRUNC " trunc + 0; print "RUNT " runt + 0; print "SNAP " snap + 0
   for (c in seen) if (seen[c] >= 2) print "CLI " c }'
 
 # bss_clients <pcap> <bssid> -> keyed lines on stdout; rc 1 when the file is unreadable or not a pcap.
@@ -817,7 +825,7 @@ cleanup() {
   if [ "$WATCH_LOCKED" = 1 ]; then _pineap EXAMINE CANCEL >/dev/null 2>&1; PINEAPPLE_EXAMINE_RESET >/dev/null 2>&1; fi
   [ -n "$RUN_ID" ] && [ "$REPORT_DONE_AT_EXIT" != 1 ] && write_report quiet
   command -v bands_restore >/dev/null 2>&1 && bands_restore         # user payload only; the hooks never change bands
-  rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
+  rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap "/tmp/cs_mem_$$.pcap" "/tmp/cs_bcn_$$.pcap" /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
   log run "exit cycles=$CYCLE"
   ui_ok && set_state FINISH
 }
@@ -2292,7 +2300,7 @@ declare -A RS_PK RS_T
 # left over from a previous target must never be applied to this one, which is the bug posture_of
 # documents for its caps globals.
 declare -A RESP_MEMBERS; RESP_MEMBERS_BSS=''
-BSS_ITMAX=0; BSS_RECS=0; BSS_SHORT=0; MEMBERS_TEXT=''; MEMBERS_WHY=''
+BSS_ITMAX=0; BSS_RECS=0; BSS_SHORT=0; BSS_TRUNC=0; BSS_RUNT=0; MEMBERS_TEXT=''; MEMBERS_WHY=''
 
 # resp_members <bssid> -> 0 with RESP_MEMBERS filled, or 1 with MEMBERS_WHY set to one of
 # NO_CAPTURE (no tcpdump, or tcpdump refused the filter), SNAP_SHORT (frames arrived but every
@@ -2300,24 +2308,29 @@ BSS_ITMAX=0; BSS_RECS=0; BSS_SHORT=0; MEMBERS_TEXT=''; MEMBERS_WHY=''
 # there). Three different answers: "we could not look", "we looked through too small a window" and
 # "the BSS is empty" are not the same finding, and before this existed they were all one silence.
 resp_members() {
-  local bss="${1,,}" f out kk vv
+  local bss="${1,,}" f out rc kk vv
   RESP_MEMBERS=(); RESP_MEMBERS_BSS=''; MEMBERS_TEXT=''; MEMBERS_WHY=''
-  BSS_ITMAX=0; BSS_RECS=0; BSS_SHORT=0
+  BSS_ITMAX=0; BSS_RECS=0; BSS_SHORT=0; BSS_TRUNC=0; BSS_RUNT=0
   if [ "$HAVE_TCPDUMP" != 1 ]; then
     MEMBERS_WHY=NO_CAPTURE; MEMBERS_TEXT="no tcpdump: cannot read who is on ${bss:9}"; return 1
   fi
   if ! f=$(capture_bss "$bss"); then
     MEMBERS_WHY=NO_CAPTURE; MEMBERS_TEXT="capture did not arm on ${bss:9}"; return 1
   fi
-  out=$(bss_clients "$f" "$bss"); rm -f "$f"
+  out=$(bss_clients "$f" "$bss"); rc=$?; rm -f "$f"
+  if (( rc != 0 )); then         # bad magic, or too short to be a pcap: we could not look, which is
+    MEMBERS_WHY=NO_CAPTURE       # not the same answer as looking and finding nobody
+    MEMBERS_TEXT="capture on ${bss:9} is not a readable pcap"; return 1
+  fi
   while read -r kk vv; do        # a here-string, so these land in THIS shell, not a subshell
     case "$kk" in
       ITMAX) BSS_ITMAX="$vv" ;; RECS) BSS_RECS="$vv" ;; SHORT) BSS_SHORT="$vv" ;;
+      TRUNC) BSS_TRUNC="$vv" ;; RUNT) BSS_RUNT="$vv" ;;
       CLI)   [ -n "$vv" ] && RESP_MEMBERS[$vv]=1 ;;
     esac
   done <<<"$out"
   if (( ${#RESP_MEMBERS[@]} == 0 )); then
-    if (( BSS_SHORT > 0 )); then
+    if (( BSS_TRUNC > 0 )); then     # a record AT the snaplen was cut: the snap is the knob
       MEMBERS_WHY=SNAP_SHORT
       MEMBERS_TEXT="snap $CLI_CAP_SNAP too small for radiotap $BSS_ITMAX: raise CLI_CAP_SNAP"
     else
@@ -2389,18 +2402,48 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
     # recorded and the Recon read still happens; only a subject set that is empty AFTER both
     # sources refuses, and it refuses with whichever reason the capture gave.
     resp_members "$R_BSSID" || true
-    # The dwell figure HANDOFF.md promised the recon-side session for resp_clamp_lock's floor,
-    # handed over as a measurement rather than a unilateral change to their function.
-    log resp "members $R_BSSID n=${#RESP_MEMBERS[@]} why=${MEMBERS_WHY:-ok} itmax=$BSS_ITMAX recs=$BSS_RECS short=$BSS_SHORT dwell=$(( EPOCHSECONDS - t_cap ))s lock=${lock_secs}s"
+    # The dwell figure the recon-side session needs for resp_clamp_lock's floor, handed over as a
+    # measurement rather than a unilateral change to their function. dev/CamHound/README.md lists it
+    # among the first-run markers to watch.
+    log resp "members $R_BSSID n=${#RESP_MEMBERS[@]} why=${MEMBERS_WHY:-ok} itmax=$BSS_ITMAX recs=$BSS_RECS short=$BSS_SHORT trunc=$BSS_TRUNC runt=$BSS_RUNT dwell=$(( EPOCHSECONDS - t_cap ))s lock=${lock_secs}s"
+    # Re-arm before the measurement, rather than sizing cap_secs to cover the parse.
+    # The capture does not need a guaranteed lock: if the radio resumes hopping mid-capture we
+    # simply hear fewer stations, and the member set honestly reports what it heard. The
+    # MEASUREMENT does need one -- a lock expiring between the pre-read and the post-read lets the
+    # post-read land on a hopping radio, whose cumulative Recon counter looks stalled, and
+    # resp_verdict scores a stalled counter MOVED. That is the exact false green this rung exists
+    # to prevent. Sizing a constant instead cannot be done honestly: the walker takes 2.5-9.1 s on
+    # the device for a full CLI_CAP_COUNT buffer (RESPONSE.md 13a-i), so any fixed number either
+    # over-locks every quiet BSS or under-locks a busy one. Re-arming costs lock_target's channel
+    # read-back and is exact. Measured on the air, the dwell line above is what tells us which.
+    lock_target "$R_BSSID" "$RESP_LOCK_SECS" "$R_CH"; rc=$?
+    case $rc in 0) lock=ok ;; 1) lock=by-channel ;; *) lock=failed ;; esac
+    if (( rc == 2 )); then
+      unlock_target
+      LOG red "lock lost after the capture: $LOCK_TEXT"; log resp "lock-failed-rearm $R_BSSID $LOCK_TEXT"
+      resp_write "$mac" "$badge" "$k" "$cmd" "$lock" - - LOCK_FAILED
+      set_state INCONCLUSIVE; return 1
+    fi
+    log resp "re-armed $R_BSSID ${RESP_LOCK_SECS}s for the measurement lock=$lock"
   fi
   resp_snapshot "$scope"
   for m in "${!RS_PK[@]}"; do subjects+=("$m"); P0[$m]="${RS_PK[$m]}"; T0[$m]="${RS_T[$m]}"; done
   if [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ]; then
     if (( ${#subjects[@]} == 0 )); then                        # nothing to disconnect, nothing to measure
       unlock_target                      # every refusal past the lock must release it, or a leaked
-      why="${MEMBERS_WHY:-NO_CLIENTS}"   # EXAMINE pins the radio off its hop cycle for the run
-      LOG red "${MEMBERS_TEXT:-no visible clients on ${R_BSSID:9}: nothing to disconnect}"
-      log resp "refused $R_BSSID $why itmax=$BSS_ITMAX recs=$BSS_RECS short=$BSS_SHORT"
+      log resp "unlocked after refusal"  # EXAMINE pins the radio off its hop cycle for the run
+      if [ -n "$MEMBERS_WHY" ]; then
+        why="$MEMBERS_WHY"; LOG red "$MEMBERS_TEXT"
+      elif (( ${#RESP_MEMBERS[@]} > 0 )); then
+        # Heard stations, but not one survived Recon and the randomised-MAC gate. Saying "no
+        # clients" here would be a lie about a BSS we demonstrably heard traffic on, and it would
+        # send the operator to look for a dead AP instead of at the gate that dropped them.
+        why=NO_MATCH
+        LOG red "heard ${#RESP_MEMBERS[@]} on ${R_BSSID:9} but none is measurable: no Recon row, or randomised"
+      else
+        why=NO_CLIENTS; LOG red "no visible clients on ${R_BSSID:9}: nothing to disconnect"
+      fi
+      log resp "refused $R_BSSID $why members=${#RESP_MEMBERS[@]} itmax=$BSS_ITMAX recs=$BSS_RECS short=$BSS_SHORT"
       resp_write "$mac" "$badge" "$k" "$cmd" "$lock" - - "$why"
       set_state RESPOND_NIL; return 1
     fi
@@ -2591,10 +2634,18 @@ st_gate() {   # st_gate <bindir> -> capture_ready's verdict with PATH masked to 
 }
 st_le32h() { printf '%02x%02x%02x%02x' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 )); }
 st_hex2bin() { local h="$1" i; for ((i = 0; i < ${#h}; i += 2)); do printf "\\x${h:$i:2}"; done; }
-st_data_pcap() {   # st_data_pcap file bssid12hex -> a pcap of mixed data frames for bss_clients
-  # radiotap it_len 18, deliberately NOT a multiple of 4: PCAP_AWK would abort on this file, which
-  # is the whole reason bss_clients has its own byte-oriented walker (PLAN_v2 item 1's corollary).
-  local f="$1" b="$2" rt out='' q L
+st_be32h() { printf '%02x%02x%02x%02x' $(( ($1 >> 24) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 8) & 255 )) $(( $1 & 255 )); }
+st_data_pcap() {   # st_data_pcap file bssid12hex [be] -> a pcap of mixed data frames for bss_clients
+  # With a third argument the pcap is written BIG-endian: magic, version and every record header
+  # word byte-swapped, while the radiotap it_len stays LITTLE-endian, because radiotap is
+  # little-endian by spec whatever the containing pcap is. That is the only fixture that can tell
+  # le16 from u16 in the walker, and without it the distinction is untested.
+  # Records of mixed, non-multiple-of-4 lengths: PCAP_AWK aborts the whole file on
+  # `incl_len % 4 != 0`, which is the reason bss_clients has its own byte-oriented walker
+  # (PLAN_v2 item 1's corollary). The radiotap it_len of 18 is chosen for a different reason -- it
+  # is an odd-but-plausible header length, and reading it with the pcap's byte order instead of
+  # little-endian turns it into 4608, which the big-endian case below detects.
+  local f="$1" b="$2" be="${3:-}" rt out='' q L gh w32
   local -a fr=()
   rt="000012000000000000000000000000000000"
   fr+=("${rt}08010000${b}ec71db000011${b}0000")        # ToDS: addr1 BSSID, addr2 client :11
@@ -2603,7 +2654,11 @@ st_data_pcap() {   # st_data_pcap file bssid12hex -> a pcap of mixed data frames
   fr+=("${rt}08020000ec71db000012${b}${b}0000")        # FromDS: client is addr1, addr2 is the AP
   fr+=("${rt}08020000ec71db000012${b}${b}0000")
   fr+=("${rt}48010000${b}ec71db000013${b}0000")        # ToDS Null, :13 seen exactly ONCE
-  fr+=("${rt}80000000ffffffffffff${b}${b}0000")        # a beacon: management, never a client
+  # Its addr2 is a station MAC, NOT the BSSID, and it appears twice -- so only the frame-TYPE check
+  # can exclude it. With the BSSID in addr2 the c == bss guard would have excluded it anyway and
+  # the case would have passed with the type check removed.
+  fr+=("${rt}80000000ffffffffffffec71db000015${b}0000")  # a beacon: management, never a client
+  fr+=("${rt}80000000ffffffffffffec71db000015${b}0000")
   fr+=("${rt}0802000001005e000001${b}${b}0000")        # FromDS to a group address
   fr+=("${rt}0802000001005e000001${b}${b}0000")
   fr+=("${rt}08010000${b}${b}${b}0000")                # the AP as its own addr2
@@ -2611,11 +2666,14 @@ st_data_pcap() {   # st_data_pcap file bssid12hex -> a pcap of mixed data frames
   fr+=("${rt}0801")                                    # runt: 20 B, below rt+16 -> counted SHORT
   fr+=("${rt}08010000${b}ec71db000014${b}0000")        # and the walk must continue past it
   fr+=("${rt}08010000${b}ec71db000014${b}0000")
+  w32=st_le32h; [ -n "$be" ] && w32=st_be32h
   for q in "${fr[@]}"; do
     L=$(( ${#q} / 2 ))
-    out+="$(st_le32h 0)$(st_le32h 0)$(st_le32h "$L")$(st_le32h "$L")$q"
+    out+="$($w32 0)$($w32 0)$($w32 "$L")$($w32 "$L")$q"
   done
-  st_hex2bin "d4c3b2a1020004000000000000000000$(st_le32h 65535)$(st_le32h 127)$out" >"$f"
+  if [ -n "$be" ]; then gh="a1b2c3d4000200040000000000000000$(st_be32h 65535)$(st_be32h 127)"
+  else gh="d4c3b2a1020004000000000000000000$(st_le32h 65535)$(st_le32h 127)"; fi
+  st_hex2bin "$gh$out" >"$f"
 }
 st_members() {   # the admitted client set, sorted and space-joined
   local m out=''
@@ -2996,7 +3054,16 @@ IWFIX
   st "bss_clients: ToDS addr2 and FromDS addr1, nothing else" "$(st_members "$tmp/mem.pcap" "$BSSC")" \
      "ec:71:db:00:00:11 ec:71:db:00:00:12 ec:71:db:00:00:14"
   st "bss_clients: radiotap it_len reported"      "$(st_bss_key "$tmp/mem.pcap" "$BSSC" ITMAX)" "18"
-  st "bss_clients: every record walked"           "$(st_bss_key "$tmp/mem.pcap" "$BSSC" RECS)"  "14"
+  st "bss_clients: every record walked"           "$(st_bss_key "$tmp/mem.pcap" "$BSSC" RECS)"  "15"
+  st "bss_clients: a short frame is a runt, not a truncation" "$(st_bss_key "$tmp/mem.pcap" "$BSSC" TRUNC)" "0"
+  st "bss_clients: the runt is counted as one"    "$(st_bss_key "$tmp/mem.pcap" "$BSSC" RUNT)"  "1"
+  # A big-endian pcap whose radiotap it_len is still little-endian. Reading it_len with the pcap's
+  # byte order would give 18 -> 4608 here, every record would fail the rt+16 guard, and the member
+  # set would be empty. This is the only case that distinguishes le16 from u16.
+  st_data_pcap "$tmp/mem_be.pcap" "$BSSH" be
+  st "bss_clients: big-endian pcap, little-endian radiotap" "$(st_members "$tmp/mem_be.pcap" "$BSSC")" \
+     "ec:71:db:00:00:11 ec:71:db:00:00:12 ec:71:db:00:00:14"
+  st "bss_clients: big-endian record lengths parsed"        "$(st_bss_key "$tmp/mem_be.pcap" "$BSSC" RECS)" "15"
   st "bss_clients: the runt is counted, not fatal" "$(st_bss_key "$tmp/mem.pcap" "$BSSC" SHORT)" "1"
   st "bss_clients: an upper-case BSSID still matches" "$(st_members "$tmp/mem.pcap" EC:71:DB:00:00:10)" \
      "ec:71:db:00:00:11 ec:71:db:00:00:12 ec:71:db:00:00:14"
