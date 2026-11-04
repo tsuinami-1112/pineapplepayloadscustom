@@ -47,8 +47,14 @@ bash dev/CamHound/gen_hooks.sh      # regenerate both hooks
 bash dev/CamHound/check_sync.sh     # must print "in sync: lib <md5> watch <md5>"
 bash library/user/reconnaissance/CamHound/payload.sh --selftest     # must end "0 failed"
 shellcheck -S warning library/user/reconnaissance/CamHound/payload.sh   # must be clean
-bash dev/CamHound/harness/run_harness.sh live                       # must print "0 failure(s)"
+bash dev/CamHound/harness/run_harness.sh                            # ALL 14 scenarios; must print "0 failure(s)"
 ```
+
+**The harness argument is a scenario filter, not a mode.** `run_harness.sh live` runs the `live`
+scenario alone - 5 checks of 91 - and still prints `0 failure(s)`, which reads exactly like a full
+pass. This gate list said `live` until 2026-11-04 and every session that copied it was running a
+fourteenth of the suite. No argument (or `all`) runs all fourteen; a scenario name runs that one,
+which is what you want while iterating, never for the gate.
 
 `gen_hooks.sh` copies three regions, delimited by markers in the user payload. Whether your edit
 moves a hash depends on which region it lands in:

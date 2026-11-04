@@ -2666,11 +2666,36 @@ write_report() {
 # =============================================================================== selftest ===
 ST_FAIL=0; ST_N=0
 st() { ST_N=$((ST_N + 1)); if [ "$2" = "$3" ]; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s: got [%s] want [%s]\n' "$1" "$2" "$3"; ST_FAIL=$((ST_FAIL + 1)); fi; }
-st_stub_ui() {   # laptop run: UI commands stubbed when absent; everything that would change the device or its saved config stubbed even when present, so --selftest is safe on a Pager
-  for c in LOG LED VIBRATE RINGTONE ALERT PROMPT ERROR_DIALOG; do command -v "$c" >/dev/null 2>&1 || eval "$c() { :; }"; done
-  for c in _pineap PINEAPPLE_EXAMINE_BSSID PINEAPPLE_EXAMINE_CHANNEL PINEAPPLE_EXAMINE_RESET PINEAPPLE_RECON_NEW PINEAPPLE_SET_BANDS \
-           PINEAPPLE_DEAUTH_CLIENT PINEAPPLE_DEAUTH_CLIENT_ALL PINEAPPLE_DEAUTH_CLIENT_CSA PAYLOAD_SET_CONFIG PAYLOAD_DEL_CONFIG; do eval "$c() { :; }"; done
+st_stub_ui() {   # --selftest must change nothing, say nothing, and never block - on a laptop or on a Pager
+  local c
+  # Display and physical effects. Stubbed EVEN WHEN PRESENT: they used to be stubbed only when
+  # absent, which is true of a laptop and false of a Pager, so on the device the selftest painted
+  # the operator's screen with its own fixtures - "settings reset to defaults", "band write
+  # restarted pineapd: Recon starts over", "sig line 0 skipped: bad label", "RSSI_MIN 60 ignored".
+  # Every one of those is a false statement about the device, on the same display a live payload is
+  # using. No case asserts on them, because the laptop they were written for stubs them away.
+  ST_QUIET=(LOG LED VIBRATE RINGTONE ALERT PROMPT ERROR_DIALOG)
+  # Anything that waits for a button press, stubbed to DECLINE. rc != 0 is the cancel path in all
+  # three callers (confirm, pick_list, settings_menu's number branch), and it is also what the
+  # laptop does today by accident: absent -> 127. These were stubbed NOWHERE, and that asymmetry is
+  # the trap - absent where the gates run, present on the Pager - so a future case reaching
+  # settings_menu, pick_list, disrupt_menu or resp_fire would pass every gate and then block a
+  # device run for ever, waiting for a press nobody is there to make.
+  ST_BLOCKING=(CONFIRMATION_DIALOG LIST_PICKER NUMBER_PICKER)
+  # Anything that changes the device or its saved config.
+  ST_DEVICE=(_pineap PINEAPPLE_EXAMINE_BSSID PINEAPPLE_EXAMINE_CHANNEL PINEAPPLE_EXAMINE_RESET PINEAPPLE_RECON_NEW PINEAPPLE_SET_BANDS
+             PINEAPPLE_DEAUTH_CLIENT PINEAPPLE_DEAUTH_CLIENT_ALL PINEAPPLE_DEAUTH_CLIENT_CSA PAYLOAD_SET_CONFIG PAYLOAD_DEL_CONFIG)
+  for c in "${ST_QUIET[@]}" "${ST_DEVICE[@]}"; do eval "$c() { :; }"; done
+  for c in "${ST_BLOCKING[@]}"; do eval "$c() { return 1; }"; done
   PAYLOAD_GET_CONFIG() { return 1; }
+  ST_STUBBED=("${ST_QUIET[@]}" "${ST_BLOCKING[@]}" "${ST_DEVICE[@]}" PAYLOAD_GET_CONFIG)
+  # Not coverable here: GPS_GET runs as `timeout 3 GPS_GET`, and timeout execs a real command, so a
+  # shell function never intercepts it. That timeout is its only bound.
+}
+st_stubs_intact() {   # -> the stubs a teardown destroyed, or "none". A teardown that unset -f's one
+  local c miss=""   # of these hands every later case the REAL command, which on a Pager is a radio.
+  for c in "${ST_STUBBED[@]}"; do [ "$(type -t "$c")" = function ] || miss+=" $c"; done
+  printf '%s' "${miss:-none}"
 }
 st_device() {   # st_device mac role "vendor text" "ssid" hidden ap_of
   local m="$1"
@@ -2762,6 +2787,7 @@ selftest() {
   local tmp="${TMPDIR:-/tmp}/cs_st.$$" f lbl n ssid
   st_stub_ui; mkdir -p "$tmp"; LOOT_DIR="$tmp"; RUN_ID="selftest"
   printf '== CamHound %s selftest ==\n' "$VERSION"
+  st "stubs: every device and UI command is stubbed before the first case" "$(st_stubs_intact)" "none"
   # 1 signatures
   if f=$(find_install_dir); then load_signatures "$f/cam_signatures.txt"; SIG_SOURCE="file"; else load_signatures <(builtin_signatures); fi
   st "signatures loaded ($SIG_SOURCE, $SIG_COUNT rows)" "$(( SIG_COUNT > 20 ))" 1
@@ -3053,7 +3079,7 @@ IWFIX
   lock_target aa:00:00:00:00:10 5 6 >/dev/null
   st "lock_target: no read-back is rc 3, not a verified lock"  "$?" 3
   st "lock_target: and it says the lock is unverified" "$(printf '%s' "$LOCK_TEXT" | grep -c unverified)" "1"
-  unset -f iwinfo iw PINEAPPLE_EXAMINE_BSSID PINEAPPLE_EXAMINE_CHANNEL
+  unset -f iwinfo iw; PINEAPPLE_EXAMINE_BSSID() { :; }; PINEAPPLE_EXAMINE_CHANNEL() { :; }   # restore the base stubs; unsetting them would expose the real ones
   st "disrupt row shows cached badge" "$(disrupt_row aa:00:00:00:00:10)" "Disrupt [C]"
   st "disrupt row bare when uncached" "$(disrupt_row aa:00:00:00:00:13)" "Disrupt"
   R_BSSID=aa:00:00:00:00:10; R_TARGET=ff:ff:ff:ff:ff:ff; R_CH=6; R_BAND=2
@@ -3261,7 +3287,7 @@ IWFIX
   unset -f pidof; st "bands apply: a pineapd restart is reported even when the write is not trusted" "$(grep -c 'pineapd restarted by the band write' "$tmp/events.log")" "1"
   st "bands apply: an issued write is remembered on disk even when untrusted" "$BANDS_WROTE:$(cut -d' ' -f1 "$BANDS_STATE")" "2,5:2,5"
   bands_restore; st "bands restore: an untrusted write is restored anyway, record gone" "$(sed -n 5p "$tmp/bands.log"):$BANDS_WROTE:$([ -e "$BANDS_STATE" ] && echo file || echo none)" "wlan9mon 2 5::none"
-  BANDS_ORIG=""; BANDS_WROTE=""; printf '2,5' >"$tmp/bands"; bands_apply; CONFIRMATION_DIALOG() { echo 1; }; settings_reset >/dev/null 2>&1; unset -f CONFIRMATION_DIALOG
+  BANDS_ORIG=""; BANDS_WROTE=""; printf '2,5' >"$tmp/bands"; bands_apply; CONFIRMATION_DIALOG() { echo 1; }; settings_reset >/dev/null 2>&1; CONFIRMATION_DIALOG() { return 1; }   # restore the declining stub, never unset it
   st "settings reset: BAND6 back at 0 restores an issued write" "$(sed -n 7p "$tmp/bands.log"):$BAND6:$BANDS_WROTE" "wlan9mon 2 5:0:"
   uci() { echo '2,5'; }; iw() { echo 'channel 37 (5975 MHz), width: 20 MHz'; }   # applied at runtime, uci untouched
   bands_apply; st "bands apply: a live 6 GHz channel is enough, uci lagging" "$BANDS_ORIG:$BANDS_LINE" "2,5:2,5,6"
@@ -3301,6 +3327,7 @@ IWFIX
   st "cli fallback via DEVICES: empty beacon/response objects are still a client; a response-only AP is not" "$(printf '%s' "$ej" | parse_cli_fallback | tr '\n' ' ')" "AA:BB:CC:00:00:02|-|5|-60|Net2|2437|1700000001|0 "
   st "cli fallback via DEVICES: same one row" "$(printf '%s' "$dj" | parse_cli_fallback | tr '\n' ' ')" "AA:BB:CC:00:00:01|-|12|-57|HomeNet|2437|1700000000|0 "
   st "cli fallback: same rows as jq from the same shape" "$(printf '%s' "$cj" | parse_cli_fallback | tr '\n' ' ')" "AA:BB:CC:00:00:01|-|12|-57|HomeNet,Cam_Net|2437|1700000000|0 AA:BB:CC:00:00:02|-|3|-70||5180|1700000002|0 "
+  st "stubs: still stubbed after the last case, so no teardown exposed a real command" "$(st_stubs_intact)" "none"
   # 8 marked blocks
   if command -v md5sum >/dev/null 2>&1 && [ -f "${BASH_SOURCE[0]}" ]; then
     printf 'lib block md5   %s\n' "$(sed -n '/^# --- camhound lib begin ---/,/^# --- camhound lib end ---/p' "${BASH_SOURCE[0]}" | md5sum | cut -c1-32)"
