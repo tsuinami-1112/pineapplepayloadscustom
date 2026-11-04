@@ -1,6 +1,6 @@
 #!/bin/bash
-out=""; filt=""
-while [ $# -gt 0 ]; do case "$1" in -w) out="$2"; shift ;; -i|-s|-c) shift ;; -nn) ;; *) filt="$filt $1" ;; esac; shift; done
+out=""; filt=""; snap=0; cnt=0
+while [ $# -gt 0 ]; do case "$1" in -w) out="$2"; shift ;; -s) snap="$2"; shift ;; -c) cnt="$2"; shift ;; -i) shift ;; -nn) ;; *) filt="$filt $1" ;; esac; shift; done
 case "$filt" in *"subtype beacon"*)
   bss=$(printf '%s' "$filt" | sed -n 's/.*addr2 \([0-9a-fA-F:]*\).*/\1/p' | tr -d ':' | tr 'A-F' 'a-f')
   # HARNESS_NO_BEACON=1: the target never beacons for us -- write nothing, so capture_beacon fails and the badge is ?
@@ -12,6 +12,41 @@ case "$filt" in *"subtype beacon"*)
   for ((i = 0; i < ${#hex}; i += 2)); do printf "\\x${hex:$i:2}"; done > "$out"
   printf 'TCPDUMP beacon %s -> %s\n' "$bss" "$out" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; exit 0 ;;
 esac
+mem=0
+case "$filt" in
+  *"(wlan addr1"*) mem=1 ;;
+  *"type data and wlan addr1"*) case "$filt" in *"not wlan addr2"*) ;; *) mem=2 ;; esac ;;
+esac
+if [ "$mem" != 0 ]; then
+  L="${HARNESS_LOG:-/tmp/cs_harness.log}"
+  bss=$(printf '%s' "$filt" | sed -n 's/.*addr1 \([0-9a-fA-F:]*\).*/\1/p' | tr -d ':' | tr 'A-F' 'a-f')
+  printf 'TCPDUMP members %s snap=%s count=%s or=%s\n' "$bss" "$snap" "$cnt" "$mem" >> "$L"
+  # HARNESS_NO_ARM=1: tcpdump refuses the filter outright -> capture_bss fails -> NO_CAPTURE
+  [ -n "${HARNESS_NO_ARM:-}" ] && { printf 'TCPDUMP members refused to arm\n' >> "$L"; exit 1; }
+  # HARNESS_NO_OR=1: only the OR form is refused, so the uplink-only fallback is exercised
+  [ -n "${HARNESS_NO_OR:-}" ] && [ "$mem" = 1 ] && { printf 'TCPDUMP members OR form refused\n' >> "$L"; exit 1; }
+  le32h() { printf '%02x%02x%02x%02x' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 )); }
+  hex="d4c3b2a1020004000000000000000000$(le32h 65535)$(le32h "${snap:-128}")"
+  # HARNESS_NO_MEMBERS=1: armed and heard nobody. tcpdump leaves exactly the 24-byte global header,
+  # which is the artifact that tells NO_CLIENTS apart from NO_CAPTURE.
+  # Only the Reolink NVR AP has clients in these fixtures; every other BSSID must hear nobody, or
+  # the stub would invent members for the setup AP that exists precisely to have none.
+  [ "$bss" != ec71db000010 ] && HARNESS_NO_MEMBERS=1
+  if [ -z "${HARNESS_NO_MEMBERS:-}" ]; then
+    rt="000012000000000000000000000000000000"          # radiotap it_len 18, not a multiple of 4
+    for c in ec71db000011 ec71db000012; do
+      for _ in 1 2; do                                  # twice each: bss_clients needs >= 2 sightings
+        fr="${rt}08010000${bss}${c}${bss}0000"          # ToDS: addr1 BSSID, addr2 client
+        fl=$(( ${#fr} / 2 )); il=$fl
+        # HARNESS_SHORT_SNAP=1: records arrive but are cut below rt+16 -> SNAP_SHORT, not NO_CLIENTS
+        [ -n "${HARNESS_SHORT_SNAP:-}" ] && { fr="${fr:0:40}"; il=20; }
+        hex+="$(le32h 0)$(le32h 0)$(le32h $il)$(le32h $fl)$fr"
+      done
+    done
+  fi
+  for ((i = 0; i < ${#hex}; i += 2)); do printf "\\x${hex:$i:2}"; done > "$out"
+  printf 'TCPDUMP members %s -> %s\n' "$bss" "$out" >> "$L"; exit 0
+fi
 printf 'TCPDUMP %s [%s]\n' "$out" "$filt" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"
 t0=$(date +%s)
 le32() { printf "\\x$(printf %02x $(( $1 & 255 )))\\x$(printf %02x $(( ($1 >> 8) & 255 )))\\x$(printf %02x $(( ($1 >> 16) & 255 )))\\x$(printf %02x $(( ($1 >> 24) & 255 )))"; }
