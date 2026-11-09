@@ -100,9 +100,7 @@ s_locate() {   # Locate on the Hikvision AP: bars, tiers, clean stop
 }
 s_disrupt() {   # shipped default (RESPONSE=1 from the config block, nothing written to the saved config): Disrupt on the Reolink AP against log-only stubs; posture, lock, loot row
   reset; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
-  # BOTH is page item 2 since posture_opts led with DEAUTH (2026-11-09); this arm covers the
-  # BSS-wide 3-argument shape, so it follows the key rather than the index.
-  rules disrupt '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '2' ' ch ' '1' "${COMMON[@]}"
+  rules disrupt '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
   answers t t B; run
   check "disrupt: fires at the shipped default, with no RESPONSE override in the saved config" "! grep -q '^RESPONSE=' $HARNESS_CFG && grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
   check "disrupt: posture read under a lock on the target channel" "grep -q 'TCPDUMP beacon ec71db000010' $T/log && grep -q 'PINEAPPLE_EXAMINE_BSSID ec:71:db:00:00:10' $T/log"
@@ -110,10 +108,28 @@ s_disrupt() {   # shipped default (RESPONSE=1 from the config block, nothing wri
   check "disrupt: regulatory probe ran against phy0, the phy the net fixture names" "grep -q '^IW phy phy0 channels' $T/log"
   check "disrupt: regulatory probe parsed the fixture (no fallback)" "! grep -q 'regulatory probe failed' $T/log"
   check "disrupt: probe read the transmitting phy, not a merge" "grep -q 'inj probe: tx phy phy0' $LOOT/events.log && ! grep -q 'tx phy unresolved' $LOOT/events.log && ! grep -q 'tx phy unresolved' $T/log"
-  check "disrupt: stub command called with bssid, broadcast target, channel 36" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_ALL ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log"
+  check "disrupt: stub command called with bssid, broadcast target, channel 36" "grep -q '^PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log"
   check "disrupt: lock verified ok (not by channel)" "grep -q 'lock: ok' $T/log"
   check "disrupt: one loot row per client, 16 fields, badge and raw caps" "[ \"\$(grep -c '^[0-9]' $LOOT/responses.tsv)\" = 2 ] && [ \"\$(sed -n 2p $LOOT/responses.tsv | awk -F'|' '{print NF}')\" = 16 ] && grep -q '|ec:71:db:00:00:11|36|5|D+C|0c00|' $LOOT/responses.tsv && grep -q '|ec:71:db:00:00:12|36|5|D+C|0c00|' $LOOT/responses.tsv"
   check "disrupt: aggregate verdict over both clients" "grep -q 'verdict MOVED ff:ff:ff:ff:ff:ff scope=bss moved=2 no_effect=0 inconclusive=0 of 2' $LOOT/events.log"
+  # BOTH is TWO commands, because no firmware command combines them. PINEAPPLE_DEAUTH_CLIENT_ALL
+  # carries the CSA command id (StartDeauthAll emits li a0,402 at 0x0086c62c, the same id as
+  # StartDeauthCsa) and builds no deauth frame at all, and pineapd's real deauth+CSA opcode 401 is
+  # reached by nothing in the Go daemon. So resp_fire issues the opcode-400 deauth itself and then
+  # the CSA, which is what 401 would have done. Page item 2; item 1 is DEAUTH.
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules disrupt3 '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '2' ' ch ' '1' "${COMMON[@]}"
+  answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "disrupt: BOTH sends the opcode-400 deauth and never _ALL" \
+    "grep -q '^PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36\$' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT_ALL' $T/log"
+  check "disrupt: BOTH also sends the CSA leg, bssid and channel only" \
+    "grep -q '^PINEAPPLE_DEAUTH_CLIENT_CSA ec:71:db:00:00:10 36\$' $T/log"
+  check "disrupt: both legs are logged and the loot names them" \
+    "grep -q 'cmd PINEAPPLE_DEAUTH_CLIENT_CSA rc=0' $LOOT/events.log && grep -q '|PINEAPPLE_DEAUTH_CLIENT+CSA|' $LOOT/responses.tsv"
+  check "disrupt: the picker labels BOTH deauth-only and CSA fw-broken" \
+    "grep -q 'items=DEAUTH bss (works);BOTH bss (deauth only);CSA bss (fw-broken);' $T/log"
+  check "disrupt: the targeted sweep still runs after BOTH" \
+    "grep -qE 'sweep PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 targeted=2 of 2' $LOOT/events.log"
   # guard: an AP with no visible clients (the Hikvision setup AP) is refused before anything is sent
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules disrupt2 '^CamHound' 'Scan,Exit' 'Review hits' '3,Exit' '^[0-9]+ HIK' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
@@ -130,7 +146,7 @@ s_blind() {   # RESPONSE=1 with no beacon capturable: the ? badge asks before fi
   check "blind: Fire blind confirm shown and accepted" "grep -q 'CONFIRM\[Posture unread on 00:00:10: no beacon captured. Fire blind[?]\] -> 1' $T/log"
   # DEAUTH leads and is the only key the badge still speaks for; BOTH and CSA read fw-broken on
   # every badge because neither can construct a valid pineapd request (see payload posture_expect).
-  check "blind: picker leads with DEAUTH, BOTH and CSA marked fw-broken, all bss-wide" "grep -q 'PICKER\[Disrupt \[[?]\] ff:ff:ff\] items=DEAUTH bss (unknown);BOTH bss (fw-broken);CSA bss (fw-broken);' $T/log"
+  check "blind: picker leads with DEAUTH, BOTH and CSA marked fw-broken, all bss-wide" "grep -q 'PICKER\[Disrupt \[[?]\] ff:ff:ff\] items=DEAUTH bss (unknown);BOTH bss (unknown);CSA bss (fw-broken);' $T/log"
   check "blind: the confirm names every client, not the broadcast target" "grep -q 'CONFIRM\[CSA on EVERY client of 00:00:10 ch 36[?]\] -> 1' $T/log"
   check "blind: CSA does not sweep, because the command takes no target" "! grep -qE '^PINEAPPLE_DEAUTH_CLIENT ' $T/log"
   check "blind: CSA fired with bssid and channel only, badge ? in the event" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_CSA ec:71:db:00:00:10 36$' $T/log && grep -q 'fire CSA ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff ch36 badge=? ' $LOOT/events.log"
@@ -182,7 +198,7 @@ s_cliscope() {   # RESPONSE=1: Disrupt on the Wyze CLIENT row -- the only menu t
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules cli1 '^CamHound' 'Scan,Exit' 'Review hits' '8,Exit' '^[0-9]+ WYZE' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
   answers t t B; run
-  check "cliscope: client row offers a mixed marker list, DEAUTH preselected" "grep -q 'PICKER\[Disrupt \[D+C\] 20:00:01\] items=DEAUTH (works);BOTH bss (fw-broken);CSA bss (fw-broken);' $T/log"
+  check "cliscope: client row offers a mixed marker list, DEAUTH preselected" "grep -q 'PICKER\[Disrupt \[D+C\] 20:00:01\] items=DEAUTH (works);BOTH bss (deauth only);CSA bss (fw-broken);' $T/log"
   check "cliscope: DEAUTH confirm names the one device, not the BSS" "grep -q 'CONFIRM\[DEAUTH on 20:00:01 via 11:22:33 ch 6[?]\] -> 1' $T/log"
   check "cliscope: DEAUTH sent with the client as its target" "grep -q '^PINEAPPLE_DEAUTH_CLIENT 9c:3d:cf:11:22:33 a4:da:22:20:00:01 6$' $T/log"
   check "cliscope: cli scope measures the picked device alone" "grep -q 'scope=cli subjects=1' $LOOT/events.log && [ \"\$(grep -c '^[0-9]' $LOOT/responses.tsv)\" = 1 ]"
@@ -241,7 +257,7 @@ s_members() {   # the real-firmware shape: clients with NO association, membersh
   # Index 6, not 4: under the DEVICES shape the review list orders differently and 4 is the
   # "-- LIKELY --" divider. The checks below pin the BSSID the capture ran against, so if this
   # index ever drifts again the scenario fails loudly instead of quietly testing another row.
-  local R=('^CamHound' 'Scan,Exit' 'Review hits' '6,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '2' ' ch ' '1')
+  local R=('^CamHound' 'Scan,Exit' 'Review hits' '6,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1')
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules mem1 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 run
   check "members: capture armed with the OR filter, snap 128, frame cap 800" \
@@ -249,7 +265,7 @@ s_members() {   # the real-firmware shape: clients with NO association, membersh
   check "members: two stations recovered from the air" "grep -q 'members ec:71:db:00:00:10 n=2 ' $LOOT/events.log"
   check "members: they became the subjects, with no association in the JSON" \
     "grep -q 'scope=bss subjects=2' $LOOT/events.log && grep -q 'client verb: DEVICES' $LOOT/events.log"
-  check "members: the attack was sent" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_ALL ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log"
+  check "members: the attack was sent" "grep -q '^PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log"
   # The targeted sweep. The broadcast frame above is kept AND one targeted deauth goes to each
   # recovered member, because on the bench a targeted deauth dropped a phone that ignored both
   # broadcast forms. Asserted per member, so a sweep that fires once and stops is caught.
@@ -303,13 +319,13 @@ s_members() {   # the real-firmware shape: clients with NO association, membersh
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules mem7 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_ALIEN_MEMBERS=1 run
   check "members: heard but unmeasurable TRANSMITS, and no longer refuses" \
-    "grep -q '^PINEAPPLE_DEAUTH_CLIENT_ALL ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log && ! grep -q '|NO_MATCH\$' $LOOT/responses.tsv && ! grep -q '|NO_CLIENTS\$' $LOOT/responses.tsv"
+    "grep -q '^PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log && ! grep -q '|NO_MATCH\$' $LOOT/responses.tsv && ! grep -q '|NO_CLIENTS\$' $LOOT/responses.tsv"
   check "members: the sweep reaches a station Recon has no row for" \
     "grep -q '^PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 ec:71:db:aa:00:01 36\$' $T/log && grep -q '^PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 ec:71:db:aa:00:02 36\$' $T/log"
   check "members: an unmeasurable subject scores INCONCLUSIVE, never MOVED or NO_EFFECT" \
     "grep -q '|ec:71:db:aa:00:01|' $LOOT/responses.tsv && grep -qE '\|INCONCLUSIVE\$' $LOOT/responses.tsv && ! grep -qE '\|(MOVED|NO_EFFECT)\$' $LOOT/responses.tsv"
   check "members: the fire line separates the transmit set from the measurable set" \
-    "grep -qE 'fire BOTH .* subjects=2 measurable=0 heard=2' $LOOT/events.log"
+    "grep -qE 'fire DEAUTH .* subjects=2 measurable=0 heard=2' $LOOT/events.log"
   # the firmware refuses the attack command -> CMD_REFUSED, never a measurement verdict.
   # Before this existed, a refusal was written to responses.tsv as NO_EFFECT or MOVED, which reads
   # as the firmware fact "CSA does not move this camera" -- an open question this rung is meant to
@@ -319,7 +335,7 @@ s_members() {   # the real-firmware shape: clients with NO association, membersh
   check "members: a refused command is CMD_REFUSED, not a verdict" \
     "grep -q '|CMD_REFUSED\$' $LOOT/responses.tsv && ! grep -qE '\|(MOVED|NO_EFFECT)\$' $LOOT/responses.tsv"
   check "members: the refusal is reported with the command rc and its stderr" \
-    "grep -qE 'cmd PINEAPPLE_DEAUTH_CLIENT_ALL rc=1 err=.*not permitted' $LOOT/events.log && grep -q 'refused (rc 1)' $T/log"
+    "grep -qE 'cmd PINEAPPLE_DEAUTH_CLIENT rc=1 err=.*not permitted' $LOOT/events.log && grep -q 'refused (rc 1)' $T/log"
   check "members: the lock is released and no verdict is logged on a refusal" \
     "grep -q 'unlocked after refusal' $LOOT/events.log && ! grep -qE '^.*resp verdict ' $LOOT/events.log"
   # the OR filter refused, the uplink-only fallback arms and still finds everyone

