@@ -50,6 +50,7 @@ RSSI_MIN=0              # * optional list gate, dBm, on the best RSSI known for 
 BAND6=0                 # * also scan 6 GHz: writes the device's bands + 6 for this run; put back at exit, by the watchdog if killed, or at the next start (0 = leave as set)
 SOUND=0                 # * RINGTONE alert on NEW CONFIRMED (0 = off)
 SHOW_MODULES=1          # modules list in the menu
+SHOW_OTHER=1            # "Other devices" list: heard, but in neither of the two lists above
 MODULE_HINT_RSSI=-55    # client RSSI at or above which a BUSY module gets the "Watch?" hint
 BUSY_PPS=10             # counted frames/s floor for BUSY (PineAP packet counter delta)
 BUSY_CYCLES=2           # consecutive cycles at or above BUSY_PPS

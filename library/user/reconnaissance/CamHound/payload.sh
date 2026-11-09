@@ -60,6 +60,7 @@ RSSI_MIN=0              # * optional list gate, dBm, on the best RSSI known for 
 BAND6=0                 # * also scan 6 GHz: writes the device's bands + 6 for this run; put back at exit, by the watchdog if killed, or at the next start (0 = leave as set)
 SOUND=0                 # * RINGTONE alert on NEW CONFIRMED (0 = off)
 SHOW_MODULES=1          # modules list in the menu
+SHOW_OTHER=1            # "Other devices" list: heard, but in neither of the two lists above
 MODULE_HINT_RSSI=-55    # client RSSI at or above which a BUSY module gets the "Watch?" hint
 BUSY_PPS=10             # counted frames/s floor for BUSY (PineAP packet counter delta)
 BUSY_CYCLES=2           # consecutive cycles at or above BUSY_PPS
@@ -1623,13 +1624,30 @@ sort_macs() {   # by band rank desc, then prox N>M>F>?, then conf desc
     case "$kind" in
       hits)    (( ${CONF[$mac]} >= 20 )) || continue; [ "${BANDNAME[$mac]}" = MODULE ] && continue ;;
       modules) { [[ ${TAGS[$mac]} =~ (^| )MODULE( |$) ]] && (( ${CONF[$mac]} < 45 )); } || continue; [ "${ROLE[$mac]}" = ap ] && continue ;;
+      # "other" is the COMPLEMENT of the two lists above, written as the negation of their own
+      # predicates so it cannot drift out of step with them. It exists because the behaviour rung -
+      # the whole point of which is devices no signature can name - was reachable only for module
+      # CLIENTS: "hits" needs a score, and the modules list refuses APs by design (PLAN_v2 item 14
+      # specifies it as client rows). So a camera running its own AP under an SSID the signature
+      # file does not carry appeared in NO list and could not be Watched at all. Seven SSID rows
+      # exist for exactly that device class, which is what makes the gap an asymmetry rather than a
+      # deliberate omission. Gated on PROX, not raw RSSI, so FAR_DBM decides and prox_of's band
+      # (-7 dB on 5/6 GHz) and role (-6 dB on a client) adjustments are already applied.
+      # A device Watched into a STREAM verdict scores >= 20 and promotes itself into Review hits,
+      # so this list drains as it is worked through rather than accumulating.
+      other)   { (( ${CONF[$mac]} >= 20 )) && [ "${BANDNAME[$mac]}" != MODULE ]; } && continue
+               { [[ ${TAGS[$mac]} =~ (^| )MODULE( |$) ]] && (( ${CONF[$mac]} < 45 )) && [ "${ROLE[$mac]}" != ap ]; } && continue
+               case "${PROX[$mac]}" in N|M) ;; *) continue ;; esac ;;
     esac
     local p=3; case "${PROX[$mac]}" in N) p=0 ;; M) p=1 ;; F) p=2 ;; esac
     local kit=0; [ "${KITAP[$mac]}" = "?" ] && kit=1
     local bz=0; [ "${BUSY[$mac]}" = 1 ] && bz=1
     local rs=${RSSI_LAST[$mac]:--200}; [[ $rs =~ ^-?[0-9]+$ ]] || rs=-200
-    if [ "$kind" = modules ]; then printf -v key '%d%d%04d%03d' $((1 - kit)) $((1 - bz)) $((200 + rs > 0 ? 400 - (200 + rs) : 400)) $((999 - ${CONF[$mac]}))
-    else band_rank "${BANDNAME[$mac]}"; printf -v key '%d%d%03d' $((3 - RANK_V)) "$p" $((999 - ${CONF[$mac]})); fi
+    case "$kind" in
+      modules) printf -v key '%d%d%04d%03d' $((1 - kit)) $((1 - bz)) $((200 + rs > 0 ? 400 - (200 + rs) : 400)) $((999 - ${CONF[$mac]})) ;;
+      other)   printf -v key '%d%04d' $((1 - bz)) $((200 + rs > 0 ? 400 - (200 + rs) : 400)) ;;   # busy first, then loudest
+      *)       band_rank "${BANDNAME[$mac]}"; printf -v key '%d%d%03d' $((3 - RANK_V)) "$p" $((999 - ${CONF[$mac]})) ;;
+    esac
     keyed+=("$key $mac")
   done
   SORTED=()
@@ -1676,6 +1694,25 @@ modules_list() {
   ROW_TEXT+=("Back"); ROW_MAC+=("")
   pick_list "[$MODE] Unidentified modules ($rows)" "" "${ROW_TEXT[@]}" || return 0
   case "$PICK" in "Back"|"not cameras until Watched") return 0 ;; esac
+  for ((i = 0; i < ${#ROW_TEXT[@]}; i++)); do [ "${ROW_TEXT[i]}" = "$PICK" ] && { detail_card "${ROW_MAC[i]}" watch; break; }; done
+}
+
+other_list() {   # heard, but in neither Review hits nor the modules list - see sort_macs "other"
+  local mac i rows=0 glyph lbl r
+  sort_macs other
+  ROW_TEXT=("heard, no camera signature"); ROW_MAC=("")
+  for mac in "${SORTED[@]}"; do
+    glyph=A; [ "${ROLE[$mac]}" = cli ] && glyph=c
+    lbl="${SSID_CLEAN[$mac]}"; [ -z "$lbl" ] && lbl="${VENDOR[$mac]}"
+    case "$lbl" in ""|-) lbl="${mac//:/}" ;; esac
+    r="${RSSI_LAST[$mac]:-}"; [ -n "$r" ] && printf -v r '%d' "$r" 2>/dev/null
+    printf -v ROW '%s %s %s%s' "$glyph" "${lbl:0:$(( ROW_W - 5 - ${#r} ))}" "${PROX[$mac]:-?}" "$r"
+    [ "${BUSY[$mac]}" = 1 ] && ROW+=" busy"
+    ROW_TEXT+=("${ROW:0:$ROW_W}"); ROW_MAC+=("$mac"); rows=$((rows + 1))
+  done
+  ROW_TEXT+=("Back"); ROW_MAC+=("")
+  pick_list "[$MODE] Other devices ($rows)" "" "${ROW_TEXT[@]}" || return 0
+  case "$PICK" in "Back"|"heard, no camera signature") return 0 ;; esac
   for ((i = 0; i < ${#ROW_TEXT[@]}; i++)); do [ "${ROW_TEXT[i]}" = "$PICK" ] && { detail_card "${ROW_MAC[i]}" watch; break; }; done
 }
 
@@ -1953,13 +1990,14 @@ scan_loop() {
 main_menu() {
   local def="Scan"
   while :; do
-    local -a menu=("Scan"); (( DEDUPE_H > 0 )) && menu+=("Scan (fresh)"); menu+=("Review hits"); [ "$SHOW_MODULES" = 1 ] && menu+=("Unidentified modules"); menu+=("Mode" "Settings" "Write report" "Exit")
+    local -a menu=("Scan"); (( DEDUPE_H > 0 )) && menu+=("Scan (fresh)"); menu+=("Review hits"); [ "$SHOW_MODULES" = 1 ] && menu+=("Unidentified modules"); [ "$SHOW_OTHER" = 1 ] && menu+=("Other devices"); menu+=("Mode" "Settings" "Write report" "Exit")
     pick_list "CamHound $VERSION [$MODE] sigs:$SIG_COUNT" "$def" "${menu[@]}" || { def="Exit"; continue; }
     case "$PICK" in
       "Scan") scan_loop || def="Exit" ;;
       "Scan (fresh)") DEDUPE_RUN=0; LOG "fresh scan: earlier runs ignored"; log mode "dedupe off for this run"; scan_loop || def="Exit" ;;
       "Review hits") review_list || def="Exit" ;;
       "Unidentified modules") modules_list ;;
+      "Other devices") other_list ;;
       "Mode") mode_menu ;;
       "Settings") settings_menu ;;
       "Write report") write_report; LOG "report: $LOOT_DIR/report_$RUN_ID.txt" ;;
@@ -2839,6 +2877,11 @@ st_device() {   # st_device mac role "vendor text" "ssid" hidden ap_of
   ROLE[$m]="$2"; VLOW[$m]="${3,,}"; VENDOR[$m]="${3:0:14}"; unset "VEND_TYPE[$m]"; SSID_CLEAN[$m]="$4"; HIDDEN[$m]="$5"; AP_OF[$m]="${6:--}"
   LAST_SEEN[$m]=$EPOCHSECONDS; N_SEEN[$m]=1; FIRST_SEEN[$m]=$EPOCHSECONDS; KITAP[$m]=""; unset "KITCL[$m]" "BEH[$m]" "BEH_GATE[$m]" "BEH_VERDICT[$m]" "EVENT_FLAG[$m]" "BUSY[$m]" "PROBES[$m]"
 }
+st_other_has() {   # st_other_has mac -> yes|no: is this MAC in the "Other devices" list?
+  sort_macs other; local m
+  for m in "${SORTED[@]}"; do [ "$m" = "$1" ] && { printf yes; return 0; }; done
+  printf no
+}
 st_pcap() {   # synthetic LE pcap: st_pcap file orig_len count ts
   local f="$1" ol="$2" n="$3" ts="$4" i
   le32() { printf "\\x$(printf %02x $(( $1 & 255 )))\\x$(printf %02x $(( ($1 >> 8) & 255 )))\\x$(printf %02x $(( ($1 >> 16) & 255 )))\\x$(printf %02x $(( ($1 >> 24) & 255 )))"; }
@@ -3039,6 +3082,38 @@ selftest() {
   st "hidden LAA AP + 3 Realtek clients = KIT?" "${KITAP[02:11:22:00:00:01]} ${TAGS[02:11:22:00:00:01]}" "? KIT?"
   st_device aa:00:00:00:00:05 ap "Hangzhou Hikvision Digital Technology" "" 1; score_device aa:00:00:00:00:05
   st "hidden Hikvision AP = 55 LIKELY HIDDEN" "${CONF[aa:00:00:00:00:05]} ${BANDNAME[aa:00:00:00:00:05]} ${TAGS[aa:00:00:00:00:05]}" "55 LIKELY HIK-OUI HIDDEN"
+  # 4b "Other devices": the complement of the two existing lists. Every row below is a device one
+  # of them drops, and the AP cases are the gap this list was added for - before it, an AP that no
+  # signature named appeared in NO list and so could not be Watched at all.
+  local _oap=cc:00:00:00:00:01 _osc=cc:00:00:00:00:02 _omc=cc:00:00:00:00:03
+  local _oma=cc:00:00:00:00:04 _ofa=cc:00:00:00:00:05 _ocl=cc:00:00:00:00:06 _ost=cc:00:00:00:00:07
+  st_device $_oap ap "Shenzhen Nobody Ltd" "bebird-R1-038686" 0; RSSI_HIST[$_oap]="-26"; BAND[$_oap]=2; score_device $_oap
+  st "other: an unscored AP under an unknown SSID is reachable at last" "$(st_other_has $_oap)" "yes"
+  st_device $_osc ap "Hangzhou Hikvision Digital Technology" "EZVIZ_ABCDEF123" 0; RSSI_HIST[$_osc]="-30"; BAND[$_osc]=2; score_device $_osc
+  st "other: a scored AP stays in Review hits and is not duplicated here" "$(st_other_has $_osc)" "no"
+  st_device $_omc cli "Espressif Inc" "" 0 aa:00:00:00:00:99; RSSI_HIST[$_omc]="-30"; BAND[$_omc]=2; score_device $_omc
+  st "other: a module CLIENT stays in the modules list" "$(st_other_has $_omc)" "no"
+  st_device $_oma ap "Espressif Inc" "" 0; RSSI_HIST[$_oma]="-30"; BAND[$_oma]=2; score_device $_oma
+  st "other: a module AP appears here, because the modules list refuses APs" "$(st_other_has $_oma)" "yes"
+  st_device $_ofa ap "Shenzhen Nobody Ltd" "far-ap" 0; RSSI_HIST[$_ofa]="-95"; BAND[$_ofa]=2; score_device $_ofa
+  st "other: a device past FAR_DBM is gated out, so the list is the room" "$(st_other_has $_ofa)" "no"
+  st_device $_ocl cli "Some Laptop Vendor" "" 0 -; RSSI_HIST[$_ocl]="-40"; BAND[$_ocl]=2; score_device $_ocl
+  st "other: an unscored non-module client is here too" "$(st_other_has $_ocl)" "yes"
+  st_device $_ost ap "Shenzhen Nobody Ltd" "streamer-ap" 0; RSSI_HIST[$_ost]="-35"; BAND[$_ost]=2; score_device $_ost
+  st "other: before Watch, a silent unknown AP is listed" "$(st_other_has $_ost)" "yes"
+  BEH[$_ost]=55; BEH_GATE[$_ost]=55; BEH_VERDICT[$_ost]=STREAM; score_device $_ost
+  # The drain property: Watch it, find it streaming, and it scores its way into Review hits. If this
+  # ever fails the list accumulates instead of emptying as the operator works through it.
+  st "other: Watched into STREAM, it promotes into Review hits and leaves this list" "$(st_other_has $_ost)" "no"
+  unset "RSSI_HIST[$_oap]" "RSSI_HIST[$_osc]" "RSSI_HIST[$_omc]" "RSSI_HIST[$_oma]" "RSSI_HIST[$_ofa]" "RSSI_HIST[$_ocl]" "RSSI_HIST[$_ost]"
+  unset "CONF[$_oap]" "CONF[$_osc]" "CONF[$_omc]" "CONF[$_oma]" "CONF[$_ofa]" "CONF[$_ocl]" "CONF[$_ost]"
+  unset "BEH[$_ost]" "BEH_GATE[$_ost]" "BEH_VERDICT[$_ost]"
+  # The filter above is well covered; the WIRING is not, and a typo in either string would make the
+  # entry unreachable with every other test still green. Same technique as the SETTINGS_TABLE check.
+  local _me _mc
+  _me=$(sed -n 's/.*menu+=("\(Other devices\)").*/\1/p' "${BASH_SOURCE[0]}" | head -1)
+  _mc=$(sed -n 's/.*"\(Other devices\)") other_list.*/\1/p' "${BASH_SOURCE[0]}" | head -1)
+  st "other: the menu entry and its dispatch label are the same string" "[$_me][$_mc]" "[Other devices][Other devices]"
   # 5 proximity
   RSSI_HIST[aa:00:00:00:00:01]="-70 -58 -65"; BAND[aa:00:00:00:00:01]=2; MODE=ROOM; apply_mode; prox_of aa:00:00:00:00:01; st "prox ROOM -58 best = N" "${PROX[aa:00:00:00:00:01]}" N
   RSSI_HIST[aa:00:00:00:00:01]="-79"; prox_of aa:00:00:00:00:01; st "prox ROOM -79 = F" "${PROX[aa:00:00:00:00:01]}" F
