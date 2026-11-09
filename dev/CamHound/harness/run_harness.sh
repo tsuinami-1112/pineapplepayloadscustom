@@ -98,6 +98,39 @@ s_locate() {   # Locate on the Hikvision AP: bars, tiers, clean stop
   check "locate: MONITOR started and bars drawn" "grep -q '^MONITOR MONITOR c0:56:e3' $T/log && grep -q 'dBm \[' $T/log"
   check "locate: stop logged" "grep -q 'locate stop' $LOOT/events.log"
 }
+s_csainj() {   # the optional CSA injector: pagerinj in place of the firmware CSA command
+  # CSA_INJECTOR is NOT starred -- cfg() takes integers only, so a path cannot arrive through
+  # PAYLOAD_SET_CONFIG -- so this arm patches a SECOND copy of the payload rather than writing the
+  # saved config. Only the config-block assignment is rewritten; everything under test
+  # (csa_newchan, csa_issue, the lock budget) is the shipped code, unmodified.
+  sed -e "s|^CSA_INJECTOR=\"\"|CSA_INJECTOR=\"$HERE/stubs/pagerinj\"|" "$T/payload_fast.sh" >"$T/payload_csa.sh"
+  grep -q "^CSA_INJECTOR=\"$HERE/stubs/pagerinj\"" "$T/payload_csa.sh" || { echo "sed on CSA_INJECTOR failed"; exit 1; }
+  # Reolink AP, ch 36 band 5, so csa_newchan must announce 40 -- never 36, which would announce no
+  # move at all and which pagerinj refuses outright without --allow-same-chan.
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules csainj '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '2' ' ch ' '1' "${COMMON[@]}"
+  answers t t B; PATH="$PATHX" timeout 300 bash "$T/payload_csa.sh" >/dev/null 2>"$T/stderr"
+  check "csainj: BOTH still sends the opcode-400 deauth" \
+    "grep -q '^PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36\$' $T/log"
+  check "csainj: the CSA leg went to the injector, not the firmware command" \
+    "grep -q '^PAGERINJ ' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT_CSA' $T/log"
+  check "csainj: it got the iface, the bssid, a DIFFERENT channel and a non-zero count" \
+    "grep -qE '^PAGERINJ -i wlan1mon --csa --bssid ec:71:db:00:00:10 --chan 40 --count 3' $T/log"
+  check "csainj: the loot names the injector, so a reader can tell which CSA this was" \
+    "grep -q '|PINEAPPLE_DEAUTH_CLIENT+pagerinj:ch40:n3|' $LOOT/responses.tsv"
+  check "csainj: the injector leg is logged with its rc" \
+    "grep -qE 'csa inject pagerinj:ch40:n3 rc=0' $LOOT/events.log"
+  # A failing injector must not read as a sent CSA, and must not retract the deauth that already
+  # left. CMD_REFUSED in particular would be a lie: a frame WAS transmitted.
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules csainj2 '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '2' ' ch ' '1' "${COMMON[@]}"
+  answers t t B; HARNESS_INJ_FAIL=1 PATH="$PATHX" timeout 300 bash "$T/payload_csa.sh" >/dev/null 2>"$T/stderr"
+  check "csainj: a failing injector leaves the deauth sent and says the CSA did not" \
+    "grep -q '^PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36\$' $T/log && grep -q 'csa leg failed' $LOOT/events.log"
+  check "csainj: a failed CSA leg is not recorded in the loot as a sent one" \
+    "! grep -q '+pagerinj' $LOOT/responses.tsv && ! grep -q '|CMD_REFUSED\$' $LOOT/responses.tsv"
+}
+
 s_disrupt() {   # shipped default (RESPONSE=1 from the config block, nothing written to the saved config): Disrupt on the Reolink AP against log-only stubs; posture, lock, loot row
   reset; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   rules disrupt '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
@@ -346,8 +379,8 @@ s_members() {   # the real-firmware shape: clients with NO association, membersh
     "grep -q 'OR filter did not arm' $LOOT/events.log && grep -qE '^TCPDUMP members ec71db000010 snap=128 count=800 or=2' $T/log && grep -q 'scope=bss subjects=2' $LOOT/events.log"
 }
 case "${1:-all}" in
-  live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; members) s_members ;; cliscope) s_cliscope ;; blind) s_blind ;; noinj) s_noinj ;; persist) s_persist ;; settings) s_settings ;; bands) s_bands ;; devices) s_devices ;;
-  all) s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_members; s_cliscope; s_blind; s_noinj; s_persist; s_settings; s_bands; s_devices ;;
+  csainj) s_csainj ;; live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; members) s_members ;; cliscope) s_cliscope ;; blind) s_blind ;; noinj) s_noinj ;; persist) s_persist ;; settings) s_settings ;; bands) s_bands ;; devices) s_devices ;;
+  all) s_csainj; s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_members; s_cliscope; s_blind; s_noinj; s_persist; s_settings; s_bands; s_devices ;;
   *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|members|cliscope|blind|noinj|persist|settings|bands|devices|all]"; exit 2 ;;
 esac
 printf '== harness: %s failure(s); temp dir %s ==\n' "$FAIL" "$T"

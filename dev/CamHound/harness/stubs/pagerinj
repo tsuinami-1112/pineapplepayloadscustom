@@ -1,0 +1,13 @@
+#!/bin/bash
+# harness stub for dev/injector/pagerinj: records the call, transmits nothing.
+# HARNESS_INJ_FAIL=1: it could not clone a beacon -- writes to stderr and returns 1.
+# NOTE it writes to stderr on SUCCESS too (the real binary prints its sent=/failed= summary there,
+# pagerinj.c's final fprintf). That is exactly why csa_issue must judge pagerinj by rc and hak5cmd
+# by stderr: one rule for both would file a fabricated result for one of them.
+printf 'PAGERINJ %s\n' "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"
+if [ -n "${HARNESS_INJ_FAIL:-}" ]; then
+  printf 'no beacon captured - is the interface on the target channel?\n' >&2
+  exit 1
+fi
+printf 'cloned 128-byte beacon; CSA element appended\nsent=30 failed=0  (sendto success does NOT mean transmitted)\n' >&2
+exit 0

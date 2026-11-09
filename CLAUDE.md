@@ -47,13 +47,13 @@ bash dev/CamHound/gen_hooks.sh      # regenerate both hooks
 bash dev/CamHound/check_sync.sh     # must print "in sync: lib <md5> watch <md5>"
 bash library/user/reconnaissance/CamHound/payload.sh --selftest     # must end "0 failed"
 shellcheck -S warning library/user/reconnaissance/CamHound/payload.sh   # must be clean
-bash dev/CamHound/harness/run_harness.sh                            # ALL 14 scenarios; must print "0 failure(s)"
+bash dev/CamHound/harness/run_harness.sh                            # ALL 15 scenarios; must print "0 failure(s)"
 ```
 
 **The harness argument is a scenario filter, not a mode.** `run_harness.sh live` runs the `live`
 scenario alone - 5 checks of 91 - and still prints `0 failure(s)`, which reads exactly like a full
 pass. This gate list said `live` until 2026-11-04 and every session that copied it was running a
-fourteenth of the suite. No argument (or `all`) runs all fourteen; a scenario name runs that one,
+fourteenth of the suite (fifteenth now). No argument (or `all`) runs them all; a scenario name runs one,
 which is what you want while iterating, never for the gate.
 
 `gen_hooks.sh` copies three regions, delimited by markers in the user payload. Whether your edit
@@ -131,6 +131,18 @@ correct**, including a 5 GHz `No IR` channel (169) that the fixture never contai
 pending validation.
 
 **Response rung** — `resp_target` (sets `R_BSSID`/`R_TARGET`/`R_CH`/`R_BAND`), `disrupt_menu`,
+`csa_newchan`/`csa_issue` (the CSA leg: routes to `CSA_INJECTOR` when one is configured and
+executable, else the firmware command, and owns the rc-vs-stderr question the two senders answer
+**oppositely** — `hak5cmd` exits 0 on every error path so stderr is its only signal, while
+`pagerinj` prints its `sent=/failed=` summary to stderr even on success so rc is its only signal;
+one rule for both would file a fabricated result). **`CSA_INJECTOR` defaults to empty and should
+stay that way until the bench says otherwise**: `dev/injector/README.md` requires pineapd STOPPED,
+and CamHound cannot stop pineapd — Recon, the EXAMINE lock and every deauth command *are* pineapd —
+so the in-payload path bets that the EXAMINE lock holds the channel well enough, and that bet is
+unmeasured. The validated way to run `pagerinj` is standalone: `dev/injector/run_17a.sh`. The three
+CSA keys (`CSA_INJECTOR`, `CSA_COUNT`, `CSA_CHAN`) are deliberately **unstarred**, because `cfg()`
+accepts integers only so a path cannot arrive via `PAYLOAD_SET_CONFIG`, and a star without a
+`SETTINGS_TABLE` row is a lie.
 `resp_fire`, `resp_snapshot`, `resp_verdict` (MOVED / NO_EFFECT / INCONCLUSIVE from recon packet
 counters), `resp_aggregate`, `resp_write` (→ `responses.tsv`, header `RESP_HDR`), `auto_respond_ok`.
 Timings: `RESP_LOCK_SECS`, `RESP_SETTLE_SECS` — both starred and wired; the lock must exceed

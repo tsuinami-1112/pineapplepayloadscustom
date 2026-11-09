@@ -68,6 +68,27 @@ done
 ssh root@172.16.52.1 'chmod +x /root/payloads/*/*/CamHound/payload.sh'
 ```
 
+### Optional: the CSA injector
+
+CamHound's CSA leg can be routed to `dev/injector/pagerinj` instead of the firmware command, which
+is the only way to get a CSA that could work: pineapd hardcodes Channel Switch Count 0 *and* a New
+Channel Number of 14 (Japan-only), both literals with one call site, so no setting reaches either.
+
+```sh
+scp dev/injector/pagerinj root@172.16.52.1:/root/pagerinj
+ssh root@172.16.52.1 'chmod +x /root/pagerinj; /root/pagerinj --selftest | tail -2'
+```
+
+**Leave `CSA_INJECTOR` empty until the bench says otherwise.** `dev/injector/README.md` requires
+pineapd STOPPED — it hops the interface and its own CSA flood is a clone source `pagerinj` skips —
+and CamHound cannot stop pineapd, because Recon, the EXAMINE lock and every deauth command *are*
+pineapd. Turning the hook on bets that CamHound's EXAMINE lock holds the channel well enough, and
+nothing has measured that. Measure it standalone first with `dev/injector/run_17a.sh`, which stops
+pineapd properly and restores it on every exit path. Once it is proven, set `CSA_INJECTOR` (and
+optionally `CSA_COUNT`, `CSA_CHAN`) in the config block of the user payload and regenerate the
+hooks; they are not starred because `cfg()` takes integers only, so a path cannot come through
+`PAYLOAD_SET_CONFIG`.
+
 `/sd/payloads/...` and `/mmc/root/payloads/...` work equally — `find_install_dir` probes
 `_PAYLOAD_HOME`, then the script's own directory, then all three roots, which is why each hook finds
 its own signature file despite all three copies carrying the same `PAYLOAD_REL`. From a Windows
