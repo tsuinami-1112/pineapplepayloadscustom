@@ -641,16 +641,19 @@ posture_expect() {
   # speak for them. This label records a MEASUREMENT, not a mechanism: on 2026-11-09, on
   # fc:58:5a:08:42:15 ch 8, PINEAPPLE_DEAUTH_CLIENT with ff:ff:ff:ff:ff:ff dropped a client on
   # demand while PINEAPPLE_DEAUTH_CLIENT_ALL with that SAME address, minutes later, did nothing --
-  # one address, one channel, one BSSID, two opcodes, two outcomes. The mechanism is NOT settled:
-  # pineapd runs one handler that dispatches on a numeric opcode (400 deauth, 401 deauth+CSA, 402
-  # CSA) and _ALL's deauth half reaches the same instruction with the same arguments as the call
-  # that works, because StartDeauthAll writes sta = ff:ff:ff:ff:ff:ff by immediate. The leading
-  # hypothesis is that inject_csa's set_and_freeze_primary_channel_hop_s retunes the radio between
-  # inject_deauth's enqueue and the injection handler's transmit. CLAUDE.md "Third contact" has the
-  # addresses and the one-command test. CSA additionally carries Channel Switch Count 0 AND a
-  # hardcoded New Channel Number of 14 (Japan-only), either of which alone would stop a US client
-  # acting on it. hak5cmd exits 0 and prints nothing on every path, so none of this is visible
-  # above the socket -- which is exactly why the operator needs the label.
+  # one address, one channel, one BSSID, two outcomes -- and the mechanism IS settled: _ALL and _CSA
+  # send the SAME opcode. pineapd's one deauth handler dispatches on a numeric id (400 deauth, 401
+  # deauth+CSA, 402 CSA) and the Go daemon emits li a0,400 in StartDeauth, li a0,402 in
+  # StartDeauthCsa and li a0,402 in StartDeauthAll -- 401 appears nowhere in the binary, so the
+  # deauth+CSA path is dead code that has never run. BOTH therefore builds NO deauth frame; the
+  # ff:ff:ff:ff:ff:ff it writes is dead data the 402 path never reads. All it queues is a CSA, and
+  # that CSA carries Channel Switch Count 0 AND a hardcoded New Channel Number of 14 (2484 MHz,
+  # Japan-only, absent from the US table), either of which alone would stop a US client acting on
+  # it -- and it only transmits if pineapd catches a beacon from the BSSID inside a 10 s TTL.
+  # hak5cmd exits 0 and prints nothing on every path, so none of this is visible above the socket,
+  # which is exactly why the operator needs the label. CLAUDE.md "Third contact" has the addresses.
+  # NOTE a real "both" is still available to us and is NOT implemented here: issue DEAUTH (400) and
+  # CSA (402) as two commands. That changes what the radio transmits, so it is the operator's call.
   # Falsified by: _ALL or _CSA disconnecting any client, on any firmware, from any caller.
   case "$k" in CSA|BOTH) printf 'fw-broken'; return 0 ;; esac
   [ "$b" = '?' ]   && { printf 'unknown'; return 0; }

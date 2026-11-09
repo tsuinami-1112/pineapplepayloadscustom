@@ -450,23 +450,45 @@ was trusted: `pineapd` `adc9d36d065b084856534dee…` / 1320040 B, `pineapple/pin
   | command | opcode | `sta` on the wire | pineapd runs |
   |---|---|---|---|
   | `DEAUTH` | 400 | the parsed target | `inject_deauth(bssid, sta, ch)` |
-  | `_ALL` | 401 | `ff:ff:ff:ff:ff:ff` (immediate) | `inject_deauth(bssid, ff:ff…, ch)` **then** `inject_csa(bssid, ch, 14)` |
-  | `_CSA` | 402 | `00:00:00:00:00:00` (zero value) | `inject_csa(bssid, ch, 14)` only |
-  So `_ALL`'s deauth half reaches the **same instruction at `0x47364e` with the same four arguments**
-  as the opcode-400 broadcast call that demonstrably drops a client. `BOTH` is still **inert** on
-  the air — that is measured — but NOT because the request is refused.
-- **So what is left is the `inject_csa` call that follows, and it is a HYPOTHESIS, not a finding.**
-  **[A]** `inject_deauth` only ENQUEUES — it makes no `libwifi_create_deauth` call and ends at
-  `ping_injection_handler()`, so the transmit happens asynchronously in `injection_handler()`.
-  `inject_csa` then calls `set_and_freeze_primary_channel_hop_s(chan, 5)`, which does
-  `set_channel(chan)`. A retune landing between the enqueue and the handler's transmit would drop
-  the queued frames, and opcode 400 never makes that call. *Testable in one command:* fire `_ALL`
-  with the radio ALREADY parked on the target channel, so the `set_channel` is a no-op —
-  `PINEAPPLE_EXAMINE_BSSID <bssid> 20; PINEAPPLE_EXAMINE_CHANNEL <ch> 20;
-  PINEAPPLE_DEAUTH_CLIENT_ALL <bssid> ff:ff:ff:ff:ff:ff <ch>`. The same pair with `DEAUTH` instead
-  of `_ALL` is already known to work, so this is its exact complement. If `_ALL` then drops the
-  client, the retune is the cause; if it still does not, the cause is elsewhere in the 401 path.
-  *Falsified by:* that test working, or by `_ALL` disconnecting a client on an idle radio.
+  | `_ALL` | **402** | `ff:ff:ff:ff:ff:ff` (immediate, and **dead data** — the 402 path never reads `sta`) | `inject_csa(bssid, ch, 14)` **only — no deauth** |
+  | `_CSA` | 402 | `00:00:00:00:00:00` (zero value, also unread) | `inject_csa(bssid, ch, 14)` only |
+  **⭐ `_ALL` SENDS THE SAME OPCODE AS `_CSA`, so "both" is CSA-only and pineapd's opcode 401 is
+  DEAD CODE that has never run.** `[V]`, and it is the whole answer to "why does BOTH do nothing
+  when deauth/disassoc works":
+  ```
+  StartDeauth     0x0086c2b8:  li a0,400     -> deauth only
+  StartDeauthCsa  0x0086c464:  li a0,402     -> CSA only
+  StartDeauthAll  0x0086c62c:  li a0,402     -> CSA only          <-- not 401
+  ```
+  `li a0,401` and `ori a0,401` occur **zero** times anywhere in `pineapple/pineapple`; the three
+  `StartDeauth*` tails are instruction-for-instruction identical bar that one immediate, and
+  `exchangeCommand` passes arg1 through untouched (`0x86e6f4 lw at,64(sp)` / `0x86e6f8 sw at,8(sp)`).
+  So `_ALL` and `_CSA` are **the same command on the wire** apart from the unread `sta` bytes, and
+  `BOTH` is inert because it puts **no deauth frame on the air at all** — not because the request is
+  refused, and not because of anything the receiving station does. 402 fails dispatch test 1
+  (402-400 = 2, and `sltiu v0,2` is false for 2) and passes test 2, so it reaches `0x473630` and
+  **never `0x47364e`**. *Falsified by:* a 401 immediate anywhere on a deauth path, or `_ALL`
+  disconnecting a client.
+- ~~**So what is left is the `inject_csa` call that follows.**~~ **WITHDRAWN the same day.** The
+  hypothesis was that `inject_csa`'s `set_and_freeze_primary_channel_hop_s` retuned the radio
+  between `inject_deauth`'s enqueue and the injection handler's transmit. Its channel half was
+  refuted on the bench — firing `_ALL` with the radio already parked on the target channel still did
+  nothing — and the opcode finding above makes the whole thing moot: **there was never a deauth to
+  lose.** Recorded because the reasoning was published here for a few hours and because the shape of
+  the error is worth keeping: a mechanism was invented to explain a difference between two code
+  paths that turned out not to be two code paths.
+- **⚠ Two methodological traps, both of which cost real time today.** (1) **Go interns field-name
+  and tag blobs**, so counting occurrences of a `json:"…"` or `msgpack:"…"` string says how many
+  distinct tag *descriptors* exist, NOT which structs use them — proved by three different
+  `json:"bssid"` blobs sharing a prefix (`json:"bssid"`, `json:"bssid" uci:"bssid"`,
+  `json:"bssid" uci:"macaddr"`). The `json:"target"` count in the section below is therefore weaker
+  evidence than it reads; its conclusion survives only because `StartDeauthAll` was measured
+  directly. (2) **A `.gopclntab` function table reconstructed by hand can be off by a constant**, and
+  this session's was: the three `li a0,40x` sites above were FOUND by a byte scan, then resolved
+  against the bad table to `loadProfile`/`playRingtone`/`playVibrate` and **discarded as HTTP status
+  codes**. The decisive evidence was in hand and thrown away because a tool known to be suspect was
+  trusted to rule it out. Spot-check a reconstructed table against a function whose first
+  instruction you can predict before using it to dismiss anything.
 - **⭐ The controlled A/B, one address, one channel, one BSSID, two opcodes, minutes apart.** On
   `FC:58:5A:08:42:15` ch 8: `PINEAPPLE_DEAUTH_CLIENT <bssid> ff:ff:ff:ff:ff:ff 8` **dropped the
   client**; `PINEAPPLE_DEAUTH_CLIENT_ALL <bssid> ff:ff:ff:ff:ff:ff 8` did nothing. This is the
