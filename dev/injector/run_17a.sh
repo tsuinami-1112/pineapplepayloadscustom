@@ -89,16 +89,36 @@ printf -- '-- parking %s on %s MHz\n' "$IF" "$FREQ" >&2
 iw dev "$IF" set freq "$FREQ" 20 2>/dev/null || printf 'WARNING: could not set freq; pagerinj uses whatever is there\n' >&2
 
 OUT="/root/loot/csa_17a_c${COUNT}_$(date +%s 2>/dev/null || echo now).pcap"
+CAPERR="/tmp/run17a_cap.err"
 if [ -n "$WIF" ]; then
   mkdir -p /root/loot 2>/dev/null
   iw dev "$WIF" set freq "$FREQ" 20 2>/dev/null
-  # Beacons AND action frames: a count-bearing CSA can arrive either way, and 17c's unicast arm is
-  # an action frame. -s 0 because the element sits past anything a short snap would keep.
-  tcpdump -i "$WIF" -nn -e -s 0 -w "$OUT" \
-    "(type mgt and subtype beacon or subtype action) and wlan addr2 $BSSID" >/dev/null 2>&1 &
+  # ONE primitive, on purpose. An earlier revision used
+  #   (type mgt and subtype beacon or subtype action) and wlan addr2 <bssid>
+  # and it cost a whole bench run: `subtype action` is NOT in pcap-filter's mgt subtype list
+  # (assoc-req, assoc-resp, reassoc-req, reassoc-resp, probe-req, probe-resp, beacon, atim,
+  # disassoc, auth, deauth), so the filter never compiled, tcpdump exited at once, and no file was
+  # ever created -- while this script cheerfully reported "capture: ... (0 bytes)" because it had
+  # sent tcpdump's stderr to /dev/null. A swallowed refusal reported as a measurement is the one
+  # thing this whole rung exists to prevent, so: keep the filter trivial, and NEVER hide the error.
+  # `wlan addr2 <bssid>` catches our cloned beacons, the AP's own beacons (useful: compare the two,
+  # and read the real DS channel) and 17c's action frames, since all of them carry the BSSID as
+  # addr2. -s 0 because the CSA element sits past anything a short snap would keep.
+  : >"$CAPERR"
+  tcpdump -i "$WIF" -nn -e -s 0 -w "$OUT" "wlan addr2 $BSSID" >/dev/null 2>"$CAPERR" &
   CAP=$!
-  sleep 1
-  printf -- '-- capturing on %s -> %s\n' "$WIF" "$OUT" >&2
+  sleep 2
+  # tcpdump writes the 24-byte pcap global header as soon as it arms, so an absent or smaller file
+  # means it never armed -- the same test capture_bss uses in the payload. Report it and carry on
+  # without a capture rather than pretending there is one.
+  if [ ! -s "$OUT" ] || [ "$(wc -c <"$OUT" 2>/dev/null || echo 0)" -lt 24 ]; then
+    printf -- '!! capture did NOT arm on %s. tcpdump said:\n' "$WIF" >&2
+    sed -n '1,6p' "$CAPERR" >&2 2>/dev/null
+    printf -- '!! check the filter compiles:  tcpdump -d %s\n' "wlan addr2 $BSSID" >&2
+    kill "$CAP" 2>/dev/null; CAP=""; OUT=""
+  else
+    printf -- '-- capturing on %s -> %s\n' "$WIF" "$OUT" >&2
+  fi
 fi
 
 printf -- '-- firing\n' >&2
@@ -107,9 +127,17 @@ RC=$?
 
 if [ -n "$CAP" ]; then
   sleep 1; kill "$CAP" 2>/dev/null; wait "$CAP" 2>/dev/null; CAP=""
-  printf -- '-- capture: %s (%s bytes)\n' "$OUT" "$(wc -c <"$OUT" 2>/dev/null || echo 0)" >&2
-  printf -- '-- read the count byte with:  tcpdump -r %s -nn -e -vvv | head -40\n' "$OUT" >&2
+  # -s on the file, not a redirect into wc: `wc -c <missing` fails in the SHELL, so the previous
+  # form printed "(0 bytes)" next to a "can't open" error from the shell itself.
+  if [ -s "$OUT" ]; then
+    printf -- '-- capture: %s (%s bytes, %s records)\n' "$OUT" \
+      "$(wc -c <"$OUT")" "$(tcpdump -r "$OUT" -nn 2>/dev/null | grep -c .)" >&2
+    printf -- '-- read the CSA element with:  tcpdump -r %s -nn -e -vvv | grep -i -A2 switch\n' "$OUT" >&2
+  else
+    printf -- '!! no capture file: nothing was recorded, so nothing here is evidence\n' >&2
+  fi
 fi
+rm -f "$CAPERR" 2>/dev/null
 
 printf -- '-- pagerinj rc=%s. sendto success does NOT mean transmitted: confirm at the receiver.\n' "$RC" >&2
 printf -- '-- now: did the client drop, and can it re-associate? That is the measurement.\n' >&2
