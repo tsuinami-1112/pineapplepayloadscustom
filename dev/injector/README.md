@@ -141,12 +141,22 @@ Verified output at this change, `gcc 13.3.0 r28597-0425664679` from the SDK the 
 across two rebuilds. These figures move with every edit to `pagerinj.c`; trust your own `stat` and
 `sha256sum` over this row:
 
+*(Rebuilt and re-recorded 2026-11-09. The previous row -- 25436 bytes, `c8526840…7fdf` -- was set in
+`df756c3`, and `pagerinj.c` was edited again in `9e245c3`, so for a week this table described a
+source that no longer existed. **Nothing is wrong with the binary; the row had simply not moved with
+the `.c`.** The SDK archive's sha256 was checked against the release's `sha256sums`
+(`636298c2…5c92`) before extraction, the ABI gate below passed, two clean rebuilds produced
+byte-identical output, and `./pagerinj-host --selftest` gave 82 checks 0 failed -- the count this
+file already recorded. Since `.gitignore` excludes the binaries on purpose, this table is the ONLY
+record of them in the repo, which is exactly why it has to be updated in the same commit as any
+`pagerinj.c` edit.)*
+
 | | |
 |---|---|
-| `pagerinj` | 25436 bytes, sha256 `c8526840…7fdf` |
+| `pagerinj` | 25468 bytes, sha256 `4cf33e5b…b471` (full: `4cf33e5b17329e2a44fa1d03ba04e110f148a3063afdd8cbdce82972f060b471`) |
 | ABI | `ELF32 LSB MIPS32r2`, little endian, interpreter `/lib/ld-musl-mipsel-sf.so.1` |
 | `NEEDED` | `libc.so` only |
-| `make static` | 98288 bytes, sha256 `706e138c…7033`, no loader, no libc — if the dynamic build ever fails on the device |
+| `make static` | 98320 bytes, sha256 `6c2b81a0…a1e5`, no loader, no libc — if the dynamic build ever fails on the device |
 
 *(Update 2026-11-02: `libgcc_s.so.1` **does** ship, byte-identical in 1.1.3 and 2.0.0 —
 `8138ad10…9dfcb`, 131359 B. So the flag below is now insurance rather than a fix for a known gap.
