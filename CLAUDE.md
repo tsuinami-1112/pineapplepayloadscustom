@@ -137,11 +137,16 @@ Timings: `RESP_LOCK_SECS`, `RESP_SETTLE_SECS` — both starred and wired; the lo
 fire + settle or it expires mid-measurement.
 `RESPONSE` **defaults to 1** — recon and response are both live out of the box; `RESPONSE=0` is the
 recon-only run. `SWEEP_TARGETED` **defaults to 1**: after a BSS-wide attack, `resp_fire` also sends
-one **targeted** `PINEAPPLE_DEAUTH_CLIENT` per recovered member, because on the bench a targeted
-deauth dropped a client that ignored both broadcast forms. It ADDS to the broadcast frame rather
-than replacing it (the two are complementary: broadcast reaches members the capture never
-enumerated and survives a stale randomised MAC), is guarded on `attack_scope`, not on `R_TARGET`,
-and never runs for `CSA`, which takes no target argument. `RECON_FRESH` **defaults to 1** and starts
+one **targeted** `PINEAPPLE_DEAUTH_CLIENT` per recovered member. *Its original rationale — "a
+targeted deauth dropped a client that ignored both broadcast forms" — was refuted 2026-11-09: the
+broadcast form of the SAME opcode drops that client fine, and the `_ALL`/`_CSA` failures are a
+firmware defect, not the station's choice (see "Third contact").* The sweep is kept, for a reason
+that survived the refutation: broadcast reaches members the capture never enumerated, targeted
+reaches a member whose traffic the BSS-wide frame somehow misses, and the two cost n+1 frames
+together. It is guarded on `attack_scope`, not on `R_TARGET`, and never runs for `CSA`. Since
+2026-11-09 it sweeps **heard** members, not only measurable ones — the transmit set and the
+measurement set are no longer the same array, which is what had silenced the rung entirely on an AP
+whose only client carried a randomised MAC. `RECON_FRESH` **defaults to 1** and starts
 a fresh Recon session at launch, so a run reports what is transmitting now; it wipes the Recon
 session for anything else using it, which is why it is starred. `attack_scope <key>` → `cli`|`bss` is the single place that decides blast radius:
 only `DEAUTH` on a client row is targeted, because `CSA` has no target argument and `_ALL`'s is
@@ -368,23 +373,22 @@ command or the log line that produced it.
 - **`lock=ok` on this unit**, on both the initial lock and the re-arm, so `cur_channel` reads the
   channel back. The `lock=unverified` path added in `32af613` is correct to exist but does not fire
   here. *Falsified by:* a unit with neither `iwinfo` nor a numeric `iw dev info` read-back.
-- **⭐ Targeted deauth works; both broadcast forms do not — against ONE client.** On AP
-  `FC:58:5A:08:42:15` ch 8, `PINEAPPLE_DEAUTH_CLIENT <bssid> 4e:42:dc:3b:d1:33 8` dropped the phone
-  immediately, while `PINEAPPLE_DEAUTH_CLIENT_ALL <bssid> ff:ff:ff:ff:ff:ff 8` and
-  `PINEAPPLE_DEAUTH_CLIENT_CSA <bssid> 8` were both accepted (rc 0, empty stderr) and did nothing.
-  **[A] on any generalisation.** The decision is made by the RECEIVING station's stack, not by the
-  Pager or the AP, so this is a property of that phone. Modern clients commonly ignore broadcast
-  deauth because it is trivially spoofable; cheap cameras run old vendor-SDK stacks and are *more*
-  likely to honour it, so this result may not transfer to CamHound's actual target class — a phone
-  is the least representative client available. *Falsified by:* a camera, laptop or IoT device that
-  does drop on a broadcast deauth. **Consequence taken anyway:** `resp_fire` now sends the broadcast
-  frame AND one targeted deauth per recovered member (`SWEEP_TARGETED`, starred, default 1), because
-  the two are complementary rather than ordered — broadcast reaches members the capture never
-  enumerated and survives a stale randomised MAC, targeted reaches members that filter broadcast.
-- **The CSA question is NOT answered by that.** CSA is inherently broadcast (a beacon element; no
-  targeted CSA exists), so `_CSA` doing nothing is equally consistent with the count-0 discard and
-  with broadcast-ness, and no firmware command can separate them. The count-0 claim stands as `[A]`.
-  Note `_ALL` includes a CSA by its own description, so a count-0 CSA HAS now been on the air.
+- ~~**⭐ Targeted deauth works; both broadcast forms do not — against ONE client.**~~
+  **REFUTED 2026-11-09 — see "Third contact" below, which supersedes this bullet entirely.** The
+  readings were right and the inference was wrong, in the shape this file warns about twice. What
+  was measured on 2026-11-05: on AP `FC:58:5A:08:42:15` ch 8,
+  `PINEAPPLE_DEAUTH_CLIENT <bssid> 4e:42:dc:3b:d1:33 8` dropped the phone immediately, while
+  `PINEAPPLE_DEAUTH_CLIENT_ALL <bssid> ff:ff:ff:ff:ff:ff 8` and
+  `PINEAPPLE_DEAUTH_CLIENT_CSA <bssid> 8` were accepted (rc 0, empty stderr) and did nothing. The
+  step that failed was reading that as *broadcast vs targeted*. It is **opcode vs opcode**:
+  `PINEAPPLE_DEAUTH_CLIENT <bssid> ff:ff:ff:ff:ff:ff 8` — broadcast, same BSSID, same channel —
+  **drops the client on demand**, so broadcast deauth works here and the `_ALL`/`_CSA` failures are
+  a firmware defect in those two commands, not a property of the receiving station. The one thing
+  the 2026-11-05 pair does still establish is narrower and was never stated: a recorded randomised
+  MAC goes stale. `4e:42:dc:3b:d1:33` no longer drops the phone, because the phone rotated it.
+- ~~**The CSA question is NOT answered by that.**~~ **ANSWERED 2026-11-09, and not by a radio
+  result** — `_CSA` cannot construct a valid request at all. See "Third contact". The count-0 claim
+  is untouched and still `[A]`; it has simply never been reachable through this command.
 - **6 GHz is genuinely in the hop set** after the GUI toggle: 22 distinct 6 GHz centres in a
   40-sample window (6015 … 7115 MHz), plus seven 5 GHz DFS channels. **But nothing was heard there**
   — every frequency in `inventory.tsv` is ≤ 5805. Receive is permitted on both (NO-IR and RADAR are
@@ -403,6 +407,132 @@ command or the log line that produced it.
   PLAN_v2 item 16 G's "scan-view button map" is answered. A scan whose cycle overruns `CYCLE_SECS`
   never reaches the wait, so the firmware keeps the button and B appears dead — that was the hang,
   not a button bug.
+
+### Third contact — the deauth commands are not three attacks, they are one with a broken argument, 2026-11-09
+
+Live bench session plus a disassembly of `pineapd`'s single deauth handler. This section **supersedes
+the two struck bullets above**. The identity pin was re-verified by sha256 before any address below
+was trusted: `pineapd` `adc9d36d065b084856534dee…` / 1320040 B, `pineapple/pineapple`
+`4493c6c6c8339e1993b5f764…` / 17685976 B. For both binaries virtual address = file offset + 0x400000.
+
+- **⭐ All three `PINEAPPLE_DEAUTH_CLIENT*` commands reach ONE pineapd function, which dispatches on
+  a numeric opcode, not on the payload.** `interface_tracker::command_send_deauth(conn, unsigned,
+  string_view)` @ `0x4733d8`. The request is MessagePack with exactly three keys, read by
+  `mpack_node_map_cstr_optional` from pointers at `0x4739b0`/`b4`/`b8` → `bssid`, `sta`, `channel`;
+  `bssid` and `sta` are 6-byte bin fields (`cmpi v0,6`), `channel` is a string. The dispatch:
+  ```
+  473528:  lw v0,576(sp); addiu v0,-400; sltiu v0,2; btnez 0x473645   # id in {400,401} -> deauth
+  473534:  lw v0,576(sp); addiu v0,-401; sltiu v0,2; btnez 0x473631   # id in {401,402} -> CSA
+  ```
+  The deauth block ends `b 0x473535`, branching **back into** the CSA test; the CSA block ends
+  `b 0x473541`, skipping the deauth test. So **400 = deauth only, 401 = deauth + CSA, 402 = CSA
+  only.** Reproduce with the MIPS16e recipe at `--start-address=0x4733d8 --stop-address=0x473b44`.
+  **[A] on the name→opcode pairing only:** `register_socket_functions()` registers numeric ids
+  (`0x46b73a`/`0x46b762`/`0x46b78a`); the name map lives in the Go daemon and hak5cmd, not here.
+- **`sta` is MANDATORY, and pineapd's missing-`sta` throw carries the WRONG MESSAGE — but no
+  shipped command reaches it.** `[V]` The `mpack_node_is_missing` test for `sta` is at `0x47347a`;
+  `0x473480 bnez v0,0x473825` branches to a throw at `0x473824` (`__cxa_allocate_exception(8)`)
+  which is **ahead of the dispatch at `0x473528`**, so a request without `sta` transmits nothing.
+  **There is no "missing sta" string because that throw reuses the missing-BSSID message at
+  `0x4739dc`** — a genuine copy-paste bug, so the string's absence is not evidence of a missing
+  check. The zero-init at `0x473412`-`0x473416` is defensive, not a fall-through.
+  **⚠ Read the next bullet before using any of this to explain a failure.** For several hours this
+  session the throw WAS the explanation offered for `_ALL` and `_CSA` doing nothing, and it is
+  wrong: all three commands supply a `sta`, so the throw is latent, not reached. Recorded because
+  it is real and because the wrong message will mislead the next person who does hit it.
+- **⭐ The Go layer supplies `sta` for all three, so the throw is unreachable and `_ALL`'s deauth
+  call is BYTE-IDENTICAL to the one that works.** `[V]`, re-derived from the Go binary:
+  `pineap.(*PineAp).StartDeauthAll` @ `0x0086c53c` writes **six `0xff` bytes by immediate** —
+  `li v1,-1` at `0x0086c5d8` then `sb v1,46(sp)`…`sb v1,51(sp)` — i.e. `sta = ff:ff:ff:ff:ff:ff`.
+  `StartDeauthCsa` @ `0x0086c390` contains **no** `0xff` immediate, and neither does `StartDeauth`
+  @ `0x0086c1bc`; all three share one `models.PineapDeauthRequest` whose `Sta [6]byte` always
+  encodes, so `_CSA` sends `00:00:00:00:00:00` and `DEAUTH` sends the parsed target.
+  | command | opcode | `sta` on the wire | pineapd runs |
+  |---|---|---|---|
+  | `DEAUTH` | 400 | the parsed target | `inject_deauth(bssid, sta, ch)` |
+  | `_ALL` | 401 | `ff:ff:ff:ff:ff:ff` (immediate) | `inject_deauth(bssid, ff:ff…, ch)` **then** `inject_csa(bssid, ch, 14)` |
+  | `_CSA` | 402 | `00:00:00:00:00:00` (zero value) | `inject_csa(bssid, ch, 14)` only |
+  So `_ALL`'s deauth half reaches the **same instruction at `0x47364e` with the same four arguments**
+  as the opcode-400 broadcast call that demonstrably drops a client. `BOTH` is still **inert** on
+  the air — that is measured — but NOT because the request is refused.
+- **So what is left is the `inject_csa` call that follows, and it is a HYPOTHESIS, not a finding.**
+  **[A]** `inject_deauth` only ENQUEUES — it makes no `libwifi_create_deauth` call and ends at
+  `ping_injection_handler()`, so the transmit happens asynchronously in `injection_handler()`.
+  `inject_csa` then calls `set_and_freeze_primary_channel_hop_s(chan, 5)`, which does
+  `set_channel(chan)`. A retune landing between the enqueue and the handler's transmit would drop
+  the queued frames, and opcode 400 never makes that call. *Testable in one command:* fire `_ALL`
+  with the radio ALREADY parked on the target channel, so the `set_channel` is a no-op —
+  `PINEAPPLE_EXAMINE_BSSID <bssid> 20; PINEAPPLE_EXAMINE_CHANNEL <ch> 20;
+  PINEAPPLE_DEAUTH_CLIENT_ALL <bssid> ff:ff:ff:ff:ff:ff <ch>`. The same pair with `DEAUTH` instead
+  of `_ALL` is already known to work, so this is its exact complement. If `_ALL` then drops the
+  client, the retune is the cause; if it still does not, the cause is elsewhere in the 401 path.
+  *Falsified by:* that test working, or by `_ALL` disconnecting a client on an idle radio.
+- **⭐ The controlled A/B, one address, one channel, one BSSID, two opcodes, minutes apart.** On
+  `FC:58:5A:08:42:15` ch 8: `PINEAPPLE_DEAUTH_CLIENT <bssid> ff:ff:ff:ff:ff:ff 8` **dropped the
+  client**; `PINEAPPLE_DEAUTH_CLIENT_ALL <bssid> ff:ff:ff:ff:ff:ff 8` did nothing. This is the
+  falsifier `attack_scope`'s own comment names, and it is now **spent in the affirmative**:
+  broadcast deauth works on this station. It also means the GUI's AP-row deauth button — which the
+  operator confirmed is fired with **only the AP row selected** — sends opcode 400 with
+  `sta = ff:ff:ff:ff:ff:ff`, i.e. exactly the frame CamHound builds on an AP row.
+- **⭐ pineapd TRANSMITS under a held EXAMINE lock.** `PINEAPPLE_EXAMINE_BSSID <bssid> 20;
+  PINEAPPLE_EXAMINE_CHANNEL 8 20; PINEAPPLE_DEAUTH_CLIENT <bssid> ff:ff:ff:ff:ff:ff 8` dropped the
+  client. This is the transmit-direction counterpart of Phase 0 13a (which answered *receive*), it
+  was a live hypothesis for why CamHound's locked fire failed, and it is now closed. The lock is
+  innocent. *Falsified by:* the same pair where the unlocked arm works and the locked arm does not.
+- **⭐ CamHound refused to transmit, seven times, and the logs name the gate.** Every bebird attempt
+  on build `40a0b3a` logged `resp members fc:58:5a:08:42:15 n=1 why=ok itmax=56 recs=286..468
+  short=0 trunc=0 runt=0` — the capture *heard* the station cleanly — then `re-armed … lock=ok`,
+  then `refused … NO_MATCH members=1`, with `pk_before` and `pk_after` both `-` in every
+  `responses.tsv` row. `resp_fire` returned at the subject guard, **before** any command ran. Cause:
+  `subjects` was both the transmit set and the measurement set, and `resp_snapshot`'s bss arm drops
+  every randomised MAC (`is_rand`, which keys on the second character) and every MAC with no Recon
+  row — so the gate that exists to keep the *oracle* honest was suppressing the *frame*. On an AP
+  row the "picked target is always a subject" escape hatch cannot help, because `R_TARGET` is
+  broadcast and no real MAC equals it. Fixed by admitting heard members as transmit targets with
+  `p0 '-'`, which scores them INCONCLUSIVE rather than inventing a verdict.
+- **CSA, for whenever a path to it exists, is beacon-triggered, and its total failure is SILENT.**
+  `recon_engine::inject_csa(char const*, pineap_wifi_channel const&, unsigned char)` @ `0x4a125c`
+  only queues a record; the frame is built when a beacon from that BSSID is indexed, which is why
+  the CSA element is constructed at `index_beacon_ns+0xc0a` — a detail this file already recorded
+  without drawing the inference. String xrefs place `Queuing CSA for {}` in `inject_csa`'s own pool
+  (word @`0x4a14e0`) and `Caught beacon for CSA on {}` / `Queued packets for CSA on {}` /
+  `Request to inject CSA expired for {}: {}ms` in `index_beacon_ns`'s (@`0x4bf1f0`/`0x4bf200`/
+  `0x4bf1fc`). **`expired` only logs when a beacon DOES arrive, late** — it sits on the age-check
+  fail branch at `0x4bef14`, downstream of the map hit. If no beacon ever arrives the record is
+  pruned without comment by the loop at `0x4a129c` on the next call, so the common total failure
+  leaves **only `Queuing CSA for`** in the log. pineapd does try to win the race:
+  `set_and_freeze_primary_channel_hop_s(chan, 5)` sets the channel and freezes the hop for 5 s
+  (~50 chances at a 102.4 ms interval), so the on-channel case normally succeeds — but **the freeze
+  is 5 s while the record TTL is 10 s**, so 5–10 s is pure luck, and if
+  `primary_interface_available()` is false (`0x46e73a`) both the set and the freeze are skipped
+  silently with the record still queued. **Keep this distinct from the count-0 claim**: separate
+  failure modes, separate falsifiers.
+- **⭐ `inject_csa`'s third `unsigned char` is the NEW CHANNEL NUMBER, hardcoded to 14 — a second
+  independent reason CSA cannot work, and it does NOT contradict the count-0 fact.** *Resolved
+  2026-11-09; this was listed as an open reading for part of the same day.* The sole call site is
+  `li a3,14` at `0x473634` (`jal 0x4a125d` at `0x47363a`, the only one in the binary by byte-pattern
+  search). The byte lands at record+36 and `index_beacon_ns` writes it into **element 37 byte 3**,
+  the New Channel Number; the Count byte is separately `0` from `li s1,0` at `0x4bee6c`. Both are
+  true at once, so pineapd's CSA says **"switch to channel 14, immediately"**. Channel 14 is
+  2484 MHz — Japan-only, 11b-only, and not in the US table at all — so a client that *did* honour
+  the element would be told to move somewhere it may not go. Neither the channel nor the count is
+  reachable by any setting or argument: both are literals with one call site.
+- **"Both" runs the IDENTICAL `inject_deauth` call as "deauth/disassoc"** — the same instruction at
+  `0x47364e`, the same four arguments from the same stack slots (`bssid` at `sp+216`, `sta` at
+  `sp+222`, channel at `sp+228`). So the difference the operator sees cannot be the code path; it
+  has to be the argument bytes the Go layer packed, which is what the missing-`sta` throw explains.
+- **`inject_deauth` @ `0x472c14` is the gate-1 site, and the recorded addresses check out.** Its
+  prologue is `lw v0,28(s0); cmpi v0,8; bteqz` at `0x472c66` (the blanket 6 GHz check) and
+  `sltiu v0,145` at `0x472c76` (the DFS range-chain entry) — matching this file's 1.1.3 column
+  exactly, which is an independent confirmation that the MIPS16e recipe and the pin are sound. It
+  makes no `libwifi_create_deauth` call and has no loop: it queues, and
+  `interface_tracker::injection_handler()` builds and sends.
+- **A transient channel read-back failure cost a whole response.** `resp lock-failed
+  50:92:6a:ae:a8:82 wlan1mon still hopping (/1/1)` — `cur_channel` returned empty, then `1`, then
+  `1`, against a target channel of 1. The radio was parked where it was asked to be, but
+  `lock_target` required all three samples equal and scored the empty one as a different channel,
+  returning 2 and refusing the response with `LOCK_FAILED`. Fixed by comparing only the samples
+  that were actually read.
 
 **`2.0.0-stable` was released 2026-10-29** and is now what `latest` serves. Everything here remains
 pinned to 1.1.3; versioned downloads still work
@@ -472,7 +602,16 @@ from each entry point, with only the `bteqz` target relocated, and both range-ch
 same `deadc0de` magic, same metadata versions, byte-identical `/etc/firmware-key` — which is mild
 evidence a downgrade would still be accepted, though no version check was looked for.
 
-**⚠ `BOTH` is untargeted, and it is the preselected default.** Four readings of the Go daemon,
+**⚠ `BOTH` is INERT, not merely untargeted, and it is no longer the preselected default.**
+*Heading corrected 2026-11-09.* The analysis below is sound and its conclusion — that `_All`'s
+struct carries no caller-supplied target — is now **measured**, not inferred: `StartDeauthAll`
+writes `sta = ff:ff:ff:ff:ff:ff` by immediate. What the section under-stated is the consequence:
+`_All` puts nothing on the air at all, measured against a client the opcode-400 broadcast drops on
+demand. **The mechanism for that is not settled** — see "Third contact", which supersedes the
+"missing `sta`" explanation this file briefly carried. `posture_opts` now leads with `DEAUTH` on
+every badge and `posture_expect` labels
+`BOTH`/`CSA` `fw-broken`, so the default Disrupt is no longer a guaranteed no-op. Four readings of
+the Go daemon,
 identical in 1.1.3 and 2.0.0, all **[V]**: **`StartDeauth`**'s argument frame is 32 bytes against 28
 for both **`StartDeauthAll`** and **`StartDeauthCsa`** — *corrected 2026-11-03; this line previously
 attributed the 32-vs-28 split to `pineAPdDeauth` against `_All`/`_Csa`, which is wrong. All three
@@ -760,11 +899,17 @@ the question is open.
 ## Open, and needs the hardware
 
 Listed in `dev/CamHound/RESPONSE.md` §13, `dev/pager-day-one.md` and — for what has already been
-closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowing: the three
-`PINEAPPLE_DEAUTH_CLIENT*` commands are documented only by `hak5cmd`'s help text; whether Recon's
-packet counters move the way `resp_verdict` assumes; whether CSA moves a real client at all; and the
-count-byte experiment (day-one step 17a). (`inj_parse_channels` is **no longer** on this list — it
-ran against a live radio on 2026-11-02 and was correct; see "First contact".)
+closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowing: whether Recon's
+packet counters move the way `resp_verdict` assumes; and the count-byte experiment (day-one step
+17a), which `pagerinj` is the instrument for.
+(`inj_parse_channels` is **no longer** on this list — it ran against a live radio on 2026-11-02 and
+was correct; see "First contact". Nor is *"the three `PINEAPPLE_DEAUTH_CLIENT*` commands are
+documented only by `hak5cmd`'s help text"* — they are now read from pineapd's own handler, see
+"Third contact". Nor is *"whether CSA moves a real client at all"*, which is not answerable through
+these commands: `_CSA` cannot build a valid request, so **no CSA this firmware's commands emit has
+ever reached the air**, and the question now belongs entirely to `pagerinj`. What replaces it on
+this list is narrower: whether `inject_csa`'s `unsigned char` — passed as the literal 14 from
+`0x473634` — is the count, the announced channel, or something else.)
 
 **⚠ FIXED 2026-11-04 for AP rows — read this as history plus a live remainder.** The block below
 described the state before `bss_clients` existed. What it says about the *cause* still holds and is

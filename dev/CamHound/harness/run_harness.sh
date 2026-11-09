@@ -100,7 +100,9 @@ s_locate() {   # Locate on the Hikvision AP: bars, tiers, clean stop
 }
 s_disrupt() {   # shipped default (RESPONSE=1 from the config block, nothing written to the saved config): Disrupt on the Reolink AP against log-only stubs; posture, lock, loot row
   reset; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
-  rules disrupt '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
+  # BOTH is page item 2 since posture_opts led with DEAUTH (2026-11-09); this arm covers the
+  # BSS-wide 3-argument shape, so it follows the key rather than the index.
+  rules disrupt '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '2' ' ch ' '1' "${COMMON[@]}"
   answers t t B; run
   check "disrupt: fires at the shipped default, with no RESPONSE override in the saved config" "! grep -q '^RESPONSE=' $HARNESS_CFG && grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
   check "disrupt: posture read under a lock on the target channel" "grep -q 'TCPDUMP beacon ec71db000010' $T/log && grep -q 'PINEAPPLE_EXAMINE_BSSID ec:71:db:00:00:10' $T/log"
@@ -122,11 +124,13 @@ s_disrupt() {   # shipped default (RESPONSE=1 from the config block, nothing wri
 }
 s_blind() {   # RESPONSE=1 with no beacon capturable: the ? badge asks before firing blind; accepted leads CSA, declined sends nothing
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
-  rules blind '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' 'Fire blind' '1' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
+  rules blind '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' 'Fire blind' '1' '^Disrupt \[' '3' ' ch ' '1' "${COMMON[@]}"
   answers t t B; HARNESS_NO_BEACON=1 run
   check "blind: capture attempted under a lock, nothing captured, badge ?" "grep -q 'TCPDUMP beacon suppressed ec71db000010' $T/log && grep -q 'PINEAPPLE_EXAMINE_BSSID ec:71:db:00:00:10' $T/log && grep -q '^LOG \[[?]\] 00:00:10 ch36 5GHz' $T/log"
   check "blind: Fire blind confirm shown and accepted" "grep -q 'CONFIRM\[Posture unread on 00:00:10: no beacon captured. Fire blind[?]\] -> 1' $T/log"
-  check "blind: picker leads with CSA, every option unknown and marked bss-wide" "grep -q 'PICKER\[Disrupt \[[?]\] ff:ff:ff\] items=CSA bss (unknown);BOTH bss (unknown);DEAUTH bss (unknown);' $T/log"
+  # DEAUTH leads and is the only key the badge still speaks for; BOTH and CSA read fw-broken on
+  # every badge because neither can construct a valid pineapd request (see payload posture_expect).
+  check "blind: picker leads with DEAUTH, BOTH and CSA marked fw-broken, all bss-wide" "grep -q 'PICKER\[Disrupt \[[?]\] ff:ff:ff\] items=DEAUTH bss (unknown);BOTH bss (fw-broken);CSA bss (fw-broken);' $T/log"
   check "blind: the confirm names every client, not the broadcast target" "grep -q 'CONFIRM\[CSA on EVERY client of 00:00:10 ch 36[?]\] -> 1' $T/log"
   check "blind: CSA does not sweep, because the command takes no target" "! grep -qE '^PINEAPPLE_DEAUTH_CLIENT ' $T/log"
   check "blind: CSA fired with bssid and channel only, badge ? in the event" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_CSA ec:71:db:00:00:10 36$' $T/log && grep -q 'fire CSA ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff ch36 badge=? ' $LOOT/events.log"
@@ -173,18 +177,20 @@ s_settings() {   # Settings: Recon page sets and persists a key; Response page's
   printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
 }
 s_cliscope() {   # RESPONSE=1: Disrupt on the Wyze CLIENT row -- the only menu that holds both scopes
-  # DEAUTH (page item 2) is the one targeted option: cli scope, the picked device alone.
+  # DEAUTH (page item 1, and what pick_list preselects) is the one targeted option: cli scope,
+  # the picked device alone. It leads since 2026-11-09 because it is the only key that transmits.
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
-  rules cli1 '^CamHound' 'Scan,Exit' 'Review hits' '8,Exit' '^[0-9]+ WYZE' 'Disrupt,Back' '^Disrupt \[' '2' ' ch ' '1' "${COMMON[@]}"
+  rules cli1 '^CamHound' 'Scan,Exit' 'Review hits' '8,Exit' '^[0-9]+ WYZE' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
   answers t t B; run
-  check "cliscope: client row offers a mixed marker list, BOTH preselected" "grep -q 'PICKER\[Disrupt \[D+C\] 20:00:01\] items=BOTH bss (works);DEAUTH (works);CSA bss (works);' $T/log"
+  check "cliscope: client row offers a mixed marker list, DEAUTH preselected" "grep -q 'PICKER\[Disrupt \[D+C\] 20:00:01\] items=DEAUTH (works);BOTH bss (fw-broken);CSA bss (fw-broken);' $T/log"
   check "cliscope: DEAUTH confirm names the one device, not the BSS" "grep -q 'CONFIRM\[DEAUTH on 20:00:01 via 11:22:33 ch 6[?]\] -> 1' $T/log"
   check "cliscope: DEAUTH sent with the client as its target" "grep -q '^PINEAPPLE_DEAUTH_CLIENT 9c:3d:cf:11:22:33 a4:da:22:20:00:01 6$' $T/log"
   check "cliscope: cli scope measures the picked device alone" "grep -q 'scope=cli subjects=1' $LOOT/events.log && [ \"\$(grep -c '^[0-9]' $LOOT/responses.tsv)\" = 1 ]"
   check "cliscope: no picked line when the pick is the only subject" "! grep -q 'picked a4:da:22:20:00:01' $LOOT/events.log"
-  # BOTH (page item 1, which pick_list preselects) is BSS-wide from that same client row.
+  # BOTH (page item 2 now) is BSS-wide from that same client row, which is the asymmetry this
+  # arm exists for: the row names one device and the frame reaches the whole BSS.
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
-  rules cli2 '^CamHound' 'Scan,Exit' 'Review hits' '8,Exit' '^[0-9]+ WYZE' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
+  rules cli2 '^CamHound' 'Scan,Exit' 'Review hits' '8,Exit' '^[0-9]+ WYZE' 'Disrupt,Back' '^Disrupt \[' '2' ' ch ' '1' "${COMMON[@]}"
   answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   check "cliscope: BOTH confirm names every client of the BSS" "grep -q 'CONFIRM\[BOTH on EVERY client of 11:22:33 ch 6[?]\] -> 1' $T/log"
   check "cliscope: bss scope from a client row measures all four clients" "grep -q 'scope=bss subjects=4' $LOOT/events.log && [ \"\$(grep -c '^[0-9]' $LOOT/responses.tsv)\" = 4 ]"
@@ -235,7 +241,7 @@ s_members() {   # the real-firmware shape: clients with NO association, membersh
   # Index 6, not 4: under the DEVICES shape the review list orders differently and 4 is the
   # "-- LIKELY --" divider. The checks below pin the BSSID the capture ran against, so if this
   # index ever drifts again the scenario fails loudly instead of quietly testing another row.
-  local R=('^CamHound' 'Scan,Exit' 'Review hits' '6,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1')
+  local R=('^CamHound' 'Scan,Exit' 'Review hits' '6,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '2' ' ch ' '1')
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules mem1 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 run
   check "members: capture armed with the OR filter, snap 128, frame cap 800" \
@@ -284,14 +290,26 @@ s_members() {   # the real-firmware shape: clients with NO association, membersh
   rules mem6 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_BAD_PCAP=1 run
   check "members: an unreadable capture is NO_CAPTURE, not an empty BSS" \
     "grep -q '|NO_CAPTURE\$' $LOOT/responses.tsv && grep -q 'not a readable pcap' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
-  # heard stations, but Recon has no row for them -> NO_MATCH, a fourth answer. Saying NO_CLIENTS
-  # here would describe a BSS we demonstrably heard traffic on as dead.
+  # Heard stations that Recon has no row for. Until 2026-11-09 this refused NO_MATCH and sent
+  # NOTHING -- and THIS ARM ASSERTED THAT REFUSAL AS CORRECT, which is why the defect survived
+  # fourteen scenarios and ninety-four checks. It was caught on the bench instead: seven
+  # consecutive Disrupts on a real camera AP logged `members n=1 why=ok itmax=56 recs=286..468`
+  # (the capture heard the station cleanly) and then `refused NO_MATCH members=1` with pk_before
+  # and pk_after both '-', zero frames on the air -- while the GUI's AP-row deauth, the same
+  # opcode-400 broadcast frame resp_fire builds, dropped that client on demand.
+  # The cause was one array doing two jobs: a station needs a Recon row and a stable address to be
+  # SCORED, but neither to be DEAUTHED. So the transmit set is now the heard set, and these
+  # stations are scored INCONCLUSIVE rather than handed an invented verdict.
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules mem7 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_ALIEN_MEMBERS=1 run
-  check "members: heard but unmeasurable is NO_MATCH, not NO_CLIENTS" \
-    "grep -q '|NO_MATCH\$' $LOOT/responses.tsv && ! grep -q '|NO_CLIENTS\$' $LOOT/responses.tsv && grep -q 'none is measurable' $T/log"
-  check "members: NO_MATCH records how many were heard" \
-    "grep -qE 'refused .* NO_MATCH members=2' $LOOT/events.log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
+  check "members: heard but unmeasurable TRANSMITS, and no longer refuses" \
+    "grep -q '^PINEAPPLE_DEAUTH_CLIENT_ALL ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36' $T/log && ! grep -q '|NO_MATCH\$' $LOOT/responses.tsv && ! grep -q '|NO_CLIENTS\$' $LOOT/responses.tsv"
+  check "members: the sweep reaches a station Recon has no row for" \
+    "grep -q '^PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 ec:71:db:aa:00:01 36\$' $T/log && grep -q '^PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 ec:71:db:aa:00:02 36\$' $T/log"
+  check "members: an unmeasurable subject scores INCONCLUSIVE, never MOVED or NO_EFFECT" \
+    "grep -q '|ec:71:db:aa:00:01|' $LOOT/responses.tsv && grep -qE '\|INCONCLUSIVE\$' $LOOT/responses.tsv && ! grep -qE '\|(MOVED|NO_EFFECT)\$' $LOOT/responses.tsv"
+  check "members: the fire line separates the transmit set from the measurable set" \
+    "grep -qE 'fire BOTH .* subjects=2 measurable=0 heard=2' $LOOT/events.log"
   # the firmware refuses the attack command -> CMD_REFUSED, never a measurement verdict.
   # Before this existed, a refusal was written to responses.tsv as NO_EFFECT or MOVED, which reads
   # as the firmware fact "CSA does not move this camera" -- an open question this rung is meant to
