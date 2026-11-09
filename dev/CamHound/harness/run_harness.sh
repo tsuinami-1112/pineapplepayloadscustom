@@ -120,6 +120,10 @@ s_csainj() {   # the optional CSA injector: pagerinj in place of the firmware CS
     "grep -q '|PINEAPPLE_DEAUTH_CLIENT+pagerinj:ch40:n3|' $LOOT/responses.tsv"
   check "csainj: the injector leg is logged with its rc" \
     "grep -qE 'csa inject pagerinj:ch40:n3 rc=0' $LOOT/events.log"
+  # The audit's one surviving finding: an injector-blind label told the operator the CSA was
+  # fw-broken in exactly the configuration where it transmits. The label must follow the sender.
+  check "csainj: the picker stops calling the CSA fw-broken once an injector is configured" \
+    "grep -q 'items=DEAUTH bss (works);BOTH bss (deauth+csa);CSA bss (injector);' $T/log"
   # A failing injector must not read as a sent CSA, and must not retract the deauth that already
   # left. CMD_REFUSED in particular would be a lie: a frame WAS transmitted.
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"

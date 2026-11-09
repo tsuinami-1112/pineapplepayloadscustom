@@ -669,7 +669,12 @@ posture_opts() {
 # posture_expect <badge> <attack key> -> works | partial | blocked | unknown
 # Labels each option honestly in the picker so a deliberate no-hope attempt is still the operator's call.
 posture_expect() {
-  local b="$1" k="$2"
+  local b="$1" k="$2" inj=0
+  # The label has to follow the SENDER, not just the badge. Caught by the audit: with an injector
+  # configured -- the one configuration the whole CSA hook exists to enable -- an injector-blind
+  # label told the operator CSA was fw-broken while csa_issue was routing it to pagerinj and the
+  # loot row recorded two legs landing. The picker lied in exactly the case it mattered.
+  [ -n "${CSA_INJECTOR:-}" ] && [ -x "${CSA_INJECTOR:-}" ] && inj=1
   [ "$b" = NOINJ ] && { printf 'blocked'; return 0; }
   [ "$b" = NONE ]  && { printf 'blocked'; return 0; }
   # CSA and BOTH transmit NOTHING on this firmware, whatever the beacon says, so the badge cannot
@@ -690,14 +695,22 @@ posture_expect() {
   # NOTE a real "both" is still available to us and is NOT implemented here: issue DEAUTH (400) and
   # CSA (402) as two commands. That changes what the radio transmits, so it is the operator's call.
   # Falsified by: _ALL or _CSA disconnecting any client, on any firmware, from any caller.
-  case "$k" in CSA) printf 'fw-broken'; return 0 ;; esac
+  [ "$inj" = 0 ] && case "$k" in CSA) printf 'fw-broken'; return 0 ;; esac
   [ "$b" = '?' ]   && { printf 'unknown'; return 0; }
   case "$k" in
     DEAUTH)      case "$b" in 'D+C') printf 'works' ;; 'D?+C') printf 'partial' ;; *) printf 'blocked' ;; esac ;;
     # BOTH is that same deauth plus a CSA that cannot land, so the badge governs the half that can.
     # "deauth only" promises the deauth and says the CSA is along for the ride, which is the honest
     # label for a two-command attack whose second command is a known no-op on this firmware.
-    BOTH)        case "$b" in 'D+C') printf 'deauth only' ;; 'D?+C') printf 'partial' ;; *) printf 'blocked' ;; esac ;;
+    # With an injector the CSA leg really transmits, so "fw-broken" would be false; but whether a
+    # corrected CSA MOVES anything is the open 17a question, so the label says what is sent rather
+    # than promising an effect. Without one, the firmware command cannot land and says so.
+    CSA)         printf 'injector' ;;
+    BOTH)        if [ "$inj" = 1 ]; then
+                   case "$b" in 'D+C') printf 'deauth+csa' ;; 'D?+C') printf 'partial' ;; *) printf 'injector' ;; esac
+                 else
+                   case "$b" in 'D+C') printf 'deauth only' ;; 'D?+C') printf 'partial' ;; *) printf 'blocked' ;; esac
+                 fi ;;
     *)           printf 'unknown' ;;
   esac
 }
@@ -3434,6 +3447,14 @@ IWFIX
     "$(printf '%s' "$CSA_ERR" | grep -c 'no beacon captured')" "1"
   CSA_INJECTOR="$tmp/not_installed"; csa_issue >/dev/null 2>&1
   st "csa issue: an absent injector falls back to the firmware command" "$CSA_CMD" "PINEAPPLE_DEAUTH_CLIENT_CSA"
+  # The picker label must follow the sender. With an injector configured, "fw-broken" is a lie.
+  CSA_INJECTOR="$tmp/inj_ok"
+  st "expect: with an injector, CSA is not fw-broken"  "$(posture_expect 'D+C' CSA)"  "injector"
+  st "expect: with an injector, BOTH names both legs"  "$(posture_expect 'D+C' BOTH)" "deauth+csa"
+  st "expect: an injector does not override NOINJ"     "$(posture_expect NOINJ CSA)"  "blocked"
+  st "expect: nor beacon protection"                   "$(posture_expect NONE BOTH)"  "blocked"
+  CSA_INJECTOR="$tmp/not_installed"
+  st "expect: a configured but absent injector is still fw-broken" "$(posture_expect 'D+C' CSA)" "fw-broken"
   CSA_INJECTOR=""
   st "cmd unknown is empty" "$(response_cmd WAT)" ""
   st "opts no PMF leads DEAUTH"    "$(posture_opts 'D+C')" "DEAUTH BOTH CSA"
