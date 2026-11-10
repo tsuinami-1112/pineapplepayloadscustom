@@ -70,10 +70,41 @@ and the `ap_bssid` column reads `-`.
 1. Copy the `CamHound` folder to `/root/payloads/user/reconnaissance/CamHound/` (or the same path on
    `/sd` or `/mmc/root`). Keep `cam_signatures.txt` next to `payload.sh`; without it a built-in copy
    of the rows is used and the status line says `(built-in)`.
-2. If the files came through Windows: `sed -i 's/\r$//' payload.sh cam_signatures.txt; chmod +x payload.sh`.
-3. Start **Recon in continuous mode** in the Pager GUI. CamHound only reads what Recon hears.
-4. Launch CamHound from the payload menu. Needs `_pineap`, `jq` (falls back to a built-in parser),
-   `tcpdump` plus `hexdump` or `od` for Watch (without them Watch is greyed), `/lib/hak5/oui.txt`.
+2. **Copy the two Recon hooks as well** — `library/recon/client/CamHound/` to
+   `/root/payloads/recon/client/CamHound/` and `library/recon/access_point/CamHound/` to
+   `/root/payloads/recon/access_point/CamHound/`, each with its own `cam_signatures.txt`. They are
+   byte-identical to each other and are what adds CamHound to the Pager's **Recon** menu, so you can
+   act on a device you selected there. On current firmware that is the **only** way to reach
+   per-client Disrupt: the Recon UI tells the hook which AP a client belongs to, and nothing in
+   `_pineap`'s output does, so a client row in CamHound's own Review list has no BSSID to aim from
+   (see "Which AP a client is associated to"). Skipping this step is not a partial install — it
+   removes a whole capability.
+3. **If you cloned on Windows, fix the line endings — this one bites.** Git for Windows defaults
+   `core.autocrlf=true`, so your working tree gets CRLF even though the repo stores LF, and the
+   device then fails with `$'\r': command not found` and `not a valid identifier`. The repo carries
+   a `.gitattributes` pinning `*.sh`/`*.txt` to LF, so the durable fix is
+   `git config core.autocrlf false`, then re-checkout (`git rm -r --cached . && git reset --hard`).
+   To repair a device that already has CRLF copies, on the Pager — using `tr` with an octal escape,
+   because this BusyBox build's `sed` does not reliably read `\r` in a pattern:
+   ```sh
+   for f in /root/payloads/user/reconnaissance/CamHound/payload.sh \
+            /root/payloads/recon/client/CamHound/payload.sh \
+            /root/payloads/recon/access_point/CamHound/payload.sh; do
+     tr -d '\015' < "$f" > "$f.lf" && mv "$f.lf" "$f" && chmod +x "$f"
+   done
+   ```
+   Note that **no gate in this repo can catch this**: `check_sync.sh`, the selftest and the harness
+   all run against the checkout that was committed from, never against the copy on the device.
+4. **Decide whether you want the Disrupt rung armed.** `RESPONSE` ships at `1`, so a fresh install
+   can transmit — behind the attack picker and a confirm, but present. For a recon-only run:
+   `PAYLOAD_SET_CONFIG camhound RESPONSE 0`, or Settings → Response settings on the device.
+5. Start **Recon in continuous mode** in the Pager GUI. CamHound only reads what Recon hears.
+6. Launch CamHound from the payload menu. Needs `_pineap`, `jq` (falls back to a built-in parser),
+   `tcpdump` plus `hexdump` or `od` for Watch and for the Disrupt rung's client capture (without them
+   Watch is greyed and a BSS-wide Disrupt refuses `NO_CAPTURE`), `/lib/hak5/oui.txt`.
+7. Worth doing once, before anything else: `bash payload.sh --selftest` **on the Pager**. It
+   transmits nothing and changes nothing, and it is the only run that exercises the `od` parsing
+   path the device actually uses — a laptop with `hexdump` never takes that branch.
 
 ## Quick start, the two-button flow
 

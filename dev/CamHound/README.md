@@ -26,7 +26,14 @@ lives inside them.
 ## Status
 
 Coded and verified on a laptop only (selftest ends `0 failed` and prints its own count, harness scenarios green, shellcheck
-clean). The v1.1 Recon hooks are generated and checked the same way. **No Pager has run any of it.**
+clean). The v1.1 Recon hooks are generated and checked the same way.
+
+**First device run, 2026-11-04: `--selftest` passes on the operator's 1.1.3 Pager — 259 checks, 0
+failed.** That is the first CamHound code to execute on hardware, and it is a narrow slice: the
+selftest stubs every device-changing command, so it exercises the parsers, the pcap walkers and the
+scoring against the device's real `jq`, `hexdump`, `awk`, `bash` and busybox, and **nothing about the
+radio**. It earned its keep immediately: the first attempt was 255 checks / **4 failed**, which is
+how the `gsub` defect below was found. No live scan, Watch, Locate or Disrupt has run yet.
 
 **Status of the response rung, 2026-11-04:** it fires from a user-payload **AP** row and from both
 Recon hooks, with the subject set recovered from a BSSID-filtered capture, because no shipped
@@ -41,20 +48,102 @@ the firmware primitives it calls and the list of what remains unverified are in 
 
 ## Loading it onto a Pager, and what to watch on the first run
 
-Nothing in CamHound has run on a device yet; everything is laptop-verified. Install per
-`library/user/reconnaissance/CamHound/README.md` — the user payload to
-`/root/payloads/user/reconnaissance/CamHound/` and, for the Recon-menu entries, the two generated
-hooks to `/root/payloads/recon/client/CamHound/` and `/root/payloads/recon/access_point/CamHound/`,
-each with `cam_signatures.txt` beside its `payload.sh` (`/sd/payloads/...` or `/mmc/root/payloads/...`
-work too; `find_install_dir` probes `_PAYLOAD_HOME`, then the script's own directory, then those
-roots). Windows checkout: `sed -i 's/\r$//' payload.sh cam_signatures.txt`.
+**Everything described here is on `master`** as of PR #21 (2026-11-04); take it from there rather
+than from a feature branch, and check `git log --oneline -1` against the tip before copying, because
+a half-updated device is the one failure mode none of the gates can see. Nothing in CamHound has
+run on a device beyond `--selftest`, which passed on 2026-11-04 (259/0, after it caught the `gsub`
+defect at 255/4); everything else is laptop-verified.
 
-`--selftest` is safe to run on the device — every device-changing command is stubbed — so the
-cheapest first step is `bash payload.sh --selftest` on the Pager itself, which exercises the `od`
-fallback path that a laptop with `hexdump` never takes.
+**Three directories, nine files.** Each needs `payload.sh` and `cam_signatures.txt` beside it; the
+signature file is byte-identical in all three, and so are the two hooks (`cmp` them — that is the
+edit contract, not a mistake).
+
+```sh
+ssh root@172.16.52.1 'mkdir -p /root/payloads/user/reconnaissance/CamHound \
+  /root/payloads/recon/client/CamHound /root/payloads/recon/access_point/CamHound'
+for d in user/reconnaissance recon/client recon/access_point; do
+  scp library/$d/CamHound/payload.sh library/$d/CamHound/cam_signatures.txt \
+      root@172.16.52.1:/root/payloads/$d/CamHound/
+done
+ssh root@172.16.52.1 'chmod +x /root/payloads/*/*/CamHound/payload.sh'
+```
+
+### Optional: the CSA injector
+
+CamHound's CSA leg can be routed to `dev/injector/pagerinj` instead of the firmware command, which
+is the only way to get a CSA that could work: pineapd hardcodes Channel Switch Count 0 *and* a New
+Channel Number of 14 (Japan-only), both literals with one call site, so no setting reaches either.
+
+```sh
+scp dev/injector/pagerinj root@172.16.52.1:/root/pagerinj
+ssh root@172.16.52.1 'chmod +x /root/pagerinj; /root/pagerinj --selftest | tail -2'
+```
+
+**Leave `CSA_INJECTOR` empty until the bench says otherwise.** `dev/injector/README.md` requires
+pineapd STOPPED — it hops the interface and its own CSA flood is a clone source `pagerinj` skips —
+and CamHound cannot stop pineapd, because Recon, the EXAMINE lock and every deauth command *are*
+pineapd. Turning the hook on bets that CamHound's EXAMINE lock holds the channel well enough, and
+nothing has measured that. Measure it standalone first with `dev/injector/run_17a.sh`. That script
+parks the radio with EXAMINE by default and leaves pineapd running; pass `--stop-pineapd` only if
+you want it stopped, because stopping it takes the monitor interfaces down with it (measured on the
+bench) and the script has to bring them back up. It restores whatever it changed on `EXIT`, `INT`,
+`TERM`, `HUP` and `QUIT` — true since 2026-11-10. Two audits went into that sentence: the first
+found the signal handler restoring and then carrying on to transmit anyway, and the second found
+that `HUP` and `QUIT` had no trap at all, so closing the ssh session the bench workflow runs over
+killed the shell without firing the `EXIT` trap and left pineapd stopped. There is still no trap
+for `KILL`, and there cannot be. Once it is proven, set `CSA_INJECTOR` (and
+optionally `CSA_COUNT`, `CSA_CHAN`) in the config block of the user payload and regenerate the
+hooks; they are not starred because `cfg()` takes integers only, so a path cannot come through
+`PAYLOAD_SET_CONFIG`.
+
+`/sd/payloads/...` and `/mmc/root/payloads/...` work equally — `find_install_dir` probes
+`_PAYLOAD_HOME`, then the script's own directory, then all three roots, which is why each hook finds
+its own signature file despite all three copies carrying the same `PAYLOAD_REL`. From a Windows
+checkout: `sed -i 's/\r$//' payload.sh cam_signatures.txt` (the repo copies are LF; `file` will tell
+you).
+
+**Driving the device from PowerShell: single quotes outside, and no `"` character anywhere inside.**
+PowerShell's escape character is a backtick, not a backslash, so `\$x` and `\"` do not mean what a
+POSIX habit expects. Worse, a `"` inside a single-quoted string is stripped when PowerShell builds
+the command line for a native program such as `ssh.exe`, and the remote shell then receives the
+command unquoted: `ssh host 'sed -n "s/.*(\([0-9]*\) MHz).*/\1/p"'` arrives at the Pager with the
+quotes gone and dies with `ash: syntax error: unexpected "("`. Three commands in one session were
+lost to this, twice after the rule had already been stated. Prefer a form that needs no quotes —
+`grep MHz` over a quoted regex, `cut -d\| -f17` over `awk -F"[|]"`. Where a quote is genuinely
+needed, send the script on **stdin**, where it never touches a command line at all:
+`'awk -F"[|]" "\$17>5925" file' | ssh root@172.16.52.1 sh` — ssh still prompts for the password,
+which it reads from `/dev/tty` rather than stdin.
+
+**Re-uploading after either session lands more work: copy all three again.** `check_sync.sh` compares
+the three copies *in the repo*, so a stale hook left on the device is invisible to every gate we
+have. The hooks change whenever the lib or watch-core block does — which is most response-rung and
+most parser work — so "I only edited the user payload" is not a reason to skip them.
+
+**`RESPONSE` ships at 1**, so a fresh install arms the Disrupt rung (still behind the attack picker
+and `RESPONSE_CONFIRM`). For a recon-only first run:
+`PAYLOAD_SET_CONFIG camhound RESPONSE 0`.
+
+`--selftest` is safe to run on the device — every device-changing command is stubbed, and since
+2026-11-04 so is every display and dialog command, so it no longer paints the Pager's screen nor can
+it block on a button press. The cheapest first step is `bash payload.sh --selftest` on the Pager
+itself. Expect `== 267 checks, 0 failed ==` and the two block hashes; a lower count means the copy
+on the device is older than the repo's.
+
+*Corrected 2026-11-04. An earlier version of this paragraph called the device run "the only way to
+exercise the `od` fallback in `pcap_stream`/`pcap_words`, since a laptop with `hexdump` never takes
+that branch and `od` is what the Pager actually has". **Both halves are backwards.** All three
+dumpers are `if hexdump; then hexdump; else od; fi` (`payload.sh:636`, `:694`, `:1894`); `hexdump`
+is in the measured device inventory and `od` ships in neither firmware image, so a Pager always
+takes the **hexdump** branch and a device run exercises the fallback less, not more. The `od` branch
+is for a host that lacks hexdump — which is what the cloud container running the gates is, so the
+two machines take opposite branches and neither alone covers both.*
 
 Then start **Recon in continuous mode** in the GUI, run CamHound, and watch
 `/root/loot/CamHound/events.log` for these, in order:
+
+**Confirmed on the device, 2026-11-04:** the `gsub` row below is why `jq_works()` exists — jq is
+present on a Pager but has no Oniguruma, so the parsers compiled to nothing and `HAVE_JQ` lied.
+`--selftest` now reports 259/0 there.
 
 | marker | means |
 |---|---|

@@ -1,3 +1,10 @@
 #!/bin/bash
 # harness stub: records the call, transmits nothing
+# HARNESS_FIRE_REFUSE=1: the firmware refuses the command. Nothing is transmitted, and resp_fire
+# must record CMD_REFUSED rather than run a measurement -- a refusal is not a firmware fact.
+if [ -n "${HARNESS_FIRE_REFUSE:-}" ]; then
+  printf "deauth refused: not permitted on this channel\n" >&2
+  printf "%s REFUSED %s\n" "PINEAPPLE_DEAUTH_CLIENT_ALL" "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"
+  exit 1
+fi
 printf '%s %s\n' "PINEAPPLE_DEAUTH_CLIENT_ALL" "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; exit 0

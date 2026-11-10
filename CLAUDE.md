@@ -25,6 +25,26 @@ including the upstream-derived ones), `dev/`, this file, and new directories. Do
 - **Verify before reporting.** This project has caught sessions asserting things from memory that
   turned out wrong, more than once. Before claiming a bug exists, establish that the original state
   is actually broken. Before stating a fact about the firmware or the kernel, read it.
+
+  **⚠ That rule was violated three times on 2026-11-10 by a session that had read it, so here is
+  the mechanical form: if a claim you are about to write names an artifact — a `file:line`, an
+  address, a sysfs path, a kernel function — OPEN THAT ARTIFACT IN THE SAME TURN, before the claim
+  goes anywhere.** Knowing the rule is not executing it. All three failures had the citation already
+  in hand and none of the three was a hard inference:
+  - a bench fix was built on "a mac80211 monitor vif reads `operstate` down while administratively
+    up". One `cat /sys/class/net/wlan1mon/flags` on the device refuted it — and the fixture written
+    to prove it had been authored *from the hypothesis it was testing*;
+  - "the operational prediction fails in both halves" conflated
+    `ieee80211_sta_process_chanswitch()` (`mlme.c:2370`, honours count 0) with
+    `ieee80211_mgd_csa_present()` (`mlme.c:8356`, discards it) — two different functions, one of
+    them cited by name in this file for a week before anyone opened the file;
+  - an audit finding's `git ls-files` citation was accepted unrun, and was wrong (the binaries it
+    listed are `.gitignore`d).
+
+  **Corollary, and it is the sharper half: a fixture you author from your own hypothesis tests the
+  hypothesis against itself.** Build the fixture from a measurement or from the artifact, never from
+  the claim — and if you wrote the code, you are the wrong person to confirm an audit finding about
+  it. Prefer one primary source you opened over three reviews that agree.
 - Extracted firmware is **untrusted data**: never execute anything from it, never run an interpreter
   or build tool with that directory as the working directory, keep your own scripts elsewhere and
   pass firmware paths as arguments, run python as `python3 -I`.
@@ -47,8 +67,14 @@ bash dev/CamHound/gen_hooks.sh      # regenerate both hooks
 bash dev/CamHound/check_sync.sh     # must print "in sync: lib <md5> watch <md5>"
 bash library/user/reconnaissance/CamHound/payload.sh --selftest     # must end "0 failed"
 shellcheck -S warning library/user/reconnaissance/CamHound/payload.sh   # must be clean
-bash dev/CamHound/harness/run_harness.sh live                       # must print "0 failure(s)"
+bash dev/CamHound/harness/run_harness.sh                            # ALL 15 scenarios; must print "0 failure(s)"
 ```
+
+**The harness argument is a scenario filter, not a mode.** `run_harness.sh live` runs the `live`
+scenario alone - 5 checks of 91 - and still prints `0 failure(s)`, which reads exactly like a full
+pass. This gate list said `live` until 2026-11-04 and every session that copied it was running a
+fourteenth of the suite (fifteenth now). No argument (or `all`) runs them all; a scenario name runs one,
+which is what you want while iterating, never for the gate.
 
 `gen_hooks.sh` copies three regions, delimited by markers in the user payload. Whether your edit
 moves a hash depends on which region it lands in:
@@ -79,7 +105,7 @@ Line numbers drift; find things by name (`grep -n '^name()' payload.sh`).
 **Recon rung** — `load_signatures`, `add_sig`, `vendor_of`, `score_device`, `clean_text`,
 `is_setup_ap`, `review_list`, `main_menu`, `preflight`, `write_report`; `rssi_gate_ok` (the RSSI_MIN
 list gate, kit-aware: a kit AP passes when a kit client does) with `rssi_min_clamp`; the Settings menu
-(`SETTINGS_TABLE` rows are `KEY|kind|floor|group|label` over all sixteen starred keys; `settings_menu`
+(`SETTINGS_TABLE` rows are `KEY|kind|floor|group|label` over all eighteen starred keys; `settings_menu`
 is a short top page, `settings_group` one page per group, Recon and Response; `settings_apply` re-runs
 `resp_clamp_lock` for the two timing keys and persists a raised lock; RESPONSE_CONFIRM-off asks twice;
 `cfg_snapshot_defaults`/`settings_reset`; `cfg_note_set` keeps the override count honest);
@@ -125,12 +151,40 @@ correct**, including a 5 GHz `No IR` channel (169) that the fixture never contai
 pending validation.
 
 **Response rung** — `resp_target` (sets `R_BSSID`/`R_TARGET`/`R_CH`/`R_BAND`), `disrupt_menu`,
+`csa_clamp` (bounds `CSA_INJ_SECS`/`CSA_INJ_WAIT` to 1-60 before both the invocation and the lock
+budget, because `pagerinj` reads `--secs 0` as "transmit until signalled" and `csa_issue` runs it in
+the foreground — a hand-edited 0 would have parked `resp_fire` forever with a transmitter no
+teardown could reach; the injector is now `child_add`ed and `timeout`-capped as well),
+`csa_newchan`/`csa_issue` (the CSA leg: routes to `CSA_INJECTOR` when one is configured and
+executable, else the firmware command, and owns the rc-vs-stderr question the two senders answer
+**oppositely** — `hak5cmd` exits 0 on every error path so stderr is its only signal, while
+`pagerinj` prints its `sent=/failed=` summary to stderr even on success so rc is its only signal;
+one rule for both would file a fabricated result). **`CSA_INJECTOR` defaults to empty and should
+stay that way until the bench says otherwise**: `dev/injector/README.md` requires pineapd STOPPED,
+and CamHound cannot stop pineapd — Recon, the EXAMINE lock and every deauth command *are* pineapd —
+so the in-payload path bets that the EXAMINE lock holds the channel well enough, and that bet is
+unmeasured. The validated way to run `pagerinj` is standalone: `dev/injector/run_17a.sh`. The three
+CSA keys (`CSA_INJECTOR`, `CSA_COUNT`, `CSA_CHAN`) are deliberately **unstarred**, because `cfg()`
+accepts integers only so a path cannot arrive via `PAYLOAD_SET_CONFIG`, and a star without a
+`SETTINGS_TABLE` row is a lie.
 `resp_fire`, `resp_snapshot`, `resp_verdict` (MOVED / NO_EFFECT / INCONCLUSIVE from recon packet
 counters), `resp_aggregate`, `resp_write` (→ `responses.tsv`, header `RESP_HDR`), `auto_respond_ok`.
 Timings: `RESP_LOCK_SECS`, `RESP_SETTLE_SECS` — both starred and wired; the lock must exceed
 fire + settle or it expires mid-measurement.
 `RESPONSE` **defaults to 1** — recon and response are both live out of the box; `RESPONSE=0` is the
-recon-only run. `attack_scope <key>` → `cli`|`bss` is the single place that decides blast radius:
+recon-only run. `SWEEP_TARGETED` **defaults to 1**: after a BSS-wide attack, `resp_fire` also sends
+one **targeted** `PINEAPPLE_DEAUTH_CLIENT` per recovered member. *Its original rationale — "a
+targeted deauth dropped a client that ignored both broadcast forms" — was refuted 2026-11-09: the
+broadcast form of the SAME opcode drops that client fine, and the `_ALL`/`_CSA` failures are a
+firmware defect, not the station's choice (see "Third contact").* The sweep is kept, for a reason
+that survived the refutation: broadcast reaches members the capture never enumerated, targeted
+reaches a member whose traffic the BSS-wide frame somehow misses, and the two cost n+1 frames
+together. It is guarded on `attack_scope`, not on `R_TARGET`, and never runs for `CSA`. Since
+2026-11-09 it sweeps **heard** members, not only measurable ones — the transmit set and the
+measurement set are no longer the same array, which is what had silenced the rung entirely on an AP
+whose only client carried a randomised MAC. `RECON_FRESH` **defaults to 1** and starts
+a fresh Recon session at launch, so a run reports what is transmitting now; it wipes the Recon
+session for anything else using it, which is why it is starred. `attack_scope <key>` → `cli`|`bss` is the single place that decides blast radius:
 only `DEAUTH` on a client row is targeted, because `CSA` has no target argument and `_ALL`'s is
 parsed and discarded, and an AP row resolves `R_TARGET` to broadcast so everything is BSS-wide
 there. `disrupt_menu` reads it twice — the picker appends ` bss` to a broad option, and the
@@ -221,13 +275,13 @@ the grep, not to replace verification.
 
 ## Review workflows: the standing rules
 
-Set by the operator on 2026-11-03 for every session that runs an agent review here. The point is
-not to ration the heavy shapes — multi-finder reviews, three-lens adversarial verification, judge
-panels, critic rounds, fix-then-reverify loops are all welcome, and are the right default for code
-the device runs, hardware-facing claims and anything novel. The point is to stop them appearing on
-trivial work: a doc edit, a comment's wording, a stale count, a renamed check. Judge the tier by what
-a wrong finding would cost if acted on and by how likely the finder is to be wrong, and spend
-accordingly.
+Set by the operator on 2026-11-03, rule 2 amended by the operator on 2026-11-04. For every session
+that runs an agent review here. The point is not to ration the heavy shapes — multi-finder reviews,
+three-lens adversarial verification, judge panels, critic rounds, fix-then-reverify loops are all
+welcome, and are the right default for code the device runs, hardware-facing claims and anything
+novel. The point is to stop them appearing on trivial work: a doc edit, a comment's wording, a
+stale count, a renamed check. Judge the tier by what a wrong finding would cost if acted on and by
+how likely the finder is to be wrong, and spend accordingly.
 
 1. **Tier the verification by consequence and by likelihood of error.** A finding gets the full
    three-lens adversarial pass (trace, intent, impact) when a fix would change code the device runs,
@@ -237,10 +291,19 @@ accordingly.
    equal consequence. Docs, comments, stale counts, wording and test gaps get one sceptical verifier
    whose prompt says: default to refuted unless you can reproduce it from the artifact. When in doubt
    between tiers, take the heavier one and say why.
-2. **Cap the finder pool at four dimensions per review.** Batch verification at nine findings per
-   agent, grouped by file. Never one agent per finding per lens, unless truly warranted — a claim
-   big enough to deserve that attention (one that would redirect the bench, overturn a measured
-   fact, or change what the device transmits) can have its own agents, with the reason stated.
+2. **No cap on the finder pool, and no batching ceiling — except for `Fable` and `Mythos`.**
+   Scale the review to the question. If it warrants twelve finder dimensions, or one agent per
+   finding per lens, run it; rule 1 is what keeps heavy shapes off trivial work, not a fixed
+   ceiling. Say in the summary why you went wide, so the next session can judge whether it paid.
+   **The exception, matched on the agent's model name: `Fable` and `Mythos` keep the old limits**
+   — at most four finder dimensions per review, verification batched at nine findings per agent
+   grouped by file, and never one agent per finding per lens unless the claim would redirect the
+   bench, overturn a measured fact, or change what the device transmits, with the reason stated.
+   *Amended 2026-11-04. The cap previously applied to every model. It was dropped because the
+   constraint it encoded — spend proportionate to consequence — is rule 1's job, and a hard
+   ceiling was also costing real findings: the review that produced this amendment's sibling
+   commit refuted two blockers in a proposal its own author had already gated, and did so by
+   fetching a primary source no single-dimension pass would have reached.*
 3. **Report the refutation count in the first line of every review summary.** A pass that refutes
    nothing is a warning about the verifiers, not a clean bill; say so when it happens.
 4. **Name what is already settled before the finders start** — measured on hardware, verified in a
@@ -323,6 +386,408 @@ firmware version lives at **`/etc/pineapplepager/version`** (two lines, `1.1.3` 
 build has **no `cat` options at all and no `sed l`**, so command blocks written for a future bench
 session must not use `cat -A` or `sed -n l` to inspect whitespace — use targeted `grep -c` instead.
 
+### Second contact — the response rung fires, and five open questions close, 2026-11-05
+
+Live bench session on the 1.1.3 unit with CamHound installed. Everything here is measured, with the
+command or the log line that produced it.
+
+- **⭐ A Disrupt transmitted FROM THE USER PAYLOAD.** This is the named falsifier for "the response
+  rung cannot transmit", and it is now spent. Loot row: `74:fe:ce:8e:58:1d|ap|…|ch 9|D+C|0c00|BOTH|
+  PINEAPPLE_DEAUTH_CLIENT_ALL|ok|3|4|NO_EFFECT`. The whole chain ran: lock, membership capture,
+  re-arm, fire, settle, measure, write.
+- **Membership really does come off the air.** `resp members 74:fe:ce:8e:58:1d n=1 why=ok itmax=56
+  recs=12 short=0 trunc=0 runt=0 dwell=4s lock=26s` — one station recovered from a BSS whose JSON
+  carries no association field, with zero short, truncated or runt records. `bss_clients`,
+  `capture_bss` and `CLI_AWK` had only ever run against harness fixtures.
+- **Phase 0 13a is ANSWERED: data frames do appear on `wlan1mon` under a held EXAMINE lock.** This
+  gated Watch entirely and was a shared dependency with the 6 GHz branch. Confirmed twice, the
+  second time by hand: `PINEAPPLE_EXAMINE_BSSID …; PINEAPPLE_EXAMINE_CHANNEL 8; tcpdump -i wlan1mon
+  -e type data and wlan addr1 …` returns a steady stream of ToDS frames.
+- **`itmax=56`** is the radiotap header length this hardware emits. So a record needs `56 + 16 = 72`
+  bytes to reach `addr2`, `-s 32` could never have worked (RESPONSE.md §13a-i's arithmetic, now with
+  a real number), and `CLI_CAP_SNAP=128` has comfortable margin.
+- **`lock=ok` on this unit**, on both the initial lock and the re-arm, so `cur_channel` reads the
+  channel back. The `lock=unverified` path added in `32af613` is correct to exist but does not fire
+  here. *Falsified by:* a unit with neither `iwinfo` nor a numeric `iw dev info` read-back.
+- ~~**⭐ Targeted deauth works; both broadcast forms do not — against ONE client.**~~
+  **REFUTED 2026-11-09 — see "Third contact" below, which supersedes this bullet entirely.** The
+  readings were right and the inference was wrong, in the shape this file warns about twice. What
+  was measured on 2026-11-05: on AP `FC:58:5A:08:42:15` ch 8,
+  `PINEAPPLE_DEAUTH_CLIENT <bssid> 4e:42:dc:3b:d1:33 8` dropped the phone immediately, while
+  `PINEAPPLE_DEAUTH_CLIENT_ALL <bssid> ff:ff:ff:ff:ff:ff 8` and
+  `PINEAPPLE_DEAUTH_CLIENT_CSA <bssid> 8` were accepted (rc 0, empty stderr) and did nothing. The
+  step that failed was reading that as *broadcast vs targeted*. It is **opcode vs opcode**:
+  `PINEAPPLE_DEAUTH_CLIENT <bssid> ff:ff:ff:ff:ff:ff 8` — broadcast, same BSSID, same channel —
+  **drops the client on demand**, so broadcast deauth works here and the `_ALL`/`_CSA` failures are
+  a firmware defect in those two commands, not a property of the receiving station. The one thing
+  the 2026-11-05 pair does still establish is narrower and was never stated: a recorded randomised
+  MAC goes stale. `4e:42:dc:3b:d1:33` no longer drops the phone, because the phone rotated it.
+- ~~**The CSA question is NOT answered by that.**~~ **ANSWERED 2026-11-09, and not by a radio
+  result** — `_CSA` cannot construct a valid request at all. See "Third contact". The count-0 claim
+  is untouched and still `[A]`; it has simply never been reachable through this command.
+- **6 GHz is genuinely in the hop set** after the GUI toggle: 22 distinct 6 GHz centres in a
+  40-sample window (6015 … 7115 MHz), plus seven 5 GHz DFS channels. **But nothing was heard there**
+  — every frequency in `inventory.tsv` is ≤ 5805. Receive is permitted on both (NO-IR and RADAR are
+  transmit restrictions), so this corroborates the two-gate model rather than challenging it.
+- **The OUI table is why the scan hung.** `/lib/hak5/oui.txt` is 1,258,802 B / 38,959 lines and ONE
+  failed `grep -i -m1` over it costs **5.05 s wall, 2.08 s CPU** on the device. At 960 devices in
+  recon that is 33–81 minutes for a single cycle, and `events.log` showed `run start` with no
+  `emit_cycle` line after ten minutes. Fixed; see the scan-path commit.
+- **Scaling factors, because the wrong one was used twice.** Device ÷ same-algorithm BusyBox in the
+  container is **~44× wall** (5050 ms ÷ 113 ms) and **~15–18× CPU** (2.08 s ÷ 0.136 s); the gap is
+  cold I/O. The ~800× figure is device-BusyBox ÷ container-GNU-grep and is an *implementation*
+  comparison — never use it to scale a BusyBox measurement to the device.
+- **`WAIT_FOR_BUTTON_PRESS` works and prints the button name**, returning 0 on a press and 124 on a
+  timeout — but **0 on its error paths too** (`ERROR: unknown button`, and the usage dump). So
+  `rc == 0` alone cannot distinguish a press from a bad argument; check the printed name.
+  PLAN_v2 item 16 G's "scan-view button map" is answered. A scan whose cycle overruns `CYCLE_SECS`
+  never reaches the wait, so the firmware keeps the button and B appears dead — that was the hang,
+  not a button bug.
+
+### Third contact — the deauth commands are not three attacks, they are one with a broken argument, 2026-11-09
+
+Live bench session plus a disassembly of `pineapd`'s single deauth handler. This section **supersedes
+the two struck bullets above**. The identity pin was re-verified by sha256 before any address below
+was trusted: `pineapd` `adc9d36d065b084856534dee…` / 1320040 B, `pineapple/pineapple`
+`4493c6c6c8339e1993b5f764…` / 17685976 B. For both binaries virtual address = file offset + 0x400000.
+
+- **⭐ All three `PINEAPPLE_DEAUTH_CLIENT*` commands reach ONE pineapd function, which dispatches on
+  a numeric opcode, not on the payload.** `interface_tracker::command_send_deauth(conn, unsigned,
+  string_view)` @ `0x4733d8`. The request is MessagePack with exactly three keys, read by
+  `mpack_node_map_cstr_optional` from pointers at `0x4739b0`/`b4`/`b8` → `bssid`, `sta`, `channel`;
+  `bssid` and `sta` are 6-byte bin fields (`cmpi v0,6`), `channel` is a string. The dispatch:
+  ```
+  473528:  lw v0,576(sp); addiu v0,-400; sltiu v0,2; btnez 0x473645   # id in {400,401} -> deauth
+  473534:  lw v0,576(sp); addiu v0,-401; sltiu v0,2; btnez 0x473631   # id in {401,402} -> CSA
+  ```
+  The deauth block ends `b 0x473535`, branching **back into** the CSA test; the CSA block ends
+  `b 0x473541`, skipping the deauth test. So **400 = deauth only, 401 = deauth + CSA, 402 = CSA
+  only.** Reproduce with the MIPS16e recipe at `--start-address=0x4733d8 --stop-address=0x473b44`.
+  **[A] on the name→opcode pairing only:** `register_socket_functions()` registers numeric ids
+  (`0x46b73a`/`0x46b762`/`0x46b78a`); the name map lives in the Go daemon and hak5cmd, not here.
+- **`sta` is MANDATORY, and pineapd's missing-`sta` throw carries the WRONG MESSAGE — but no
+  shipped command reaches it.** `[V]` The `mpack_node_is_missing` test for `sta` is at `0x47347a`;
+  `0x473480 bnez v0,0x473825` branches to a throw at `0x473824` (`__cxa_allocate_exception(8)`)
+  which is **ahead of the dispatch at `0x473528`**, so a request without `sta` transmits nothing.
+  **There is no "missing sta" string because that throw reuses the missing-BSSID message at
+  `0x4739dc`** — a genuine copy-paste bug, so the string's absence is not evidence of a missing
+  check. The zero-init at `0x473412`-`0x473416` is defensive, not a fall-through.
+  **⚠ Read the next bullet before using any of this to explain a failure.** For several hours this
+  session the throw WAS the explanation offered for `_ALL` and `_CSA` doing nothing, and it is
+  wrong: all three commands supply a `sta`, so the throw is latent, not reached. Recorded because
+  it is real and because the wrong message will mislead the next person who does hit it.
+- **⭐ The Go layer supplies `sta` for all three, so the throw is unreachable — and `_ALL` has no
+  deauth call at all to be identical to.** `[V]`, re-derived from the Go binary. *Heading corrected
+  2026-11-10: it previously read "`_ALL`'s deauth call is BYTE-IDENTICAL to the one that works",
+  which the table four lines below contradicts — `_ALL` sends opcode 402 and never reaches
+  `0x47364e`. That phrasing was a leftover from the withdrawn missing-`sta` explanation, where the
+  call was reached and the arguments were the difference. The `[V]` readings in this bullet are
+  unaffected; only the conclusion drawn in the heading was stale.*
+  `pineap.(*PineAp).StartDeauthAll` @ `0x0086c53c` writes **six `0xff` bytes by immediate** —
+  `li v1,-1` at `0x0086c5d8` then `sb v1,46(sp)`…`sb v1,51(sp)` — i.e. `sta = ff:ff:ff:ff:ff:ff`.
+  `StartDeauthCsa` @ `0x0086c390` contains **no** `0xff` immediate, and neither does `StartDeauth`
+  @ `0x0086c1bc`; all three share one `models.PineapDeauthRequest` whose `Sta [6]byte` always
+  encodes, so `_CSA` sends `00:00:00:00:00:00` and `DEAUTH` sends the parsed target.
+  | command | opcode | `sta` on the wire | pineapd runs |
+  |---|---|---|---|
+  | `DEAUTH` | 400 | the parsed target | `inject_deauth(bssid, sta, ch)` |
+  | `_ALL` | **402** | `ff:ff:ff:ff:ff:ff` (immediate, and **dead data** — the 402 path never reads `sta`) | `inject_csa(bssid, ch, 14)` **only — no deauth** |
+  | `_CSA` | 402 | `00:00:00:00:00:00` (zero value, also unread) | `inject_csa(bssid, ch, 14)` only |
+  **⭐ `_ALL` SENDS THE SAME OPCODE AS `_CSA`, so "both" is CSA-only and pineapd's opcode 401 is
+  DEAD CODE that has never run.** `[V]`, and it is the whole answer to "why does BOTH do nothing
+  when deauth/disassoc works":
+  ```
+  StartDeauth     0x0086c2b8:  li a0,400     -> deauth only
+  StartDeauthCsa  0x0086c464:  li a0,402     -> CSA only
+  StartDeauthAll  0x0086c62c:  li a0,402     -> CSA only          <-- not 401
+  ```
+  `li a0,401` and `ori a0,401` occur **zero** times anywhere in `pineapple/pineapple`; the three
+  `StartDeauth*` tails are instruction-for-instruction identical bar that one immediate, and
+  `exchangeCommand` passes arg1 through untouched (`0x86e6f4 lw at,64(sp)` / `0x86e6f8 sw at,8(sp)`).
+  So `_ALL` and `_CSA` are **the same command on the wire** apart from the unread `sta` bytes, and
+  `BOTH` is inert because it puts **no deauth frame on the air at all** — not because the request is
+  refused, and not because of anything the receiving station does. 402 fails dispatch test 1
+  (402-400 = 2, and `sltiu v0,2` is false for 2) and passes test 2, so it reaches `0x473630` and
+  **never `0x47364e`**. *Falsified by:* a 401 immediate anywhere on a deauth path, or `_ALL`
+  disconnecting a client.
+- ~~**So what is left is the `inject_csa` call that follows.**~~ **WITHDRAWN the same day.** The
+  hypothesis was that `inject_csa`'s `set_and_freeze_primary_channel_hop_s` retuned the radio
+  between `inject_deauth`'s enqueue and the injection handler's transmit. Its channel half was
+  refuted on the bench — firing `_ALL` with the radio already parked on the target channel still did
+  nothing — and the opcode finding above makes the whole thing moot: **there was never a deauth to
+  lose.** Recorded because the reasoning was published here for a few hours and because the shape of
+  the error is worth keeping: a mechanism was invented to explain a difference between two code
+  paths that turned out not to be two code paths.
+- **⚠ Two methodological traps, both of which cost real time today.** (1) **Go interns field-name
+  and tag blobs**, so counting occurrences of a `json:"…"` or `msgpack:"…"` string says how many
+  distinct tag *descriptors* exist, NOT which structs use them — proved by three different
+  `json:"bssid"` blobs sharing a prefix (`json:"bssid"`, `json:"bssid" uci:"bssid"`,
+  `json:"bssid" uci:"macaddr"`). The `json:"target"` count in the section below is therefore weaker
+  evidence than it reads; its conclusion survives only because `StartDeauthAll` was measured
+  directly. (2) **A `.gopclntab` function table reconstructed by hand can be off by a constant**, and
+  this session's was: the three `li a0,40x` sites above were FOUND by a byte scan, then resolved
+  against the bad table to `loadProfile`/`playRingtone`/`playVibrate` and **discarded as HTTP status
+  codes**. The decisive evidence was in hand and thrown away because a tool known to be suspect was
+  trusted to rule it out. Spot-check a reconstructed table against a function whose first
+  instruction you can predict before using it to dismiss anything.
+- **⭐ The controlled A/B, one address, one channel, one BSSID, two opcodes, minutes apart.** On
+  `FC:58:5A:08:42:15` ch 8: `PINEAPPLE_DEAUTH_CLIENT <bssid> ff:ff:ff:ff:ff:ff 8` **dropped the
+  client**; `PINEAPPLE_DEAUTH_CLIENT_ALL <bssid> ff:ff:ff:ff:ff:ff 8` did nothing. This is the
+  falsifier `attack_scope`'s own comment names, and it is now **spent in the affirmative**:
+  broadcast deauth works on this station. It also means the GUI's AP-row deauth button — which the
+  operator confirmed is fired with **only the AP row selected** — sends opcode 400 with
+  `sta = ff:ff:ff:ff:ff:ff`, i.e. exactly the frame CamHound builds on an AP row.
+- **⭐ pineapd TRANSMITS under a held EXAMINE lock.** `PINEAPPLE_EXAMINE_BSSID <bssid> 20;
+  PINEAPPLE_EXAMINE_CHANNEL 8 20; PINEAPPLE_DEAUTH_CLIENT <bssid> ff:ff:ff:ff:ff:ff 8` dropped the
+  client. This is the transmit-direction counterpart of Phase 0 13a (which answered *receive*), it
+  was a live hypothesis for why CamHound's locked fire failed, and it is now closed. The lock is
+  innocent. *Falsified by:* the same pair where the unlocked arm works and the locked arm does not.
+- **⭐ CamHound refused to transmit, seven times, and the logs name the gate.** Every bebird attempt
+  on build `40a0b3a` logged `resp members fc:58:5a:08:42:15 n=1 why=ok itmax=56 recs=286..468
+  short=0 trunc=0 runt=0` — the capture *heard* the station cleanly — then `re-armed … lock=ok`,
+  then `refused … NO_MATCH members=1`, with `pk_before` and `pk_after` both `-` in every
+  `responses.tsv` row. `resp_fire` returned at the subject guard, **before** any command ran. Cause:
+  `subjects` was both the transmit set and the measurement set, and `resp_snapshot`'s bss arm drops
+  every randomised MAC (`is_rand`, which keys on the second character) and every MAC with no Recon
+  row — so the gate that exists to keep the *oracle* honest was suppressing the *frame*. On an AP
+  row the "picked target is always a subject" escape hatch cannot help, because `R_TARGET` is
+  broadcast and no real MAC equals it. Fixed by admitting heard members as transmit targets with
+  `p0 '-'`, which scores them INCONCLUSIVE rather than inventing a verdict.
+- **CSA, for whenever a path to it exists, is beacon-triggered, and its total failure is SILENT.**
+  `recon_engine::inject_csa(char const*, pineap_wifi_channel const&, unsigned char)` @ `0x4a125c`
+  only queues a record; the frame is built when a beacon from that BSSID is indexed, which is why
+  the CSA element is constructed at `index_beacon_ns+0xc0a` — a detail this file already recorded
+  without drawing the inference. String xrefs place `Queuing CSA for {}` in `inject_csa`'s own pool
+  (word @`0x4a14e0`) and `Caught beacon for CSA on {}` / `Queued packets for CSA on {}` /
+  `Request to inject CSA expired for {}: {}ms` in `index_beacon_ns`'s (@`0x4bf1f0`/`0x4bf200`/
+  `0x4bf1fc`). **`expired` only logs when a beacon DOES arrive, late** — it sits on the age-check
+  fail branch at `0x4bef14`, downstream of the map hit. If no beacon ever arrives the record is
+  pruned without comment by the loop at `0x4a129c` on the next call, so the common total failure
+  leaves **only `Queuing CSA for`** in the log. pineapd does try to win the race:
+  `set_and_freeze_primary_channel_hop_s(chan, 5)` sets the channel and freezes the hop for 5 s
+  (~50 chances at a 102.4 ms interval), so the on-channel case normally succeeds — but **the freeze
+  is 5 s while the record TTL is 10 s**, so 5–10 s is pure luck, and if
+  `primary_interface_available()` is false (`0x46e73a`) both the set and the freeze are skipped
+  silently with the record still queued. **Keep this distinct from the count-0 claim**: separate
+  failure modes, separate falsifiers.
+- **⭐ `inject_csa`'s third `unsigned char` is the NEW CHANNEL NUMBER, hardcoded to 14 — a second
+  independent reason CSA cannot work, and it does NOT contradict the count-0 fact.** *Resolved
+  2026-11-09; this was listed as an open reading for part of the same day.* The sole call site is
+  `li a3,14` at `0x473634` (`jal 0x4a125d` at `0x47363a`, the only one in the binary by byte-pattern
+  search). The byte lands at record+36 and `index_beacon_ns` writes it into **element 37 byte 3**,
+  the New Channel Number; the Count byte is separately `0` from `li s1,0` at `0x4bee6c`. Both are
+  true at once, so pineapd's CSA says **"switch to channel 14, immediately"**. Channel 14 is
+  2484 MHz — Japan-only, 11b-only, and not in the US table at all — so a client that *did* honour
+  the element would be told to move somewhere it may not go. Neither the channel nor the count is
+  reachable by any setting or argument: both are literals with one call site.
+- ~~**"Both" runs the IDENTICAL `inject_deauth` call as "deauth/disassoc"**~~ **WITHDRAWN
+  2026-11-10 — it is the opposite, and the bullet also endorsed the explanation this section
+  withdraws.** `inject_deauth` is called from exactly one instruction, `0x47364e`, with four
+  arguments from fixed stack slots (`bssid` at `sp+216`, `sta` at `sp+222`, channel at `sp+228`) —
+  that reading stands. What does not is "Both runs it": `0x47364e` sits in the block reached only by
+  dispatch test 1, i.e. opcode 400 or 401, and `_ALL` sends **402**, which fails that test
+  (402-400 = 2, `sltiu v0,2` false) and reaches `0x473630` instead. So BOTH never executes this
+  call, and the difference the operator sees IS the code path — not the argument bytes, and not the
+  missing-`sta` throw, which no shipped command reaches. Kept rather than deleted because the
+  address and argument slots are still the right ones for the DEAUTH path, and because this bullet
+  is where the wrong inference was recorded.
+- **`inject_deauth` @ `0x472c14` is the gate-1 site, and the recorded addresses check out.** Its
+  prologue is `lw v0,28(s0); cmpi v0,8; bteqz` at `0x472c66` (the blanket 6 GHz check) and
+  `sltiu v0,145` at `0x472c76` (the DFS range-chain entry) — matching this file's 1.1.3 column
+  exactly, which is an independent confirmation that the MIPS16e recipe and the pin are sound. It
+  makes no `libwifi_create_deauth` call and has no loop: it queues, and
+  `interface_tracker::injection_handler()` builds and sends.
+- **A transient channel read-back failure cost a whole response.** `resp lock-failed
+  50:92:6a:ae:a8:82 wlan1mon still hopping (/1/1)` — `cur_channel` returned empty, then `1`, then
+  `1`, against a target channel of 1. The radio was parked where it was asked to be, but
+  `lock_target` required all three samples equal and scored the empty one as a different channel,
+  returning 2 and refusing the response with `LOCK_FAILED`. Fixed by comparing only the samples
+  that were actually read — **but the first fix only covered ONE empty sample, which is the case
+  that was measured.** It backfilled `c1` from `c2` before repairing `c2` from `c3`, so with `c1`
+  and `c2` both unreadable `c1` stayed empty and the comparison scored the identical
+  `still hopping (/1/1)` refusal. Found by the 2026-11-10 audit (three finder dimensions
+  independently), reproduced, and fixed by backfilling from the last sample outward.
+  **Then a second 2026-11-10 audit found three more defects in the same function, and the two-empty
+  answer above was itself wrong.** It returned 0 and wrote `lock=ok` from a *single* readable
+  sample — more confidence than the two-readable-samples case beside it, which returns 3 — because
+  the backfill turns the comparison into `c3 = c3 = c3`, a tautology. All three are fixed: one
+  readable sample is now `lock=unverified` (rc 3, which still **proceeds**, so the original fix is
+  intact and only the label changed); the **fourth** `cur_channel` read, the one after
+  `EXAMINE_CHANNEL`, had no empty-sample protection at all and still refused the whole response on
+  a transient empty (rc 2 → rc 3); and the hopping log line printed the *backfilled* triple, so the
+  `(/1/1)` signature that made this diagnosable in the first place had become unreachable by
+  construction — it now prints the raw samples, e.g. `_/6/11`. Selftest coverage is one-empty,
+  middle-empty, one-readable-sample, empty-fourth-read and genuinely-hopping, each confirmed by a
+  mutation that fails only its own case. *An earlier version of this line also claimed an `st_lock`
+  helper; no such function has ever existed, and the cases are inline.* *Falsified by:* a
+  `lock_target` rc changing for any of those patterns without `cur_channel` changing.
+
+### Fourth contact — the CSA count byte makes no difference to a real client, 2026-11-10
+
+Live bench on the 1.1.3 unit, `pagerinj` driven by `dev/injector/run_17a.sh`. Target the bebird
+camera AP `FC:58:5A:08:42:15` on ch 8, announcing ch 1. **Day-one step 17a has now run.**
+
+- **⭐ Both arms transmitted, and the count byte changed nothing observable.** Transmit is `[V]`;
+  the cause of the disruption is `[A]`.
+  - count 0: `cloned 108-byte beacon; CSA {37,3,mode=1,ch=1,count=0}; 121 bytes`, `sent=92 failed=0`, rc 0.
+  - count 3: `CSA {37,3,mode=1,ch=1,count=3}`, `sent=97 failed=0`, rc 0.
+  - Operator observation, **identical for both**: the camera's video feed froze completely for the
+    duration of the run and re-associated by itself once the script finished.
+- ~~**So the operational prediction fails in both halves.**~~ **WITHDRAWN 2026-11-10, same day —
+  both halves conflated two different kernel functions. See "Fifth contact" below, which supersedes
+  this bullet.** The short version: the *switch* path honours count 0, so count 0 disrupting was
+  never evidence against anything; and "count 3 did not deny reconnection" is not what was observed
+  — the client recovered *after* injection stopped, which is precisely what the refusal mechanism
+  predicts. The readings were right and the inference was wrong, for the fifth time in three days.
+- **Four reasons this does not refute the kernel reading itself.** The reading and the prediction
+  are different claims and this project has conflated them before.
+  1. `ieee80211_mgd_csa_present()` is **Linux mac80211**. The client here is a consumer handset
+     whose chipset most likely handles CSA in WLAN firmware, so the function may not govern it.
+  2. **No receiver-side proof.** All three captures recorded **zero packets** — see below — so
+     "a frame reached the air" rests on `sendto` success, which this file already says proves nothing.
+  3. ~~`pagerinj` sent a **constant** count where a conformant AP decrements.~~ **Instrumented and
+     RUN 2026-11-10 (`--count-dec`): no observable difference, but see "Fifth contact" — the
+     observable itself cannot see the difference, so this caveat is neither confirmed nor spent.**
+     The cadence turned out close to faithful (~109 ms per step against a 102.4 ms TBTT); what is
+     still unfaithful is that the countdown wraps to 3 instead of switching and going quiet.
+  4. ~~The run also holds an EXAMINE lock for 30 s and brings interfaces up.~~ **Eliminated by an
+     accidental negative control in the same session.** The first count-0 attempt issued the
+     EXAMINE lock, brought `wlan1mon` and `wlan0mon` up, started the capture, and then transmitted
+     **nothing** (`pagerinj rc=1`, `no beacon captured`) — and the feed did **not** freeze. The two
+     runs that transmitted froze it. So the freeze tracks the transmitted frames, not the script's
+     preamble. What remains confounded is narrower: whether it is the **CSA element** or merely a
+     flood of cloned beacons carrying the AP's own BSSID. ~~`pagerinj` has no clone-and-flood mode
+     without the element.~~ **BUILT AND RUN 2026-11-10 (`--clone`, twice, no effect) — but the
+     adversarial pass then showed that arm is a near-tautological control on a mac80211 client, so
+     only the AIRTIME half of this confound is eliminated. See "Fifth contact".**
+- **⭐ What is new and positive: a CSA-bearing cloned beacon from `pagerinj` disrupts a live
+  client.** "Whether CSA moves a real client at all" was listed as open and unanswerable through
+  the firmware commands. Something in that frame reaches this client — most plausibly the CSA,
+  since the feed recovered the moment injection stopped, which is what honouring a switch to an
+  empty channel then falling back looks like. ~~*Falsified by:* the same freeze from `pagerinj`
+  injecting the cloned beacon with the CSA element omitted.~~ **That falsifier was spent on
+  2026-11-10 — two `--clone` runs did nothing to the feed — but it turned out to be a WEAK
+  falsifier: a verbatim clone hashes to the same `beacon_crc` as the AP's own beacons and mac80211
+  drops it at `mlme.c:6929` before the switch handler, so its null result is close to a tautology.
+  What the pair establishes is that the FIVE APPENDED BYTES do the work, not that the channel-switch
+  semantics do. The arm that would separate those is `--elem=32:00`, built and unrun.** Also: "most
+  plausibly the CSA" is now the weaker reading — Channel Switch Mode 1 blocks the client's TX queues
+  count-independently (`mlme.c:2610`), which fits the observable without any switch occurring. See
+  "Fifth contact".
+- **⚠ The watch interface is blind, and it is pineapd's doing.** Zero packets in all three runs,
+  including zero of the AP's own ~10/s beacons, which the `wlan addr2 <bssid>` filter would have
+  caught — so the filter is innocent. pineapd's cmdline carries
+  `--interface wlan0mon --band wlan0mon:2`, so it **hops** `wlan0mon` and the script's
+  `iw dev wlan0mon set freq` is overridden within a hop interval. EXAMINE parks only the
+  **primary** (`wlan1mon`). On-device frame-level proof therefore needs the primary — which is also
+  the transmitter — or an external receiver. *Falsified by:* a non-empty `wlan0mon` capture on a
+  fixed channel while pineapd runs.
+- **`wlan1mon` can be administratively DOWN while pineapd is running.** `flags 0x1102`
+  (`IFF_BROADCAST|IFF_PROMISC|IFF_MULTICAST`, **no `IFF_UP`**) with `operstate down` and
+  `pidof pineapd` = 11482; one run later, `0x1103` / `unknown`, with no intervention but the
+  script's own `ip link set up`. So "pineapd is up" does **not** imply "its interfaces are up".
+  A run must check, and must try to bring it up rather than refuse.
+- **And when `IFF_UP` IS set, this device reports `operstate` `unknown`, never `up`.** Worth
+  recording because a fix was built this morning on the assumption that a monitor vif reports
+  `down` while up; it does not, and `dev/CamHound/AUDIT-2026-11-10.md`'s last section is the
+  retraction.
+
+### Fifth contact — the control arm ran, and an adversarial pass then dismantled what I concluded from it, 2026-11-10
+
+**Read both halves. The second supersedes the first.** Part one is bench data and stands. Part two
+is a four-dimension, three-lens adversarial pass — **12 refuted, 11 survived, 0 unverified, every
+verifier completed** — which found that the experiment was measuring something other than what it
+claimed. Every `[V]` below is `net/mac80211/mlme.c` at v6.12.61, the backports base this firmware
+carries, read rather than recalled.
+
+| arm | frame | result | feed |
+|---|---|---|---|
+| `--clone` control, run 1 | 116 B, verbatim, **no element** | `sent=93 failed=0` | **nothing** |
+| `--clone` control, run 2 | 116 B | `sent=90 failed=7` | **nothing** |
+| `--csa --count 3 --count-dec` | 121 B, `{37,3,mode=1,ch=1,count=3}` | `sent=92 failed=0` | **froze for the run, recovered unaided** |
+
+Every run printed `park confirmed: wlan1mon reads ch 8 twice`, so the park is not an assumption.
+
+**WHAT SURVIVES.** The **five appended bytes** are what disrupt this client: 3 for 3 with them,
+0 for 3 without, plus the accidental null arm. The confound that is eliminated is **airtime and
+duplicate-BSSID presence** — not "beacon flood" in general.
+
+**WHAT DOES NOT SURVIVE, and the mechanisms the three-way list missed.**
+
+1. **`--clone` was a near-guaranteed null on a mac80211 client, so it cannot carry "the CSA element
+   is what reaches the client".** `[V]` `ncrc = crc32_be(0, &mgmt->u.beacon.beacon_int, 4)`
+   (`:6837`), `parse_params.filter = care_about_ies` (`:6839`), `ncrc = elems->crc` (`:6853`), and
+   the gate `if ((ncrc == link->u.mgd.beacon_crc && link->u.mgd.beacon_crc_valid) || …) goto free;`
+   (`:6929`) sits **ahead of** `ieee80211_rx_bss_info()` (`:6934`) and
+   `ieee80211_sta_process_chanswitch()` (`:6936`). `care_about_ies` (`:6050-6057`) is COUNTRY(7),
+   ERP_INFO(42), CHANNEL_SWITCH(37), PWR_CONSTRAINT(32), HT_CAPABILITY(45), HT_OPERATION(61),
+   EXT_CHANSWITCH_ANN(60). A verbatim clone matches all of it, so after the first one every clone
+   hits `goto free` and reaches neither handler. **Element 37 being inside that filter is exactly
+   why the CSA arm got through.** So the control separates "extra beacon frames" from "a
+   CRC-relevant change", and not "the CSA element" from "any CRC-relevant change to a spoofed
+   beacon". The control that does separate them is `--elem=32:00` — **built 2026-11-10, unrun.**
+   *A vendor-specific element (221) would be another null: the filter additionally tracks only the
+   Microsoft (00:50:F2) and Cisco DTPC OUIs (`:6035-6040`), so an arbitrary OUI changes no CRC. The
+   adversarial pass proposed the vendor element and was wrong about it for this reason; pagerinj now
+   warns when `--elem` names an id outside the filter.*
+2. **Channel Switch Mode = 1 freezes the client count-INDEPENDENTLY, and this repo already said so.**
+   `pagerinj` defaults `mode = 1` and every bench line reads `mode=1`. `[V]`
+   `ch_switch.block_tx = csa_ie.mode` (`:2412`), `link->u.mgd.csa.blocked_tx = csa_ie.mode`
+   (`:2608`), `if (csa_ie.mode) ieee80211_vif_block_queues_csa(sdata)` (`:2610`). And
+   **`dev/pager-csa-primitives.md:408` already carried it**: "mode = 1 sets `blocked_tx`, so an
+   accepting client also stops transmitting." A stalled uplink alone freezes a video stream — no
+   ACKs, no keepalives. **One count-independent mechanism predicts the identical observable for all
+   three arms**, which is what was measured. Null if the client's driver advertises
+   `IEEE80211_HW_HANDLES_QUIET_CSA`.
+3. **The genuine AP's CSA-free beacons ABORT the pending switch, ~10/s.** `[V]`
+   `case IEEE80211_CSA_SOURCE_BEACON: … else if (res) { ieee80211_sta_abort_chanswitch(link); return; }`
+   (`:2452`). So an accepted CSA is contradicted within about one beacon interval: count 0 switches
+   with zero delay and wins that race, count 3's ~205 ms loses it. **17a as built cannot produce a
+   completed count ≥ 1 switch against an AP that is still on the air.** And
+   `ieee80211_sta_abort_chanswitch()` returns early at `:2244` when the driver exposes no
+   `abort_channel_switch` op — the abort becomes a no-op and the quiesce persists instead. Two
+   opposite behaviours from the same frames, selected by a driver flag.
+4. **The `--count-dec` arm transmitted count 0 on 23 of its 92 frames, and the LAST frame on the air
+   carried 0.** `count_dec_step` wrapped through 0, and 92 = 4 × 23 exactly. That arm strictly
+   *contained* the separate count-0 condition, so it can support no claim of the form "count N
+   behaves like count 0". **Fixed: it floors at 1 (a real AP beacons 3,2,1 and then switches; it
+   never announces 0 on the channel it is leaving) and the log now reports frames by count.**
+   Separately, by this repo's own `[V]` reading (`dev/pager-csa-primitives.md:413`) **any** count
+   1-255 survives `csa_present()`, so a constant count 3 was already a maximally eligible denial
+   stimulus — decrementing belongs to the move/tracking path, not the refusal path, and was never
+   the right instrument for the denial question.
+5. **The auth/assoc refusal cannot freeze an ASSOCIATED client.** `csa_in_process` is reached only
+   from `ieee80211_mgd_auth()` (`:8478`) and `ieee80211_mgd_assoc()` (`:8827`) — the paths a station
+   takes when it is *not* associated and is trying to join. So it is downstream of whatever
+   disconnected the client, not a sibling explanation, and the cached beacon IEs alternate
+   CSA-bearing / CSA-free at ~10 Hz, giving a refusal window of ~100 ms at roughly 50% duty.
+6. **No capture ran in any of the three arms, and the filter could not have seen the client anyway.**
+   No `<watch-if>` was passed, so the `-- capturing on` line appears in none of the logs — the
+   zero-packet captures belong to the Fourth-contact runs, and this file briefly said otherwise.
+   Worse, the filter was `wlan addr2 <bssid>`: addr2 is the TRANSMITTER, so it could only ever show
+   the AP and our clones, never the station that is the whole subject of 17a. **Fixed to
+   `wlan addr1 <bssid> or wlan addr2 <bssid>`**, which adds the client's ToDS data and its
+   auth/assoc requests, and the script now says plainly when no capture will run.
+
+**So the honest state of 17a: the count byte's effect is UN-MEASURED, not measured-as-null, and the
+oracle in use cannot see it.** "Is the feed frozen?" is satisfied by the mode-1 quiesce, by a
+completed switch, by an aborted switch thrashing block/unblock at 10 Hz, by a post-disconnect
+auth/assoc refusal, and by plain beacon loss. Four sessions went into the transmitter and none into
+the measurement.
+
+**⭐ NEXT, in this order, and the first two need no new code.**
+1. `--elem=32:00` — a CRC-relevant element that announces nothing. A freeze here means the reaction
+   is to the beacon changing at all, and every count result so far is about beacon churn.
+2. `--mode=1` with announce-chan **equal** to target-chan (quiet, nothing to move to) against
+   `--mode=0` with them different (move announced, no transmit restriction). If the quiet arm
+   freezes and the move arm does not, the count byte was never in the causal path.
+3. Pass **the inject interface** as `<watch-if>` for both — it is the one EXAMINE parks, and
+   "Second contact" measured that client ToDS frames appear on it. Then look for whether the feed's
+   return is preceded by an auth/assoc exchange: if it is, the client was disconnected; if not, it
+   was quiesced and never left. *This supersedes the earlier "a Linux client and `dmesg -w`"
+   recommendation as the FIRST step — that is still the cleanest read of the refusal path, but it is
+   no longer needed to separate the two leading mechanisms.*
+
 **`2.0.0-stable` was released 2026-10-29** and is now what `latest` serves. Everything here remains
 pinned to 1.1.3; versioned downloads still work
 (`…/firmwares/1.1.3-stable`, 303 → signed .bin, sha256 `3073d6b8…cd33`).
@@ -391,7 +856,20 @@ from each entry point, with only the `bteqz` target relocated, and both range-ch
 same `deadc0de` magic, same metadata versions, byte-identical `/etc/firmware-key` — which is mild
 evidence a downgrade would still be accepted, though no version check was looked for.
 
-**⚠ `BOTH` is untargeted, and it is the preselected default.** Four readings of the Go daemon,
+**⚠ `BOTH` is INERT, not merely untargeted, and it is no longer the preselected default.**
+*Heading corrected 2026-11-09.* The analysis below is sound and its conclusion — that `_All`'s
+struct carries no caller-supplied target — is now **measured**, not inferred: `StartDeauthAll`
+writes `sta = ff:ff:ff:ff:ff:ff` by immediate. What the section under-stated is the consequence:
+`_All` puts nothing on the air at all, measured against a client the opcode-400 broadcast drops on
+demand. **The mechanism IS settled** — `_All` sends opcode 402, so it queues a CSA and builds no
+deauth frame; see "Third contact", which supersedes the "missing `sta`" explanation this file
+briefly carried. *Corrected 2026-11-10: this line read "The mechanism for that is not settled"
+while pointing at the section that settles it, and described `posture_expect` as labelling
+`BOTH`/`CSA` `fw-broken`, which it no longer does.* `posture_opts` now leads with `DEAUTH` on every
+badge; `BOTH` is wired to the opcode-400 deauth rather than `_ALL`, and `posture_expect`'s labels
+follow the SENDER — `fw-broken` for a firmware CSA, `injector`/`deauth+csa` when `CSA_INJECTOR` is
+configured — so the default Disrupt is no longer a guaranteed no-op. Four readings of
+the Go daemon,
 identical in 1.1.3 and 2.0.0, all **[V]**: **`StartDeauth`**'s argument frame is 32 bytes against 28
 for both **`StartDeauthAll`** and **`StartDeauthCsa`** — *corrected 2026-11-03; this line previously
 attributed the 32-vs-28 split to `pineAPdDeauth` against `_All`/`_Csa`, which is wrong. All three
@@ -521,9 +999,27 @@ CamHound uses.** All six uppercase commands it calls (`GPS_GET`, `LED`, `PAYLOAD
 `PAYLOAD_SET_CONFIG`, `RINGTONE`, `VIBRATE`) are byte-identical, as are `tcpdump`, `uci`, `jq`,
 `hexdump`, `iw`, `libpcap.so.1.10.5` and `libwifi.so.0.0.10`.
 
-- **The three `PINEAPPLE_DEAUTH_CLIENT*` commands survive with identical arity**, confirmed **from
-  the parser** (`cmd_deauth` still does `cmpi a2,3`) rather than from help text. 46 `PINEAPPLE_*`
-  commands, zero added, zero removed.
+- ~~**The three `PINEAPPLE_DEAUTH_CLIENT*` commands survive with identical arity**, confirmed from
+  the parser (`cmd_deauth` still does `cmpi a2,3`).~~ **REFUTED on hardware 2026-11-05.**
+  `PINEAPPLE_DEAUTH_CLIENT_CSA` takes **two** arguments, not three: with `<bssid> <channel>` it
+  reaches MAC parsing (`ERROR: invalid MAC address`), and with a third argument it prints usage and
+  does nothing. Reproduce, transmitting nothing, with an unparseable MAC:
+  `PINEAPPLE_DEAUTH_CLIENT_CSA ZZ:ZZ:ZZ:ZZ:ZZ:ZZ 9` vs the same plus a third argument.
+  The disassembly reading may well be right for whichever function was read; the step from "this
+  function checks for 3" to "all three commands take 3" is the part that failed, and it is the same
+  reading-then-wrong-inference shape this file warns about twice. `resp_fire` was already correct
+  (`CSA` passes two, the others three) - by luck, since no test or measurement covered it until now.
+  46 `PINEAPPLE_*` commands, zero added, zero removed, still stands.
+- **All three deauth commands are symlinks to `/usr/bin/hak5cmd`** (`readlink -f`, 2026-11-05), so
+  the GUI button and a payload's command are the same code path below `/tmp/api.sock`. Their own
+  usage text describes the split: `DEAUTH` = "a Wi-Fi client" (deauth + disassoc), `_ALL` = "all
+  Wi-Fi clients on an AP" (deauth + disassoc + **CSA**), `_CSA` = "all clients" (CSA only). That
+  independently corroborates the `[A]` inference below that `_ALL` is untargeted - weakly, since
+  this binary's help has been wrong three times, but it points the same way.
+- **`hak5cmd` exits 0 on every path, including its error paths**, and writes errors to **stderr**
+  (measured 2026-11-05: `2>/dev/null` swallows the message, `1>/dev/null` does not). So an exit
+  status from any `PINEAPPLE_*` command is worthless as a success signal and the stderr capture is
+  load-bearing. `resp_fire` checks both; anything new must check stderr, not `$?`.
 - **`hak5cmd` is a provable pure relink** — identical token and string sets, strings at a uniform
   −4 offset, the only real change being the version literal. **`_pineap` is a genuine recompile**
   (85.69% of bytes differ, 43 verbs retained, 13 added, 0 removed). *Both keep their exact size,
@@ -661,11 +1157,25 @@ the question is open.
 ## Open, and needs the hardware
 
 Listed in `dev/CamHound/RESPONSE.md` §13, `dev/pager-day-one.md` and — for what has already been
-closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowing: the three
-`PINEAPPLE_DEAUTH_CLIENT*` commands are documented only by `hak5cmd`'s help text; whether Recon's
-packet counters move the way `resp_verdict` assumes; whether CSA moves a real client at all; and the
-count-byte experiment (day-one step 17a). (`inj_parse_channels` is **no longer** on this list — it
-ran against a live radio on 2026-11-02 and was correct; see "First contact".)
+closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowing: whether Recon's
+packet counters move the way `resp_verdict` assumes. **The count-byte experiment (day-one step 17a) has RUN — 2026-11-10, see "Fourth contact" and then "Fifth contact", which withdraws its headline.** **Both instruments were run too (`--clone` and `--count-dec`, 2026-11-10), and an adversarial pass then showed the OBSERVABLE was the weak half** — see "Fifth contact", which is the state of record. What survives: the five appended bytes are what disrupt this client. What does not: `--clone` is a near-tautological control on a mac80211 client (a verbatim clone hashes to the same `beacon_crc` and is dropped at `mlme.c:6929`), Channel Switch **Mode 1** freezes the client count-independently (`mlme.c:2610`), the real AP's own beacons abort a pending switch ~10/s (`mlme.c:2452`), and the `--count-dec` arm transmitted count 0 on 23 of 92 frames. **The count byte's effect is un-measured, not null.** Next: `--elem=32:00`, then `--mode=1` same-channel against `--mode=0` different-channel, both with the inject interface as the watch interface. Whether a frame reaches the air on **5 GHz DFS or 6 GHz** still needs an external receiver.
+(`inj_parse_channels` is **no longer** on this list — it ran against a live radio on 2026-11-02 and
+was correct; see "First contact". Nor is *"the three `PINEAPPLE_DEAUTH_CLIENT*` commands are
+documented only by `hak5cmd`'s help text"* — they are now read from pineapd's own handler, see
+"Third contact". Nor is *"whether CSA moves a real client at all"*, which is not answerable through
+these commands: every CSA they queue announces **channel 14 with count 0**, so a US client that
+honoured it would be told to move immediately to a channel it may not use, and the question now
+belongs entirely to `pagerinj`. Nor is *"whether `inject_csa`'s `unsigned char` is the count or the
+channel"* — resolved in "Third contact": it is the **New Channel Number**, the literal 14 from
+`0x473634`, landing in element 37 byte 3, with the Count byte separately `0` from `li s1,0` at
+`0x4bee6c`.
+*Corrected 2026-11-10, two stale claims removed from this parenthesis.* It previously said `_CSA`
+"cannot build a valid request, so no CSA this firmware's commands emit has ever reached the air" —
+that was the withdrawn missing-`sta` explanation. `_CSA` sends a well-formed opcode-402 request
+whose `sta` is simply never read, so `inject_csa` **is** called and a CSA record **is** queued; what
+is unknown is whether the beacon race then transmits it, which is a separate open question with its
+own falsifier. And it listed the `unsigned char` question as the replacement open item when the same
+day's work had already closed it.)
 
 **⚠ FIXED 2026-11-04 for AP rows — read this as history plus a live remainder.** The block below
 described the state before `bss_clients` existed. What it says about the *cause* still holds and is
@@ -702,8 +1212,12 @@ device is flashed", which implied a flash would buy a working rung. It would not
 load-bearing half. The 1.1.3 half stands.* Note the determination plan's standing instruction —
 `dev/pager-6ghz-determination-plan.md:155` "never flash it to this device" — therefore costs nothing
 on this axis. **[A]** — the byte counts and object shape are `[V]`; the code paths were read; the
-composition is the inference. *Falsified by:* a Disrupt transmitting **from the user payload** on either firmware (the earlier
-form of this falsifier said "on an AP row", which could not catch the hook path at all), or
+composition is the inference. ~~*Falsified by:* a Disrupt transmitting **from the user payload** on
+either firmware.~~ **SPENT 2026-11-05 — that Disrupt happened.** See "Second contact" above for the
+loot row and the log. What the block above still describes correctly is the CAUSE (no firmware
+supplies an association) and the remainder (a user-payload **client** row still aborts in
+`resp_target`'s client branch, and client Watch, Stimulus, kit detection and the AP-to-client tree
+stay inert). The second falsifier is untouched and still live:
 `_pineap RECON CLIENTS format=json | jq '.[0]|keys'` on a 2.0.0 Pager returning a key with the BSSID.
 
 **Lead, half followed 2026-11-03:** 1.1.3 *does* have `RECON DEVICES`/`COUNT DEVICES` (only
@@ -747,7 +1261,11 @@ step 17a needs. It now also carries 17a's third arm (`--ecsa-count`: element 37 
 eCSA, since `csa_present()` discards per element) and the unicast cat-0 Spectrum-Management CSA of
 day-one step 17c. Since df756c3 it also binds its capture to `-i`, skips a clone source that already
 carries a CSA or eCSA element, refuses a `--chan` equal to the cloned beacon's DS channel unless
-`--allow-same-chan`, and emits a radiotap RATE field with `--phy-rate <Mbps>`.
+`--allow-same-chan`, and emits a radiotap RATE field with `--phy-rate <Mbps>`. **Since 2026-11-10 it
+carries 17a's control arm, `--clone`** (flood a captured beacon verbatim, no element appended — the
+one thing that separates "the client honoured the switch" from "the client was upset by spoofed
+beacons"), **and `--count-dec`** (decrement the count 3,2,1,0 and repeat, as a real AP does,
+instead of the constant count every run before this sent).
 
 **hcxdumptool splits by band, and the 6 GHz half is a trap** — settled against the 6.3.4 tag: it
 reads only `FREQUENCY_ATTR_FREQ`, `MAX_TX_POWER` and `DISABLED`, never `NO_IR` or `RADAR` **[V]**,
