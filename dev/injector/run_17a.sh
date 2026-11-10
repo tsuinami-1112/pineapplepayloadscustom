@@ -50,6 +50,8 @@
 set -u
 
 PAGERINJ="${PAGERINJ:-/root/pagerinj}"
+# Overridable so iface_up can be exercised against a fixture tree off the device.
+NET_SYS="${NET_SYS:-/sys/class/net}"
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
@@ -85,22 +87,40 @@ mhz_for() {
 FREQ="${FREQ:-$(mhz_for "$TCHAN")}"
 [ -n "$FREQ" ] || die "cannot map channel $TCHAN to a frequency; pass FREQ=<MHz> yourself"
 
-# iface_up <if> -> 0 when the kernel says the interface is up and running.
+# iface_up <if> -> 0 the kernel says it is UP, 1 the kernel says it is DOWN, 2 the kernel does not
+# say (no such netdev, or sysfs unreadable). ONLY 1 is evidence of a problem.
+#
+# ⚠ THE FIRST REVISION HAD THE TWO FILES THE WRONG WAY ROUND, and it cost the operator a bench run
+# on 2026-11-10: it vetoed operstate first with an `up|unknown` whitelist, and the run died with
+# "wlan1mon is not up, so nothing can be transmitted" on an interface that was perfectly usable.
+# operstate is an RFC2863 CARRIER notion (net/core/link_watch.c, rfc2863_policy): a device that
+# never calls netif_carrier_on reads "down" there whatever its admin state, and a mac80211 monitor
+# vif is exactly such a device. flags bit 0 IS IFF_UP -- the administrative state, which is the
+# thing we want -- so flags is authoritative and operstate is only the fallback for a kernel that
+# does not export flags. Hex, e.g. 0x1003, so an odd last nibble means IFF_UP.
 iface_up() {
-  [ -r "/sys/class/net/$1/operstate" ] || return 1
-  case "$(cat "/sys/class/net/$1/operstate" 2>/dev/null)" in
-    up|unknown) ;;                       # a monitor iface commonly reports "unknown" while usable
-    *) return 1 ;;
+  [ -d "$NET_SYS/$1" ] || return 2
+  f=$(cat "$NET_SYS/$1/flags" 2>/dev/null) || f=""
+  case "$f" in
+    *[13579bdfBDF]) return 0 ;;
+    *[02468aceACE]) return 1 ;;
+    *) ;;                                # empty or not hex -- ask operstate instead
   esac
-  # flags bit 0 is IFF_UP. /sys/class/net/<if>/flags is hex, e.g. 0x1003.
-  f=$(cat "/sys/class/net/$1/flags" 2>/dev/null) || return 1
-  case "$f" in *[13579bdfBDF]) return 0 ;; *) return 1 ;; esac
+  case "$(cat "$NET_SYS/$1/operstate" 2>/dev/null)" in
+    up|unknown) return 0 ;;
+    down|lowerlayerdown) return 1 ;;
+    *) return 2 ;;
+  esac
 }
+
+# iface_down <if> -> true ONLY when the kernel positively says down. Every caller wants this and
+# not `! iface_up`, because rc 2 means "no answer" and must not be read as bad news.
+iface_down() { iface_up "$1"; [ $? = 1 ]; }
 
 bring_up() {
   ip link set "$1" up 2>/dev/null || ifconfig "$1" up 2>/dev/null || return 1
   sleep 1
-  iface_up "$1"
+  ! iface_down "$1"
 }
 
 PINEAPD_WAS_UP=0
@@ -121,10 +141,10 @@ restore() {
     # run walks into "That device is not up" -- which is exactly what happened on the bench.
     i=0
     while [ "$i" -lt 12 ]; do
-      iface_up "$IF" && break
+      iface_down "$IF" || break
       sleep 1; i=$(( i + 1 ))
     done
-    iface_up "$IF" || printf 'WARNING: %s is still down after 12s. Wait, or reboot before re-running.\n' "$IF" >&2
+    iface_down "$IF" && printf 'WARNING: %s is still down after 12s. Wait, or reboot before re-running.\n' "$IF" >&2
   fi
   rm -f "$CAPERR" 2>/dev/null
 }
@@ -147,7 +167,7 @@ if [ "$STOP_PINEAPD" = 1 ]; then
   fi
   # pineapd OWNS these interfaces; stopping it takes them down. Measured on the bench.
   for i in "$IF" ${WIF:+$WIF}; do
-    iface_up "$i" || { printf -- '-- %s went down with pineapd; bringing it up\n' "$i" >&2; bring_up "$i" || true; }
+    iface_down "$i" && { printf -- '-- %s went down with pineapd; bringing it up\n' "$i" >&2; bring_up "$i" || true; }
   done
   printf -- '-- parking %s on %s MHz\n' "$IF" "$FREQ" >&2
   iw dev "$IF" set freq "$FREQ" 20 2>/dev/null \
@@ -156,6 +176,11 @@ else
   # EXAMINE pins the radio to the target's channel without taking the interfaces away, and pineapd
   # is measured to transmit under a held lock. The lock must outlast the whole episode.
   LOCK=$(( 10 + 10 + 10 ))
+  if [ "$PINEAPD_WAS_UP" = 0 ]; then
+    printf -- '!! pineapd is NOT running, so EXAMINE cannot park the radio and %s may not even\n' "$IF" >&2
+    printf -- '!! exist -- pineapd creates and owns the monitor interfaces. Start it (open the web\n' >&2
+    printf -- '!! UI, or /etc/init.d/pineapd start) and re-run. Continuing unparked.\n' >&2
+  fi
   printf -- '-- parking with EXAMINE for %ss (pineapd left running: it owns %s)\n' "$LOCK" "$IF" >&2
   PINEAPPLE_EXAMINE_BSSID "$BSSID" "$LOCK" >/dev/null 2>&1
   PINEAPPLE_EXAMINE_CHANNEL "$TCHAN" "$LOCK" >/dev/null 2>&1
@@ -163,14 +188,26 @@ else
   sleep 2
 fi
 
-# Refuse to fire into a dead interface. pagerinj would print "recv: Network is down" and return 1,
-# which the operator may not notice next to "did the client drop?" -- three bench runs were read as
-# inconsistent client behaviour when nothing had been transmitted at all.
-iface_up "$IF" || die "$IF is not up, so nothing can be transmitted. If you used --stop-pineapd, wait for pineapd to restore it, or run without that flag."
+# ⚠ THIS IS A HINT, NOT A VETO, and the first revision got that wrong too. It called die() here,
+# and on the bench it aborted a run outright over a sysfs reading that was itself wrong (see
+# iface_up) -- converting "fire and report honestly" into "fire nothing", which is the worse
+# failure of the two. The thing this check was added to prevent is the operator mistaking a
+# non-transmitting run for a client observation, and the == banner at the end already prevents it
+# from pagerinj's own rc, which is ground truth. So: warn, try to help, fire anyway.
+iface_up "$IF"; ifrc=$?
+if [ "$ifrc" = 1 ]; then
+  printf -- '!! %s reads DOWN (flags=%s operstate=%s). Trying to bring it up.\n' "$IF" \
+    "$(cat "$NET_SYS/$IF/flags" 2>/dev/null || echo '?')" \
+    "$(cat "$NET_SYS/$IF/operstate" 2>/dev/null || echo '?')" >&2
+  bring_up "$IF" || true
+  iface_down "$IF" && printf -- '!! %s is STILL down. Firing anyway: if the == line below says\n!! NOTHING WAS TRANSMITTED, this is why -- pineapd owns the monitor interfaces, so check\n!! `pidof pineapd` before blaming the radio.\n' "$IF" >&2
+elif [ "$ifrc" = 2 ]; then
+  printf -- '!! cannot tell whether %s is up: no %s/%s. Firing anyway; the == line below is the\n!! only thing that settles whether a frame was transmitted.\n' "$IF" "$NET_SYS" "$IF" >&2
+fi
 
 if [ -n "$WIF" ]; then
   mkdir -p /root/loot 2>/dev/null
-  iface_up "$WIF" || { printf -- '-- %s is down; bringing it up\n' "$WIF" >&2; bring_up "$WIF" || true; }
+  iface_down "$WIF" && { printf -- '-- %s is down; bringing it up\n' "$WIF" >&2; bring_up "$WIF" || true; }
   iw dev "$WIF" set freq "$FREQ" 20 2>/dev/null
   OUT="/root/loot/csa_17a_c${COUNT}_$(date +%s 2>/dev/null || echo now).pcap"
   # ONE primitive, on purpose. An earlier revision used
