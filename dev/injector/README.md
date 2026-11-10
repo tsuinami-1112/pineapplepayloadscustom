@@ -97,7 +97,7 @@ selftest asserts `it_len`, the bitmap and the value, and a second host instance 
 `--phy-rate 6` beacon over a real socket. Whether mt76 honours the rate on 6 GHz is for the bench;
 run the same frame on 5180 as the rate control, as control 5 says.
 
-### `--clone`: 17a's control arm, and why every result before it was confounded
+### `--clone`: the airtime control, and why it is weaker than it looks
 
 Added 2026-11-10, straight after the first 17a run. That run put a CSA-bearing cloned beacon on the
 air and **the camera's video feed froze for the duration, identically for `--count 0` and
@@ -115,25 +115,97 @@ because a clone of one of those is not a control).
 ./pagerinj -i wlan1mon --clone --bssid FC:58:5A:08:42:15 --secs 10
 ```
 
-How to read it, and it cuts both ways:
+**⚠ IT RAN ON 2026-11-10 AND IT IS A WEAKER CONTROL THAN IT LOOKS.** Two runs, 93 and 90 frames,
+did nothing to the feed — and then an adversarial pass found out why that was nearly guaranteed.
+mac80211 filters beacons it has already seen: `ncrc = crc32_be(0, &mgmt->u.beacon.beacon_int, 4)`
+(`mlme.c:6837` at v6.12.61), `parse_params.filter = care_about_ies` (`:6839`),
+`ncrc = elems->crc` (`:6853`), and then
+
+```c
+if ((ncrc == link->u.mgd.beacon_crc && link->u.mgd.beacon_crc_valid) || …)
+        goto free;                                  /* mlme.c:6929 */
+```
+
+which sits **ahead of** `ieee80211_rx_bss_info()` (`:6934`) and
+`ieee80211_sta_process_chanswitch()` (`:6936`). `care_about_ies` (`:6050-6057`) covers COUNTRY(7),
+ERP_INFO(42), CHANNEL_SWITCH(37), PWR_CONSTRAINT(32), HT_CAPABILITY(45), HT_OPERATION(61),
+EXT_CHANSWITCH_ANN(60) — and a **verbatim** clone matches on all of it. So on a mac80211 client every
+clone after the first hits `goto free` and reaches neither handler. Element 37 being inside that
+filter is precisely why the CSA arm gets through.
+
+So what the pair actually establishes:
 
 | result | what it means |
 |---|---|
-| the feed freezes here too | the element is irrelevant; the experiment has been measuring beacon spoofing, and "count makes no difference" is a statement about nothing |
-| the feed does **not** freeze | the element is doing the work, and the count-0-vs-count-3 result stands as a claim about the CSA |
+| the feed freezes here too | the element is irrelevant and the experiment has been measuring airtime |
+| the feed does **not** freeze | the **five appended bytes** do the work — but "the channel-switch semantics do" does NOT follow, because any CRC-relevant change would also have got through |
 
-CLAUDE.md's "Fourth contact" names this exact run as the falsifier for *"a CSA-bearing cloned beacon
-from `pagerinj` disrupts a live client"* and records that it **could not be run**, because `--csa` is
-what appends the element. It can now. Run it before trusting any 17a conclusion.
+Use `--elem` below to close that gap. `--clone` still earns its place: it eliminates the airtime and
+duplicate-BSSID half of the confound, which is real.
+
+### `--elem <eid>:<hex>`: the content control `--clone` cannot be
+
+Appends ONE arbitrary element to the clone instead of a CSA, so the beacon's filtered element set
+changes — and its `beacon_crc` with it — **without anything announcing a channel switch**.
+
+```sh
+./pagerinj -i wlan1mon --elem 32:00 --bssid FC:58:5A:08:42:15 --secs 10
+```
+
+`32:00` is Power Constraint with a 1-byte payload: inside `care_about_ies`, semantically a no-op,
+and almost never already present in a 2.4 GHz beacon. A freeze here means the client reacts to its
+AP's beacon changing at all, and every count result so far is about beacon churn rather than about
+channel switching.
+
+**Pick an id inside the filter or the arm is worthless**, and the tool says so: `--elem 221:…`
+(vendor-specific) prints a warning, because the filter additionally tracks only the Microsoft
+(00:50:F2) and Cisco DTPC OUIs (`mlme.c:6035-6040`), so an arbitrary vendor OUI changes no CRC and
+would be a second guaranteed null. The 2026-11-10 adversarial pass proposed exactly that vendor
+element and was wrong about it for this reason. It also refuses an id the cloned beacon already
+carries, since the client reads the first instance — the same trap `capture_beacon()` avoids for CSA.
+
+### `--mode`: the half of a CSA nobody had separated
+
+Channel Switch Mode 1 — pineapd's value, and this tool's default — **blocks the client's transmit
+queues on the first accepted beacon**, independently of the count:
+`ch_switch.block_tx = csa_ie.mode` (`mlme.c:2412`), `blocked_tx = csa_ie.mode` (`:2608`),
+`if (csa_ie.mode) ieee80211_vif_block_queues_csa(sdata)` (`:2610`). A stalled uplink alone freezes a
+video stream — no ACKs, no keepalives. `dev/pager-csa-primitives.md:408` already said this; three
+bench sessions reasoned about the count byte without it.
+
+Two arms separate the quiet from the move, and neither needs new code:
+
+```sh
+# quiet, with nothing to move to  (announce the channel it is already on)
+./run_17a.sh wlan1mon <bssid> 8 8 3 wlan1mon --mode=1
+# move announced, no transmit restriction
+./run_17a.sh wlan1mon <bssid> 8 1 3 wlan1mon --mode=0
+```
+
+If the quiet arm freezes and the move arm does not, the count byte was never in the causal path.
+Note `--mode 0` naming the current channel is discarded outright by `csa_present()` (`mlme.c:8379`),
+which is why the quiet arm must be mode 1.
 
 ### `--count-dec`: a real AP counts down, and this never did
 
-A conformant AP **decrements** the Channel Switch Count on every beacon — 3, 2, 1, 0 — and switches
-when it hits zero. `pagerinj` has always transmitted a **constant** count, which no AP ever sends,
-and a client that tracks the countdown has nothing to track in a constant stream. Of the four
-reasons CLAUDE.md gives for why 17a's count-3 arm behaved no differently from count 0, this is the
-strongest one still standing (the EXAMINE-lock confound was eliminated by an accidental negative
-control in the same session, and the capture confound is about evidence rather than mechanism).
+A conformant AP **decrements** the Channel Switch Count on every beacon — 3, 2, 1 — and switches
+when it runs out. `pagerinj` used to transmit a **constant** count, which no AP ever sends, and a
+client that tracks the countdown has nothing to track in a constant stream.
+
+**⚠ IT RAN ON 2026-11-10 AND THE ARM WAS CONTAMINATED.** `count_dec_step` wrapped through **0**, so
+the bench run's `23 complete countdown(s)` with `sent=92` — and 92 = 4 × 23 exactly — means 23 of
+the 92 frames carried count 0, *including the last frame on the air* before the operator watched for
+reconnection. An arm built to test count ≥ 1 strictly contained the separate count-0 condition, so
+no claim of the form "count N behaves like count 0" could come from it. **Fixed: it floors at 1 and
+the log reports frames by count rather than how many times it wrapped** — which is how the
+contamination stayed invisible for a whole bench pass. Flooring at 1 is also the faithful model: per
+802.11 the count is TBTTs remaining, so a real AP beacons 3, 2, 1 and then switches, and never
+announces 0 on the channel it is leaving.
+
+A second correction worth having: decrementing was never the right instrument for the *denial*
+question anyway. By this repo's own `[V]` reading (`dev/pager-csa-primitives.md:413`) **any** count
+1-255 survives `csa_present()`, so a constant count 3 was already maximally eligible. Decrementing
+belongs to the move/tracking path.
 
 ```sh
 ./pagerinj -i wlan1mon --csa --bssid FC:58:5A:08:42:15 --chan 1 --count 3 --count-dec --secs 10
@@ -144,12 +216,19 @@ changes between transmissions — the selftest asserts exactly that, one byte di
 byte is located by *searching* the built frame for element 37 rather than by computing
 `RTAP_TX_LEN + clone_len + 4`: that offset depends on the radiotap length, which `--phy-rate`
 changes, and a wrong offset would not fail, it would silently rewrite an arbitrary byte of the frame
-once per transmission. After reaching 0 the countdown restarts, so a `--secs` window gives the
-client several complete countdowns instead of one four-beacon burst at the start; the run reports
-how many completed. With `--ecsa-count` both counts step together.
+once per transmission. After reaching 1 the countdown restarts, so a `--secs` window gives the
+client several complete countdowns instead of one short burst at the start; the run reports frames
+by count. With `--ecsa-count` both counts step together.
 
-`--count 0 --count-dec` is refused: it would hold the byte at 0 all run — `--count 0` with extra
-steps — while reading in a log as though a countdown had happened.
+The cadence is close to faithful: the 2026-11-10 run put ~109 ms between steps against a real AP's
+102.4 ms TBTT, within about 7%. What is still unfaithful is structural — the countdown restarts
+instead of switching and going quiet, and the genuine AP keeps beaconing CSA-free alongside, which
+on a mac80211 client **aborts the pending switch** (`mlme.c:2452`) roughly every 100 ms. That is why
+17a as built cannot produce a completed count ≥ 1 switch against an AP still on the air.
+
+`--count 0 --count-dec` and `--count 1 --count-dec` are both refused: 0 is the "switch immediately"
+condition and a separate arm, and 1 would step 1 → 1 forever, a constant stream that the log would
+call a countdown.
 
 ### 17a's third arm, and why it beats the pair
 
@@ -202,14 +281,14 @@ which is exactly why it has to move in the same commit as any `pagerinj.c` edit;
 to do that once, in `df756c3`, so check it rather than trusting it. Verified this time: the SDK
 archive's sha256 matched the release's `sha256sums` (`636298c2…5c92`) before extraction, the ABI
 gate below passed, two clean rebuilds produced byte-identical output, and
-`./pagerinj-host --selftest` gave **104 checks, 0 failed**.)*
+`./pagerinj-host --selftest` gave **126 checks, 0 failed**. Re-recorded a third time the same day, for the `--elem` content control and the `--count-dec` floor fix.)*
 
 | | |
 |---|---|
-| `pagerinj` | 30300 bytes, sha256 `361c3aca…22e2` (full: `361c3acaa82e6c371c3de616673fedc9f4ab221c6e82f9e05de74409d88a22e2`) |
+| `pagerinj` | 36476 bytes, sha256 `d44fd10e…8a21` (full: `d44fd10e2fe41d5f58667afe27cfd220e7cfb71312a943152864e5542a668a21`) |
 | ABI | `ELF32 LSB MIPS32r2`, little endian, interpreter `/lib/ld-musl-mipsel-sf.so.1` |
 | `NEEDED` | `libc.so` only |
-| `make static` | 105520 bytes, sha256 `0a112e65…e5e8`, no loader, no libc — if the dynamic build ever fails on the device |
+| `make static` | 109776 bytes, sha256 `795e07da…f2fa`, no loader, no libc — if the dynamic build ever fails on the device |
 
 *(Update 2026-11-02: `libgcc_s.so.1` **does** ship, byte-identical in 1.1.3 and 2.0.0 —
 `8138ad10…9dfcb`, 131359 B. So the flag below is now insurance rather than a fix for a known gap.
@@ -224,7 +303,7 @@ Binaries are `.gitignore`d — build them, don't commit them.
 ## Validation done without a radio
 
 ```sh
-make host && ./pagerinj-host --selftest        # 104 checks, 0 failed
+make host && ./pagerinj-host --selftest        # 126 checks, 0 failed
 ```
 
 The selftest covers the CSA element against the bytes pineapd writes at `0x4bee8a`

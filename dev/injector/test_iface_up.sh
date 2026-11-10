@@ -195,6 +195,26 @@ has   "count-dec arm: sends --csa"          "$T/injargv" '--csa'
 has   "count-dec arm: sends --count-dec"    "$T/injargv" '--count-dec'
 hasnt "count-dec arm: no --clone"           "$T/injargv" '--clone'
 
+O=$(run 0 measured_up --elem=32:00)
+has   "elem arm: sends --elem with the spec"   "$T/injargv" '\-\-elem 32:00'
+hasnt "elem arm: sends NO --csa"               "$T/injargv" '\-\-csa'
+has   "elem arm: warns that count is ignored"  "$O" 'are IGNORED'
+
+O=$(run 0 measured_up --mode=0)
+has   "mode arm: passes --mode through"        "$T/injargv" '\-\-mode 0'
+has   "mode arm: still a --csa arm"            "$T/injargv" '\-\-csa'
+hasnt "mode arm: no stray --allow-same-chan"   "$T/injargv" 'allow-same-chan'
+
+# --elem and --clone are different controls; so are --elem and --count-dec.
+O=$(run 0 measured_up --elem=32:00 --clone)
+has   "elem+clone is refused"                  "$O" 'different controls'
+O=$(run 0 measured_up --elem=32:00 --count-dec)
+has   "elem+count-dec is refused"              "$O" 'no CSA element'
+
+# A value-taking flag spelled without its value must be refused, not silently ignored.
+O=$(run 0 measured_up --elem)
+has   "bare --elem is refused"                 "$O" 'takes a value'
+
 # The two arms are mutually exclusive: --clone sends no element, so there is no count to decrement.
 O=$(run 0 measured_up --clone --count-dec)
 has   "clone+count-dec is refused"          "$O" 'different arms'
