@@ -195,7 +195,7 @@ Verified output at this change, `gcc 13.3.0 r28597-0425664679` from the SDK the 
 across two rebuilds. These figures move with every edit to `pagerinj.c`; trust your own `stat` and
 `sha256sum` over this row:
 
-*(Rebuilt and re-recorded **2026-11-10**, for the `--clone` and `--count-dec` commit. The previous
+*(Rebuilt and re-recorded **2026-11-10** twice: for the `--clone`/`--count-dec` commit and again for the `PARTIAL RUN` warning that the first bench pass of those modes showed was needed. The previous
 row -- 25468 bytes, `4cf33e5b…b471` -- described the source before those modes existed. Since
 `.gitignore` excludes the binaries on purpose, this table is the ONLY record of them in the repo,
 which is exactly why it has to move in the same commit as any `pagerinj.c` edit; it has now failed
@@ -206,10 +206,10 @@ gate below passed, two clean rebuilds produced byte-identical output, and
 
 | | |
 |---|---|
-| `pagerinj` | 30012 bytes, sha256 `5b702073…b208` (full: `5b702073b2b361b69aa43e2099567e68040bfcdb78c1d9217c08d7d5adfdb208`) |
+| `pagerinj` | 30300 bytes, sha256 `361c3aca…22e2` (full: `361c3acaa82e6c371c3de616673fedc9f4ab221c6e82f9e05de74409d88a22e2`) |
 | ABI | `ELF32 LSB MIPS32r2`, little endian, interpreter `/lib/ld-musl-mipsel-sf.so.1` |
 | `NEEDED` | `libc.so` only |
-| `make static` | 102864 bytes, sha256 `c871c444…c58b`, no loader, no libc — if the dynamic build ever fails on the device |
+| `make static` | 105520 bytes, sha256 `0a112e65…e5e8`, no loader, no libc — if the dynamic build ever fails on the device |
 
 *(Update 2026-11-02: `libgcc_s.so.1` **does** ship, byte-identical in 1.1.3 and 2.0.0 —
 `8138ad10…9dfcb`, 131359 B. So the flag below is now insurance rather than a fix for a known gap.

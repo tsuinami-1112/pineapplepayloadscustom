@@ -1371,6 +1371,18 @@ transmit:
     fprintf(stderr, "%ssent=%ld failed=%ld  (sendto success does NOT mean transmitted — "
                     "confirm at the external receiver)\n",
             stop_flag ? "interrupted: " : "", sent, failed);
+    /* A PARTIAL run is the dangerous one, and nothing used to flag it. rc is 0 whenever anything
+     * was sent (failed && !sent ? 1 : 0, below), so run_17a.sh's banner says FRAMES LEFT THE RADIO
+     * for sent=2 failed=90 exactly as it does for sent=92 failed=0. Measured 2026-11-10: a control
+     * arm came back sent=90 failed=7 with "sendto: Network is down" -- wlan1mon went down mid-run --
+     * and the only hint was the counts themselves. At 7/97 the comparison survived; at 90/92 it
+     * would not have, and the arm would still have read as clean. */
+    if (failed)
+        fprintf(stderr, "!! PARTIAL RUN: %ld of %ld sends failed (first reason above). The "
+                        "interface went down\n!! under it or the driver refused. A client "
+                        "observation from this run is worth less than\n!! one from a clean arm -- "
+                        "if the failure share is large, re-run before recording anything.\n",
+                failed, sent + failed);
     close(fd);
     return failed && !sent ? 1 : 0;
 }

@@ -613,21 +613,23 @@ camera AP `FC:58:5A:08:42:15` on ch 8, announcing ch 1. **Day-one step 17a has n
   - count 3: `CSA {37,3,mode=1,ch=1,count=3}`, `sent=97 failed=0`, rc 0.
   - Operator observation, **identical for both**: the camera's video feed froze completely for the
     duration of the run and re-associated by itself once the script finished.
-- **So the operational prediction fails in both halves.** The `[A]` claim derived from
-  `ieee80211_mgd_csa_present()` was that a count-0 CSA is discarded before the auth/assoc refusal
-  check — so count 0 should kick without denying reconnection, and count ≥ 1 should do both.
-  Measured: count 0 **did** disrupt, and count 3 did **not** deny reconnection. *Falsified by:* a
-  repeat where count 3 holds the client off after the injection stops while count 0 does not.
+- ~~**So the operational prediction fails in both halves.**~~ **WITHDRAWN 2026-11-10, same day —
+  both halves conflated two different kernel functions. See "Fifth contact" below, which supersedes
+  this bullet.** The short version: the *switch* path honours count 0, so count 0 disrupting was
+  never evidence against anything; and "count 3 did not deny reconnection" is not what was observed
+  — the client recovered *after* injection stopped, which is precisely what the refusal mechanism
+  predicts. The readings were right and the inference was wrong, for the fifth time in three days.
 - **Four reasons this does not refute the kernel reading itself.** The reading and the prediction
   are different claims and this project has conflated them before.
   1. `ieee80211_mgd_csa_present()` is **Linux mac80211**. The client here is a consumer handset
      whose chipset most likely handles CSA in WLAN firmware, so the function may not govern it.
   2. **No receiver-side proof.** All three captures recorded **zero packets** — see below — so
      "a frame reached the air" rests on `sendto` success, which this file already says proves nothing.
-  3. `pagerinj` sent a **constant** count where a conformant AP decrements 3,2,1,0, and a client
-     that tracks the countdown has nothing to track in a constant stream. This is the strongest
-     surviving reason a count-3 CSA under-performed. **Instrumented 2026-11-10: `--count-dec`
-     counts down and repeats, stepping the eCSA count too.** Not yet run on hardware.
+  3. ~~`pagerinj` sent a **constant** count where a conformant AP decrements.~~ **Instrumented and
+     RUN 2026-11-10 (`--count-dec`): no observable difference, but see "Fifth contact" — the
+     observable itself cannot see the difference, so this caveat is neither confirmed nor spent.**
+     The cadence turned out close to faithful (~109 ms per step against a 102.4 ms TBTT); what is
+     still unfaithful is that the countdown wraps to 3 instead of switching and going quiet.
   4. ~~The run also holds an EXAMINE lock for 30 s and brings interfaces up.~~ **Eliminated by an
      accidental negative control in the same session.** The first count-0 attempt issued the
      EXAMINE lock, brought `wlan1mon` and `wlan0mon` up, started the capture, and then transmitted
@@ -635,18 +637,17 @@ camera AP `FC:58:5A:08:42:15` on ch 8, announcing ch 1. **Day-one step 17a has n
      runs that transmitted froze it. So the freeze tracks the transmitted frames, not the script's
      preamble. What remains confounded is narrower: whether it is the **CSA element** or merely a
      flood of cloned beacons carrying the AP's own BSSID. ~~`pagerinj` has no clone-and-flood mode
-     without the element.~~ **Built 2026-11-10: `--clone` floods a captured beacon verbatim, no CSA
-     and no eCSA**, so the control in the bullet below is now runnable and should be run before any
-     17a conclusion is trusted.
+     without the element.~~ **BUILT AND RUN 2026-11-10 — `--clone`, twice, and the confound is
+     ELIMINATED: a verbatim flood with no element did nothing to the feed.** See "Fifth contact".
 - **⭐ What is new and positive: a CSA-bearing cloned beacon from `pagerinj` disrupts a live
   client.** "Whether CSA moves a real client at all" was listed as open and unanswerable through
   the firmware commands. Something in that frame reaches this client — most plausibly the CSA,
   since the feed recovered the moment injection stopped, which is what honouring a switch to an
-  empty channel then falling back looks like. *Falsified by:* the same freeze from `pagerinj`
-  injecting the cloned beacon with the CSA element omitted — which is now one command,
-  `pagerinj -i wlan1mon --clone --bssid <bssid> --secs 10`, and is the first thing to run on the
-  next bench pass. Until it has been run, "the CSA is what reaches this client" is an inference
-  from a confounded experiment, not a measurement.
+  empty channel then falling back looks like. ~~*Falsified by:* the same freeze from `pagerinj`
+  injecting the cloned beacon with the CSA element omitted.~~ **That falsifier was SPENT on
+  2026-11-10 and the claim SURVIVED it: two `--clone` runs, 93 and 90 frames, did nothing to the
+  feed.** So "the CSA element is what reaches this client" is now a controlled measurement rather
+  than an inference. See "Fifth contact".
 - **⚠ The watch interface is blind, and it is pineapd's doing.** Zero packets in all three runs,
   including zero of the AP's own ~10/s beacons, which the `wlan addr2 <bssid>` filter would have
   caught — so the filter is innocent. pineapd's cmdline carries
@@ -664,6 +665,72 @@ camera AP `FC:58:5A:08:42:15` on ch 8, announcing ch 1. **Day-one step 17a has n
   recording because a fix was built this morning on the assumption that a monitor vif reports
   `down` while up; it does not, and `dev/CamHound/AUDIT-2026-11-10.md`'s last section is the
   retraction.
+
+### Fifth contact — the control arm runs, and the experiment's ORACLE was the problem, 2026-11-10
+
+Same bench session, hours after "Fourth contact". Same target (`FC:58:5A:08:42:15` ch 8), same
+script, and **every run below printed `park confirmed: wlan1mon reads ch 8 twice`** — the park is
+no longer an assumption.
+
+| arm | frame | result | feed |
+|---|---|---|---|
+| `--clone` control, run 1 | 116 B, verbatim, **no element** | `sent=93 failed=0` | **nothing** |
+| `--clone` control, run 2 | 116 B | `sent=90 failed=7` | **nothing** |
+| `--csa --count 3 --count-dec` | 121 B, `{37,3,mode=1,ch=1,count=3}`, 23 countdowns | `sent=92 failed=0` | **froze for the run, recovered unaided** |
+
+- **⭐ THE BEACON-FLOOD CONFOUND IS ELIMINATED: the CSA element is what reaches this client.** Both
+  arms clone the *same* beacon verbatim, so timestamp, sequence number, SSID and DS channel are
+  identical between them; 121 − 116 = 5 bytes = the element, and it is the only difference on the
+  wire. A comparable flood without it did nothing, **twice**. With the three CSA arms (92, 97, 92
+  frames, all froze) and the accidental null arm (transmitted nothing, no freeze), that is 3 for 3
+  with the element and 0 for 3 without. *Falsified by:* a `--clone` run that freezes the feed.
+- **⭐ That differential is also behavioural proof the frames reach the air on 2.4 GHz ch 8.** A
+  frame silently dropped by cfg80211 cannot produce a differential effect on a client, so the whole
+  chain is validated: radiotap header, clone, append, socket, driver. **It says nothing about 5 GHz
+  DFS or 6 GHz**, where gate 2 actually fires and where an external receiver is still mandatory.
+- **⚠ AND THE SUCCESS CRITERION WAS WRONG, which is why "Fourth contact"'s headline is withdrawn.**
+  Read at v6.12.61, `[V]`: the count byte is consulted by **two different functions** and this
+  project had been treating them as one.
+  - **The switch path** — `ieee80211_sta_process_chanswitch()` (`mlme.c:2370`) — reads
+    `csa_ie.count` and passes it through as `ch_switch.count` (`mlme.c:2414`). It does **not**
+    discard count 0. Count 0 means *switch immediately*.
+  - **The refusal path** — `ieee80211_mgd_csa_present()` (`mlme.c:8356`) — is reached ONLY via
+    `ieee80211_mgd_csa_in_process()` (`:8396`) from `ieee80211_mgd_auth()` (`:8478`) and
+    `ieee80211_mgd_assoc()` (`:8827`), each returning `-EINVAL` and logging
+    `"AP is in CSA process, reject auth"` / `"reject assoc"`. **This** is where
+    `if (csa && csa->count == 0) csa = NULL;` lives (`:8377`).
+
+  So count 0 disrupting the feed was **never** evidence against the count-0 claim — the switch path
+  honours it. And "count 3 did not deny reconnection" is not what was observed: the client did not
+  recover *during* injection and did recover *after*, and that is exactly what the refusal predicts,
+  because `csa_in_process` reads the **cfg80211 cached beacon IEs**, which refresh from the AP's own
+  CSA-free beacons the moment injection stops.
+- **⭐ So the oracle cannot see the thing being measured.** "Is the video feed frozen?" is satisfied
+  by at least three mechanisms, and all three recover when injection stops:
+  1. the client honoured an immediate switch to ch 1, found nothing there, and came back;
+  2. the client stayed on ch 8 and was refused auth/assoc while the CSA sat in its scan cache;
+  3. the client simply lost its AP's beacons among ~92 clones.
+
+  **Nothing measured so far distinguishes them**, so "the count byte makes no difference" is
+  unsupported in *either* direction. The data is silent on it, not negative. Three bench sessions
+  were spent refining the transmitter when the measurement was the weak half.
+- **⭐ The next measurement is on the CLIENT, and mac80211 prints the answer verbatim.** Associate a
+  **Linux** station to the target AP and watch `dmesg -w` through each arm. `"AP is in CSA process,
+  reject auth"` appearing under count ≥ 1 and absent under count 0 reads out *which code path
+  fired*, collapsing the three-way ambiguity to one log line. That is worth more than any further
+  Pager-side work on 17a. *Falsified by:* a client whose kernel log shows neither string under any
+  arm — which would mean mac80211 is not governing it, and only then does the
+  "chipset-does-CSA-in-firmware" explanation become the live one.
+- **`--count-dec`'s cadence is closer to faithful than expected.** 23 complete countdowns × 4 steps
+  = 92 frames in `--secs 10`, i.e. ~109 ms per step against a real AP's 102.4 ms TBTT — within ~7%.
+  The remaining infidelity is structural, not timing: a real AP reaches 0, switches, and stops
+  beaconing on the old channel, whereas this wraps back to 3 while the AP's own CSA-free beacons
+  continue in parallel on the same channel.
+- **`wlan1mon` flapped mid-run again.** Control run 2: `sendto: Network is down`, `failed=7` of 97.
+  Second instance in one day (the first was `flags 0x1102` with pineapd running). At 7/97 the
+  comparison survives; the hazard is that rc is 0 whenever *anything* was sent, so the banner read
+  identically to a clean run. `pagerinj` now prints a `!! PARTIAL RUN` line whenever `failed` is
+  non-zero — `sent=2 failed=90` used to look exactly like `sent=92 failed=0`.
 
 **`2.0.0-stable` was released 2026-10-29** and is now what `latest` serves. Everything here remains
 pinned to 1.1.3; versioned downloads still work
@@ -1035,7 +1102,7 @@ the question is open.
 
 Listed in `dev/CamHound/RESPONSE.md` §13, `dev/pager-day-one.md` and — for what has already been
 closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowing: whether Recon's
-packet counters move the way `resp_verdict` assumes. **The count-byte experiment (day-one step 17a) has RUN — 2026-11-10, see "Fourth contact" — and found no difference between count 0 and count 3.** What it leaves open is narrower and better posed, and both halves now have an instrument: whether a *decrementing* count behaves differently from the constant one (`--count-dec`, built 2026-11-10, unrun), and whether the disruption is the CSA element at all rather than the beacon flood that carries it (`--clone`, same commit, unrun — **run this one first, it decides whether the rest of 17a means anything**). Whether any injected frame reaches the air still needs an external receiver, because pineapd hops the only spare interface.
+packet counters move the way `resp_verdict` assumes. **The count-byte experiment (day-one step 17a) has RUN — 2026-11-10, see "Fourth contact" and then "Fifth contact", which withdraws its headline.** **Both instruments have now been run too (`--clone` and `--count-dec`, 2026-11-10), and what they found is that the OBSERVABLE was the weak half** — see "Fifth contact". `--clone` settled the real question: the CSA element is what reaches the client, not the beacon flood. `--count-dec` changed nothing observable, but "is the feed frozen?" cannot distinguish a client that moved from one that was refused re-association, so the count question is **open and un-measured**, not answered. **The next step is a Linux client and `dmesg -w`**: mac80211 logs `"AP is in CSA process, reject auth"` (`mlme.c:8479`) and that one line reads out which code path fired. Whether a frame reaches the air on **5 GHz DFS or 6 GHz** still needs an external receiver; on 2.4 GHz ch 8 it is now demonstrated behaviourally.
 (`inj_parse_channels` is **no longer** on this list — it ran against a live radio on 2026-11-02 and
 was correct; see "First contact". Nor is *"the three `PINEAPPLE_DEAUTH_CLIENT*` commands are
 documented only by `hak5cmd`'s help text"* — they are now read from pineapd's own handler, see
