@@ -29,19 +29,28 @@
 # --stop-pineapd restores the old behaviour for the one case it is right for: when pineapd has
 # recently been asked for a firmware CSA on this BSSID, so its own count-0 clones are in the air
 # and pagerinj would skip them as clone sources. In that mode this script brings the interfaces
-# back up itself and refuses to fire if it cannot.
+# back up itself, and WARNS BUT STILL FIRES if it cannot -- it does not refuse. (It did refuse until
+# 2026-11-10; the refusal cost a bench run over a sysfs reading, and pagerinj's own rc plus the ==
+# banner are the honest signal. See the HINT, NOT A VETO comment at the interface gate.)
 #
 # WHAT IT STILL DOES NOT DO. It does not tell you whether a frame reached the air. sendto()
 # returning success proves nothing -- a cfg80211-blocked frame is freed and the path returns
-# NETDEV_TX_OK. Pass a <watch-if> to capture, or better, use an external receiver. On 2.4 GHz
-# wlan0mon can watch while wlan1mon injects; on 5 GHz it cannot (radio0 is 2g, receive-only), so
-# there you need the external receiver and the capture argument is useless.
+# NETDEV_TX_OK. Only an external receiver settles that.
+#
+# ⚠ THE <watch-if> CAPTURE IS BLIND IN THE DEFAULT MODE -- measured 2026-11-10, three runs, each
+# recording ZERO packets, including zero of the AP's own ~10/s beacons, which the filter would have
+# caught. pineapd's cmdline carries "--interface wlan0mon --band wlan0mon:2", so it HOPS wlan0mon
+# and the `iw dev wlan0mon set freq` below is overridden within a hop interval; EXAMINE parks only
+# the PRIMARY interface. So an earlier version of this paragraph -- "on 2.4 GHz wlan0mon can watch
+# while wlan1mon injects" -- is true only with --stop-pineapd, and the examples below did not pass
+# it. Pass a watch-if if you like, but read the capture verdict at the end before believing it, and
+# on 5 GHz it cannot work at all (radio0 is 2g, receive-only).
 #
 # Usage:
 #   ./run_17a.sh <inject-if> <bssid> <target-chan> <announce-chan> <count> [watch-if] [--stop-pineapd]
 #
-#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 0 wlan0mon     # the count-0 control
-#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 3 wlan0mon     # the arm that should differ
+#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 0     # the count-0 control
+#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 3     # the arm that should differ
 #
 # Run the control FIRST, reconnect the client, then the count-3 arm. One arm per invocation on
 # purpose: the thing being measured is a client's behaviour, and that needs you watching it.
@@ -90,14 +99,29 @@ FREQ="${FREQ:-$(mhz_for "$TCHAN")}"
 # iface_up <if> -> 0 the kernel says it is UP, 1 the kernel says it is DOWN, 2 the kernel does not
 # say (no such netdev, or sysfs unreadable). ONLY 1 is evidence of a problem.
 #
-# ⚠ THE FIRST REVISION HAD THE TWO FILES THE WRONG WAY ROUND, and it cost the operator a bench run
-# on 2026-11-10: it vetoed operstate first with an `up|unknown` whitelist, and the run died with
-# "wlan1mon is not up, so nothing can be transmitted" on an interface that was perfectly usable.
-# operstate is an RFC2863 CARRIER notion (net/core/link_watch.c, rfc2863_policy): a device that
-# never calls netif_carrier_on reads "down" there whatever its admin state, and a mac80211 monitor
-# vif is exactly such a device. flags bit 0 IS IFF_UP -- the administrative state, which is the
-# thing we want -- so flags is authoritative and operstate is only the fallback for a kernel that
-# does not export flags. Hex, e.g. 0x1003, so an odd last nibble means IFF_UP.
+# ⚠ READ THE RETRACTION BEFORE TRUSTING ANY REASONING HERE. An earlier version of this comment said
+# the 2026-11-10 bench refusal happened because "a mac80211 monitor vif reads operstate down
+# whatever its admin state", and that the interface had been "perfectly usable". The diagnostic the
+# operator ran the same day refutes both:
+#
+#     run 1   flags 0x1102   operstate down      bit 0 CLEAR -> genuinely down
+#     run 2   flags 0x1103   operstate unknown   bit 0 set   -> up
+#
+# So on THIS device an up monitor vif reports operstate `unknown` (which the old `up|unknown`
+# whitelist accepted) and a `down` reading agrees with flags. wlan1mon was simply administratively
+# down, with pineapd running (pid 11482) -- "pineapd is up" does not imply "its interfaces are up".
+# The old ordering would have answered correctly on both readings; what actually cost the run was
+# the die() at the gate below, not this ordering. The fixture the fix was built on was synthetic and
+# tested its own hypothesis. Full retraction: dev/CamHound/AUDIT-2026-11-10.md, last section.
+#
+# flags-first is kept as HARDENING, not as the fix, and the reason is narrow and does not depend on
+# the retracted claim: flags bit 0 IS IFF_UP, the administrative state, which is the thing this
+# script wants to know, whereas operstate is a carrier notion that a driver need not maintain.
+# Hex, e.g. 0x1003, so an odd last nibble means IFF_UP. The genuine defect the rewrite fixed is the
+# third state: an ABSENT netdev used to return "down", a positive claim about something that is not
+# there. (Whether the kernel calls netif_carrier_on for a monitor vif is NOT settled here -- an
+# audit finder read net/mac80211/iface.c and says it does, which would predict `up` rather than the
+# `unknown` this device reported. Unresolved, and deliberately not load-bearing for anything below.)
 iface_up() {
   [ -d "$NET_SYS/$1" ] || return 2
   f=$(cat "$NET_SYS/$1/flags" 2>/dev/null) || f=""
@@ -113,14 +137,65 @@ iface_up() {
   esac
 }
 
-# iface_down <if> -> true ONLY when the kernel positively says down. Every caller wants this and
-# not `! iface_up`, because rc 2 means "no answer" and must not be read as bad news.
+# iface_down <if> -> true ONLY when the kernel positively says down. This is the right test at the
+# pre-fire GATE, where the question is "should I warn?" and rc 2 is genuinely no news.
 iface_down() { iface_up "$1"; [ $? = 1 ]; }
+
+# iface_ready <if> -> true only when the kernel positively says UP. This is the right test for a
+# recovery WAIT, where the question is "has it come back yet?" -- and there an absent netdev is not
+# an unanswered question, it is the strongest possible NO.
+#
+# ⚠ The first revision used iface_down at both kinds of call site, and the 2026-11-10 audit caught
+# it from four finder dimensions independently: because iface_down is false for rc 2, an absent
+# interface made restore()'s 12 s settle loop exit on iteration 0 AND suppressed its
+# "still down after 12s" warning -- in exactly the state the loop exists to wait out, since this
+# script's own header says stopping pineapd "removes the very interfaces pagerinj needs". The old
+# predicate waited the full 12 s and warned. One helper cannot serve both questions.
+iface_ready() { iface_up "$1"; [ $? = 0 ]; }
 
 bring_up() {
   ip link set "$1" up 2>/dev/null || ifconfig "$1" up 2>/dev/null || return 1
   sleep 1
-  ! iface_down "$1"
+  iface_ready "$1"
+}
+
+# cur_chan <if> -> the channel the radio is actually on, or empty. iw is in the measured device
+# inventory; iwinfo is not, so there is no iwinfo arm here.
+cur_chan() { iw dev "$1" info 2>/dev/null | sed -n 's/.*channel \([0-9]*\) .*/\1/p' | head -1; }
+
+# examine_park -- ask pineapd to hold the radio, and SURFACE what it says.
+# Both commands are hak5cmd symlinks, and hak5cmd exits 0 on every path including its error paths
+# and writes the reason to stderr (measured 2026-11-05). The first revision sent both to
+# >/dev/null 2>&1, which threw away the only signal that exists: a failed park was byte-for-byte
+# indistinguishable from a successful one in this script's output.
+examine_park() {
+  _e=$(PINEAPPLE_EXAMINE_BSSID "$BSSID" "$LOCK" 2>&1 >/dev/null)
+  [ -n "$_e" ] && printf -- '!! EXAMINE_BSSID said: %s\n' "$_e" >&2
+  _e=$(PINEAPPLE_EXAMINE_CHANNEL "$TCHAN" "$LOCK" 2>&1 >/dev/null)
+  [ -n "$_e" ] && printf -- '!! EXAMINE_CHANNEL said: %s\n' "$_e" >&2
+  EXAMINED=1
+  return 0
+}
+
+# park_check -- two channel read-backs, because an unparked radio is the one failure that produces a
+# CONFIDENT wrong answer: pagerinj can still catch a target beacon during a hop pass, clone it, and
+# report rc 0 while most of the burst went out on other channels. CamHound answers the same question
+# the same way (lock_target's three cur_channel samples); this is the cut-down version.
+park_check() {
+  _a=$(cur_chan "$IF"); sleep 1; _b=$(cur_chan "$IF")
+  if [ -z "$_a" ] || [ -z "$_b" ]; then
+    printf -- '!! park UNVERIFIED: cannot read %s channel back. If the == line below says frames\n' "$IF" >&2
+    printf -- '!! left the radio, they may have gone out across pineapd hop set, not on ch %s.\n' "$TCHAN" >&2
+    return 2
+  fi
+  if [ "$_a" = "$TCHAN" ] && [ "$_b" = "$TCHAN" ]; then
+    printf -- '-- park confirmed: %s reads ch %s twice\n' "$IF" "$TCHAN" >&2
+    return 0
+  fi
+  printf -- '!! park FAILED: %s reads ch %s then ch %s, wanted %s. The radio is still hopping, so\n' "$IF" "$_a" "$_b" "$TCHAN" >&2
+  printf -- '!! the burst will be sprayed across the hop set. Do not record an observation from\n' >&2
+  printf -- '!! this run -- fix the park and fire again.\n' >&2
+  return 1
 }
 
 PINEAPD_WAS_UP=0
@@ -141,10 +216,11 @@ restore() {
     # run walks into "That device is not up" -- which is exactly what happened on the bench.
     i=0
     while [ "$i" -lt 12 ]; do
-      iface_down "$IF" || break
+      iface_ready "$IF" && break
       sleep 1; i=$(( i + 1 ))
     done
-    iface_down "$IF" && printf 'WARNING: %s is still down after 12s. Wait, or reboot before re-running.\n' "$IF" >&2
+    iface_ready "$IF" || printf 'WARNING: %s is not up after 12s (iface_up rc %s). Wait, or reboot before re-running.\n' \
+      "$IF" "$(iface_up "$IF"; echo $?)" >&2
   fi
   rm -f "$CAPERR" 2>/dev/null
 }
@@ -152,12 +228,23 @@ restore() {
 # Ctrl-C restarted pineapd, reset the EXAMINE lock, and the script went on to transmit into a radio
 # that was no longer parked. Exiting FROM the signal handler fires the EXIT trap, so restore still
 # runs, exactly once, and the run actually stops. 130/143 are the conventional SIGINT/SIGTERM codes.
+# HUP and QUIT matter as much as INT here, and were missing until the 2026-11-10 audit: the
+# documented workflow is ssh, and closing the terminal or dropping the link delivers SIGHUP to the
+# foreground process group. Untrapped, the shell dies WITHOUT running the EXIT trap, so on the
+# --stop-pineapd path a dropped connection left pineapd stopped, the EXAMINE lock unreleased and the
+# backgrounded tcpdump alive -- the precise state this script's header says cost three bench runs.
 trap restore EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap 'exit 131' QUIT
 
 printf -- '-- target %s ch %s (%s MHz); announcing ch %s with count %s on %s\n' \
   "$BSSID" "$TCHAN" "$FREQ" "$ACHAN" "$COUNT" "$IF" >&2
+
+# EXAMINE pins the radio to the target's channel without taking the interfaces away, and pineapd is
+# measured to transmit under a held lock. The lock must outlast the whole episode.
+LOCK=$(( 10 + 10 + 10 ))
 
 if [ "$STOP_PINEAPD" = 1 ]; then
   if [ "$PINEAPD_WAS_UP" = 1 ]; then
@@ -167,25 +254,12 @@ if [ "$STOP_PINEAPD" = 1 ]; then
   fi
   # pineapd OWNS these interfaces; stopping it takes them down. Measured on the bench.
   for i in "$IF" ${WIF:+$WIF}; do
-    iface_down "$i" && { printf -- '-- %s went down with pineapd; bringing it up\n' "$i" >&2; bring_up "$i" || true; }
+    iface_ready "$i" || { printf -- '-- %s is not up after the pineapd stop; bringing it up\n' "$i" >&2; bring_up "$i" || true; }
   done
-  printf -- '-- parking %s on %s MHz\n' "$IF" "$FREQ" >&2
-  iw dev "$IF" set freq "$FREQ" 20 2>/dev/null \
-    || printf 'WARNING: could not set freq on %s; pagerinj uses whatever is there\n' "$IF" >&2
-else
-  # EXAMINE pins the radio to the target's channel without taking the interfaces away, and pineapd
-  # is measured to transmit under a held lock. The lock must outlast the whole episode.
-  LOCK=$(( 10 + 10 + 10 ))
-  if [ "$PINEAPD_WAS_UP" = 0 ]; then
-    printf -- '!! pineapd is NOT running, so EXAMINE cannot park the radio and %s may not even\n' "$IF" >&2
-    printf -- '!! exist -- pineapd creates and owns the monitor interfaces. Start it (open the web\n' >&2
-    printf -- '!! UI, or /etc/init.d/pineapd start) and re-run. Continuing unparked.\n' >&2
-  fi
-  printf -- '-- parking with EXAMINE for %ss (pineapd left running: it owns %s)\n' "$LOCK" "$IF" >&2
-  PINEAPPLE_EXAMINE_BSSID "$BSSID" "$LOCK" >/dev/null 2>&1
-  PINEAPPLE_EXAMINE_CHANNEL "$TCHAN" "$LOCK" >/dev/null 2>&1
-  EXAMINED=1
-  sleep 2
+elif [ "$PINEAPD_WAS_UP" = 0 ]; then
+  printf -- '!! pineapd is NOT running, so EXAMINE cannot park the radio and %s may not even\n' "$IF" >&2
+  printf -- '!! exist -- pineapd creates and owns the monitor interfaces. Start it (open the web\n' >&2
+  printf -- '!! UI, or /etc/init.d/pineapd start) and re-run.\n' >&2
 fi
 
 # ⚠ THIS IS A HINT, NOT A VETO, and the first revision got that wrong too. It called die() here,
@@ -205,9 +279,32 @@ elif [ "$ifrc" = 2 ]; then
   printf -- '!! cannot tell whether %s is up: no %s/%s. Firing anyway; the == line below is the\n!! only thing that settles whether a frame was transmitted.\n' "$IF" "$NET_SYS" "$IF" >&2
 fi
 
+# ⚠ THE PARK GOES HERE, AFTER the interface repair -- it used to go before it. The EXAMINE branch
+# asked pineapd to hold a radio and THEN changed the administrative state of that very vif with
+# `ip link set up`, without re-parking or re-checking; the --stop-pineapd branch already sequenced
+# it the other way round, which is what made the asymmetry visible to the 2026-11-10 audit. Parking
+# last also means the 30 s lock covers more of the fire rather than being spent on sleeps.
+if [ "$STOP_PINEAPD" = 1 ]; then
+  printf -- '-- parking %s on %s MHz\n' "$IF" "$FREQ" >&2
+  iw dev "$IF" set freq "$FREQ" 20 2>/dev/null \
+    || printf 'WARNING: could not set freq on %s; pagerinj uses whatever is there\n' "$IF" >&2
+  park_check || true
+elif [ "$PINEAPD_WAS_UP" = 1 ]; then
+  printf -- '-- parking with EXAMINE for %ss (pineapd owns %s, so it is left running)\n' "$LOCK" "$IF" >&2
+  examine_park
+  sleep 2
+  park_check || true
+else
+  # No park was issued and none could be. Saying so is the whole point: the first revision printed
+  # "parking with EXAMINE for 30s (pineapd left running)" unconditionally, one line after warning
+  # that pineapd was NOT running -- five finder dimensions reported that contradiction, and the
+  # false line was the one printed last and in the informational style.
+  printf -- '!! NOT PARKED: no EXAMINE was issued, so the radio is wherever it happens to be.\n' >&2
+fi
+
 if [ -n "$WIF" ]; then
   mkdir -p /root/loot 2>/dev/null
-  iface_down "$WIF" && { printf -- '-- %s is down; bringing it up\n' "$WIF" >&2; bring_up "$WIF" || true; }
+  iface_ready "$WIF" || { printf -- '-- %s is not up; bringing it up\n' "$WIF" >&2; bring_up "$WIF" || true; }
   iw dev "$WIF" set freq "$FREQ" 20 2>/dev/null
   OUT="/root/loot/csa_17a_c${COUNT}_$(date +%s 2>/dev/null || echo now).pcap"
   # ONE primitive, on purpose. An earlier revision used
@@ -238,7 +335,23 @@ printf -- '-- firing\n' >&2
 RC=$?
 
 if [ -n "$CAP" ]; then
+  # ⚠ Re-check liveness. The only previous check was `kill -0` at t+2, and the fire does not start
+  # until t+4 at the earliest -- so the whole transmit window lay OUTSIDE the period that check
+  # covered, and a tcpdump that died at t+5 still produced the healthy "capture: ... (N bytes)" line
+  # plus the read-the-CSA-element invitation. pineapd owning and retuning the monitor interfaces is
+  # a concrete mechanism for exactly that death.
+  if kill -0 "$CAP" 2>/dev/null; then capalive=1; else capalive=0; fi
   sleep 1; kill "$CAP" 2>/dev/null; wait "$CAP" 2>/dev/null; CAP=""
+  if [ "$capalive" = 0 ]; then
+    printf -- '!! the capture DIED before the fire finished, so it did not record the transmit\n' >&2
+    printf -- '!! window and nothing in the file is evidence either way. tcpdump said:\n' >&2
+    sed -n '1,6p' "$CAPERR" >&2 2>/dev/null
+  elif [ -s "$CAPERR" ]; then
+    # tcpdump prints its own "N packets captured" summary to stderr on SIGTERM, and that count is a
+    # better total than the file size. The first revision binned it and then deleted the file.
+    printf -- '-- tcpdump reported:\n' >&2
+    sed -n '1,6p' "$CAPERR" >&2 2>/dev/null
+  fi
   # ⚠ NOT [ -s "$OUT" ]. A libpcap file header is 24 bytes and every record adds at least a
   # 16-byte record header, so `-s` is true for a capture containing ZERO packets -- and on
   # 2026-11-10 it was, three runs in a row: the script printed "capture: ... (24 bytes)" and then
@@ -249,6 +362,16 @@ if [ -n "$CAP" ]; then
   if [ "$CAPB" -gt 24 ]; then
     printf -- '-- capture: %s (%s bytes)\n' "$OUT" "$CAPB" >&2
     printf -- '-- read the CSA element with:  tcpdump -r %s -nn -e -vvv | grep -i -B2 -A4 switch\n' "$OUT" >&2
+    # The caveat belongs on THIS branch too. `CAPB > 24` is satisfied by ONE recorded frame of any
+    # kind, and the filter matches the AP's own beacons as well as our clones -- so a hopping
+    # receiver's most likely output is a few of the AP's beacons and none of our burst, which lands
+    # here and reads as healthy. Finding nothing when you grep for `switch` is then uninformative,
+    # and the branch below says so at length while this one used to say nothing.
+    if [ "$STOP_PINEAPD" != 1 ]; then
+      printf -- '!! but pineapd HOPS %s in this mode, so a short capture is most likely the AP own\n' "$WIF" >&2
+      printf -- '!! beacons caught between hops, NOT our burst. No channel-switch element here is\n' >&2
+      printf -- '!! weak evidence of anything. An external receiver is the only frame-level proof.\n' >&2
+    fi
   elif [ "$CAPB" = 24 ]; then
     printf -- '!! capture recorded ZERO packets (%s is a %s-byte pcap header and nothing else).\n' "$OUT" "$CAPB" >&2
     printf -- '!! Nothing in it is evidence, and the filter is probably innocent: it would have\n' >&2

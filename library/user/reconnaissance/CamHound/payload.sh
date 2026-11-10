@@ -955,7 +955,7 @@ cleanup() {
   if [ "$WATCH_LOCKED" = 1 ]; then _pineap EXAMINE CANCEL >/dev/null 2>&1; PINEAPPLE_EXAMINE_RESET >/dev/null 2>&1; fi
   [ -n "$RUN_ID" ] && [ "$REPORT_DONE_AT_EXIT" != 1 ] && write_report quiet
   command -v bands_restore >/dev/null 2>&1 && bands_restore         # user payload only; the hooks never change bands
-  rm -f "$LOCK_FILE" "$CHILD_FILE" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap "/tmp/cs_mem_$$.pcap" "/tmp/cs_bcn_$$.pcap" "$FIRE_ERR" /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
+  rm -f "$LOCK_FILE" "$CHILD_FILE" "$CHILD_FILE.n" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap "/tmp/cs_mem_$$.pcap" "/tmp/cs_bcn_$$.pcap" "$FIRE_ERR" /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
   log run "exit cycles=$CYCLE"
   ui_ok && set_state FINISH
 }
@@ -968,7 +968,18 @@ kill_children() {   # by stored PID only, never by pattern
   : >"$CHILD_FILE"
 }
 child_add() { printf '%s\n' "$1" >>"$CHILD_FILE"; }
-child_del() { [ -f "$CHILD_FILE" ] && grep -v -x "$1" "$CHILD_FILE" >"$CHILD_FILE.n" 2>/dev/null && mv "$CHILD_FILE.n" "$CHILD_FILE"; }
+# The `|| :` is load-bearing. grep exits 1 when it selects NO lines, which is exactly what
+# happens when the pid being removed is the file's only line -- so the old `&& mv` never ran, the
+# pid stayed registered for the rest of the run, and kill_children later SIGTERMed then SIGKILLed a
+# pid the kernel may have recycled onto an unrelated process. On this device the neighbours are
+# pineapd, the Go UI and tcpdump. The function's own comment says "by stored PID only, never by
+# pattern"; its bookkeeping was defeating that. Found by the 2026-11-10 audit; predates it
+# (758dfd7). It also left $CHILD_FILE.n behind every time, which cleanup now removes.
+child_del() {
+  [ -f "$CHILD_FILE" ] || return 0
+  { grep -v -x "$1" "$CHILD_FILE" >"$CHILD_FILE.n" 2>/dev/null || :; }
+  mv "$CHILD_FILE.n" "$CHILD_FILE" 2>/dev/null
+}
 
 # ============================================================================ scan state ===
 declare -A ROLE SSID_CLEAN AP_OF CH FREQ BAND HIDDEN PROBES PREV_PKT PREV_T RATE BUSY_N BUSY
@@ -2111,15 +2122,16 @@ declare -a RUNS
 # lock_target bssid secs [channel] -> 0 locked, 1 locked by channel, 2 lock failed
 LOCK_TEXT=""
 lock_target() {   # lock_target <bssid> <secs> [channel]; the channel defaults to the current Watch target's
-  local bssid="$1" secs="$2" c1 c2 c3 want="${3:-${WATCH_CH:-0}}"
+  local bssid="$1" secs="$2" c1 c2 c3 c4 raw ngood want="${3:-${WATCH_CH:-0}}"
   PINEAPPLE_EXAMINE_BSSID "$bssid" "$secs" >/dev/null 2>&1; WATCH_LOCKED=1; LAST_LOCK_TS=$EPOCHSECONDS
   sleep 0.5; c1=$(cur_channel); sleep 0.5; c2=$(cur_channel); sleep 0.5; c3=$(cur_channel)
+  raw="${c1:-_}/${c2:-_}/${c3:-_}"      # kept BEFORE the backfill: this is what the operator gets told
   LOCK_TEXT="$RECON_IF ch ${c3:-?}, target ch $want"
   # rc 3, not 0: we could not read the channel back, so we do not know whether the lock took.
   # Returning 0 here recorded lock=ok for a lock that was never verified, and LOCK_TEXT never
   # reached the operator. Proceeding is still right -- the alternative is refusing every response
   # on a device whose channel cannot be read -- but it must be labelled honestly in the loot.
-  [ -z "$c3" ] && { LOCK_TEXT="$RECON_IF: no channel read-back, lock unverified"; return 3; }
+  [ -z "$c3" ] && { LOCK_TEXT="$RECON_IF: no channel read-back ($raw), lock unverified"; return 3; }
   # A transient unreadable sample is not evidence of hopping. Measured on the bench 2026-11-09:
   # c1 came back EMPTY while c2 and c3 both read 1 and the target channel WAS 1 -- the radio was
   # parked exactly where it was asked to be -- yet the all-three-equal test below scored that
@@ -2132,17 +2144,48 @@ lock_target() {   # lock_target <bssid> <secs> [channel]; the channel defaults t
   # before c2 itself was repaired, so with c1 AND c2 both unreadable c1 stayed empty and the
   # all-three-equal test below scored "still hopping (/1/1)" -- character for character the bench
   # symptom this repair was added to stop. The measured case (ONE empty sample) passed either way,
-  # which is why neither the harness nor the selftest caught it; the audit did. st_lock covers both.
+  # which is why neither the harness nor the selftest caught it; the audit did. The selftest cases
+  # are inline below (search 'lock_target:'), not in a helper -- an earlier version of this line
+  # said "st_lock covers both" and no such function has ever existed.
+  ngood=0
+  [ -n "$c1" ] && ngood=$(( ngood + 1 ))
+  [ -n "$c2" ] && ngood=$(( ngood + 1 ))
+  [ -n "$c3" ] && ngood=$(( ngood + 1 ))
   [ -z "$c2" ] && c2="$c3"
   [ -z "$c1" ] && c1="$c2"
   if [ "$c1" = "$c2" ] && [ "$c2" = "$c3" ]; then
+    # ⚠ ONE readable sample cannot establish that the radio is parked, and the backfill above makes
+    # the comparison PASS on one: with c1 AND c2 unreadable the test becomes c3 = c3 = c3, a
+    # tautology carrying no stability information at all. Until 2026-11-10 that returned 0 and wrote
+    # lock=ok -- MORE confidence from LESS evidence than the two-readable-samples case beside it,
+    # which returns 3 -- inverting the contract this function states ten lines above. One sample now
+    # reports the unverified state that already exists. rc 3 still PROCEEDS, so the 2026-11-09 fix
+    # (never refuse a parked radio over a transient empty read) is intact; only the label changes,
+    # and the loot stops asserting a verification that did not happen.
+    if (( ngood < 2 )); then
+      LOCK_TEXT="$RECON_IF ch $c3 from ONE readable sample ($raw): lock unverified"
+      return 3
+    fi
     [ "$c3" = "$want" ] || [ "$want" = 0 ] && return 0
-    PINEAPPLE_EXAMINE_CHANNEL "$want" "$secs" >/dev/null 2>&1; sleep 1; c3=$(cur_channel)
-    LOCK_TEXT="locked by channel: $RECON_IF ch $c3"
-    [ "$c3" = "$want" ] && return 1
-    LOCK_TEXT="ch $c3 != $want, lock failed"; return 2
+    # The FOURTH read, which both the 2026-11-09 and 2026-11-10 repairs stopped short of: they
+    # protected c1-c3 and left this one bare, so one transient empty here still scored
+    # "ch  != 1, lock failed" -- rc 2, which refuses the whole response and transmits nothing. Same
+    # function, same cur_channel, same failure mode, and at the re-arm call site the membership
+    # capture and its dwell have already been spent by the time it fires.
+    PINEAPPLE_EXAMINE_CHANNEL "$want" "$secs" >/dev/null 2>&1; sleep 1; c4=$(cur_channel)
+    if [ -z "$c4" ]; then
+      LOCK_TEXT="$RECON_IF: no read-back after EXAMINE_CHANNEL $want, lock unverified"
+      return 3
+    fi
+    LOCK_TEXT="locked by channel: $RECON_IF ch $c4"
+    [ "$c4" = "$want" ] && return 1
+    LOCK_TEXT="ch $c4 != $want, lock failed"; return 2
   fi
-  LOCK_TEXT="$RECON_IF still hopping ($c1/$c2/$c3): lock failed"; return 2
+  # The RAW triple, not the backfilled one. The 2026-11-09 defect was diagnosable only because the
+  # log read "still hopping (/1/1)" and the empty slot was visible; printing the repaired values
+  # made that signature unreachable by construction and reported sample values that were never
+  # read. The backfill is the right input to the comparison and the wrong output to the operator.
+  LOCK_TEXT="$RECON_IF still hopping (samples $raw): lock failed"; return 2
 }
 # cur_channel: iwinfo first, then iw. iwinfo is a declared dependency but is NOT in the measured
 # device inventory (CLAUDE.md "First contact" lists tcpdump/iw/hak5cmd/scp present and does not
@@ -2654,6 +2697,22 @@ csa_newchan() {
 # a hand edit of the config block, which is exactly what "Edit these here" invites. Clamp both to a
 # finite window ONCE so the invocation and resp_fire's lock budget cannot disagree, and log it when
 # it bites rather than silently overriding what the operator wrote. Idempotent: called from both.
+# BusyBox's timeout accepts -k on recent builds and REJECTS it on older ones, and every other
+# timeout call in this payload is the bare `timeout N cmd` form -- so -k is a new syntax dependency
+# that no measurement on this device covers. An unsupported flag would make the injector fail with a
+# usage error on every single CSA, which is a worse failure than the soft bound -k exists to harden.
+# So probe once and fall back. Without -k the cap still bounds any child that honours SIGTERM, which
+# the shipped pagerinj does (it sets a flag and its nanosleep returns EINTR); what is lost is the
+# guarantee against a child that ignores it.
+TIMEOUT_K_PROBED=0; declare -a TIMEOUT_K=()
+timeout_k() {
+  (( TIMEOUT_K_PROBED )) && return 0
+  TIMEOUT_K_PROBED=1
+  if timeout -k 1 1 true >/dev/null 2>&1; then TIMEOUT_K=(-k 5)
+  else log resp "timeout has no -k: the injector cap will TERM but cannot KILL"; fi
+  return 0
+}
+
 csa_clamp() {
   local s=$CSA_INJ_SECS w=$CSA_INJ_WAIT
   (( CSA_INJ_SECS < 1 ))  && CSA_INJ_SECS=1
@@ -2675,11 +2734,23 @@ csa_issue() {
       log resp "csa injector skipped: no band for $R_BSSID, cannot pick a new channel"
     else
       : >"$FIRE_ERR"
-      # Registered as a child and capped by timeout, so BOTH teardown paths can reach a transmitter
-      # that outlives its window: child_add puts it where the watchdog and kill_children look, and
-      # timeout bounds it even if the pid file is lost. wait returns the child's own status, so the
-      # rc-is-the-signal rule for pagerinj (it prints its summary to stderr on SUCCESS) still holds.
-      timeout $(( CSA_INJ_SECS + CSA_INJ_WAIT + 10 )) \
+      # Registered as a child AND capped, so both teardown paths can reach a transmitter that
+      # outlives its window: child_add puts it where the watchdog and kill_children look, and
+      # timeout bounds it even if the pid file is lost.
+      #
+      # ⚠ TWO CORRECTIONS from the 2026-11-10 audit, both of which this comment previously got
+      # wrong. (1) The cap was `+10` while resp_fire reserves `+2` of lock for this injector, so
+      # the cap could ONLY ever fire 8 s after the lock budget it was supposed to live inside had
+      # been spent -- i.e. the backstop fired exclusively in the window where the measurement that
+      # follows it is already invalid. It now uses the SAME expression as the reservation in
+      # resp_fire; if you change one, change both, and `csa_clamp` bounds the inputs of both.
+      # (2) `wait` does NOT return the child's own status here -- it returns `timeout`'s, which is
+      # 124 on expiry whatever the injector exited with (measured). The rc-is-the-signal rule for
+      # pagerinj therefore does not survive the wrapper unaltered, and the classification below is
+      # what restores it. `-k 5` is what makes the cap a real bound rather than a polite request:
+      # plain `timeout` sends SIGTERM and then waits forever on a child that ignores it.
+      timeout_k
+      timeout "${TIMEOUT_K[@]}" $(( CSA_INJ_SECS + CSA_INJ_WAIT + 2 )) \
         "$CSA_INJECTOR" -i "$RECON_IF" --csa --bssid "$R_BSSID" --chan "$nc" \
         --count "$CSA_COUNT" --secs "$CSA_INJ_SECS" --wait "$CSA_INJ_WAIT" \
         >/dev/null 2>"$FIRE_ERR" &
@@ -2688,8 +2759,17 @@ csa_issue() {
       CSA_CMD="${CSA_INJECTOR##*/}:ch$nc:n$CSA_COUNT"   # expansion, not basename: one less command to exist
       log resp "csa inject $CSA_CMD rc=$rc${err:+ out=${err:0:200}}"
       (( rc == 0 )) && return 0
+      # rc 2 means "it DID transmit and was then capped". Distinguishing it from "it sent nothing"
+      # is not cosmetic: resp_fire's refusal path writes CMD_REFUSED, which asserts no frame left
+      # the radio, and the harness comment on that row says in as many words that CMD_REFUSED
+      # "would be a lie: a frame WAS transmitted". A capped run has pagerinj's own
+      # `interrupted: sent=N failed=0` on stderr, so the evidence is right there in `err`.
+      if (( rc == 124 )) || (( rc >= 128 )) || printf '%s' "$err" | grep -q 'sent=[1-9]'; then
+        CSA_ERR="injector capped after transmitting (rc $rc): ${err:0:160}"
+        return 2
+      fi
       CSA_ERR="injector rc $rc: ${err:0:160}"
-      return "$rc"
+      return 1
     fi
   fi
   fw=$(response_cmd CSA)
@@ -2826,6 +2906,15 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
     # its own command line. It also names itself for the loot, so a reader can tell a pagerinj CSA
     # from a firmware one without cross-referencing the config.
     csa_issue; frc=$?; ferr="$CSA_ERR"; cmd="$CSA_CMD"
+    # rc 2 is "transmitted, then capped by its own timeout" -- frames provably left the radio, so
+    # this must not take the refusal path below. Let it through to the measurement, which scores it
+    # on the counters like any other fire; a capped injector is a reason to distrust the DWELL, not
+    # a reason to claim nothing was sent.
+    if (( frc == 2 )); then
+      LOG yellow "CSA injector was capped after transmitting; measuring anyway"
+      log resp "csa capped-after-send ${ferr:0:160}"
+      frc=0; ferr=''
+    fi
   else
     : >"$FIRE_ERR"
     "$cmd" "$R_BSSID" "$R_TARGET" "$R_CH" >/dev/null 2>"$FIRE_ERR"
@@ -2843,7 +2932,11 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   # 401 is dead code no command reaches). A refused CSA leg must NOT fail the attempt -- the deauth
   # has already left -- so it warns and the loot records which legs went out.
   if [ "$k" = BOTH ]; then
-    if csa_issue; then
+    csa_issue; local crc=$?
+    # 0 sent cleanly, 2 sent then capped. Both put frames on the air, so both name the sender in
+    # the loot; only a real failure takes the warning branch.
+    if (( crc == 0 )) || (( crc == 2 )); then
+      (( crc == 2 )) && log resp "csa leg capped after sending ${CSA_ERR:0:160}"
       # Keep the firmware spelling stable for readers and for the gates; name the injector when it
       # is what actually sent, since "which CSA was this" is the first question a loot row raises.
       case "$CSA_CMD" in PINEAPPLE_*) cmd="$cmd+CSA" ;; *) cmd="$cmd+$CSA_CMD" ;; esac
@@ -3477,6 +3570,27 @@ IWFIX
   st "csa issue: a non-zero injector rc is a failure"            "$?" 1
   st "csa issue: and the reason is carried to the caller" \
     "$(printf '%s' "$CSA_ERR" | grep -c 'no beacon captured')" "1"
+  # A CAPPED injector transmitted and was then killed by its own timeout, so rc is timeout's (124)
+  # and not pagerinj's. Scoring that as a refusal writes CMD_REFUSED -- "nothing was transmitted" --
+  # for frames that provably left the radio, which the harness calls a lie in as many words. rc 2 is
+  # the third state. Falsified by: csa_issue returning 1 for a run whose stderr reports sent=N, N>0.
+  printf '#!/bin/sh\nprintf "interrupted: sent=90 failed=0\\n" >&2\nexit 124\n' >"$tmp/inj_capped"
+  printf '#!/bin/sh\nprintf "interrupted: sent=5 failed=0\\n" >&2\nexit 7\n' >"$tmp/inj_sent7"
+  chmod +x "$tmp/inj_capped" "$tmp/inj_sent7"
+  # -k is a syntax dependency this payload cannot verify against the Pager's busybox, so csa_issue
+  # has to fall back rather than fail. Stub a timeout that rejects -k the way an older build would.
+  timeout() { case "$1" in -k) return 1 ;; esac; shift; "$@"; }
+  TIMEOUT_K_PROBED=0; TIMEOUT_K=()
+  CSA_INJECTOR="$tmp/inj_ok"; csa_issue
+  st "csa issue: a timeout that rejects -k still runs the injector" "$?" 0
+  st "csa issue: and it ran with no -k in the argv"  "$(grep -c -- '-k' "$tmp/injargs")" "0"
+  unset -f timeout; TIMEOUT_K_PROBED=0; TIMEOUT_K=()
+  CSA_INJECTOR="$tmp/inj_capped"; csa_issue >/dev/null 2>&1
+  st "csa issue: a capped injector is rc 2 (sent, then killed), not a refusal" "$?" 2
+  st "csa issue: and the reason says it transmitted first" \
+    "$(printf '%s' "$CSA_ERR" | grep -c 'capped after transmitting')" "1"
+  CSA_INJECTOR="$tmp/inj_sent7"; csa_issue >/dev/null 2>&1
+  st "csa issue: any rc whose stderr reports sent=N>0 is rc 2, not a refusal" "$?" 2
   CSA_INJECTOR="$tmp/not_installed"; csa_issue >/dev/null 2>&1
   st "csa issue: an absent injector falls back to the firmware command" "$CSA_CMD" "PINEAPPLE_DEAUTH_CLIENT_CSA"
   st "csa issue: a successful injector leaves no error behind" \
@@ -3598,6 +3712,15 @@ IWFIX
   st "verdict absent, no baseline, seen after" "$(resp_verdict - - 10 20 1)" "INCONCLUSIVE"
   st "verdict no follow-up"     "$(resp_verdict 100 50 - - 1)"     "INCONCLUSIVE"
   st "verdict non-numeric"      "$(resp_verdict x 50 y 60 1)"      "INCONCLUSIVE"
+  # child_del on a file whose only line IS the pid: grep -v -x selects nothing and exits 1, so the
+  # old `&& mv` never ran and the pid stayed registered. kill_children then SIGTERMed and SIGKILLed
+  # a pid the kernel may have recycled, on a device whose neighbours are pineapd and the Go UI.
+  st_cf="$CHILD_FILE"; CHILD_FILE="$tmp/children"
+  printf '4242\n' >"$CHILD_FILE"; child_del 4242
+  st "child_del: removes the pid when it is the file's only line" "$(cat "$CHILD_FILE")" ""
+  printf '4242\n999\n' >"$CHILD_FILE"; child_del 4242
+  st "child_del: and still removes one of several"                "$(cat "$CHILD_FILE")" "999"
+  CHILD_FILE="$st_cf"
   POSTURE[aa:00:00:00:00:10]=C; POSTURE_TS[aa:00:00:00:00:10]=$EPOCHSECONDS
   # cur_channel must not depend on iwinfo alone: it is a declared dependency that the measured
   # device inventory does not list, and without the iw fallback lock_target failed OPEN and wrote
@@ -3621,15 +3744,40 @@ IWFIX
   iwinfo() { printf 'x' >>"$tmp/chseq"; [ "$(wc -c <"$tmp/chseq" | tr -d ' ')" -gt 1 ] && printf '          Channel: 1 (2.412 GHz)\n'; return 0; }
   lock_target aa:00:00:00:00:10 5 1 >/dev/null
   st "lock_target: an empty first sample is not 'still hopping'" "$?" 0
-  # TWO unreadable samples, same parked radio. The 2026-11-09 repair above did NOT cover this: it
-  # backfilled c1 from c2 BEFORE repairing c2 from c3, so with c1 and c2 both empty c1 stayed empty
-  # and the all-three-equal test scored the identical "still hopping (/1/1)" refusal the one-sample
-  # fix was written to stop. Found by the 2026-11-10 audit, three finder dimensions independently;
-  # the measured one-sample case passed either way, which is why nothing here caught it.
+  # MIDDLE sample unreadable. This is the one empty pattern that behaves identically under either
+  # backfill order, so the mutation test has no teeth on it -- which is exactly why it needs a case
+  # of its own. CLAUDE.md claimed this was covered before 2026-11-10; it was not.
+  : >"$tmp/chseq"
+  iwinfo() { printf 'x' >>"$tmp/chseq"; [ "$(wc -c <"$tmp/chseq" | tr -d ' ')" != 2 ] && printf '          Channel: 1 (2.412 GHz)\n'; return 0; }
+  lock_target aa:00:00:00:00:10 5 1 >/dev/null
+  st "lock_target: a MIDDLE empty sample is not 'still hopping'" "$?" 0
+  # TWO unreadable samples leave exactly ONE reading, and one reading cannot establish that the
+  # radio is parked: the backfill turns the comparison into c3 = c3 = c3, a tautology. This used to
+  # return 0 and write lock=ok -- more confidence from less evidence than the two-good-samples case
+  # four lines up, which returns 3. rc 3 proceeds, so the 2026-11-09 fix is intact; only the label
+  # is honest now. Falsified by: this returning 0, or returning 2 (a refusal, the original bug).
   : >"$tmp/chseq"
   iwinfo() { printf 'x' >>"$tmp/chseq"; [ "$(wc -c <"$tmp/chseq" | tr -d ' ')" -gt 2 ] && printf '          Channel: 1 (2.412 GHz)\n'; return 0; }
   lock_target aa:00:00:00:00:10 5 1 >/dev/null
-  st "lock_target: TWO empty samples are not 'still hopping' either" "$?" 0
+  st "lock_target: ONE readable sample is unverified, not a verified lock" "$?" 3
+  st "lock_target: and it is still not scored as hopping" \
+    "$(printf '%s' "$LOCK_TEXT" | grep -c 'hopping')" "0"
+  # The FOURTH read-back, after EXAMINE_CHANNEL. Protected by neither the 2026-11-09 nor the
+  # 2026-11-10 repair: a transient empty here scored "ch  != 1, lock failed" -- rc 2, refusing the
+  # whole response and transmitting nothing, with the same empty-field signature as the original bug.
+  : >"$tmp/chseq"
+  iwinfo() { printf 'x' >>"$tmp/chseq"; [ "$(wc -c <"$tmp/chseq" | tr -d ' ')" -lt 4 ] && printf '          Channel: 6 (2.437 GHz)\n'; return 0; }
+  lock_target aa:00:00:00:00:10 5 1 >/dev/null
+  st "lock_target: an empty FOURTH read is unverified, not a failed lock" "$?" 3
+  # The hopping log line must show the RAW samples. The 2026-11-09 defect was found only because
+  # "(/1/1)" made the empty slot visible; printing the backfilled values hid it and reported a
+  # sample that was never read.
+  : >"$tmp/chseq"
+  iwinfo() { printf 'x' >>"$tmp/chseq"; case "$(wc -c <"$tmp/chseq" | tr -d ' ')" in 2) printf '          Channel: 6 (2.437 GHz)\n' ;; 3) printf '          Channel: 11 (2.462 GHz)\n' ;; esac; return 0; }
+  lock_target aa:00:00:00:00:10 5 1 >/dev/null
+  st "lock_target: a genuinely hopping radio is still a failed lock" "$?" 2
+  st "lock_target: and the log shows the unread sample as _, not a backfilled value" \
+    "$(printf '%s' "$LOCK_TEXT" | grep -c '_/6/11')" "1"
   : >"$tmp/chseq"
   iwinfo() { printf 'x' >>"$tmp/chseq"; printf '          Channel: %s (2.412 GHz)\n' "$(wc -c <"$tmp/chseq" | tr -d ' ')"; }
   lock_target aa:00:00:00:00:10 5 1 >/dev/null

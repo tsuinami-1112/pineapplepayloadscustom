@@ -86,9 +86,12 @@ pineapd. Turning the hook on bets that CamHound's EXAMINE lock holds the channel
 nothing has measured that. Measure it standalone first with `dev/injector/run_17a.sh`. That script
 parks the radio with EXAMINE by default and leaves pineapd running; pass `--stop-pineapd` only if
 you want it stopped, because stopping it takes the monitor interfaces down with it (measured on the
-bench) and the script has to bring them back up. It restores whatever it changed on every exit path
-including Ctrl-C — true since 2026-11-10, when the audit found the signal handler restored and then
-carried on transmitting anyway. Once it is proven, set `CSA_INJECTOR` (and
+bench) and the script has to bring them back up. It restores whatever it changed on `EXIT`, `INT`,
+`TERM`, `HUP` and `QUIT` — true since 2026-11-10. Two audits went into that sentence: the first
+found the signal handler restoring and then carrying on to transmit anyway, and the second found
+that `HUP` and `QUIT` had no trap at all, so closing the ssh session the bench workflow runs over
+killed the shell without firing the `EXIT` trap and left pineapd stopped. There is still no trap
+for `KILL`, and there cannot be. Once it is proven, set `CSA_INJECTOR` (and
 optionally `CSA_COUNT`, `CSA_CHAN`) in the config block of the user payload and regenerate the
 hooks; they are not starred because `cfg()` takes integers only, so a path cannot come through
 `PAYLOAD_SET_CONFIG`.

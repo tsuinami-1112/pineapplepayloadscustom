@@ -586,10 +586,21 @@ was trusted: `pineapd` `adc9d36d065b084856534dee…` / 1320040 B, `pineapple/pin
   that was measured.** It backfilled `c1` from `c2` before repairing `c2` from `c3`, so with `c1`
   and `c2` both unreadable `c1` stayed empty and the comparison scored the identical
   `still hopping (/1/1)` refusal. Found by the 2026-11-10 audit (three finder dimensions
-  independently), reproduced, and fixed by backfilling from the last sample outward; the selftest
-  now covers one-empty, two-empty and middle-empty, and a mutation test confirms the two-empty case
-  fails against the old order. *Falsified by:* a `lock_target` rc changing for any of those four
-  sample patterns without `cur_channel` changing.
+  independently), reproduced, and fixed by backfilling from the last sample outward.
+  **Then a second 2026-11-10 audit found three more defects in the same function, and the two-empty
+  answer above was itself wrong.** It returned 0 and wrote `lock=ok` from a *single* readable
+  sample — more confidence than the two-readable-samples case beside it, which returns 3 — because
+  the backfill turns the comparison into `c3 = c3 = c3`, a tautology. All three are fixed: one
+  readable sample is now `lock=unverified` (rc 3, which still **proceeds**, so the original fix is
+  intact and only the label changed); the **fourth** `cur_channel` read, the one after
+  `EXAMINE_CHANNEL`, had no empty-sample protection at all and still refused the whole response on
+  a transient empty (rc 2 → rc 3); and the hopping log line printed the *backfilled* triple, so the
+  `(/1/1)` signature that made this diagnosable in the first place had become unreachable by
+  construction — it now prints the raw samples, e.g. `_/6/11`. Selftest coverage is one-empty,
+  middle-empty, one-readable-sample, empty-fourth-read and genuinely-hopping, each confirmed by a
+  mutation that fails only its own case. *An earlier version of this line also claimed an `st_lock`
+  helper; no such function has ever existed, and the cases are inline.* *Falsified by:* a
+  `lock_target` rc changing for any of those patterns without `cur_channel` changing.
 
 ### Fourth contact — the CSA count byte makes no difference to a real client, 2026-11-10
 
