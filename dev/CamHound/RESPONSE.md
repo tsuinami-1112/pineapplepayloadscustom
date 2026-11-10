@@ -3,10 +3,12 @@
 Developer reference for the **Disrupt** rung: the part of CamHound that turns a detection into a
 disconnection. `PLAN_v2.md` covers the recon side; this covers everything downstream of it.
 
-Status: coded and laptop-verified; `--selftest` passes on a real 1.1.3 Pager as of 2026-11-04
-(259/0), but **no part of this rung has transmitted, or even been reached, on hardware** — the
-selftest stubs every device-changing command. Section
-[What is unverified](#what-is-unverified) is the honest list.
+Status: coded, laptop-verified, and **transmitting on hardware since 2026-11-05** — a Disrupt ran the
+whole chain from the user payload on the 1.1.3 unit (CLAUDE.md "Second contact"), and since
+2026-11-10 an AP row fires even when the capture recovers nobody (below). `--selftest` last passed on
+the Pager at 259/0 (2026-11-04); the suite is 334 checks on the laptop as of 2026-11-10. The selftest
+still stubs every device-changing command, so section [What is unverified](#what-is-unverified)
+remains the honest list of what the bench has not measured.
 
 ---
 
@@ -421,7 +423,8 @@ No combination of the three keys reaches the air without a dialog.*
 
 ## 11. Loot
 
-`responses.tsv`, `|`-separated with a `#` header, **one row per measured subject** (so an attempt
+`responses.tsv`, `|`-separated with a `#` header, **one row per subject** — each measured client, or,
+since 2026-11-10, the broadcast placeholder `ff:ff:ff:ff:ff:ff` when a zero-member AP row fires — (so an attempt
 whose scope is `bss` against a BSSID with four clients writes four rows, one attempt — including when
 the operator picked a single client row and chose `CSA` or `BOTH`):
 
@@ -430,7 +433,10 @@ the operator picked a single client row and chose `CSA` or `BOTH`):
 ```
 
 `mac` is the enumerated target the operator acted on; **`target` is the subject actually measured**
-— the individual client for a broadcast attempt, not `ff:ff:ff:ff:ff:ff`. `resp_write` takes that as
+— the individual client for a broadcast attempt, not `ff:ff:ff:ff:ff:ff` — **with one exception since
+2026-11-10: a zero-member AP row writes exactly one row whose `target` IS `ff:ff:ff:ff:ff:ff`, with
+`pk_before`/`pk_after` `-` and verdict `INCONCLUSIVE`, because nothing could be measured** (the
+2026-11-10 paragraph above). `resp_write` takes that as
 an optional 9th argument and defaults to `R_TARGET`. `rsn_caps` is the raw 2-octet RSN Capabilities
 field, low octet first; `beacon_prot` is octet 10 of the Extended Capabilities element, or `-` when
 absent. Keeping the raw bytes means a disputed badge can be re-derived from the loot rather than
@@ -448,7 +454,8 @@ the three `PINEAPPLE_DEAUTH_CLIENT*` commands that record their arguments and tr
 a synthetic-beacon branch in the fake `tcpdump`. That scenario checks the posture read happening
 under a lock on the target channel, the badge derived from the beacon, the correct command invoked
 with the right BSSID/target/channel, the lock verified as `ok` rather than by-channel, the
-per-subject loot rows with badge and raw caps, the aggregate verdict, the no-clients guard, the
+per-subject loot rows with badge and raw caps, the aggregate verdict, the zero-member AP row firing
+anyway and looting `INCONCLUSIVE` (`nomem_fired`, since 2026-11-10; before that, the no-clients guard), the
 cached badge appearing on the card afterwards, and EXAMINE being released. Two further scenarios
 reach the confirms the badge logic adds: `blind` (the fake `tcpdump` captures no beacon, so the badge
 is `?`) checks that the "Fire blind?" dialog appears, that accepting it offers CSA first with every

@@ -3950,6 +3950,10 @@ IWFIX
   resp_fire "$BSSC" DEAUTH 'D+C' >/dev/null 2>&1
   st "zero members, AP row: a refused command is still CMD_REFUSED, rc 1, one row" \
      "$? $(grep -c '^[0-9]' "$tmp/responses.tsv" 2>/dev/null) $(awk -F'|' 'NR == 2 { print $16 }' "$tmp/responses.tsv" 2>/dev/null)" "1 1 CMD_REFUSED"
+  # pins the 'fired' line BELOW the refusal gate: a refused command must not leave an events.log line
+  # that reads as a transmission (review finding TF1, 2026-11-10)
+  st "zero members, AP row: a refused command logs no 'fired ... with no members recovered' line" \
+     "$(grep -c 'broadcast with no members recovered' "$tmp/events.log" 2>/dev/null)" 0
   unset ST_WHY ST_REFUSE; rm -f "$tmp/fired" "$tmp/responses.tsv" "$tmp/events.log"
   PINEAPPLE_DEAUTH_CLIENT() { :; }
   eval "$o_lock"; eval "$o_unlock"; eval "$o_mem"; RESP_SETTLE_SECS="$o_settle"

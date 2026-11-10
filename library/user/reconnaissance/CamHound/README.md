@@ -327,13 +327,16 @@ before the client address (raise `CLI_CAP_SNAP`), or no usable `tcpdump` — **s
 broadcast frame** (operator-decided 2026-11-10: *"I'll accept nuclear blast. Let the AP row fire broadcast frames."*). It
 writes one `INCONCLUSIVE` row for `ff:ff:ff:ff:ff:ff` with `pk_before`/`pk_after` `-`, because there
 is nothing to measure, and `events.log` names the reason: `no-members <bssid> why=NO_CLIENTS`,
-`SNAP_SHORT` or `NO_CAPTURE`, then `fired … with no members recovered`.
+`SNAP_SHORT` or `NO_CAPTURE`, then `fired … with no members recovered`. Loot written before 2026-11-10
+may still carry `NO_CLIENTS`, `NO_MATCH`, `SNAP_SHORT` or `NO_CAPTURE` in the verdict column: those
+rows recorded a refusal, and nothing was transmitted for them.
 
 What is measured follows the attack's **scope**, not the row you picked. A `cli`-scope attempt
 (`DEAUTH` from a client row) measures that one device. A `bss`-scope attempt (`CSA` or `BOTH` from any
 row, or anything from an AP row) is measured on the BSSID's visible, non-randomised clients, since the
 AP itself keeps beaconing whatever happens; the device you picked is always among them, even behind a
-randomised MAC. `responses.tsv` gets one row per measured subject, and the verdict shown is the
+randomised MAC. `responses.tsv` gets one row per subject (each measured client, or the broadcast
+placeholder when nobody was heard), and the verdict shown is the
 aggregate (`MOVED` only when every subject went quiet, `NO_EFFECT` when any kept transmitting,
 `INCONCLUSIVE` otherwise). When you picked one device and more than one was measured, a second line
 `picked <mac>: <verdict>` names that device's own result, so a collateral `NO_EFFECT` cannot read as
@@ -364,7 +367,8 @@ that reuse a captured beacon's timestamp.
   `#first_seen|last_seen|run_id|mac|role|cat|vendor|label|conf|id_score|beh_score|beh_verdict|band|ssid|ap_bssid|ch|freq|rssi_best|rssi_best_ts|rssi_last|prox|n_seen|pkt_rate|signals|lan_tag|lat|lon`
   (`band` = 2/5/6 GHz, `signals` = tags, epoch seconds, `-` for empty). ~160 B per MAC.
 - `events.log`: `epoch level msg` (cycle, alert, mode, watch, locate, cfg, warn, run, resp).
-- `responses.tsv` (only once a response is fired): one `|`-separated row per measured subject, so a
+- `responses.tsv` (only once a response is fired): one `|`-separated row per subject — each measured
+  client, or `ff:ff:ff:ff:ff:ff` itself when an AP row fired with nobody heard — so a
   `bss`-scope attempt against a BSSID with four visible clients writes four rows for one attempt. Header:
   `#epoch|mac|role|bssid|target|ch|band|badge|rsn_caps|beacon_prot|attack|cmd|lock|pk_before|pk_after|verdict`
   (`rsn_caps` is the raw 2-octet RSN Capabilities field, low octet first; `beacon_prot` is octet 10
