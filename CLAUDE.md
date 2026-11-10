@@ -788,6 +788,55 @@ the measurement.
    recommendation as the FIRST step — that is still the cleanest read of the refusal path, but it is
    no longer needed to separate the two leading mechanisms.*
 
+### Sixth contact — the content control settles C1: the channel-switch element specifically, 2026-11-10
+
+Same session, same target, and **the first 17a arms with a real capture on the parked primary.**
+Every arm printed `park confirmed: wlan1mon reads ch 8 twice`.
+
+| arm | frame | frames | feed |
+|---|---|---|---|
+| `--elem=32:00` — CRC-relevant, **no switch** | 119 B, `+{32,1}` | `sent=93 failed=5` | **nothing** |
+| `--mode=1`, announce ch **8** = target (quiet, no move) | 121 B, `{37,3,mode=1,ch=8,count=3}` | `sent=84 failed=7` | **intermittent** — seconds frozen, brief recovery, repeating |
+| `--mode=0`, announce ch 1 ≠ target (move, no quiet) | 121 B, `{37,3,mode=0,ch=1,count=3}` | `sent=92 failed=0` | **intermittent**, same pattern |
+
+Compare Fourth contact's `mode=1` + announce ch 1 arm, `sent=97 failed=0`: a **constant** freeze.
+
+- **⭐ C1 NOW HOLDS IN THE STRONG FORM — it is the channel-switch element, not beacon churn.**
+  `--elem 32:00` appends PWR_CONSTRAINT, which **is** in `care_about_ies` (`mlme.c:6052`), so the
+  frame changes `elems->crc`, clears the gate at `:6929`, and reaches both
+  `ieee80211_rx_bss_info()` (`:6934`) and `ieee80211_sta_process_chanswitch()` (`:6936`) — where,
+  carrying no CSA, the parse sets `res = 1` and it takes the abort branch. So the frame was
+  **parsed, handled, and did nothing visible.** That is the control `--clone` could not be: a
+  CRC-relevant, parsed, non-switch change to the AP's own beacon has no effect, while the same
+  beacon plus five channel-switch bytes does. The IE-churn confound the adversarial pass raised is
+  **spent**. *Falsified by:* any `--elem` arm from `care_about_ies` that freezes the feed.
+- **⭐ Both halves of a CSA contribute, and the constant freeze needs BOTH.** Two single-variable
+  comparisons against the constant-freeze arm:
+  - **drop the quiet** (`--mode=0`, same announce channel): constant → intermittent, at
+    `sent=92 failed=0` against `97 failed=0`. This is the clean comparison.
+  - **drop the move** (announce the current channel, keep mode 1): constant → intermittent, but at
+    `sent=84 failed=7` — 13% fewer frames on the air, so this arm is confounded by its own
+    degradation and is the weaker of the two.
+  So the mode-1 quiesce is **not** the whole story, which is what the adversarial pass's strongest
+  finding proposed, and neither is the move. A both-matter answer, not either/or.
+- **The intermittency is new, and it matches the abort race.** Earlier arms were a constant freeze;
+  these cycle seconds-frozen / briefly-recovered. The genuine AP's CSA-free beacons abort the
+  pending switch at ~10/s (`mlme.c:2452`), so whatever state the client enters is torn down and
+  re-established repeatedly. A ~10 Hz trigger against seconds-long freezes says the client's
+  recovery costs far more than the cycle — plausibly a stream re-establish per abort. **[A]**: the
+  cycle rate was not measured, only described.
+- **⭐ AND THERE ARE CAPTURES — 2617, 4224 and 3638 packets on the PARKED primary**, 1.9-4.5 MB,
+  with the `addr1 or addr2` filter. The first on-device 17a captures that could see the client at
+  all, and they contain the observation that separates "disconnected, then re-associated" from
+  "quiesced and never left": whether the feed's return is preceded by an auth/assoc exchange.
+  **Not yet read — and no further transmission is needed to read them.**
+- **`wlan1mon` flapped in two of the three arms** (`failed=5` of 98, `failed=7` of 91, `failed=0`
+  in the third). Third and fourth instances in a day; `!! PARTIAL RUN` now names it, which is how
+  the 2a confound above was visible at all.
+- *Fixed the same day:* the `> 24`-byte capture branch printed "pineapd HOPS wlan1mon" over 2600
+  packets captured on the interface EXAMINE had just parked. The caveat is now scoped to a watch
+  interface that is **not** the parked one.
+
 **`2.0.0-stable` was released 2026-10-29** and is now what `latest` serves. Everything here remains
 pinned to 1.1.3; versioned downloads still work
 (`…/firmwares/1.1.3-stable`, 303 → signed .bin, sha256 `3073d6b8…cd33`).
@@ -1158,7 +1207,7 @@ the question is open.
 
 Listed in `dev/CamHound/RESPONSE.md` §13, `dev/pager-day-one.md` and — for what has already been
 closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowing: whether Recon's
-packet counters move the way `resp_verdict` assumes. **The count-byte experiment (day-one step 17a) has RUN — 2026-11-10, see "Fourth contact" and then "Fifth contact", which withdraws its headline.** **Both instruments were run too (`--clone` and `--count-dec`, 2026-11-10), and an adversarial pass then showed the OBSERVABLE was the weak half** — see "Fifth contact", which is the state of record. What survives: the five appended bytes are what disrupt this client. What does not: `--clone` is a near-tautological control on a mac80211 client (a verbatim clone hashes to the same `beacon_crc` and is dropped at `mlme.c:6929`), Channel Switch **Mode 1** freezes the client count-independently (`mlme.c:2610`), the real AP's own beacons abort a pending switch ~10/s (`mlme.c:2452`), and the `--count-dec` arm transmitted count 0 on 23 of 92 frames. **The count byte's effect is un-measured, not null.** Next: `--elem=32:00`, then `--mode=1` same-channel against `--mode=0` different-channel, both with the inject interface as the watch interface. Whether a frame reaches the air on **5 GHz DFS or 6 GHz** still needs an external receiver.
+packet counters move the way `resp_verdict` assumes. **The count-byte experiment (day-one step 17a) has RUN — 2026-11-10, see "Fourth contact" and then "Fifth contact", which withdraws its headline.** **Both instruments were run too (`--clone` and `--count-dec`, 2026-11-10), and an adversarial pass then showed the OBSERVABLE was the weak half** — see "Fifth contact", which is the state of record. What survives: the five appended bytes are what disrupt this client. What does not: `--clone` is a near-tautological control on a mac80211 client (a verbatim clone hashes to the same `beacon_crc` and is dropped at `mlme.c:6929`), Channel Switch **Mode 1** freezes the client count-independently (`mlme.c:2610`), the real AP's own beacons abort a pending switch ~10/s (`mlme.c:2452`), and the `--count-dec` arm transmitted count 0 on 23 of 92 frames. **The count byte's effect is un-measured, not null.** **All three next-steps were then run — see "Sixth contact", which is the state of record.** `--elem=32:00` did nothing, so C1 holds in the strong form: it is the channel-switch element, not beacon churn. The mode arms gave a both-matter answer rather than either/or. **The next step needs no transmission at all: three captures totalling ~10,000 packets on the parked primary are sitting in `/root/loot` unread, and they carry the auth/assoc observation that separates "disconnected" from "quiesced".** Whether a frame reaches the air on **5 GHz DFS or 6 GHz** still needs an external receiver.
 (`inj_parse_channels` is **no longer** on this list — it ran against a live radio on 2026-11-02 and
 was correct; see "First contact". Nor is *"the three `PINEAPPLE_DEAUTH_CLIENT*` commands are
 documented only by `hak5cmd`'s help text"* — they are now read from pineapd's own handler, see
