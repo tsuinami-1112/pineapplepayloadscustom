@@ -31,12 +31,12 @@ ok() {   # ok <label> <got> <want>
   if [ "$2" = "$3" ]; then PASS=$(( PASS + 1 ))
   else FAIL=$(( FAIL + 1 )); printf 'FAIL %s: got [%s] want [%s]\n' "$1" "$2" "$3"; fi
 }
-has() {  # has <label> <haystack-file> <needle>
-  if grep -q -- "$3" "$2"; then PASS=$(( PASS + 1 ))
+has() {  # has <label> <haystack-file> [--] <needle>
+  if grep -q -e "$3" "$2"; then PASS=$(( PASS + 1 ))
   else FAIL=$(( FAIL + 1 )); printf 'FAIL %s: output does not contain [%s]\n' "$1" "$3"; fi
 }
 hasnt() {
-  if grep -q -- "$3" "$2"; then FAIL=$(( FAIL + 1 )); printf 'FAIL %s: output DOES contain [%s]\n' "$1" "$3"
+  if grep -q -e "$3" "$2"; then FAIL=$(( FAIL + 1 )); printf 'FAIL %s: output DOES contain [%s]\n' "$1" "$3"
   else PASS=$(( PASS + 1 )); fi
 }
 
@@ -126,16 +126,20 @@ mkstub tcpdump   'sleep 30'
 mkstub PINEAPPLE_EXAMINE_BSSID   'exit 0'
 mkstub PINEAPPLE_EXAMINE_CHANNEL 'exit 0'
 mkstub PINEAPPLE_EXAMINE_RESET   'exit 0'
-mkstub pagerinj  'printf "sent=92 failed=0\n" >&2; exit 0'
+mkstub pagerinj  "printf '%s\n' \"\$*\" > $T/injargv; printf 'sent=92 failed=0\n' >&2; exit 0"
 CH=8
 mkstub iw "case \"\$*\" in *info*) printf 'channel %s (2447 MHz), width: 20 MHz\n' \"\$(cat $T/ch)\" ;; esac; exit 0"
 printf '%s\n' "$CH" > "$T/ch"
 
-run() {   # run <pidof-rc> <net-fixture-name> -> output file
+RUNN=0
+run() {   # run <pidof-rc> <net-fixture-name> [extra args...] -> output file path
   mkstub pidof "exit $1"
-  out="$T/out.$$"
+  RUNN=$(( RUNN + 1 ))
+  out="$T/out.$RUNN"
+  : >"$T/injargv"
+  net="$2"; shift 2
   PATH="$B:$PATH" NET_SYS="$N" PAGERINJ="$B/pagerinj" \
-    sh "$SCRIPT" "$2" FC:58:5A:08:42:15 8 1 0 >"$out" 2>&1 || true
+    sh "$SCRIPT" "$net" FC:58:5A:08:42:15 8 1 0 "$@" >"$out" 2>&1 || true
   printf '%s' "$out"
 }
 
@@ -171,6 +175,30 @@ has "down iface: still fires"       "$O" 'firing'
 O=$(run 0 absent)
 has   "absent iface: says it cannot tell" "$O" 'cannot tell whether'
 hasnt "absent iface: does not claim DOWN" "$O" 'reads DOWN'
+
+# ------------------------------------------------- THE THREE 17a ARMS ----------------------
+# What actually goes on the air is decided by one branch, so assert the argv rather than the prose.
+O=$(run 0 measured_up)
+has   "default arm: sends --csa"            "$T/injargv" '--csa'
+has   "default arm: sends the count"        "$T/injargv" '--count 0'
+hasnt "default arm: no --clone"             "$T/injargv" '--clone'
+hasnt "default arm: no --count-dec"         "$T/injargv" '--count-dec'
+
+O=$(run 0 measured_up --clone)
+has   "clone arm: sends --clone"            "$T/injargv" '--clone'
+hasnt "clone arm: sends NO --csa"           "$T/injargv" '--csa'
+hasnt "clone arm: sends no --count"         "$T/injargv" '--count'
+has   "clone arm: warns that count is ignored" "$O" 'are IGNORED'
+
+O=$(run 0 measured_up --count-dec)
+has   "count-dec arm: sends --csa"          "$T/injargv" '--csa'
+has   "count-dec arm: sends --count-dec"    "$T/injargv" '--count-dec'
+hasnt "count-dec arm: no --clone"           "$T/injargv" '--clone'
+
+# The two arms are mutually exclusive: --clone sends no element, so there is no count to decrement.
+O=$(run 0 measured_up --clone --count-dec)
+has   "clone+count-dec is refused"          "$O" 'different arms'
+hasnt "clone+count-dec never fires"         "$O" 'FRAMES LEFT THE RADIO'
 
 printf '== %s checks, %s failed ==\n' "$(( PASS + FAIL ))" "$FAIL"
 [ "$FAIL" = 0 ]

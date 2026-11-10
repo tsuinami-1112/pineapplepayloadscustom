@@ -624,23 +624,29 @@ camera AP `FC:58:5A:08:42:15` on ch 8, announcing ch 1. **Day-one step 17a has n
      whose chipset most likely handles CSA in WLAN firmware, so the function may not govern it.
   2. **No receiver-side proof.** All three captures recorded **zero packets** — see below — so
      "a frame reached the air" rests on `sendto` success, which this file already says proves nothing.
-  3. `pagerinj` sends a **constant** count where a conformant AP decrements 3,2,1,0. A client may
-     require the decrement before acting. This is the most likely reason a count-3 CSA under-performs.
+  3. `pagerinj` sent a **constant** count where a conformant AP decrements 3,2,1,0, and a client
+     that tracks the countdown has nothing to track in a constant stream. This is the strongest
+     surviving reason a count-3 CSA under-performed. **Instrumented 2026-11-10: `--count-dec`
+     counts down and repeats, stepping the eCSA count too.** Not yet run on hardware.
   4. ~~The run also holds an EXAMINE lock for 30 s and brings interfaces up.~~ **Eliminated by an
      accidental negative control in the same session.** The first count-0 attempt issued the
      EXAMINE lock, brought `wlan1mon` and `wlan0mon` up, started the capture, and then transmitted
      **nothing** (`pagerinj rc=1`, `no beacon captured`) — and the feed did **not** freeze. The two
      runs that transmitted froze it. So the freeze tracks the transmitted frames, not the script's
      preamble. What remains confounded is narrower: whether it is the **CSA element** or merely a
-     flood of cloned beacons carrying the AP's own BSSID. `pagerinj` has no clone-and-flood mode
-     without the element (`--csa` is what appends it), so the control named in the bullet below is
-     **not currently runnable** and wants a small addition.
+     flood of cloned beacons carrying the AP's own BSSID. ~~`pagerinj` has no clone-and-flood mode
+     without the element.~~ **Built 2026-11-10: `--clone` floods a captured beacon verbatim, no CSA
+     and no eCSA**, so the control in the bullet below is now runnable and should be run before any
+     17a conclusion is trusted.
 - **⭐ What is new and positive: a CSA-bearing cloned beacon from `pagerinj` disrupts a live
   client.** "Whether CSA moves a real client at all" was listed as open and unanswerable through
   the firmware commands. Something in that frame reaches this client — most plausibly the CSA,
   since the feed recovered the moment injection stopped, which is what honouring a switch to an
   empty channel then falling back looks like. *Falsified by:* the same freeze from `pagerinj`
-  injecting the cloned beacon with the CSA element omitted.
+  injecting the cloned beacon with the CSA element omitted — which is now one command,
+  `pagerinj -i wlan1mon --clone --bssid <bssid> --secs 10`, and is the first thing to run on the
+  next bench pass. Until it has been run, "the CSA is what reaches this client" is an inference
+  from a confounded experiment, not a measurement.
 - **⚠ The watch interface is blind, and it is pineapd's doing.** Zero packets in all three runs,
   including zero of the AP's own ~10/s beacons, which the `wlan addr2 <bssid>` filter would have
   caught — so the filter is innocent. pineapd's cmdline carries
@@ -1029,7 +1035,7 @@ the question is open.
 
 Listed in `dev/CamHound/RESPONSE.md` §13, `dev/pager-day-one.md` and — for what has already been
 closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowing: whether Recon's
-packet counters move the way `resp_verdict` assumes. **The count-byte experiment (day-one step 17a) has RUN — 2026-11-10, see "Fourth contact" — and found no difference between count 0 and count 3.** What it leaves open is narrower and better posed: whether a *decrementing* count behaves differently from `pagerinj`'s constant one, and whether any injected frame reaches the air at all, which needs an external receiver because pineapd hops the only spare interface.
+packet counters move the way `resp_verdict` assumes. **The count-byte experiment (day-one step 17a) has RUN — 2026-11-10, see "Fourth contact" — and found no difference between count 0 and count 3.** What it leaves open is narrower and better posed, and both halves now have an instrument: whether a *decrementing* count behaves differently from the constant one (`--count-dec`, built 2026-11-10, unrun), and whether the disruption is the CSA element at all rather than the beacon flood that carries it (`--clone`, same commit, unrun — **run this one first, it decides whether the rest of 17a means anything**). Whether any injected frame reaches the air still needs an external receiver, because pineapd hops the only spare interface.
 (`inj_parse_channels` is **no longer** on this list — it ran against a live radio on 2026-11-02 and
 was correct; see "First contact". Nor is *"the three `PINEAPPLE_DEAUTH_CLIENT*` commands are
 documented only by `hak5cmd`'s help text"* — they are now read from pineapd's own handler, see
@@ -1132,7 +1138,11 @@ step 17a needs. It now also carries 17a's third arm (`--ecsa-count`: element 37 
 eCSA, since `csa_present()` discards per element) and the unicast cat-0 Spectrum-Management CSA of
 day-one step 17c. Since df756c3 it also binds its capture to `-i`, skips a clone source that already
 carries a CSA or eCSA element, refuses a `--chan` equal to the cloned beacon's DS channel unless
-`--allow-same-chan`, and emits a radiotap RATE field with `--phy-rate <Mbps>`.
+`--allow-same-chan`, and emits a radiotap RATE field with `--phy-rate <Mbps>`. **Since 2026-11-10 it
+carries 17a's control arm, `--clone`** (flood a captured beacon verbatim, no element appended — the
+one thing that separates "the client honoured the switch" from "the client was upset by spoofed
+beacons"), **and `--count-dec`** (decrement the count 3,2,1,0 and repeat, as a real AP does,
+instead of the constant count every run before this sent).
 
 **hcxdumptool splits by band, and the 6 GHz half is a trap** — settled against the 6.3.4 tag: it
 reads only `FREQUENCY_ATTR_FREQ`, `MAX_TX_POWER` and `DISABLED`, never `NO_IR` or `RADAR` **[V]**,

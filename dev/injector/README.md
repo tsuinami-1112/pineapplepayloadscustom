@@ -97,6 +97,60 @@ selftest asserts `it_len`, the bitmap and the value, and a second host instance 
 `--phy-rate 6` beacon over a real socket. Whether mt76 honours the rate on 6 GHz is for the bench;
 run the same frame on 5180 as the rate control, as control 5 says.
 
+### `--clone`: 17a's control arm, and why every result before it was confounded
+
+Added 2026-11-10, straight after the first 17a run. That run put a CSA-bearing cloned beacon on the
+air and **the camera's video feed froze for the duration, identically for `--count 0` and
+`--count 3`, recovering by itself afterwards.** The reading that suggests itself is that the client
+honoured the announced switch, went to an empty channel and came back. But the run also put ~95
+spoofed beacons carrying the AP's own BSSID on the air, and *that* is an equally good explanation
+for a frozen feed. Nothing in the experiment separated the two.
+
+`--clone` separates them: it captures one clean beacon from `--bssid` and floods it **verbatim**,
+with no CSA and no eCSA appended. Nothing else changes — same socket, same rate, same `--secs`,
+same clone-source discipline (a beacon that already carries element 37 or 60 is still skipped,
+because a clone of one of those is not a control).
+
+```sh
+./pagerinj -i wlan1mon --clone --bssid FC:58:5A:08:42:15 --secs 10
+```
+
+How to read it, and it cuts both ways:
+
+| result | what it means |
+|---|---|
+| the feed freezes here too | the element is irrelevant; the experiment has been measuring beacon spoofing, and "count makes no difference" is a statement about nothing |
+| the feed does **not** freeze | the element is doing the work, and the count-0-vs-count-3 result stands as a claim about the CSA |
+
+CLAUDE.md's "Fourth contact" names this exact run as the falsifier for *"a CSA-bearing cloned beacon
+from `pagerinj` disrupts a live client"* and records that it **could not be run**, because `--csa` is
+what appends the element. It can now. Run it before trusting any 17a conclusion.
+
+### `--count-dec`: a real AP counts down, and this never did
+
+A conformant AP **decrements** the Channel Switch Count on every beacon — 3, 2, 1, 0 — and switches
+when it hits zero. `pagerinj` has always transmitted a **constant** count, which no AP ever sends,
+and a client that tracks the countdown has nothing to track in a constant stream. Of the four
+reasons CLAUDE.md gives for why 17a's count-3 arm behaved no differently from count 0, this is the
+strongest one still standing (the EXAMINE-lock confound was eliminated by an accidental negative
+control in the same session, and the capture confound is about evidence rather than mechanism).
+
+```sh
+./pagerinj -i wlan1mon --csa --bssid FC:58:5A:08:42:15 --chan 1 --count 3 --count-dec --secs 10
+```
+
+It rewrites the count byte **in place** in the already-built frame, so nothing else about the frame
+changes between transmissions — the selftest asserts exactly that, one byte differing per step. The
+byte is located by *searching* the built frame for element 37 rather than by computing
+`RTAP_TX_LEN + clone_len + 4`: that offset depends on the radiotap length, which `--phy-rate`
+changes, and a wrong offset would not fail, it would silently rewrite an arbitrary byte of the frame
+once per transmission. After reaching 0 the countdown restarts, so a `--secs` window gives the
+client several complete countdowns instead of one four-beacon burst at the start; the run reports
+how many completed. With `--ecsa-count` both counts step together.
+
+`--count 0 --count-dec` is refused: it would hold the byte at 0 all run — `--count 0` with extra
+steps — while reading in a log as though a countdown had happened.
+
 ### 17a's third arm, and why it beats the pair
 
 `ieee80211_mgd_csa_present()` discards **per element** — `if (csa && csa->count == 0) csa = NULL;`
@@ -141,22 +195,21 @@ Verified output at this change, `gcc 13.3.0 r28597-0425664679` from the SDK the 
 across two rebuilds. These figures move with every edit to `pagerinj.c`; trust your own `stat` and
 `sha256sum` over this row:
 
-*(Rebuilt and re-recorded 2026-11-09. The previous row -- 25436 bytes, `c8526840…7fdf` -- was set in
-`df756c3`, and `pagerinj.c` was edited again in `9e245c3`, so for a week this table described a
-source that no longer existed. **Nothing is wrong with the binary; the row had simply not moved with
-the `.c`.** The SDK archive's sha256 was checked against the release's `sha256sums`
-(`636298c2…5c92`) before extraction, the ABI gate below passed, two clean rebuilds produced
-byte-identical output, and `./pagerinj-host --selftest` gave 82 checks 0 failed -- the count this
-file already recorded. Since `.gitignore` excludes the binaries on purpose, this table is the ONLY
-record of them in the repo, which is exactly why it has to be updated in the same commit as any
-`pagerinj.c` edit.)*
+*(Rebuilt and re-recorded **2026-11-10**, for the `--clone` and `--count-dec` commit. The previous
+row -- 25468 bytes, `4cf33e5b…b471` -- described the source before those modes existed. Since
+`.gitignore` excludes the binaries on purpose, this table is the ONLY record of them in the repo,
+which is exactly why it has to move in the same commit as any `pagerinj.c` edit; it has now failed
+to do that once, in `df756c3`, so check it rather than trusting it. Verified this time: the SDK
+archive's sha256 matched the release's `sha256sums` (`636298c2…5c92`) before extraction, the ABI
+gate below passed, two clean rebuilds produced byte-identical output, and
+`./pagerinj-host --selftest` gave **104 checks, 0 failed**.)*
 
 | | |
 |---|---|
-| `pagerinj` | 25468 bytes, sha256 `4cf33e5b…b471` (full: `4cf33e5b17329e2a44fa1d03ba04e110f148a3063afdd8cbdce82972f060b471`) |
+| `pagerinj` | 30012 bytes, sha256 `5b702073…b208` (full: `5b702073b2b361b69aa43e2099567e68040bfcdb78c1d9217c08d7d5adfdb208`) |
 | ABI | `ELF32 LSB MIPS32r2`, little endian, interpreter `/lib/ld-musl-mipsel-sf.so.1` |
 | `NEEDED` | `libc.so` only |
-| `make static` | 98320 bytes, sha256 `6c2b81a0…a1e5`, no loader, no libc — if the dynamic build ever fails on the device |
+| `make static` | 102864 bytes, sha256 `c871c444…c58b`, no loader, no libc — if the dynamic build ever fails on the device |
 
 *(Update 2026-11-02: `libgcc_s.so.1` **does** ship, byte-identical in 1.1.3 and 2.0.0 —
 `8138ad10…9dfcb`, 131359 B. So the flag below is now insurance rather than a fix for a known gap.
@@ -171,7 +224,7 @@ Binaries are `.gitignore`d — build them, don't commit them.
 ## Validation done without a radio
 
 ```sh
-make host && ./pagerinj-host --selftest        # 82 checks, 0 failed
+make host && ./pagerinj-host --selftest        # 104 checks, 0 failed
 ```
 
 The selftest covers the CSA element against the bytes pineapd writes at `0x4bee8a`
