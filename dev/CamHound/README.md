@@ -107,10 +107,24 @@ PowerShell's escape character is a backtick, not a backslash, so `\$x` and `\"` 
 POSIX habit expects. Worse, a `"` inside a single-quoted string is stripped when PowerShell builds
 the command line for a native program such as `ssh.exe`, and the remote shell then receives the
 command unquoted: `ssh host 'sed -n "s/.*(\([0-9]*\) MHz).*/\1/p"'` arrives at the Pager with the
-quotes gone and dies with `ash: syntax error: unexpected "("`. Three commands in one session were
-lost to this, twice after the rule had already been stated. Prefer a form that needs no quotes —
-`grep MHz` over a quoted regex, `cut -d\| -f17` over `awk -F"[|]"`. Where a quote is genuinely
-needed, send the script on **stdin**, where it never touches a command line at all:
+quotes gone and dies with `ash: syntax error: unexpected "("`. **Four commands across two sessions
+now, three of them after the rule had already been stated** — the fourth on 2026-11-10, composing a
+`tcpdump -e "type mgt and (subtype auth or ...)"` read of the 17a captures. Note what makes it
+sticky: the error names the `(`, so it reads as a filter-syntax problem, and the author goes looking
+at pcap-filter grammar instead of at their own quoting. It also bites when you are *writing commands
+for the operator to paste* rather than driving the device yourself, which feels different and is not.
+
+Prefer a form that needs no quotes:
+- `grep MHz` over a quoted regex; `cut -d\| -f17` over `awk -F"[|]"`; `cut -c1-8` over `awk '{print $1}'`.
+- **Repeat `-e` instead of using alternation**: `grep -i -e assoc -e authentication -e deauth`
+  needs no quotes at all, where `grep -iE 'assoc|auth'` needs them twice over — once for PowerShell
+  and once to keep `ash` from reading the `|` as a pipe.
+- tcpdump joins its trailing arguments into the filter, so `tcpdump -r f -nn -e type mgt` and
+  `tcpdump -r f -nn wlan addr1 AA:BB:...` need no quoting either. It is only the operators that
+  take parentheses or `or` chains that do — and those are the ones to push into `grep`.
+
+Where a quote is genuinely needed, send the script on **stdin**, where it never touches a command
+line at all:
 `'awk -F"[|]" "\$17>5925" file' | ssh root@172.16.52.1 sh` — ssh still prompts for the password,
 which it reads from `/dev/tty` rather than stdin.
 

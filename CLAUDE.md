@@ -124,6 +124,13 @@ captures it ships with — raising any Watch snap to reach addresses breaks it; 
 2026-11-04, see `dev/CamHound/PLAN_v2.md` item 1**),
 `capture_ready` (gates `HAVE_TCPDUMP` on tcpdump + *either* hex dumper), `lock_target`/
 `unlock_target` (EXAMINE channel lock), `capture_beacon`, `beacon_find`, `ie_find`, `rsn_caps`.
+**⚠ `lock_target` rc 3 is "unverified, PROCEED" and is not a failure — do not normalise it to 0.**
+It is returned when the channel cannot be read back at all, when only ONE of the three samples was
+readable (one sample cannot establish that the radio is parked), and when the read after
+`EXAMINE_CHANNEL` comes back empty. All three write `lock=unverified` to the loot and carry on,
+which is the point: refusing every response on a device whose channel will not read back is worse
+than labelling it. rc **2** is the refusal. Four separate fixes converged on this shape over two
+days; see "Third contact"'s last bullet for the whole sequence.
 
 **Posture** (what will work against a target, read from its beacon) —
 - `posture_read_pcap` → sets `POSTURE_RSN` / `POSTURE_EXT` / `POSTURE_BADGE`
@@ -169,6 +176,11 @@ accepts integers only so a path cannot arrive via `PAYLOAD_SET_CONFIG`, and a st
 `SETTINGS_TABLE` row is a lie.
 `resp_fire`, `resp_snapshot`, `resp_verdict` (MOVED / NO_EFFECT / INCONCLUSIVE from recon packet
 counters), `resp_aggregate`, `resp_write` (→ `responses.tsv`, header `RESP_HDR`), `auto_respond_ok`.
+**⚠ `csa_issue` rc 2 means "it DID transmit and was then capped by its own timeout" — do not
+collapse it to 1.** `wait` returns `timeout`'s status, not the injector's, so a capped run comes
+back 124 whatever the injector exited with; scoring that as a refusal writes `CMD_REFUSED`, which
+asserts no frame left the radio, for frames whose own stderr says `sent=90`. Both call sites in
+`resp_fire` (the `CSA` arm and the `BOTH` arm) handle rc 2 as a send, and the selftest pins it.
 Timings: `RESP_LOCK_SECS`, `RESP_SETTLE_SECS` — both starred and wired; the lock must exceed
 fire + settle or it expires mid-measurement.
 `RESPONSE` **defaults to 1** — recon and response are both live out of the box; `RESPONSE=0` is the
@@ -316,6 +328,15 @@ how likely the finder is to be wrong, and spend accordingly.
 asking it.** Everything below was derived from static analysis of firmware 1.1.3-stable and kernel
 source, as of commit `07916df`. Full working and citations are in the docs above, and each claim
 carries the thing that would falsify it.
+
+**⚠ THE SIX "CONTACT" SECTIONS EACH CONTAIN WITHDRAWN CLAIMS, STRUCK IN PLACE ON PURPOSE.** Text in
+`~~strikethrough~~` is wrong and is kept because the *shape* of the error is the useful part — four
+of the withdrawals are the same shape, a correct reading composed into a wrong inference, and three
+of those were withdrawn by the session that wrote them within hours. So: read a struck claim as a
+warning, never as a fact, and when two sections disagree the LATER one supersedes. Second contact is
+superseded by Third on the deauth commands, Fourth by Fifth on the count byte, and Fifth by Sixth on
+what the control arms established. If you find a third answer anywhere, that is a bug in this file
+and worth a commit on its own.
 
 **The device arrived on 2026-11-02, and a first read-only session checked much of it.** What that
 confirmed, and the one thing it corrected, is in "First contact" immediately below. Claims not
