@@ -239,9 +239,23 @@ RC=$?
 
 if [ -n "$CAP" ]; then
   sleep 1; kill "$CAP" 2>/dev/null; wait "$CAP" 2>/dev/null; CAP=""
-  if [ -s "$OUT" ]; then
-    printf -- '-- capture: %s (%s bytes)\n' "$OUT" "$(wc -c <"$OUT")" >&2
+  # ⚠ NOT [ -s "$OUT" ]. A libpcap file header is 24 bytes and every record adds at least a
+  # 16-byte record header, so `-s` is true for a capture containing ZERO packets -- and on
+  # 2026-11-10 it was, three runs in a row: the script printed "capture: ... (24 bytes)" and then
+  # cheerfully offered "read the CSA element with:" for a file with nothing in it. That is the
+  # exact mislead this script exists to prevent, committed by the script itself.
+  CAPB=$(wc -c <"$OUT" 2>/dev/null | tr -d ' ')
+  [ -n "$CAPB" ] || CAPB=0
+  if [ "$CAPB" -gt 24 ]; then
+    printf -- '-- capture: %s (%s bytes)\n' "$OUT" "$CAPB" >&2
     printf -- '-- read the CSA element with:  tcpdump -r %s -nn -e -vvv | grep -i -B2 -A4 switch\n' "$OUT" >&2
+  elif [ "$CAPB" = 24 ]; then
+    printf -- '!! capture recorded ZERO packets (%s is a %s-byte pcap header and nothing else).\n' "$OUT" "$CAPB" >&2
+    printf -- '!! Nothing in it is evidence, and the filter is probably innocent: it would have\n' >&2
+    printf -- '!! caught the AP own beacons too, and it caught none. The likely cause is that\n' >&2
+    printf -- '!! pineapd HOPS %s -- its cmdline carries "--interface %s --band %s:2" -- so the\n' "$WIF" "$WIF" "$WIF" >&2
+    printf -- '!! "iw dev %s set freq" above is overridden within a hop interval. EXAMINE parks\n' "$WIF" >&2
+    printf -- '!! only the PRIMARY interface (%s). Use an external receiver for frame-level proof.\n' "$IF" >&2
   else
     printf -- '!! capture file is empty: nothing was recorded, so nothing here is evidence\n' >&2
   fi

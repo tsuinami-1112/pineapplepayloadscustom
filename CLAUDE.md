@@ -591,6 +591,56 @@ was trusted: `pineapd` `adc9d36d065b084856534dee…` / 1320040 B, `pineapple/pin
   fails against the old order. *Falsified by:* a `lock_target` rc changing for any of those four
   sample patterns without `cur_channel` changing.
 
+### Fourth contact — the CSA count byte makes no difference to a real client, 2026-11-10
+
+Live bench on the 1.1.3 unit, `pagerinj` driven by `dev/injector/run_17a.sh`. Target the bebird
+camera AP `FC:58:5A:08:42:15` on ch 8, announcing ch 1. **Day-one step 17a has now run.**
+
+- **⭐ Both arms transmitted, and the count byte changed nothing observable.** Transmit is `[V]`;
+  the cause of the disruption is `[A]`.
+  - count 0: `cloned 108-byte beacon; CSA {37,3,mode=1,ch=1,count=0}; 121 bytes`, `sent=92 failed=0`, rc 0.
+  - count 3: `CSA {37,3,mode=1,ch=1,count=3}`, `sent=97 failed=0`, rc 0.
+  - Operator observation, **identical for both**: the camera's video feed froze completely for the
+    duration of the run and re-associated by itself once the script finished.
+- **So the operational prediction fails in both halves.** The `[A]` claim derived from
+  `ieee80211_mgd_csa_present()` was that a count-0 CSA is discarded before the auth/assoc refusal
+  check — so count 0 should kick without denying reconnection, and count ≥ 1 should do both.
+  Measured: count 0 **did** disrupt, and count 3 did **not** deny reconnection. *Falsified by:* a
+  repeat where count 3 holds the client off after the injection stops while count 0 does not.
+- **Four reasons this does not refute the kernel reading itself.** The reading and the prediction
+  are different claims and this project has conflated them before.
+  1. `ieee80211_mgd_csa_present()` is **Linux mac80211**. The client here is a consumer handset
+     whose chipset most likely handles CSA in WLAN firmware, so the function may not govern it.
+  2. **No receiver-side proof.** All three captures recorded **zero packets** — see below — so
+     "a frame reached the air" rests on `sendto` success, which this file already says proves nothing.
+  3. `pagerinj` sends a **constant** count where a conformant AP decrements 3,2,1,0. A client may
+     require the decrement before acting. This is the most likely reason a count-3 CSA under-performs.
+  4. The disruption is correlational: it began with the run and ended with it, twice. The run also
+     holds an EXAMINE lock for 30 s and brings interfaces up.
+- **⭐ What is new and positive: a CSA-bearing cloned beacon from `pagerinj` disrupts a live
+  client.** "Whether CSA moves a real client at all" was listed as open and unanswerable through
+  the firmware commands. Something in that frame reaches this client — most plausibly the CSA,
+  since the feed recovered the moment injection stopped, which is what honouring a switch to an
+  empty channel then falling back looks like. *Falsified by:* the same freeze from `pagerinj`
+  injecting the cloned beacon with the CSA element omitted.
+- **⚠ The watch interface is blind, and it is pineapd's doing.** Zero packets in all three runs,
+  including zero of the AP's own ~10/s beacons, which the `wlan addr2 <bssid>` filter would have
+  caught — so the filter is innocent. pineapd's cmdline carries
+  `--interface wlan0mon --band wlan0mon:2`, so it **hops** `wlan0mon` and the script's
+  `iw dev wlan0mon set freq` is overridden within a hop interval. EXAMINE parks only the
+  **primary** (`wlan1mon`). On-device frame-level proof therefore needs the primary — which is also
+  the transmitter — or an external receiver. *Falsified by:* a non-empty `wlan0mon` capture on a
+  fixed channel while pineapd runs.
+- **`wlan1mon` can be administratively DOWN while pineapd is running.** `flags 0x1102`
+  (`IFF_BROADCAST|IFF_PROMISC|IFF_MULTICAST`, **no `IFF_UP`**) with `operstate down` and
+  `pidof pineapd` = 11482; one run later, `0x1103` / `unknown`, with no intervention but the
+  script's own `ip link set up`. So "pineapd is up" does **not** imply "its interfaces are up".
+  A run must check, and must try to bring it up rather than refuse.
+- **And when `IFF_UP` IS set, this device reports `operstate` `unknown`, never `up`.** Worth
+  recording because a fix was built this morning on the assumption that a monitor vif reports
+  `down` while up; it does not, and `dev/CamHound/AUDIT-2026-11-10.md`'s last section is the
+  retraction.
+
 **`2.0.0-stable` was released 2026-10-29** and is now what `latest` serves. Everything here remains
 pinned to 1.1.3; versioned downloads still work
 (`…/firmwares/1.1.3-stable`, 303 → signed .bin, sha256 `3073d6b8…cd33`).
@@ -961,8 +1011,7 @@ the question is open.
 
 Listed in `dev/CamHound/RESPONSE.md` §13, `dev/pager-day-one.md` and — for what has already been
 closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowing: whether Recon's
-packet counters move the way `resp_verdict` assumes; and the count-byte experiment (day-one step
-17a), which `pagerinj` is the instrument for.
+packet counters move the way `resp_verdict` assumes. **The count-byte experiment (day-one step 17a) has RUN — 2026-11-10, see "Fourth contact" — and found no difference between count 0 and count 3.** What it leaves open is narrower and better posed: whether a *decrementing* count behaves differently from `pagerinj`'s constant one, and whether any injected frame reaches the air at all, which needs an external receiver because pineapd hops the only spare interface.
 (`inj_parse_channels` is **no longer** on this list — it ran against a live radio on 2026-11-02 and
 was correct; see "First contact". Nor is *"the three `PINEAPPLE_DEAUTH_CLIENT*` commands are
 documented only by `hak5cmd`'s help text"* — they are now read from pineapd's own handler, see
