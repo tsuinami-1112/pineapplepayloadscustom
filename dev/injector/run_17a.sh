@@ -457,7 +457,11 @@ if [ -n "$CAP" ]; then
     # receiver's most likely output is a few of the AP's beacons and none of our burst, which lands
     # here and reads as healthy. Finding nothing when you grep for `switch` is then uninformative,
     # and the branch below says so at length while this one used to say nothing.
-    if [ "$STOP_PINEAPD" != 1 ]; then
+    # Only when the watch interface is NOT the parked one. EXAMINE parks the PRIMARY, so passing
+    # the inject interface as watch-if gives a capture that is held on the target channel -- and
+    # printing "pineapd HOPS wlan1mon" over 2600 captured packets on the parked primary is simply
+    # false. pineapd hops the interfaces it was NOT asked to park.
+    if [ "$STOP_PINEAPD" != 1 ] && [ "$WIF" != "$IF" ]; then
       printf -- '!! but pineapd HOPS %s in this mode, so a short capture is most likely the AP own\n' "$WIF" >&2
       printf -- '!! beacons caught between hops, NOT our burst. No channel-switch element here is\n' >&2
       printf -- '!! weak evidence of anything. An external receiver is the only frame-level proof.\n' >&2
