@@ -213,8 +213,17 @@ the picked target is always among them (even behind a randomised MAC the `bss` s
 association.** `bss_clients`/`capture_bss`/`CLI_AWK`/`pcap_stream` (lib block, so the hooks get them)
 read a BSSID-filtered data capture and report which stations talked to it; `resp_snapshot` **unions**
 that set with the `ap_mac` test rather than replacing it, and ignores a set gathered for a different
-BSSID. `resp_members` turns a failed capture into one of four answers — `NO_CAPTURE`, `SNAP_SHORT`,
-`NO_MATCH`, `NO_CLIENTS` — instead of one silence. `resp_fire` takes the lock **first**, captures,
+BSSID. `resp_members` turns a failed capture into one of three answers — `NO_CAPTURE`, `SNAP_SHORT`,
+`NO_CLIENTS` — instead of one silence (a fourth, `NO_MATCH`, has had no producer since the
+2026-11-09 transmit-set fix). **Since 2026-11-10 none of them refuses an AP row — operator-decided:
+*"I'll accept nuclear blast. Let the AP row fire broadcast frames."*** `CLI_AWK`'s `seen[c] >= 2` filter is unchanged and can
+legitimately admit zero members from an occupied BSS; when the subject set is empty after both
+sources, `resp_fire` now fires the broadcast anyway, makes the broadcast target itself the one
+subject with `p0 '-'` (so `resp_verdict` scores it `INCONCLUSIVE`), skips the targeted sweep, and
+logs `no-members <bssid> why=<reason>` before the fire and `fired <key> <bssid> broadcast with no
+members recovered why=<reason>` after it. The reason is now an `events.log` line, never a loot
+verdict; refusals that are not about membership (`LOCK_FAILED`, `CMD_REFUSED`, a missing command)
+are untouched. Selftest `zero members, AP row: …`; harness `nomem_fired`. `resp_fire` takes the lock **first**, captures,
 **re-arms** for the measurement, then fires; the re-arm exists because the walker's parse is
 2.5-9.1 s on the device and no constant covers it honestly. The `resp` line logs the measured dwell.
 Read `RESPONSE.md` §13a-i before changing any of it: three mechanics that look obvious are wrong
@@ -224,7 +233,9 @@ substring walker is O(records x filesize)).
 `AP_OF`, so client Watch, Stimulus, kit detection and the AP→client tree stay inert, and a
 user-payload **client** row still aborts in `resp_target`'s client branch. What now fires: a
 user-payload **AP** row, the Recon **access_point** hook, and the Recon **client** hook's
-subject set. See `RESPONSE.md` §13a-i's bound table.
+subject set — and since 2026-11-10 (operator-decided, "nuclear blast") an AP row fires its
+broadcast frame **even when the capture recovers nobody**, looting one `INCONCLUSIVE` row for
+`ff:ff:ff:ff:ff:ff`. See `RESPONSE.md` §13a-i's bound table.
 
 **Selftest** — `selftest()` plus `st_*` helpers (`st_device`, `st_pcap`, `st_beacon_pcap`,
 `st_gate`, `st_hex2bin`, `st_subjects`). Runs on a laptop with no radio. Add a case for anything you change.
@@ -1325,7 +1336,9 @@ own falsifier. And it listed the `unsigned char` question as the replacement ope
 day's work had already closed it.)
 
 **⚠ FIXED 2026-11-04 for AP rows — read this as history plus a live remainder.** The block below
-described the state before `bss_clients` existed. What it says about the *cause* still holds and is
+described the state before `bss_clients` existed. *And since 2026-11-10 the `NO_CLIENTS` refusal it
+describes no longer exists for an AP row at all: operator-decided, *"I'll accept nuclear blast. Let the AP row fire broadcast frames."* A
+zero-member AP row fires and loots `INCONCLUSIVE`; see the Response rung paragraph of the code map.* What it says about the *cause* still holds and is
 measured: no shipped firmware supplies a client→AP association. What no longer holds is the
 conclusion that nothing can fire: an AP row, and both Recon hooks, now recover the subject set from
 a capture (`RESPONSE.md` §13a-i). **Still true:** a user-payload **client** row aborts in
@@ -1382,12 +1395,13 @@ detection (`kit_eval`), the AP→client tree (`write_report`) and, for client ro
 rung (`resp_target`). **Cited by name on purpose** — these four line numbers were exact on
 2026-11-04 and all four pointed into unrelated functions one commit later.
 But the *attack* never needed it — `CSA` is `<bssid> <ch>` and `BOTH`'s target is discarded, and
-`RECON APS` supplies both on 1.1.3, so the firmware can transmit today. What refuses is CamHound's
-own `NO_CLIENTS` measurement guard. The fix is to read the association off the air with a
+`RECON APS` supplies both on 1.1.3, so the firmware can transmit today. What refused was CamHound's
+own `NO_CLIENTS` measurement guard — **removed for AP rows 2026-11-10, operator-decided ("nuclear
+blast")**: a zero-member AP row now fires the broadcast and loots `INCONCLUSIVE`. The fix was to read the association off the air with a
 BSSID-filtered capture (the filter shape at `:1804`, the radiotap-aware frame walker in
 `beacon_find`), which is firmware-independent and better evidence than Recon's cumulative counters.
 Full working, ranked options and the resolved mechanics are in `dev/CamHound/RESPONSE.md` §13a
-and §13a-i. **Not yet implemented.** ⚠ Three mechanics stated in §13a's first draft are
+and §13a-i. **Implemented 2026-11-04** (`bss_clients`/`capture_bss`/`CLI_AWK`). ⚠ Three mechanics stated in §13a's first draft are
 **wrong** and are corrected in §13a-i, which is the build decision of record: `addr2` is the
 client only on a **ToDS** frame, `-s 32` cannot reach `addr2` at all, and the bash
 `pcap_bytes`/`hex_octet` walker beacon_find uses is **O(n²)** and cannot be reused at this

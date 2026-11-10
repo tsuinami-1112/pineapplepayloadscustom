@@ -165,7 +165,7 @@ present on a Pager but has no Oniguruma, so the parsers compiled to nothing and 
 | `inj probe: tx phy phy1` | the injection gate read the transmitting phy, not a merge of all of them |
 | `members <bssid> n=N ... dwell=Ns lock=Ns` | a `bss`-scope Disrupt recovered N stations off the air; **this is the dwell figure `resp_clamp_lock`'s floor needs** |
 | `re-armed <bssid> Ns for the measurement` | the lock was re-armed after the capture, so the parse cannot eat the verdict window |
-| `NO_CAPTURE` / `SNAP_SHORT` / `NO_MATCH` / `NO_CLIENTS` in `responses.tsv` | a refusal, and which of the four reasons — `SNAP_SHORT` names `CLI_CAP_SNAP` as the knob |
+| `no-members <bssid> why=NO_CAPTURE\|SNAP_SHORT\|NO_CLIENTS` then `fired … broadcast with no members recovered` | an AP-row Disrupt recovered nobody and **fired the broadcast anyway** (operator-decided 2026-11-10, "nuclear blast"); `responses.tsv` has one `INCONCLUSIVE` row for `ff:ff:ff:ff:ff:ff`. These tokens are no longer loot verdicts — `SNAP_SHORT` still names `CLI_CAP_SNAP` as the knob |
 
 Known-inert on 1.1.3, so do not read these as faults: client association (kit detection, client
 Watch and Stimulus, the AP→client tree, and per-client Disrupt from the user payload), and `BAND6`

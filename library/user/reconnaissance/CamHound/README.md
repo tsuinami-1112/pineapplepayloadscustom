@@ -101,7 +101,8 @@ and the `ap_bssid` column reads `-`.
 5. Start **Recon in continuous mode** in the Pager GUI. CamHound only reads what Recon hears.
 6. Launch CamHound from the payload menu. Needs `_pineap`, `jq` (falls back to a built-in parser),
    `tcpdump` plus `hexdump` or `od` for Watch and for the Disrupt rung's client capture (without them
-   Watch is greyed and a BSS-wide Disrupt refuses `NO_CAPTURE`), `/lib/hak5/oui.txt`.
+   Watch is greyed, and a BSS-wide Disrupt from an AP row cannot list the clients it hits — it still
+   fires its broadcast frame and records `INCONCLUSIVE`), `/lib/hak5/oui.txt`.
 7. Worth doing once, before anything else: `bash payload.sh --selftest` **on the Pager**. It
    transmits nothing and changes nothing, and it is the only run that exercises the `od` parsing
    path the device actually uses — a laptop with `hexdump` never takes that branch.
@@ -320,10 +321,13 @@ re-read from Recon:
 | `NO_EFFECT` | packet counter still advancing — it never left |
 | `INCONCLUSIVE` | no baseline, no follow-up reading, or the counter stalled but it was seen again |
 | `LOCK_FAILED` | the radio would not hold the target channel; nothing was transmitted |
-| `NO_CLIENTS` | listened on the channel and heard no station; refused before anything was transmitted |
-| `NO_MATCH` | stations were heard, but none has a Recon row or all were randomised; nothing transmitted |
-| `SNAP_SHORT` | the capture was cut before the client address; raise `CLI_CAP_SNAP`; nothing transmitted |
-| `NO_CAPTURE` | no `tcpdump`, the capture would not start, or what came back was not a readable pcap |
+
+An AP-row Disrupt whose client capture recovered **nobody** — no station heard twice, a capture cut
+before the client address (raise `CLI_CAP_SNAP`), or no usable `tcpdump` — **still fires its
+broadcast frame** (operator-decided 2026-11-10: *"I'll accept nuclear blast. Let the AP row fire broadcast frames."*). It
+writes one `INCONCLUSIVE` row for `ff:ff:ff:ff:ff:ff` with `pk_before`/`pk_after` `-`, because there
+is nothing to measure, and `events.log` names the reason: `no-members <bssid> why=NO_CLIENTS`,
+`SNAP_SHORT` or `NO_CAPTURE`, then `fired … with no members recovered`.
 
 What is measured follows the attack's **scope**, not the row you picked. A `cli`-scope attempt
 (`DEAUTH` from a client row) measures that one device. A `bss`-scope attempt (`CSA` or `BOTH` from any
@@ -338,7 +342,8 @@ aggregate (`MOVED` only when every subject went quiet, `NO_EFFECT` when any kept
 to, so for a `bss`-scope attempt CamHound listens for a few seconds on the target's channel and takes
 the stations it hears talking to that BSSID. A station has to be heard at least twice to count, so a
 camera that sends nothing in the window is missed — and an AP whose clients are all silent is
-refused rather than attacked blind. That listening happens under the channel lock, which is
+**still attacked**, blind, with the broadcast frame (operator-decided 2026-11-10; the confirm says
+"on EVERY client of <bssid>"), and recorded `INCONCLUSIVE`. That listening happens under the channel lock, which is
 therefore held for `RESP_LOCK_SECS + CLI_CAP_SECS + 2` and then **re-armed** for the measurement
 itself, so a slow parse cannot eat the window the verdict depends on.
 
