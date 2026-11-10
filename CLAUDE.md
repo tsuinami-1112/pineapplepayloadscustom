@@ -615,8 +615,15 @@ camera AP `FC:58:5A:08:42:15` on ch 8, announcing ch 1. **Day-one step 17a has n
      "a frame reached the air" rests on `sendto` success, which this file already says proves nothing.
   3. `pagerinj` sends a **constant** count where a conformant AP decrements 3,2,1,0. A client may
      require the decrement before acting. This is the most likely reason a count-3 CSA under-performs.
-  4. The disruption is correlational: it began with the run and ended with it, twice. The run also
-     holds an EXAMINE lock for 30 s and brings interfaces up.
+  4. ~~The run also holds an EXAMINE lock for 30 s and brings interfaces up.~~ **Eliminated by an
+     accidental negative control in the same session.** The first count-0 attempt issued the
+     EXAMINE lock, brought `wlan1mon` and `wlan0mon` up, started the capture, and then transmitted
+     **nothing** (`pagerinj rc=1`, `no beacon captured`) — and the feed did **not** freeze. The two
+     runs that transmitted froze it. So the freeze tracks the transmitted frames, not the script's
+     preamble. What remains confounded is narrower: whether it is the **CSA element** or merely a
+     flood of cloned beacons carrying the AP's own BSSID. `pagerinj` has no clone-and-flood mode
+     without the element (`--csa` is what appends it), so the control named in the bullet below is
+     **not currently runnable** and wants a small addition.
 - **⭐ What is new and positive: a CSA-bearing cloned beacon from `pagerinj` disrupts a live
   client.** "Whether CSA moves a real client at all" was listed as open and unanswerable through
   the firmware commands. Something in that frame reaches this client — most plausibly the CSA,
