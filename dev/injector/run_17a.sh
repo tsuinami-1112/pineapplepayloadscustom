@@ -451,7 +451,14 @@ if [ -n "$CAP" ]; then
   [ -n "$CAPB" ] || CAPB=0
   if [ "$CAPB" -gt 24 ]; then
     printf -- '-- capture: %s (%s bytes)\n' "$OUT" "$CAPB" >&2
-    printf -- '-- read the CSA element with:  tcpdump -r %s -nn -e -vvv | grep -i -B2 -A4 switch\n' "$OUT" >&2
+    # ⚠ tcpdump does NOT decode element 37. A beacon with the CSA appended prints identically to one
+    # without, at every -v level (verified against a fixture pcap, tcpdump 4.99.4), so the hint this
+    # line used to give -- 'grep -i switch' -- found nothing and read as "no CSA was sent". Count the
+    # raw element bytes instead: 25 03 01 is {eid 37, len 3, mode 1}. The clone length is constant
+    # within a run, so the hex alignment is too, and the count comes back as either about sent= or 0.
+    printf -- '-- tcpdump cannot decode element 37, so grep for its bytes instead:\n' >&2
+    printf -- '--   tcpdump -r %s -nn -x type mgt subtype beacon | grep -c 2503     (mode 1; ~sent= or 0)\n' "$OUT" >&2
+    printf -- '--   0 can mean odd alignment: retry with 0301, but that also matches a DS element\n' >&2
     # The caveat belongs on THIS branch too. `CAPB > 24` is satisfied by ONE recorded frame of any
     # kind, and the filter matches the AP's own beacons as well as our clones -- so a hopping
     # receiver's most likely output is a few of the AP's beacons and none of our burst, which lands
