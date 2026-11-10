@@ -213,8 +213,17 @@ the picked target is always among them (even behind a randomised MAC the `bss` s
 association.** `bss_clients`/`capture_bss`/`CLI_AWK`/`pcap_stream` (lib block, so the hooks get them)
 read a BSSID-filtered data capture and report which stations talked to it; `resp_snapshot` **unions**
 that set with the `ap_mac` test rather than replacing it, and ignores a set gathered for a different
-BSSID. `resp_members` turns a failed capture into one of four answers — `NO_CAPTURE`, `SNAP_SHORT`,
-`NO_MATCH`, `NO_CLIENTS` — instead of one silence. `resp_fire` takes the lock **first**, captures,
+BSSID. `resp_members` turns a failed capture into one of three answers — `NO_CAPTURE`, `SNAP_SHORT`,
+`NO_CLIENTS` — instead of one silence (a fourth, `NO_MATCH`, has had no producer since the
+2026-11-09 transmit-set fix). **Since 2026-11-10 none of them refuses an AP row — operator-decided:
+*"I'll accept nuclear blast. Let the AP row fire broadcast frames."*** `CLI_AWK`'s `seen[c] >= 2` filter is unchanged and can
+legitimately admit zero members from an occupied BSS; when the subject set is empty after both
+sources, `resp_fire` now fires the broadcast anyway, makes the broadcast target itself the one
+subject with `p0 '-'` (so `resp_verdict` scores it `INCONCLUSIVE`), skips the targeted sweep, and
+logs `no-members <bssid> why=<reason>` before the fire and `fired <key> <bssid> broadcast with no
+members recovered why=<reason>` after it. The reason is now an `events.log` line, never a loot
+verdict; refusals that are not about membership (`LOCK_FAILED`, `CMD_REFUSED`, a missing command)
+are untouched. Selftest `zero members, AP row: …`; harness `nomem_fired`. `resp_fire` takes the lock **first**, captures,
 **re-arms** for the measurement, then fires; the re-arm exists because the walker's parse is
 2.5-9.1 s on the device and no constant covers it honestly. The `resp` line logs the measured dwell.
 Read `RESPONSE.md` §13a-i before changing any of it: three mechanics that look obvious are wrong
@@ -224,7 +233,9 @@ substring walker is O(records x filesize)).
 `AP_OF`, so client Watch, Stimulus, kit detection and the AP→client tree stay inert, and a
 user-payload **client** row still aborts in `resp_target`'s client branch. What now fires: a
 user-payload **AP** row, the Recon **access_point** hook, and the Recon **client** hook's
-subject set. See `RESPONSE.md` §13a-i's bound table.
+subject set — and since 2026-11-10 (operator-decided, "nuclear blast") an AP row fires its
+broadcast frame **even when the capture recovers nobody**, looting one `INCONCLUSIVE` row for
+`ff:ff:ff:ff:ff:ff`. See `RESPONSE.md` §13a-i's bound table.
 
 **Selftest** — `selftest()` plus `st_*` helpers (`st_device`, `st_pcap`, `st_beacon_pcap`,
 `st_gate`, `st_hex2bin`, `st_subjects`). Runs on a laptop with no radio. Add a case for anything you change.
@@ -329,10 +340,14 @@ asking it.** Everything below was derived from static analysis of firmware 1.1.3
 source, as of commit `07916df`. Full working and citations are in the docs above, and each claim
 carries the thing that would falsify it.
 
-**⚠ THE SEVEN "CONTACT" SECTIONS EACH CONTAIN WITHDRAWN CLAIMS, STRUCK IN PLACE ON PURPOSE.** Text
+**⚠ THE "CONTACT" SECTIONS CONTAIN WITHDRAWN CLAIMS, STRUCK IN PLACE ON PURPOSE — five of the
+eight do as of 2026-11-10, and the eighth is itself where part of the seventh is withdrawn.** Text
 in `~~strikethrough~~` is wrong and is kept because the *shape* of the error is the useful part —
 five of the withdrawals are the same shape, a correct reading composed into a wrong inference, and
-four of those were withdrawn by the session that wrote them, three within hours. So: read a struck
+four of those were withdrawn by the session that wrote them, three within hours. **That tally is
+the file's own, is enumerated nowhere, and so is not a figure you can re-check; two more of the
+same shape have been struck since it was written — Fourth contact's "most plausibly the CSA" and
+Seventh contact's "the client went to ch 1", the latter in "Eighth contact".** So: read a struck
 claim as a warning, never as a fact, and when two sections disagree the **later one supersedes**:
 
 | question | superseded | by |
@@ -341,6 +356,7 @@ claim as a warning, never as a fact, and when two sections disagree the **later 
 | the count byte's effect | Fourth contact | **Fifth** |
 | what the control arms established | Fifth contact | **Sixth** |
 | why the feed froze | Fourth contact | **Seventh** (the captures) |
+| whether a switch ever completed | Seventh contact | **Eighth** (the capture, frame by frame) |
 
 If you find a third answer anywhere, that is a bug in this file and worth a commit on its own.
 
@@ -859,8 +875,9 @@ Compare Fourth contact's `mode=1` + announce ch 1 arm, `sent=97 failed=0`: a **c
   all, and they contain the observation that separates "disconnected, then re-associated" from
   "quiesced and never left": whether the feed's return is preceded by an auth/assoc exchange.
   ~~Not yet read.~~ **READ 2026-11-10 — see "Seventh contact". Only the mode-0 arm contains auth/assoc;
-  every mode-1 arm contains none, which separates quiesce-in-place from a real switch and refutes
-  Fourth contact's mechanism.**
+  every mode-1 arm contains none, which separates quiesce-in-place from ~~a real switch~~ a
+  re-association — that it was a *switch* is `[A]`, withdrawn as a reading 2026-11-10, see
+  "Eighth contact" — and refutes Fourth contact's mechanism.**
 - **`wlan1mon` flapped in two of the three arms** (`failed=5` of 98, `failed=7` of 91, `failed=0`
   in the third). Third and fourth instances in a day; `!! PARTIAL RUN` now names it, which is how
   the 2a confound above was visible at all.
@@ -899,8 +916,15 @@ The one arm that produced them, twice, ~3 s apart:
   problem.** `[V]` from the captures:
   - **Channel Switch Mode 1 quiesces the client IN PLACE.** Zero auth, zero assoc, zero deauth
     across *six* mode-1 arms. The client never left the BSS and never had to come back.
-  - **Mode 0 produces a real switch and a real return.** The client went to ch 1, found nothing, came
-    back and re-associated — twice inside one 10-second run.
+  - **Mode 0 produces auth and reassoc frames where mode 1 produces none.** `[V]`: a complete
+    Authentication / ReAssoc Request / ReAssoc Response cycle, twice inside one 10-second run.
+    ~~**Mode 0 produces a real switch and a real return.** The client went to ch 1, found nothing,
+    came back~~ — **[A], and withdrawn as a reading 2026-11-10: no frame in the capture shows the
+    station change channel or says where it went.** What it holds is the station ceasing to be
+    heard on ch 8 three times (2.947 / 2.482 / 2.450 s) and returning each time, each return
+    preceded by a directed Probe Response (155 ms and 144 ms before the two Authentications),
+    with zero deauth and zero disassoc anywhere in it. The mode-0-vs-mode-1 DIFFERENCE stands;
+    the destination does not. See "Eighth contact".
   Both present to an operator as a frozen video feed, which is exactly why three bench sessions
   could not tell them apart.
 - **⭐ So Fourth contact's mechanism is REFUTED, not merely weakened.** It read the freeze as "what
@@ -915,13 +939,26 @@ The one arm that produced them, twice, ~3 s apart:
   window is ~100 ms at roughly 50% duty and the client simply lands in a gap. **If that is right,
   17a cannot test the denial path at all against an AP that is still on the air** — and this AP
   cannot be silenced. That is a structural limit on the experiment, not a missing arm. **[A]** on
-  the mechanism; `[V]` that the re-association succeeded under injection.
-- **⚠ An open tension, left open rather than explained away.** The adversarial pass predicted
+  the mechanism; `[V]` that the re-association succeeded under injection. **The gaps are now
+  measured, and they are small** (`[V]`, "Eighth contact"): our last CSA-bearing beacon preceded
+  the two Authentications by **20.64 ms** and **70.66 ms**, and the AP's own last CSA-free beacon
+  preceded the first by **51.00 ms** — so at the first re-association our CSAs and the AP's
+  refreshing beacons were both on the air inside the 51 ms before the Authentication that should
+  have been refused.
+- **⚠ An open tension, left open rather than explained away. RESOLVED 2026-11-10 — and it
+  DISSOLVED rather than being decided; see "Eighth contact".** The adversarial pass predicted
   (`mlme.c:2452`) that the genuine AP's beacons abort a pending switch ~10/s, so a count-3 switch
-  would lose the race and never complete. **It completed twice.** Both readings are sound and the
+  would lose the race and never complete. ~~**It completed twice.**~~ **Nothing in the capture
+  shows a completed switch — the premise was an inference, not a reading, so there is no
+  composition left to repair.** Both readings are sound and the
   composition does not work, which is precisely the shape this file warns about — so no mechanism is
   invented here. *Resolved by:* a capture read for the ordering of our CSA beacons against the AP's
-  own around 02:37:23, which the same pcap already contains.
+  own around 02:37:23, which the same pcap already contains. **SPENT 2026-11-10: that read is
+  done. The AP's beacons were present and interleaved ~1:1 with ours throughout — 112 beacons,
+  9.68/s, zero gaps over 250 ms — including immediately before both re-associations and before
+  two of the three departures, so "there was nothing to abort the switch" is ruled out as the
+  general explanation. One 204.5 ms unopposed CSA window exists, before the FIRST departure
+  only.**
 - **The quiet arm's uplink dipped but never stopped.** Client→AP frames per second across the
   mode-1 run: `6, 83, 93, 263, 224, 93, 12, 237, 162, 256, 132, 32`. One deep trough — 12 frames in
   a second against a 100-260 baseline — then full recovery. So mode 1 is a *partial, repeated*
@@ -932,8 +969,91 @@ The one arm that produced them, twice, ~3 s apart:
   (see "Third contact"). Worth knowing that the only station on this AP is one of those.
 
 **What 17a has actually produced, in one line:** the channel-switch element reaches this client and
-does two separable things — mode 1 quiesces it in place, mode 0 moves it — and the count byte's
-denial half cannot be measured here because the target AP keeps beaconing.
+does two separable things — mode 1 quiesces it in place, ~~mode 0 moves it~~ **mode 0 makes it
+re-associate** (`[V]`; that it *moves* is **[A]**, not in the capture — see "Eighth contact") — and
+the count byte's denial half cannot be measured here because the target AP keeps beaconing.
+
+### Eighth contact — the mode-0 capture read frame by frame dissolves Seventh contact's tension, 2026-11-10
+
+Not a new transmission: the **record-level** read of the one Sixth-contact arm that produced
+auth/assoc — the `--mode=0`, announce-ch-1, count-3 arm on the parked primary, **3638 records**,
+filter `wlan addr1 fc:58:5a:08:42:15 or wlan addr2 fc:58:5a:08:42:15`, spanning 11.582 s, first
+record at absolute `1793893037.781670`. `dev/injector/run_17a.sh:380` names such a capture
+`/root/loot/csa_17a_c3_<epoch>.pcap`, so it is the `…_c3_1793893037.pcap` file provided the capture
+was opened in the same second as its first record — **[A]**: the read identified the pcap by its
+records alone, and `date +%s` runs before tcpdump's first write. Times below are relative to the
+first record, and **every figure here is `[V]`, computed from those 3638 records, unless tagged
+`[A]`.**
+
+- **⭐ THE TENSION DISSOLVES, because its premise was never a reading.** The capture holds 204
+  beacons, 5 Authentication, 2 Reassociation Request, 2 Reassociation Response, 3 Probe Response —
+  and **0 Deauthentication, 0 Disassociation, and no frame showing the station change channel or
+  saying where it went**. What it shows is the station ceasing to be heard on ch 8 three times and
+  returning each time, so Seventh contact's "it completed twice" was an inference, not a reading.
+  **[A]** Going to ch 1 fits it; so does an off-channel scan, a driver reset, a sleep or a range
+  change, and nothing here separates them, no receiver being on ch 1. *Falsified by:* a channel-1
+  capture holding this station's frames during one of the three absences below.
+- **⭐ "There was nothing to abort the switch" is RULED OUT as the general explanation.** The AP
+  beaconed continuously: **112 beacons, 9.68/s, zero gaps longer than 250 ms**, and by TBTT
+  accounting (each beacon's own TSF divided by the 102400 µs TBTT) exactly **one** of 113 TBTTs
+  carries no captured beacon — index 3686, at t ≈ 2.172993. Inside the injection window the two
+  streams strictly alternate: of 88 runs of our beacons, **85 are a single beacon of ours between
+  two of the AP's**, the longest unopposed run being **3**. *Falsified by:* an AP beacon gap over
+  250 ms in this pcap.
+- **⭐ The one unopposed window precedes the FIRST departure only.** `2.070865` → `2.275380` is a
+  **204.5 ms** span with no AP beacon captured, holding our three beacons at `2.071488`,
+  `2.171862`, `2.272598`, with the station's last frame at `2.261299` falling 190.4 ms into it — a
+  real coincidence, not waved away. **[A]**, and two reasons it still does not establish that the
+  AP was silent when it mattered: at a 102.4 ms TBTT a count of 3 schedules the switch about 307 ms
+  after the announcing beacon (count semantics as this file records them, not re-read in that
+  pass), so 204.5 ms is about two TBTTs and shorter than the announcement needs; and the capture
+  cannot say the AP's beacon was absent from the *air*, only that this receiver recorded none
+  there. *Falsified by:* a second unopposed CSA window anywhere in this pcap, or a captured AP
+  beacon at TBTT index 3686.
+- **⭐ Both returns were preceded by a directed Probe Response, under strict alternation.** One
+  addressed to the station precedes each Authentication — `5.252967` (155 ms before), `8.333463`
+  (144 ms before), a third at `11.400612` — and the beacon order over the 600 ms before each is
+  `AOAOAOAOAOAO` and `OAOAOAOAOAOA` (A = the AP's, O = ours). **[A]** A directed Probe Response
+  means the AP received a Probe Request, i.e. each return was an active scan; the station's own
+  Probe Requests are outside this filter, carrying the BSSID in neither address. *Falsified by:* a
+  station Authentication in this pcap with no directed Probe Response ahead of it.
+
+The three departures, which is where a switch would have begun — 3.531 s and 3.107 s apart, with
+presence windows of 2.26, 0.58 and 0.63 s, which **[A]** reads as a station-side scan or roam timer
+rather than a reaction clocked by our 9.94/s beacons:
+
+| # | last station frame | next station frame | absent | last AP beacon before it | CSA-only run before it |
+|---|---|---|---|---|---|
+| 1 | `2.261299` | `5.208104` | 2.947 s | `2.070865`, **190.43 ms** | **n = 2**, span 100.4 ms |
+| 2 | `5.791976` | `8.273588` | 2.482 s | `5.756885`, 35.09 ms | n = 1, span 0.0 ms |
+| 3 | `8.898842` | `11.348584` | 2.450 s | `8.834094`, 64.75 ms | **n = 0** (the AP's was last) |
+
+- **⚠ Our stimulus is less AP-like than `sent=92` suggests — three instrument facts the next bench
+  session should have.** Across all 92 clones: the **sequence number never advanced** (138 on every
+  frame), the **beacon TSF field never advanced** (`377241614`, the clone source's value — the AP
+  beacon at `t=1.968337`), and the **TIM was frozen** at `01020006` while the genuine AP's
+  alternated `00020006`/`01020006` every beacon. Element 37 is `000103` — mode 0, channel 1,
+  count 3 — on all 92, while the DS Parameter Set still says channel 8. The clones carry an
+  **8-byte radiotap header and no signal field** against the AP's 56 B; **[A]** that this makes
+  them locally looped-back transmit records, proving a transmit *attempt* and not reception.
+  *Falsified by:* a clone here with a 56-byte radiotap header or a signal field.
+- **What this capture cannot decide**, stated plainly because several are load-bearing:
+  - whether the station **received** any particular beacon — the ordering measured is this
+    receiver's, not the station's;
+  - **where** the station went during each ~2.5 s absence, and so whether any switch occurred;
+  - **why** it left — no deauth, no disassoc, no AP-originated CSA, no frame stating a reason;
+  - whether the kernel **abort path** (`mlme.c:2452`, read in "Fifth contact") governs this
+    station's stack — the capture carries no driver or OS identity, and the MAC is randomised
+    (`3a:57:cb:46:8b:77`);
+  - whether the **count byte** did anything — all 92 clones carried count 3 and mode 0;
+  - whether the AP transmitted at TBTT 3686. **Five of the six clones that landed within 3 ms
+    before an AP TBTT still produced a captured beacon**, so **[A]** monitor deafening fails as a
+    *general* mechanism and that one absent beacon is left unexplained rather than attributed.
+
+**What this read produces, in one line:** the mode-0-vs-mode-1 difference measured in Seventh
+contact stands, "there was nothing to abort the switch" is ruled out everywhere but the first
+departure, and "the client went to ch 1" is withdrawn as a reading — what this capture shows is a
+station leaving and rejoining channel 8, not a channel switch.
 
 **`2.0.0-stable` was released 2026-10-29** and is now what `latest` serves. Everything here remains
 pinned to 1.1.3; versioned downloads still work
@@ -1305,7 +1425,7 @@ the question is open.
 
 Listed in `dev/CamHound/RESPONSE.md` §13, `dev/pager-day-one.md` and — for what has already been
 closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowing: whether Recon's
-packet counters move the way `resp_verdict` assumes. **The count-byte experiment (day-one step 17a) has RUN — 2026-11-10, see "Fourth contact" and then "Fifth contact", which withdraws its headline.** **Both instruments were run too (`--clone` and `--count-dec`, 2026-11-10), and an adversarial pass then showed the OBSERVABLE was the weak half** — see "Fifth contact", which is the state of record. What survives: the five appended bytes are what disrupt this client. What does not: `--clone` is a near-tautological control on a mac80211 client (a verbatim clone hashes to the same `beacon_crc` and is dropped at `mlme.c:6929`), Channel Switch **Mode 1** freezes the client count-independently (`mlme.c:2610`), the real AP's own beacons abort a pending switch ~10/s (`mlme.c:2452`), and the `--count-dec` arm transmitted count 0 on 23 of 92 frames. **The count byte's effect is un-measured, not null.** **All three next-steps were then run — see "Sixth contact", which is the state of record.** `--elem=32:00` did nothing, so C1 holds in the strong form: it is the channel-switch element, not beacon churn. The mode arms gave a both-matter answer rather than either/or. **Those captures have been read — see "Seventh contact".** Only the mode-0 arm contains auth/assoc; all six mode-1 arms contain none, so mode 1 quiesces the client in place while mode 0 moves it, and Fourth contact's "honoured a switch then fell back" is refuted. The count >= 1 denial prediction was tested at last and FAILED — the client re-associated successfully while count-3 CSAs were in the air — and the likely reason is structural: the target AP's own beacons keep refreshing the cached IEs, so **17a cannot test the denial path against an AP that is still on the air.** Whether a frame reaches the air on **5 GHz DFS or 6 GHz** still needs an external receiver.
+packet counters move the way `resp_verdict` assumes. **The count-byte experiment (day-one step 17a) has RUN — 2026-11-10, see "Fourth contact" and then "Fifth contact", which withdraws its headline.** **Both instruments were run too (`--clone` and `--count-dec`, 2026-11-10), and an adversarial pass then showed the OBSERVABLE was the weak half** — see "Fifth contact", which is the state of record. What survives: the five appended bytes are what disrupt this client. What does not: `--clone` is a near-tautological control on a mac80211 client (a verbatim clone hashes to the same `beacon_crc` and is dropped at `mlme.c:6929`), Channel Switch **Mode 1** freezes the client count-independently (`mlme.c:2610`), the real AP's own beacons abort a pending switch ~10/s (`mlme.c:2452`), and the `--count-dec` arm transmitted count 0 on 23 of 92 frames. **The count byte's effect is un-measured, not null.** **All three next-steps were then run — see "Sixth contact", which is the state of record.** `--elem=32:00` did nothing, so C1 holds in the strong form: it is the channel-switch element, not beacon churn. The mode arms gave a both-matter answer rather than either/or. **Those captures have been read — see "Seventh contact", and "Eighth contact", which reads the mode-0 capture frame by frame.** Only the mode-0 arm contains auth/assoc; all six mode-1 arms contain none, so mode 1 quiesces the client in place while mode 0 makes it re-associate — ~~mode 0 moves it~~ is **[A]** and was withdrawn as a reading 2026-11-10: that capture holds no frame showing the station change channel or saying where it went, only a station leaving and rejoining ch 8 three times, and no receiver was on ch 1. Fourth contact's "honoured a switch then fell back" is refuted. The count >= 1 denial prediction was tested at last and FAILED — the client re-associated successfully while count-3 CSAs were in the air — and the likely reason is structural: the target AP's own beacons keep refreshing the cached IEs, so **17a cannot test the denial path against an AP that is still on the air.** Whether a frame reaches the air on **5 GHz DFS or 6 GHz** still needs an external receiver.
 (`inj_parse_channels` is **no longer** on this list — it ran against a live radio on 2026-11-02 and
 was correct; see "First contact". Nor is *"the three `PINEAPPLE_DEAUTH_CLIENT*` commands are
 documented only by `hak5cmd`'s help text"* — they are now read from pineapd's own handler, see
@@ -1325,7 +1445,9 @@ own falsifier. And it listed the `unsigned char` question as the replacement ope
 day's work had already closed it.)
 
 **⚠ FIXED 2026-11-04 for AP rows — read this as history plus a live remainder.** The block below
-described the state before `bss_clients` existed. What it says about the *cause* still holds and is
+described the state before `bss_clients` existed. *And since 2026-11-10 the `NO_CLIENTS` refusal it
+describes no longer exists for an AP row at all: operator-decided, *"I'll accept nuclear blast. Let the AP row fire broadcast frames."* A
+zero-member AP row fires and loots `INCONCLUSIVE`; see the Response rung paragraph of the code map.* What it says about the *cause* still holds and is
 measured: no shipped firmware supplies a client→AP association. What no longer holds is the
 conclusion that nothing can fire: an AP row, and both Recon hooks, now recover the subject set from
 a capture (`RESPONSE.md` §13a-i). **Still true:** a user-payload **client** row aborts in
@@ -1382,12 +1504,13 @@ detection (`kit_eval`), the AP→client tree (`write_report`) and, for client ro
 rung (`resp_target`). **Cited by name on purpose** — these four line numbers were exact on
 2026-11-04 and all four pointed into unrelated functions one commit later.
 But the *attack* never needed it — `CSA` is `<bssid> <ch>` and `BOTH`'s target is discarded, and
-`RECON APS` supplies both on 1.1.3, so the firmware can transmit today. What refuses is CamHound's
-own `NO_CLIENTS` measurement guard. The fix is to read the association off the air with a
+`RECON APS` supplies both on 1.1.3, so the firmware can transmit today. What refused was CamHound's
+own `NO_CLIENTS` measurement guard — **removed for AP rows 2026-11-10, operator-decided ("nuclear
+blast")**: a zero-member AP row now fires the broadcast and loots `INCONCLUSIVE`. The fix was to read the association off the air with a
 BSSID-filtered capture (the filter shape at `:1804`, the radiotap-aware frame walker in
 `beacon_find`), which is firmware-independent and better evidence than Recon's cumulative counters.
 Full working, ranked options and the resolved mechanics are in `dev/CamHound/RESPONSE.md` §13a
-and §13a-i. **Not yet implemented.** ⚠ Three mechanics stated in §13a's first draft are
+and §13a-i. **Implemented 2026-11-04** (`bss_clients`/`capture_bss`/`CLI_AWK`). ⚠ Three mechanics stated in §13a's first draft are
 **wrong** and are corrected in §13a-i, which is the build decision of record: `addr2` is the
 client only on a **ToDS** frame, `-s 32` cannot reach `addr2` at all, and the bash
 `pcap_bytes`/`hex_octet` walker beacon_find uses is **O(n²)** and cannot be reused at this

@@ -46,6 +46,20 @@ rules() { local f="$T/rules_$1"; shift; printf '%s\t%s\n' "$@" >"$f"; export HAR
 answers() { printf '%s\n' "$@" >"$HARNESS_ANSWERS"; }
 check() { if eval "$2"; then printf 'PASS %s\n' "$1"; else printf 'FAIL %s\n' "$1"; FAIL=$((FAIL + 1)); fi; }
 run() { PATH="$PATHX" timeout 300 bash "$T/payload_fast.sh" >/dev/null 2>"$T/stderr"; }
+# nomem_fired <why>: the zero-member AP-row contract (operator-decided 2026-11-10, "I'll accept
+# nuclear blast. Let the AP row fire broadcast frames."). Exactly ONE attack command, and it is the
+# broadcast one (so no per-member sweep ran on the placeholder); exactly one loot row, for the
+# broadcast target, p0/p1 '-', INCONCLUSIVE; no refusal token in the loot; and events.log names the
+# capture's reason both before and after the fire.
+nomem_fired() {
+  [ "$(grep -c '^PINEAPPLE_DEAUTH_CLIENT ' "$T/log")" = 1 ] &&
+  grep -q '^PINEAPPLE_DEAUTH_CLIENT [^ ]* ff:ff:ff:ff:ff:ff ' "$T/log" &&
+  [ "$(grep -c '^[0-9]' "$LOOT/responses.tsv")" = 1 ] &&
+  [ "$(awk -F'|' '$5 == "ff:ff:ff:ff:ff:ff" && $14 == "-" && $15 == "-" && $16 == "INCONCLUSIVE"' "$LOOT/responses.tsv" | grep -c .)" = 1 ] &&
+  ! grep -qE '[|](NO_CLIENTS|NO_CAPTURE|SNAP_SHORT|NO_MATCH|CMD_REFUSED)$' "$LOOT/responses.tsv" &&
+  grep -qE "no-members [^ ]+ why=$1 " "$LOOT/events.log" &&
+  grep -qE "fired [A-Z]+ [^ ]+ broadcast with no members recovered why=$1" "$LOOT/events.log"
+}
 COMMON=('Watch now' 0 'Watch top' 0 'Locate' 0 'Exit CamHound' 1 'Recon list' 0)
 
 s_live() {   # Live view on the Reolink NVR AP -> STREAM, conf 80 -> 100
@@ -167,11 +181,12 @@ s_disrupt() {   # shipped default (RESPONSE=1 from the config block, nothing wri
     "grep -q 'items=DEAUTH bss (works);BOTH bss (deauth only);CSA bss (fw-broken);' $T/log"
   check "disrupt: the targeted sweep still runs after BOTH" \
     "grep -qE 'sweep PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 targeted=2 of 2' $LOOT/events.log"
-  # guard: an AP with no visible clients (the Hikvision setup AP) is refused before anything is sent
+  # an AP with no visible clients (the Hikvision setup AP). Until 2026-11-10 this was refused before
+  # anything was sent; the operator decided it fires its broadcast frame anyway ("nuclear blast").
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules disrupt2 '^CamHound' 'Scan,Exit' 'Review hits' '3,Exit' '^[0-9]+ HIK' 'Disrupt,Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
   answers t t B; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
-  check "disrupt: AP without clients refused, nothing sent" "grep -qE 'no visible clients|no clients heard' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log && grep -q '|NO_CLIENTS$' $LOOT/responses.tsv"
+  check "disrupt: AP without clients fires the broadcast anyway and loots INCONCLUSIVE" "grep -qE 'no visible clients|no clients heard' $T/log && nomem_fired NO_CLIENTS"
   check "disrupt: cached badge shown on the card afterwards" "grep -q 'items=.*Disrupt \[D+C\]' $T/log"
   check "disrupt: EXAMINE released, no lock file" "grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log && [ ! -e /tmp/cs_run.pid ]"
 }
@@ -317,32 +332,33 @@ s_members() {   # the real-firmware shape: clients with NO association, membersh
   check "members: the measurement lock was re-armed, not stretched" \
     "grep -qE 're-armed ec:71:db:00:00:10 [0-9]+s for the measurement' $LOOT/events.log"
   check "members: EXAMINE released and no lock file left" "grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log && [ ! -e /tmp/cs_run.pid ]"
-  # armed, heard nobody -> NO_CLIENTS. This is the arm that used to be the whole bug.
+  # armed, heard nobody -> NO_CLIENTS. This is the arm that used to be the whole bug. Since
+  # 2026-11-10 (operator-decided, "nuclear blast") it is a REASON, not a refusal: the AP row fires.
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules mem2 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_NO_MEMBERS=1 run
-  check "members: silent BSS refuses NO_CLIENTS and sends nothing" \
-    "grep -q 'no clients heard on 00:00:10' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log && grep -q '|NO_CLIENTS\$' $LOOT/responses.tsv"
-  check "members: resp_fire itself released the lock on that refusal" \
-    "grep -q 'unlocked after refusal' $LOOT/events.log && grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log"
+  check "members: silent BSS fires the broadcast anyway, one INCONCLUSIVE row, no NO_CLIENTS" \
+    "grep -q 'no clients heard on 00:00:10' $T/log && grep -q '^PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36\$' $T/log && nomem_fired NO_CLIENTS"
+  check "members: the lock is released after the zero-member fire, and nothing called it a refusal" \
+    "grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log && ! grep -q 'unlocked after refusal' $LOOT/events.log && [ ! -e /tmp/cs_run.pid ]"
   # tcpdump refuses the filter -> NO_CAPTURE, a different answer from an empty BSS
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules mem3 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_NO_ARM=1 run
-  check "members: a capture that cannot arm refuses NO_CAPTURE, not NO_CLIENTS" \
-    "grep -q '|NO_CAPTURE\$' $LOOT/responses.tsv && ! grep -q '|NO_CLIENTS\$' $LOOT/responses.tsv && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
+  check "members: a capture that cannot arm is NO_CAPTURE, not NO_CLIENTS, and still fires" \
+    "nomem_fired NO_CAPTURE && ! grep -q 'why=NO_CLIENTS' $LOOT/events.log"
   # records arrive but are cut below rt+16 -> SNAP_SHORT, and the message names the fix
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules mem4 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_SHORT_SNAP=1 run
-  check "members: truncated records refuse SNAP_SHORT and name the constant" \
-    "grep -q '|SNAP_SHORT\$' $LOOT/responses.tsv && grep -q 'raise CLI_CAP_SNAP' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
+  check "members: truncated records are SNAP_SHORT, name the constant, and still fire" \
+    "nomem_fired SNAP_SHORT && grep -q 'raise CLI_CAP_SNAP' $T/log"
   check "members: the short capture is reported with its radiotap length" \
-    "grep -qE 'refused .* SNAP_SHORT members=0 itmax=18 recs=[0-9]+ short=[1-9]' $LOOT/events.log && grep -qE 'members .* trunc=[1-9]' $LOOT/events.log"
+    "grep -qE 'no-members .* why=SNAP_SHORT members=0 itmax=18 recs=[0-9]+ short=[1-9]' $LOOT/events.log && grep -qE 'members .* trunc=[1-9]' $LOOT/events.log"
   # a file exists but is not a pcap -> NO_CAPTURE. Without this arm, resp_members discarding
   # bss_clients' exit status is invisible: the selftest cannot see it, because it covers
   # bss_clients directly and never goes through resp_members.
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules mem6 "${R[@]}" "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_BAD_PCAP=1 run
-  check "members: an unreadable capture is NO_CAPTURE, not an empty BSS" \
-    "grep -q '|NO_CAPTURE\$' $LOOT/responses.tsv && grep -q 'not a readable pcap' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT' $T/log"
+  check "members: an unreadable capture is NO_CAPTURE, not an empty BSS, and still fires" \
+    "nomem_fired NO_CAPTURE && grep -q 'not a readable pcap' $T/log"
   # Heard stations that Recon has no row for. Until 2026-11-09 this refused NO_MATCH and sent
   # NOTHING -- and THIS ARM ASSERTED THAT REFUSAL AS CORRECT, which is why the defect survived
   # fourteen scenarios and ninety-four checks. It was caught on the bench instead: seven

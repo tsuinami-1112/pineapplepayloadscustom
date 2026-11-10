@@ -104,7 +104,11 @@ air and **the camera's video feed froze for the duration, identically for `--cou
 `--count 3`, recovering by itself afterwards.** The reading that suggests itself is that the client
 honoured the announced switch, went to an empty channel and came back. But the run also put ~95
 spoofed beacons carrying the AP's own BSSID on the air, and *that* is an equally good explanation
-for a frozen feed. Nothing in the experiment separated the two.
+for a frozen feed. Nothing in the experiment separated the two. *Both halves of that reading were
+later refuted by captures. Every mode-1 arm, these two included, contains zero auth and zero assoc
+frames, so the client never left: it was quiesced in place by Channel Switch Mode 1 (CLAUDE.md
+"Seventh contact"). And in the one mode-0 arm where the client did re-associate, "went to an
+empty channel" is an inference the capture cannot confirm (CLAUDE.md "Eighth contact").*
 
 `--clone` separates them: it captures one clean beacon from `--bssid` and floods it **verbatim**,
 with no CSA and no eCSA appended. Nothing else changes — same socket, same rate, same `--secs`,
@@ -224,7 +228,10 @@ The cadence is close to faithful: the 2026-11-10 run put ~109 ms between steps a
 102.4 ms TBTT, within about 7%. What is still unfaithful is structural — the countdown restarts
 instead of switching and going quiet, and the genuine AP keeps beaconing CSA-free alongside, which
 on a mac80211 client **aborts the pending switch** (`mlme.c:2452`) roughly every 100 ms. That is why
-17a as built cannot produce a completed count ≥ 1 switch against an AP still on the air.
+17a as built cannot produce a completed count ≥ 1 switch against an AP still on the air. *(The
+Seventh-contact "it completed twice" in the mode-0 arm looked like a counter-example; the
+frame-by-frame read of that capture, CLAUDE.md "Eighth contact", withdrew it — the capture shows
+two re-associations, not a completed switch — so this statement stands unchallenged.)*
 
 `--count 0 --count-dec` and `--count 1 --count-dec` are both refused: 0 is the "switch immediately"
 condition and a separate arm, and 1 would step 1 → 1 forever, a constant stream that the log would

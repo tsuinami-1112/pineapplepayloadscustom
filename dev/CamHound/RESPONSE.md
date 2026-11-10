@@ -3,10 +3,12 @@
 Developer reference for the **Disrupt** rung: the part of CamHound that turns a detection into a
 disconnection. `PLAN_v2.md` covers the recon side; this covers everything downstream of it.
 
-Status: coded and laptop-verified; `--selftest` passes on a real 1.1.3 Pager as of 2026-11-04
-(259/0), but **no part of this rung has transmitted, or even been reached, on hardware** — the
-selftest stubs every device-changing command. Section
-[What is unverified](#what-is-unverified) is the honest list.
+Status: coded, laptop-verified, and **transmitting on hardware since 2026-11-05** — a Disrupt ran the
+whole chain from the user payload on the 1.1.3 unit (CLAUDE.md "Second contact"), and since
+2026-11-10 an AP row fires even when the capture recovers nobody (below). `--selftest` last passed on
+the Pager at 259/0 (2026-11-04); the suite is 334 checks on the laptop as of 2026-11-10. The selftest
+still stubs every device-changing command, so section [What is unverified](#what-is-unverified)
+remains the honest list of what the bench has not measured.
 
 ---
 
@@ -267,7 +269,8 @@ row types and the error mattered, because it made the rung look merely degraded 
 unable to fire:*
 
 - on an **AP row** the picked target is `ff:ff:ff:ff:ff:ff`, so there is no target to fall back to:
-  subjects are **0** and `resp_fire` refuses with `NO_CLIENTS` before transmitting;
+  subjects are **0** and `resp_fire` refuses with `NO_CLIENTS` before transmitting *(the state of
+  2026-11-03; since 2026-11-10 an AP row with zero subjects fires anyway — see below)*;
 - on a **client row** it never reaches the sweep at all — `AP_OF` is `-`, so `resp_target` returns 1
   and `disrupt_menu` aborts with "nothing to attack: no associated BSS".
 
@@ -286,9 +289,20 @@ Recon. `recon_stat` therefore failed, `present` was 0, and **every broadcast att
 `resp_verdict`'s branches in isolation and never the composition that fed it, so they passed while
 the result was wrong.
 
-**A broadcast target with no measurable subjects is refused** before anything is transmitted, and
-records a row whose verdict column says which of four reasons applied. There is nothing to
-disconnect and nothing to measure, so sending would be unverifiable noise.
+**A broadcast target with no subjects FIRES — operator-decided 2026-11-10: *"I'll accept nuclear blast. Let the AP row fire broadcast frames."***
+Until that day it was refused before anything was transmitted, with a loot row whose verdict column
+named the capture's reason, on the argument that "sending would be unverifiable noise". That
+argument was the 2026-11-09 defect one layer up: the frame is addressed to `ff:ff:ff:ff:ff:ff` and
+needs no member list, and `CLI_AWK`'s `seen[c] >= 2` filter (kept, unchanged — it guards the
+*measurement* set against FCS-corrupt addresses) can legitimately admit zero members from a BSS
+proven occupied by hundreds of records (`AUDIT-2026-11-10.md`, "Open question"). So the measurement
+gate was again gating the transmit. Now `resp_fire` makes the broadcast target itself the one
+subject with `p0 '-'`, so `resp_verdict` scores it `INCONCLUSIVE` and the loot has exactly one row,
+for `ff:ff:ff:ff:ff:ff`, `pk_before`/`pk_after` `-`; the targeted sweep is skipped (there is no
+station to aim at); and `events.log` carries `no-members <bssid> why=<reason> …` before the fire and
+`fired <key> <bssid> broadcast with no members recovered why=<reason>` after it. The blast radius is
+the confirm's ("on EVERY client of <bssid>"), unchanged. Refusals that are not about membership —
+`LOCK_FAILED`, `CMD_REFUSED`, a missing command — still refuse.
 
 *Corrected 2026-11-04: this used to read "refused **before the lock is taken**", which is now the
 opposite of the code.* The lock is taken first, because the membership capture has to run on the
@@ -296,17 +310,19 @@ target's channel and the pre-read has to see what it found. Every refusal path p
 therefore calls `unlock_target` and logs `unlocked after refusal` — a leaked EXAMINE would pin the
 radio off its hop cycle for the rest of the run.
 
-| verdict | meaning | the knob |
+The reasons below are **`events.log` reasons, no longer loot verdicts** (since 2026-11-10):
+
+| reason | meaning | the knob |
 |---|---|---|
 | `NO_CAPTURE` | no `tcpdump`, the filter would not arm, or what came back is not a readable pcap | fix the tool or the filter |
 | `SNAP_SHORT` | records arrived but a record **at the snaplen** was cut before `addr2` | raise `CLI_CAP_SNAP` |
-| `NO_MATCH` | stations were heard, but none has a Recon row or all were randomised | nothing is wrong with the capture |
+| ~~`NO_MATCH`~~ | *retired 2026-11-09: heard members are transmit targets now, so it has no producer* | — |
 | `NO_CLIENTS` | armed, listened, nobody there | the BSS really is empty |
 
 Before this split they were one silence, and "we could not look" was indistinguishable from "the BSS
-is empty". `NO_MATCH` matters most of the four: reporting it as `NO_CLIENTS` would describe a BSS we
-demonstrably heard traffic on as dead, and send the operator to look for a dead AP instead of at the
-gate that dropped the stations.
+is empty". `NO_MATCH` mattered most of the four while it existed: reporting it as `NO_CLIENTS` would
+describe a BSS we demonstrably heard traffic on as dead, and send the operator to look for a dead AP
+instead of at the gate that dropped the stations.
 
 `resp_fire` then snapshots, transmits, waits `RESP_SETTLE_SECS`, re-snapshots, and judges **each
 subject** with `resp_verdict`:
@@ -317,7 +333,7 @@ subject** with `resp_verdict`:
 | `NO_EFFECT` | counter still advancing — it never left |
 | `INCONCLUSIVE` | no baseline, no follow-up reading, or the counter stalled but it was seen again |
 | `LOCK_FAILED` | the radio would not hold the channel; nothing was transmitted |
-| `NO_CLIENTS` | broadcast target with no measurable clients; nothing was transmitted |
+| ~~`NO_CLIENTS`~~ | *no longer written (2026-11-10): a broadcast target with no clients fires, and is the one `INCONCLUSIVE` subject* |
 
 `resp_aggregate` reduces those to the one verdict shown on screen and written to `events.log`:
 **`MOVED` only when every subject went quiet**, `NO_EFFECT` when any kept transmitting,
@@ -407,7 +423,8 @@ No combination of the three keys reaches the air without a dialog.*
 
 ## 11. Loot
 
-`responses.tsv`, `|`-separated with a `#` header, **one row per measured subject** (so an attempt
+`responses.tsv`, `|`-separated with a `#` header, **one row per subject** — each measured client, or,
+since 2026-11-10, the broadcast placeholder `ff:ff:ff:ff:ff:ff` when a zero-member AP row fires — (so an attempt
 whose scope is `bss` against a BSSID with four clients writes four rows, one attempt — including when
 the operator picked a single client row and chose `CSA` or `BOTH`):
 
@@ -416,7 +433,10 @@ the operator picked a single client row and chose `CSA` or `BOTH`):
 ```
 
 `mac` is the enumerated target the operator acted on; **`target` is the subject actually measured**
-— the individual client for a broadcast attempt, not `ff:ff:ff:ff:ff:ff`. `resp_write` takes that as
+— the individual client for a broadcast attempt, not `ff:ff:ff:ff:ff:ff` — **with one exception since
+2026-11-10: a zero-member AP row writes exactly one row whose `target` IS `ff:ff:ff:ff:ff:ff`, with
+`pk_before`/`pk_after` `-` and verdict `INCONCLUSIVE`, because nothing could be measured** (the
+2026-11-10 paragraph above). `resp_write` takes that as
 an optional 9th argument and defaults to `R_TARGET`. `rsn_caps` is the raw 2-octet RSN Capabilities
 field, low octet first; `beacon_prot` is octet 10 of the Extended Capabilities element, or `-` when
 absent. Keeping the raw bytes means a disputed badge can be re-derived from the loot rather than
@@ -434,7 +454,8 @@ the three `PINEAPPLE_DEAUTH_CLIENT*` commands that record their arguments and tr
 a synthetic-beacon branch in the fake `tcpdump`. That scenario checks the posture read happening
 under a lock on the target channel, the badge derived from the beacon, the correct command invoked
 with the right BSSID/target/channel, the lock verified as `ok` rather than by-channel, the
-per-subject loot rows with badge and raw caps, the aggregate verdict, the no-clients guard, the
+per-subject loot rows with badge and raw caps, the aggregate verdict, the zero-member AP row firing
+anyway and looting `INCONCLUSIVE` (`nomem_fired`, since 2026-11-10; before that, the no-clients guard), the
 cached badge appearing on the card afterwards, and EXAMINE being released. Two further scenarios
 reach the confirms the badge logic adds: `blind` (the fake `tcpdump` captures no beacon, so the badge
 is `?`) checks that the "Fire blind?" dialog appears, that accepting it offers CSA first with every
@@ -467,6 +488,12 @@ Unit coverage:
 `check_sync.sh` clean, all three payloads parse, `shellcheck` clean.
 
 ## 13. What is unverified
+
+*Superseded three times, so read this floor as history: 2026-11-04 (membership read off the air,
+§13a-i), 2026-11-05 (a Disrupt transmitted from the user payload, CLAUDE.md "Second contact"), and
+2026-11-10 (an AP row fires even when the capture recovers nobody — operator-decided,
+*"I'll accept nuclear blast. Let the AP row fire broadcast frames."*). The `NO_CLIENTS` outcomes in the table below no longer happen on an AP row.
+What still holds is the user-payload **client** row aborting in `resp_target`.*
 
 **⚠ First, the floor — and it applies to the USER PAYLOAD only.** From the user payload this rung
 cannot transmit on any shipped firmware, and flashing does not fix that. The Recon hooks reach the
@@ -528,7 +555,8 @@ highest-value change available to this payload, and worth more than a firmware f
 goes on the air (`resp_fire`'s transmit): `CSA` is `<bssid> <ch>` and `BOTH` is `<bssid> <target>
 <ch>` with the target discarded. **Both need only a BSSID and a channel, and `RECON APS` supplies
 both on 1.1.3.** The firmware can transmit these today. What refuses is CamHound's own verification
-guard (`resp_fire`, the `NO_CLIENTS` branch): `resp_snapshot` found nobody to *measure*. So the
+guard (`resp_fire`, the `NO_CLIENTS` branch — *removed for AP rows 2026-11-10, operator-decided,
+"nuclear blast"*): `resp_snapshot` found nobody to *measure*. So the
 blocker is the oracle, not the capability — the rung is asking the firmware a question the firmware
 cannot answer, when the answer is on the air.
 
@@ -638,7 +666,8 @@ transform until a capture runs.
 values; `devices.json`, the fixture built from the measured 1.1.3 output, carries none. Only
 `HARNESS_NO_CLIENTS=1` reaches `devices.json` (`harness/stubs/_pineap`), and the three scenarios
 that set it — `nojq`, `devices` — never open Disrupt. So the `NO_CLIENTS` refusal that is the entire
-bug **has no coverage today**, and `s_disrupt`'s `moved=2 ... of 2` is produced by association data
+bug **has no coverage today** *(history: `s_members` covered it from 2026-11-04, and since 2026-11-10
+that arm asserts the zero-member AP row FIRES, via `nomem_fired`)*, and `s_disrupt`'s `moved=2 ... of 2` is produced by association data
 the device never supplies. Any fix here must add a Disrupt-under-`HARNESS_NO_CLIENTS` arm or it is
 testing fiction.
 

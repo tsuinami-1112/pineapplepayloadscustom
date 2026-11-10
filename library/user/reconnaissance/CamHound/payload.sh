@@ -2785,7 +2785,7 @@ csa_issue() {
 
 resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was reached
   local mac="$1" k="$2" badge="$3" cmd lock rc m p0 t0 p1 t1 present verdict nmv=0 nne=0 ninc=0 n
-  local scope tgt_verdict=- cap_secs lock_secs csa_secs=0 t_cap why frc ferr nmeas=0
+  local scope tgt_verdict=- cap_secs lock_secs csa_secs=0 t_cap frc ferr nmeas=0 nomem=''
   local -a subjects=(); local -A P0=() T0=()
   RESP_MEMBERS=(); RESP_MEMBERS_BSS=''      # never inherit a previous target's set
   cmd=$(response_cmd "$k")
@@ -2821,8 +2821,10 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
     # A capture that hears nothing is a REASON, never a verdict on its own. Returning here would
     # REPLACE the ap_mac path rather than add to it -- the same mistake as replacing resp_snapshot's
     # ap_mac test instead of unioning with it, one level up in the control flow. So the reason is
-    # recorded and the Recon read still happens; only a subject set that is empty AFTER both
-    # sources refuses, and it refuses with whichever reason the capture gave.
+    # recorded and the Recon read still happens. A subject set that is empty AFTER both sources
+    # used to refuse with that reason; on an AP row it now fires the broadcast anyway, logs the
+    # reason to events.log and loots one INCONCLUSIVE row (operator-decided 2026-11-10; see the
+    # empty-set branch below).
     resp_members "$R_BSSID" || true
     # The dwell figure the recon-side session needs for resp_clamp_lock's floor, handed over as a
     # measurement rather than a unilateral change to their function. dev/CamHound/README.md lists it
@@ -2871,19 +2873,20 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
         subjects+=("$m"); P0[$m]=-; T0[$m]=-
       done
     fi
-    if (( ${#subjects[@]} == 0 )); then     # heard nobody AND can measure nobody: nothing to aim at
-      unlock_target                      # every refusal past the lock must release it, or a leaked
-      log resp "unlocked after refusal"  # EXAMINE pins the radio off its hop cycle for the run
-      if [ -n "$MEMBERS_WHY" ]; then
-        why="$MEMBERS_WHY"; LOG red "$MEMBERS_TEXT"
-      else
-        # Reachable only if a membership set was gathered for a DIFFERENT BSSID, which resp_fire's
-        # entry reset should prevent; kept as a guard rather than a claim about the air.
-        why=NO_CLIENTS; LOG red "no visible clients on ${R_BSSID:9}: nothing to disconnect"
-      fi
-      log resp "refused $R_BSSID $why members=${#RESP_MEMBERS[@]} itmax=$BSS_ITMAX recs=$BSS_RECS short=$BSS_SHORT"
-      resp_write "$mac" "$badge" "$k" "$cmd" "$lock" - - "$why"
-      set_state RESPOND_NIL; return 1
+    if (( ${#subjects[@]} == 0 )); then     # heard nobody AND can measure nobody
+      # FIRES ANYWAY -- operator-decided 2026-11-10: "I'll accept nuclear blast. Let the AP row fire
+      # broadcast frames." This used to refuse with the capture's reason and transmit nothing, which
+      # was the 2026-11-09 defect one layer up: the frame is addressed to ff:ff:ff:ff:ff:ff and needs
+      # no member list, so a measurement gate was again gating the transmit. CLI_AWK's seen>=2 filter
+      # (which can legitimately admit nobody from an occupied BSS) is untouched -- it still guards
+      # the MEASUREMENT set. With nothing to measure, the broadcast target itself is the one subject,
+      # with p0 '-', so resp_verdict scores it INCONCLUSIVE and the loot never claims an effect.
+      # MEMBERS_WHY empty is reachable only if a set was gathered for a DIFFERENT BSSID, which the
+      # entry reset should prevent; it is reported as NO_CLIENTS, as the refusal used to.
+      nomem="${MEMBERS_WHY:-NO_CLIENTS}"
+      LOG yellow "${MEMBERS_TEXT:-no visible clients on ${R_BSSID:9}}"$'\n'"firing broadcast anyway"
+      log resp "no-members $R_BSSID why=$nomem members=${#RESP_MEMBERS[@]} itmax=$BSS_ITMAX recs=$BSS_RECS short=$BSS_SHORT: firing broadcast anyway, nothing to measure"
+      subjects=("$R_TARGET"); P0[$R_TARGET]=-; T0[$R_TARGET]=-
     fi
   else
     (( ${#subjects[@]} == 0 )) && { subjects=("$R_TARGET"); P0[$R_TARGET]=-; T0[$R_TARGET]=-; }
@@ -2892,7 +2895,7 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   [ "$lock" = unverified ] && LOG yellow "$LOCK_TEXT"
   set_state RESPOND
   LOG "$k -> ${R_BSSID:9} ch $R_CH"$'\n'"lock: $lock, $n subject(s)"
-  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock scope=$scope subjects=$n measurable=$nmeas heard=${#RESP_MEMBERS[@]}"
+  log resp "fire $k $R_BSSID $R_TARGET ch$R_CH badge=$badge lock=$lock scope=$scope subjects=$n measurable=$nmeas heard=${#RESP_MEMBERS[@]}${nomem:+ members=none why=$nomem}"
   # Capture the command's rc AND its stderr. Discarding both was a real defect: if the firmware
   # refuses the command nothing leaves the radio, yet the loot row still read NO_EFFECT (subjects
   # kept transmitting) or MOVED (a counter happened to stall) -- indistinguishable from a real
@@ -2927,6 +2930,7 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
     for m in "${subjects[@]}"; do resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "${P0[$m]}" - CMD_REFUSED "$m"; done
     set_state RESPOND_NIL; return 1
   fi
+  [ -n "$nomem" ] && log resp "fired $k $R_BSSID broadcast with no members recovered why=$nomem: INCONCLUSIVE by construction"
   # The CSA half of BOTH, issued as its own command because no firmware command combines them (see
   # response_cmd: _ALL is the CSA opcode under another name, and pineapd's real deauth+CSA opcode
   # 401 is dead code no command reaches). A refused CSA leg must NOT fail the attempt -- the deauth
@@ -2958,7 +2962,8 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   # is decided, and a CLIENT row firing BOTH is scope=bss with R_TARGET set to the client - _ALL
   # discards that target and goes BSS-wide regardless - so an R_TARGET test would skip the sweep in
   # exactly the case it is most needed. Unreachable until the inverse lookup lands; wrong now.
-  if [ "$SWEEP_TARGETED" = 1 ] && [ "$k" != CSA ] && [ "$scope" = bss ] && (( n > 0 )); then
+  # Not when nomem is set: the one subject is then the broadcast placeholder, not a station.
+  if [ "$SWEEP_TARGETED" = 1 ] && [ "$k" != CSA ] && [ "$scope" = bss ] && (( n > 0 )) && [ -z "$nomem" ]; then
     local sw_cmd sw_ok=0 sw_rc sw_err
     sw_cmd=$(response_cmd DEAUTH)
     if [ -n "$sw_cmd" ] && command -v "$sw_cmd" >/dev/null 2>&1; then
@@ -3914,6 +3919,44 @@ IWFIX
   RESP_MEMBERS=([ec:71:db:00:00:11]=1); RESP_MEMBERS_BSS=aa:00:00:00:00:99
   resp_snapshot bss
   st "snapshot bss: a set gathered for another BSSID is ignored" "$(st_subjects)" ""
+  # 7k-ii An AP row whose capture recovered NOBODY still fires its broadcast frame -- operator-decided
+  # 2026-11-10 ("I'll accept nuclear blast. Let the AP row fire broadcast frames."). Before, this
+  # refused with the capture's reason and sent nothing. Drives resp_fire itself, with the lock, the
+  # capture and the command stubbed; recon_lines is still the ap_mac '-' stub above, so with an empty
+  # member set the snapshot finds nobody, which is exactly the shape that used to refuse.
+  local o_lock o_unlock o_mem o_settle="$RESP_SETTLE_SECS"; o_lock=$(declare -f lock_target)
+  o_unlock=$(declare -f unlock_target); o_mem=$(declare -f resp_members)
+  lock_target() { LOCK_TEXT=''; return 0; }; unlock_target() { :; }
+  resp_members() { RESP_MEMBERS=(); RESP_MEMBERS_BSS=''; MEMBERS_WHY="${ST_WHY:-NO_CLIENTS}"; MEMBERS_TEXT="stub $MEMBERS_WHY"; return 1; }
+  PINEAPPLE_DEAUTH_CLIENT() { printf '%s\n' "$*" >>"$tmp/fired"; [ -z "${ST_REFUSE:-}" ] || printf 'not permitted\n' >&2; }
+  RESP_SETTLE_SECS=0; R_BSSID="$BSSC"; R_TARGET=ff:ff:ff:ff:ff:ff; R_CH=6; R_BAND=2
+  rm -f "$tmp/fired" "$tmp/responses.tsv" "$tmp/events.log"
+  resp_fire "$BSSC" DEAUTH 'D+C' >/dev/null 2>&1
+  st "zero members, AP row: resp_fire reaches a verdict (rc 0)" "$?" 0
+  st "zero members, AP row: the broadcast frame is sent, once, and no sweep" "$(cat "$tmp/fired" 2>/dev/null)" "$BSSC ff:ff:ff:ff:ff:ff 6"
+  st "zero members, AP row: exactly one loot row" "$(grep -c '^[0-9]' "$tmp/responses.tsv" 2>/dev/null)" 1
+  st "zero members, AP row: that row is the target, p0/p1 '-', INCONCLUSIVE" \
+     "$(awk -F'|' 'NR == 2 { print $5, $14, $15, $16 }' "$tmp/responses.tsv" 2>/dev/null)" "ff:ff:ff:ff:ff:ff - - INCONCLUSIVE"
+  st "zero members, AP row: no CMD_REFUSED and no NO_CLIENTS row" \
+     "$(grep -cE '[|](CMD_REFUSED|NO_CLIENTS|NO_CAPTURE|SNAP_SHORT)$' "$tmp/responses.tsv" 2>/dev/null)" 0
+  st "zero members, AP row: events.log says it fired with no members, and why" \
+     "$(grep -c "fired DEAUTH $BSSC broadcast with no members recovered why=NO_CLIENTS" "$tmp/events.log" 2>/dev/null)" 1
+  rm -f "$tmp/fired" "$tmp/responses.tsv" "$tmp/events.log"; ST_WHY=SNAP_SHORT
+  resp_fire "$BSSC" DEAUTH 'D+C' >/dev/null 2>&1
+  st "zero members, AP row: a SNAP_SHORT capture fires too and names its reason" \
+     "$(grep -c "no-members $BSSC why=SNAP_SHORT" "$tmp/events.log" 2>/dev/null) $(awk -F'|' 'NR == 2 { print $16 }' "$tmp/responses.tsv" 2>/dev/null)" "1 INCONCLUSIVE"
+  # the command refusal is NOT about membership and still refuses: CMD_REFUSED, no verdict row
+  rm -f "$tmp/fired" "$tmp/responses.tsv" "$tmp/events.log"; ST_WHY=''; ST_REFUSE=1
+  resp_fire "$BSSC" DEAUTH 'D+C' >/dev/null 2>&1
+  st "zero members, AP row: a refused command is still CMD_REFUSED, rc 1, one row" \
+     "$? $(grep -c '^[0-9]' "$tmp/responses.tsv" 2>/dev/null) $(awk -F'|' 'NR == 2 { print $16 }' "$tmp/responses.tsv" 2>/dev/null)" "1 1 CMD_REFUSED"
+  # pins the 'fired' line BELOW the refusal gate: a refused command must not leave an events.log line
+  # that reads as a transmission (review finding TF1, 2026-11-10)
+  st "zero members, AP row: a refused command logs no 'fired ... with no members recovered' line" \
+     "$(grep -c 'broadcast with no members recovered' "$tmp/events.log" 2>/dev/null)" 0
+  unset ST_WHY ST_REFUSE; rm -f "$tmp/fired" "$tmp/responses.tsv" "$tmp/events.log"
+  PINEAPPLE_DEAUTH_CLIENT() { :; }
+  eval "$o_lock"; eval "$o_unlock"; eval "$o_mem"; RESP_SETTLE_SECS="$o_settle"
   eval "$orig_recon"
   RESP_MEMBERS=(); RESP_MEMBERS_BSS=''
   RS_PK=(); RS_T=(); R_BSSID=aa:00:00:00:00:10; R_TARGET=ff:ff:ff:ff:ff:ff; R_CH=6; R_BAND=2
