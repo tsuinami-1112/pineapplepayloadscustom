@@ -2126,8 +2126,15 @@ lock_target() {   # lock_target <bssid> <secs> [channel]; the channel defaults t
   # "still hopping (/1/1)", returned 2, and refused the whole response (loot row LOCK_FAILED on
   # 50:92:6a:ae:a8:82). cur_channel returns empty on a read it cannot parse, which is a missing
   # sample, not a different channel; compare only the samples we actually got.
-  [ -z "$c1" ] && c1="$c2"
+  # Backfill from the LAST sample outward. c3 is known non-empty -- the rc 3 guard above returned if
+  # it was not -- so repairing c2 from c3, then c1 from the REPAIRED c2, collapses any run of
+  # unreadable samples onto the one reading we actually have. The other order copied c2 into c1
+  # before c2 itself was repaired, so with c1 AND c2 both unreadable c1 stayed empty and the
+  # all-three-equal test below scored "still hopping (/1/1)" -- character for character the bench
+  # symptom this repair was added to stop. The measured case (ONE empty sample) passed either way,
+  # which is why neither the harness nor the selftest caught it; the audit did. st_lock covers both.
   [ -z "$c2" ] && c2="$c3"
+  [ -z "$c1" ] && c1="$c2"
   if [ "$c1" = "$c2" ] && [ "$c2" = "$c3" ]; then
     [ "$c3" = "$want" ] || [ "$want" = 0 ] && return 0
     PINEAPPLE_EXAMINE_CHANNEL "$want" "$secs" >/dev/null 2>&1; sleep 1; c3=$(cur_channel)
@@ -2640,20 +2647,44 @@ csa_newchan() {
 #            on success, so RC is the signal and testing stderr would report failure every time.
 # Getting that backwards either way files a fabricated result, which is the whole thing this rung
 # exists to prevent.
+# pagerinj reads --secs 0 as "transmit until SIGINT/SIGTERM" (its own usage, dev/injector/pagerinj.c),
+# and csa_issue runs it in the FOREGROUND, so a hand-edited CSA_INJ_SECS=0 would park resp_fire
+# forever with a transmitter running that no teardown could reach -- the watchdog and kill_children
+# only TERM pids listed in CHILD_FILE. Neither knob is starred, so the only route to a bad value is
+# a hand edit of the config block, which is exactly what "Edit these here" invites. Clamp both to a
+# finite window ONCE so the invocation and resp_fire's lock budget cannot disagree, and log it when
+# it bites rather than silently overriding what the operator wrote. Idempotent: called from both.
+csa_clamp() {
+  local s=$CSA_INJ_SECS w=$CSA_INJ_WAIT
+  (( CSA_INJ_SECS < 1 ))  && CSA_INJ_SECS=1
+  (( CSA_INJ_SECS > 60 )) && CSA_INJ_SECS=60
+  (( CSA_INJ_WAIT < 1 ))  && CSA_INJ_WAIT=1
+  (( CSA_INJ_WAIT > 60 )) && CSA_INJ_WAIT=60
+  [ "$s" = "$CSA_INJ_SECS" ] && [ "$w" = "$CSA_INJ_WAIT" ] && return 0
+  log resp "csa inject clamped: secs $s->$CSA_INJ_SECS wait $w->$CSA_INJ_WAIT"
+}
+
 CSA_CMD=''; CSA_ERR=''
 csa_issue() {
-  local nc rc err fw
+  local nc rc err fw ipid
   CSA_CMD=''; CSA_ERR=''
+  csa_clamp
   if [ -n "$CSA_INJECTOR" ] && [ -x "$CSA_INJECTOR" ]; then
     nc=$(csa_newchan)
     if [ -z "$nc" ]; then
       log resp "csa injector skipped: no band for $R_BSSID, cannot pick a new channel"
     else
       : >"$FIRE_ERR"
-      "$CSA_INJECTOR" -i "$RECON_IF" --csa --bssid "$R_BSSID" --chan "$nc" \
+      # Registered as a child and capped by timeout, so BOTH teardown paths can reach a transmitter
+      # that outlives its window: child_add puts it where the watchdog and kill_children look, and
+      # timeout bounds it even if the pid file is lost. wait returns the child's own status, so the
+      # rc-is-the-signal rule for pagerinj (it prints its summary to stderr on SUCCESS) still holds.
+      timeout $(( CSA_INJ_SECS + CSA_INJ_WAIT + 10 )) \
+        "$CSA_INJECTOR" -i "$RECON_IF" --csa --bssid "$R_BSSID" --chan "$nc" \
         --count "$CSA_COUNT" --secs "$CSA_INJ_SECS" --wait "$CSA_INJ_WAIT" \
-        >/dev/null 2>"$FIRE_ERR"
-      rc=$?; err=$(tr '\n' ' ' <"$FIRE_ERR" 2>/dev/null); rm -f "$FIRE_ERR"
+        >/dev/null 2>"$FIRE_ERR" &
+      ipid=$!; child_add "$ipid"; wait "$ipid"; rc=$?; child_del "$ipid"
+      err=$(tr '\n' ' ' <"$FIRE_ERR" 2>/dev/null); rm -f "$FIRE_ERR"
       CSA_CMD="${CSA_INJECTOR##*/}:ch$nc:n$CSA_COUNT"   # expansion, not basename: one less command to exist
       log resp "csa inject $CSA_CMD rc=$rc${err:+ out=${err:0:200}}"
       (( rc == 0 )) && return 0
@@ -2693,6 +2724,7 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   # locked episode, so its budget has to be in the lock or the lock expires mid-fire and the
   # post-read lands on a hopping radio -- the exact false green resp_verdict exists to prevent.
   if [ -n "$CSA_INJECTOR" ] && [ -x "$CSA_INJECTOR" ] && { [ "$k" = CSA ] || [ "$k" = BOTH ]; }; then
+    csa_clamp                                 # before the budget, so a clamped run cannot outlast its lock
     csa_secs=$(( CSA_INJ_SECS + CSA_INJ_WAIT + 2 ))
   fi
   lock_secs=$(( RESP_LOCK_SECS + cap_secs + csa_secs ))   # additive: resp_clamp_lock's floor is not ours to move
@@ -2734,7 +2766,7 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
       resp_write "$mac" "$badge" "$k" "$cmd" "$lock" - - LOCK_FAILED
       set_state INCONCLUSIVE; return 1
     fi
-    log resp "re-armed $R_BSSID ${RESP_LOCK_SECS}s for the measurement lock=$lock"
+    log resp "re-armed $R_BSSID $(( RESP_LOCK_SECS + csa_secs ))s for the measurement lock=$lock"
   fi
   resp_snapshot "$scope"
   for m in "${!RS_PK[@]}"; do subjects+=("$m"); P0[$m]="${RS_PK[$m]}"; T0[$m]="${RS_T[$m]}"; done
@@ -3447,6 +3479,23 @@ IWFIX
     "$(printf '%s' "$CSA_ERR" | grep -c 'no beacon captured')" "1"
   CSA_INJECTOR="$tmp/not_installed"; csa_issue >/dev/null 2>&1
   st "csa issue: an absent injector falls back to the firmware command" "$CSA_CMD" "PINEAPPLE_DEAUTH_CLIENT_CSA"
+  st "csa issue: a successful injector leaves no error behind" \
+    "$( CSA_INJECTOR="$tmp/inj_ok"; csa_issue && printf '[%s]' "$CSA_ERR" )" "[]"
+  # The two senders answer the rc-vs-stderr question OPPOSITELY and csa_issue has to get both right.
+  # hak5cmd exits 0 on EVERY path including its error paths and writes the reason to stderr
+  # (measured 2026-11-05), so for the firmware command stderr is the only signal and rc is worthless.
+  # pagerinj is the reverse: it prints its sent=/failed= summary to stderr ON SUCCESS, so rc is the
+  # only signal -- which the inj_ok case above covers. Nothing exercised the firmware half, so the
+  # `[ -z "$err" ]` guard could have been dropped in a refactor with every test still green.
+  # Falsified by: csa_issue returning 0 for a command that printed to stderr, on either sender.
+  PINEAPPLE_DEAUTH_CLIENT_CSA() { printf 'close - IO is pending on closed socket\n' >&2; return 0; }
+  CSA_INJECTOR=""; csa_issue >/dev/null 2>&1
+  st "csa issue: the firmware shape -- rc 0 WITH stderr -- is a failure, not a send" "$?" 1
+  st "csa issue: and that stderr reaches the caller as the reason" \
+    "$(printf '%s' "$CSA_ERR" | grep -c 'IO is pending')" "1"
+  PINEAPPLE_DEAUTH_CLIENT_CSA() { return 0; }
+  CSA_INJECTOR=""; csa_issue >/dev/null 2>&1
+  st "csa issue: rc 0 with a silent firmware command is a send"  "$?" 0
   # The picker label must follow the sender. With an injector configured, "fw-broken" is a lie.
   CSA_INJECTOR="$tmp/inj_ok"
   st "expect: with an injector, CSA is not fw-broken"  "$(posture_expect 'D+C' CSA)"  "injector"
@@ -3572,6 +3621,15 @@ IWFIX
   iwinfo() { printf 'x' >>"$tmp/chseq"; [ "$(wc -c <"$tmp/chseq" | tr -d ' ')" -gt 1 ] && printf '          Channel: 1 (2.412 GHz)\n'; return 0; }
   lock_target aa:00:00:00:00:10 5 1 >/dev/null
   st "lock_target: an empty first sample is not 'still hopping'" "$?" 0
+  # TWO unreadable samples, same parked radio. The 2026-11-09 repair above did NOT cover this: it
+  # backfilled c1 from c2 BEFORE repairing c2 from c3, so with c1 and c2 both empty c1 stayed empty
+  # and the all-three-equal test scored the identical "still hopping (/1/1)" refusal the one-sample
+  # fix was written to stop. Found by the 2026-11-10 audit, three finder dimensions independently;
+  # the measured one-sample case passed either way, which is why nothing here caught it.
+  : >"$tmp/chseq"
+  iwinfo() { printf 'x' >>"$tmp/chseq"; [ "$(wc -c <"$tmp/chseq" | tr -d ' ')" -gt 2 ] && printf '          Channel: 1 (2.412 GHz)\n'; return 0; }
+  lock_target aa:00:00:00:00:10 5 1 >/dev/null
+  st "lock_target: TWO empty samples are not 'still hopping' either" "$?" 0
   : >"$tmp/chseq"
   iwinfo() { printf 'x' >>"$tmp/chseq"; printf '          Channel: %s (2.412 GHz)\n' "$(wc -c <"$tmp/chseq" | tr -d ' ')"; }
   lock_target aa:00:00:00:00:10 5 1 >/dev/null

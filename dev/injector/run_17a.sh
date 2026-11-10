@@ -128,7 +128,13 @@ restore() {
   fi
   rm -f "$CAPERR" 2>/dev/null
 }
-trap restore EXIT INT TERM
+# restore() does not exit, so trapping it on INT/TERM directly ran the handler and then CARRIED ON:
+# Ctrl-C restarted pineapd, reset the EXAMINE lock, and the script went on to transmit into a radio
+# that was no longer parked. Exiting FROM the signal handler fires the EXIT trap, so restore still
+# runs, exactly once, and the run actually stops. 130/143 are the conventional SIGINT/SIGTERM codes.
+trap restore EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 printf -- '-- target %s ch %s (%s MHz); announcing ch %s with count %s on %s\n' \
   "$BSSID" "$TCHAN" "$FREQ" "$ACHAN" "$COUNT" "$IF" >&2

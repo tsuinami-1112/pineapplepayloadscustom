@@ -131,6 +131,10 @@ correct**, including a 5 GHz `No IR` channel (169) that the fixture never contai
 pending validation.
 
 **Response rung** — `resp_target` (sets `R_BSSID`/`R_TARGET`/`R_CH`/`R_BAND`), `disrupt_menu`,
+`csa_clamp` (bounds `CSA_INJ_SECS`/`CSA_INJ_WAIT` to 1-60 before both the invocation and the lock
+budget, because `pagerinj` reads `--secs 0` as "transmit until signalled" and `csa_issue` runs it in
+the foreground — a hand-edited 0 would have parked `resp_fire` forever with a transmitter no
+teardown could reach; the injector is now `child_add`ed and `timeout`-capped as well),
 `csa_newchan`/`csa_issue` (the CSA leg: routes to `CSA_INJECTOR` when one is configured and
 executable, else the firmware command, and owns the rc-vs-stderr question the two senders answer
 **oppositely** — `hak5cmd` exits 0 on every error path so stderr is its only signal, while
@@ -452,8 +456,13 @@ was trusted: `pineapd` `adc9d36d065b084856534dee…` / 1320040 B, `pineapple/pin
   session the throw WAS the explanation offered for `_ALL` and `_CSA` doing nothing, and it is
   wrong: all three commands supply a `sta`, so the throw is latent, not reached. Recorded because
   it is real and because the wrong message will mislead the next person who does hit it.
-- **⭐ The Go layer supplies `sta` for all three, so the throw is unreachable and `_ALL`'s deauth
-  call is BYTE-IDENTICAL to the one that works.** `[V]`, re-derived from the Go binary:
+- **⭐ The Go layer supplies `sta` for all three, so the throw is unreachable — and `_ALL` has no
+  deauth call at all to be identical to.** `[V]`, re-derived from the Go binary. *Heading corrected
+  2026-11-10: it previously read "`_ALL`'s deauth call is BYTE-IDENTICAL to the one that works",
+  which the table four lines below contradicts — `_ALL` sends opcode 402 and never reaches
+  `0x47364e`. That phrasing was a leftover from the withdrawn missing-`sta` explanation, where the
+  call was reached and the arguments were the difference. The `[V]` readings in this bullet are
+  unaffected; only the conclusion drawn in the heading was stale.*
   `pineap.(*PineAp).StartDeauthAll` @ `0x0086c53c` writes **six `0xff` bytes by immediate** —
   `li v1,-1` at `0x0086c5d8` then `sb v1,46(sp)`…`sb v1,51(sp)` — i.e. `sta = ff:ff:ff:ff:ff:ff`.
   `StartDeauthCsa` @ `0x0086c390` contains **no** `0xff` immediate, and neither does `StartDeauth`
@@ -551,10 +560,17 @@ was trusted: `pineapd` `adc9d36d065b084856534dee…` / 1320040 B, `pineapple/pin
   2484 MHz — Japan-only, 11b-only, and not in the US table at all — so a client that *did* honour
   the element would be told to move somewhere it may not go. Neither the channel nor the count is
   reachable by any setting or argument: both are literals with one call site.
-- **"Both" runs the IDENTICAL `inject_deauth` call as "deauth/disassoc"** — the same instruction at
-  `0x47364e`, the same four arguments from the same stack slots (`bssid` at `sp+216`, `sta` at
-  `sp+222`, channel at `sp+228`). So the difference the operator sees cannot be the code path; it
-  has to be the argument bytes the Go layer packed, which is what the missing-`sta` throw explains.
+- ~~**"Both" runs the IDENTICAL `inject_deauth` call as "deauth/disassoc"**~~ **WITHDRAWN
+  2026-11-10 — it is the opposite, and the bullet also endorsed the explanation this section
+  withdraws.** `inject_deauth` is called from exactly one instruction, `0x47364e`, with four
+  arguments from fixed stack slots (`bssid` at `sp+216`, `sta` at `sp+222`, channel at `sp+228`) —
+  that reading stands. What does not is "Both runs it": `0x47364e` sits in the block reached only by
+  dispatch test 1, i.e. opcode 400 or 401, and `_ALL` sends **402**, which fails that test
+  (402-400 = 2, `sltiu v0,2` false) and reaches `0x473630` instead. So BOTH never executes this
+  call, and the difference the operator sees IS the code path — not the argument bytes, and not the
+  missing-`sta` throw, which no shipped command reaches. Kept rather than deleted because the
+  address and argument slots are still the right ones for the DEAUTH path, and because this bullet
+  is where the wrong inference was recorded.
 - **`inject_deauth` @ `0x472c14` is the gate-1 site, and the recorded addresses check out.** Its
   prologue is `lw v0,28(s0); cmpi v0,8; bteqz` at `0x472c66` (the blanket 6 GHz check) and
   `sltiu v0,145` at `0x472c76` (the DFS range-chain entry) — matching this file's 1.1.3 column
@@ -566,7 +582,14 @@ was trusted: `pineapd` `adc9d36d065b084856534dee…` / 1320040 B, `pineapple/pin
   `1`, against a target channel of 1. The radio was parked where it was asked to be, but
   `lock_target` required all three samples equal and scored the empty one as a different channel,
   returning 2 and refusing the response with `LOCK_FAILED`. Fixed by comparing only the samples
-  that were actually read.
+  that were actually read — **but the first fix only covered ONE empty sample, which is the case
+  that was measured.** It backfilled `c1` from `c2` before repairing `c2` from `c3`, so with `c1`
+  and `c2` both unreadable `c1` stayed empty and the comparison scored the identical
+  `still hopping (/1/1)` refusal. Found by the 2026-11-10 audit (three finder dimensions
+  independently), reproduced, and fixed by backfilling from the last sample outward; the selftest
+  now covers one-empty, two-empty and middle-empty, and a mutation test confirms the two-empty case
+  fails against the old order. *Falsified by:* a `lock_target` rc changing for any of those four
+  sample patterns without `cur_channel` changing.
 
 **`2.0.0-stable` was released 2026-10-29** and is now what `latest` serves. Everything here remains
 pinned to 1.1.3; versioned downloads still work
@@ -641,10 +664,14 @@ evidence a downgrade would still be accepted, though no version check was looked
 struct carries no caller-supplied target — is now **measured**, not inferred: `StartDeauthAll`
 writes `sta = ff:ff:ff:ff:ff:ff` by immediate. What the section under-stated is the consequence:
 `_All` puts nothing on the air at all, measured against a client the opcode-400 broadcast drops on
-demand. **The mechanism for that is not settled** — see "Third contact", which supersedes the
-"missing `sta`" explanation this file briefly carried. `posture_opts` now leads with `DEAUTH` on
-every badge and `posture_expect` labels
-`BOTH`/`CSA` `fw-broken`, so the default Disrupt is no longer a guaranteed no-op. Four readings of
+demand. **The mechanism IS settled** — `_All` sends opcode 402, so it queues a CSA and builds no
+deauth frame; see "Third contact", which supersedes the "missing `sta`" explanation this file
+briefly carried. *Corrected 2026-11-10: this line read "The mechanism for that is not settled"
+while pointing at the section that settles it, and described `posture_expect` as labelling
+`BOTH`/`CSA` `fw-broken`, which it no longer does.* `posture_opts` now leads with `DEAUTH` on every
+badge; `BOTH` is wired to the opcode-400 deauth rather than `_ALL`, and `posture_expect`'s labels
+follow the SENDER — `fw-broken` for a firmware CSA, `injector`/`deauth+csa` when `CSA_INJECTOR` is
+configured — so the default Disrupt is no longer a guaranteed no-op. Four readings of
 the Go daemon,
 identical in 1.1.3 and 2.0.0, all **[V]**: **`StartDeauth`**'s argument frame is 32 bytes against 28
 for both **`StartDeauthAll`** and **`StartDeauthCsa`** — *corrected 2026-11-03; this line previously
@@ -940,10 +967,19 @@ packet counters move the way `resp_verdict` assumes; and the count-byte experime
 was correct; see "First contact". Nor is *"the three `PINEAPPLE_DEAUTH_CLIENT*` commands are
 documented only by `hak5cmd`'s help text"* — they are now read from pineapd's own handler, see
 "Third contact". Nor is *"whether CSA moves a real client at all"*, which is not answerable through
-these commands: `_CSA` cannot build a valid request, so **no CSA this firmware's commands emit has
-ever reached the air**, and the question now belongs entirely to `pagerinj`. What replaces it on
-this list is narrower: whether `inject_csa`'s `unsigned char` — passed as the literal 14 from
-`0x473634` — is the count, the announced channel, or something else.)
+these commands: every CSA they queue announces **channel 14 with count 0**, so a US client that
+honoured it would be told to move immediately to a channel it may not use, and the question now
+belongs entirely to `pagerinj`. Nor is *"whether `inject_csa`'s `unsigned char` is the count or the
+channel"* — resolved in "Third contact": it is the **New Channel Number**, the literal 14 from
+`0x473634`, landing in element 37 byte 3, with the Count byte separately `0` from `li s1,0` at
+`0x4bee6c`.
+*Corrected 2026-11-10, two stale claims removed from this parenthesis.* It previously said `_CSA`
+"cannot build a valid request, so no CSA this firmware's commands emit has ever reached the air" —
+that was the withdrawn missing-`sta` explanation. `_CSA` sends a well-formed opcode-402 request
+whose `sta` is simply never read, so `inject_csa` **is** called and a CSA record **is** queued; what
+is unknown is whether the beacon race then transmits it, which is a separate open question with its
+own falsifier. And it listed the `unsigned char` question as the replacement open item when the same
+day's work had already closed it.)
 
 **⚠ FIXED 2026-11-04 for AP rows — read this as history plus a live remainder.** The block below
 described the state before `bss_clients` existed. What it says about the *cause* still holds and is

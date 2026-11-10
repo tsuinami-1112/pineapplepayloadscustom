@@ -8,7 +8,7 @@
 # was handed: for an answer further down the list it presses 'More...' first, as an operator would,
 # and it refuses (exit 1, logged 'not on this page') an answer that is on no page.
 # Needs bash 5 and jq; uses busybox hexdump/awk when busybox is installed (closer to the Pager).
-# Usage: dev/CamHound/harness/run_harness.sh [live|stimulus|lock|nojq|locate|disrupt|members|cliscope|blind|noinj|persist|settings|bands|devices|all]
+# Usage: dev/CamHound/harness/run_harness.sh [live|stimulus|lock|nojq|locate|disrupt|members|cliscope|csainj|blind|noinj|persist|settings|bands|devices|all]
 set -u
 # ONE RUN AT A TIME. Scenarios share /tmp/cs_run.pid, /tmp/cs_children, /tmp/cs_harness_* and the
 # payload's own fixed temp paths, so two concurrent runs corrupt each other - and the failures
@@ -115,7 +115,7 @@ s_csainj() {   # the optional CSA injector: pagerinj in place of the firmware CS
   check "csainj: the CSA leg went to the injector, not the firmware command" \
     "grep -q '^PAGERINJ ' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT_CSA' $T/log"
   check "csainj: it got the iface, the bssid, a DIFFERENT channel and a non-zero count" \
-    "grep -qE '^PAGERINJ -i wlan1mon --csa --bssid ec:71:db:00:00:10 --chan 40 --count 3' $T/log"
+    "grep -qE '^PAGERINJ -i wlan1mon --csa --bssid ec:71:db:00:00:10 --chan 40 --count 3 --secs 3 --wait 5\$' $T/log"
   check "csainj: the loot names the injector, so a reader can tell which CSA this was" \
     "grep -q '|PINEAPPLE_DEAUTH_CLIENT+pagerinj:ch40:n3|' $LOOT/responses.tsv"
   check "csainj: the injector leg is logged with its rc" \
@@ -132,7 +132,7 @@ s_csainj() {   # the optional CSA injector: pagerinj in place of the firmware CS
   check "csainj: a failing injector leaves the deauth sent and says the CSA did not" \
     "grep -q '^PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36\$' $T/log && grep -q 'csa leg failed' $LOOT/events.log"
   check "csainj: a failed CSA leg is not recorded in the loot as a sent one" \
-    "! grep -q '+pagerinj' $LOOT/responses.tsv && ! grep -q '|CMD_REFUSED\$' $LOOT/responses.tsv"
+    "grep -q '|BOTH|PINEAPPLE_DEAUTH_CLIENT|' $LOOT/responses.tsv && ! grep -q '+pagerinj' $LOOT/responses.tsv && ! grep -q '|CMD_REFUSED\$' $LOOT/responses.tsv"
 }
 
 s_disrupt() {   # shipped default (RESPONSE=1 from the config block, nothing written to the saved config): Disrupt on the Reolink AP against log-only stubs; posture, lock, loot row
@@ -385,7 +385,7 @@ s_members() {   # the real-firmware shape: clients with NO association, membersh
 case "${1:-all}" in
   csainj) s_csainj ;; live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; members) s_members ;; cliscope) s_cliscope ;; blind) s_blind ;; noinj) s_noinj ;; persist) s_persist ;; settings) s_settings ;; bands) s_bands ;; devices) s_devices ;;
   all) s_csainj; s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_members; s_cliscope; s_blind; s_noinj; s_persist; s_settings; s_bands; s_devices ;;
-  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|members|cliscope|blind|noinj|persist|settings|bands|devices|all]"; exit 2 ;;
+  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|members|cliscope|csainj|blind|noinj|persist|settings|bands|devices|all]"; exit 2 ;;
 esac
 printf '== harness: %s failure(s); temp dir %s ==\n' "$FAIL" "$T"
 exit $(( FAIL > 0 ))
