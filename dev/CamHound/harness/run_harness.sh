@@ -8,7 +8,7 @@
 # was handed: for an answer further down the list it presses 'More...' first, as an operator would,
 # and it refuses (exit 1, logged 'not on this page') an answer that is on no page.
 # Needs bash 5 and jq; uses busybox hexdump/awk when busybox is installed (closer to the Pager).
-# Usage: dev/CamHound/harness/run_harness.sh [live|stimulus|lock|nojq|locate|disrupt|members|cliscope|csainj|blind|noinj|persist|settings|bands|devices|all]
+# Usage: dev/CamHound/harness/run_harness.sh [live|stimulus|lock|nojq|locate|disrupt|members|cliscope|csainj|blind|noinj|persist|settings|bands|devices|assoc|all]
 set -u
 # ONE RUN AT A TIME. Scenarios share /tmp/cs_run.pid, /tmp/cs_children, /tmp/cs_harness_* and the
 # payload's own fixed temp paths, so two concurrent runs corrupt each other - and the failures
@@ -32,16 +32,18 @@ sed -e 's/^WIN_SECS=10 /WIN_SECS=5 /' -e 's/^LIVE_WINDOWS=6 /LIVE_WINDOWS=4 /' \
     -e 's/^RESP_SETTLE_SECS=6 /RESP_SETTLE_SECS=1 /' -e 's/^CLI_CAP_SECS=4 /CLI_CAP_SECS=2 /' -e 's/^BCN_CAP_SECS=4 /BCN_CAP_SECS=2 /' \
     -e "s|^INJ_SYSFS=\"/sys/class/ieee80211\"|INJ_SYSFS=\"$T/phy\"|" -e "s|^NET_SYSFS=\"/sys/class/net\"|NET_SYSFS=\"$T/net\"|" \
     -e 's/^BANDS_PROBE_N=12; BANDS_PROBE_WAIT=0.5 /BANDS_PROBE_N=2; BANDS_PROBE_WAIT=0.1 /' \
+    -e 's/^ASSOC_CAP_SECS=6 /ASSOC_CAP_SECS=2 /' \
     -e "s|^LOOT_DIR=\"/root/loot/CamHound\"|LOOT_DIR=\"$LOOT\"|" "$SRC" >"$T/payload_fast.sh"
 grep -q "LOOT_DIR=\"$LOOT\"" "$T/payload_fast.sh" || { echo "sed on the config block failed"; exit 1; }
 grep -q "INJ_SYSFS=\"$T/phy\"" "$T/payload_fast.sh" || { echo "sed on INJ_SYSFS failed"; exit 1; }
 grep -q "NET_SYSFS=\"$T/net\"" "$T/payload_fast.sh" || { echo "sed on NET_SYSFS failed"; exit 1; }
 grep -q '^BANDS_PROBE_N=2; BANDS_PROBE_WAIT=0.1 ' "$T/payload_fast.sh" || { echo "sed on BANDS_PROBE_N failed"; exit 1; }
+grep -q '^ASSOC_CAP_SECS=2 ' "$T/payload_fast.sh" || { echo "sed on ASSOC_CAP_SECS failed"; exit 1; }
 mkdir -p "$T/phy/phy0"          # fallback-merge fixture only: with the net tree below naming phy0, no scenario lists this directory
 mkdir -p "$T/net/wlan1mon/phy80211"; printf 'phy0\n' >"$T/net/wlan1mon/phy80211/name"   # RECON_IF's phy: the probe reads this one, no merge
 printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
 PATHX="$HERE/stubs:$T/bin:$PATH"
-reset() { [ "${1:-}" = keep ] || rm -rf "$LOOT"; rm -rf "$T/log" "$T"/rules*.c* /tmp/cs_harness_chan /tmp/cs_harness_pps /tmp/cs_harness_bands /tmp/cs_run.pid /tmp/cs_children; mkdir -p "$LOOT"; echo 0 >/tmp/cs_harness_cycle; }
+reset() { [ "${1:-}" = keep ] || rm -rf "$LOOT"; rm -rf "$T/log" "$T"/rules*.c* /tmp/cs_harness_chan /tmp/cs_harness_pps /tmp/cs_harness_bands /tmp/cs_run.pid /tmp/cs_children; mkdir -p "$LOOT"; echo 0 >/tmp/cs_harness_cycle; : >/tmp/cs_harness_hop; }   # cs_harness_hop: the radio starts out hopping, and the EXAMINE stubs park and release it
 rules() { local f="$T/rules_$1"; shift; printf '%s\t%s\n' "$@" >"$f"; export HARNESS_RULES="$f"; }
 answers() { printf '%s\n' "$@" >"$HARNESS_ANSWERS"; }
 check() { if eval "$2"; then printf 'PASS %s\n' "$1"; else printf 'FAIL %s\n' "$1"; FAIL=$((FAIL + 1)); fi; }
@@ -398,10 +400,85 @@ s_members() {   # the real-firmware shape: clients with NO association, membersh
   check "members: the OR filter failing falls back to uplink-only and still fires" \
     "grep -q 'OR filter did not arm' $LOOT/events.log && grep -qE '^TCPDUMP members ec71db000010 snap=128 count=800 or=2' $T/log && grep -q 'scope=bss subjects=2' $LOOT/events.log"
 }
+s_assoc() {   # the inverse lookup on the real-firmware shape: a client's AP read off the air when Watch or Disrupt is picked
+  # HARNESS_NO_CLIENTS=1 throughout: RECON DEVICES rows, no association anywhere, which is what both
+  # shipped firmwares return. Review-list indices are for that shape (5 the Wyze client, 6 the
+  # Reolink NVR AP, 7 and 8 its two cameras); every check below pins the MAC it ran against, so an
+  # index that drifts fails loudly instead of testing another row. Who is associated to whom comes
+  # from fix/cli.json's ap_mac column, through the tcpdump stub's inverse arm.
+  local W=a4:da:22:20:00:01 WA=9c:3d:cf:11:22:33
+  local R=('^CamHound' 'Scan,Scan,Exit' 'Review hits' '5,Exit,Exit' '^[0-9]+ WYZE' 'Watch (find AP first),Disrupt,Back'
+           '^Watch ' 'Live view' '^(STREAM|EVENT|NONE|IDLE|DOWN|QUIET)' 'Back' '^Disrupt \[' '1' ' ch ' '1')
+  # 1. find the AP from the Watch row, watch the client, disrupt it, scan again
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules asc1 "${R[@]}" "${COMMON[@]}"; answers t t B t t t t B; HARNESS_NO_CLIENTS=1 run
+  check "assoc: an unresolved client's card offers the lookup where it used to say n/a" \
+    "grep -q 'PICKER\[45 WYZE-OUI 20:00:01\] items=Watch (find AP first);Disrupt (find AP first);Locate;Ignore for session;Back;' $T/log"
+  check "assoc: the radio is parked on the client's channel, the capture runs, and the radio is released" \
+    "awk '/^PINEAPPLE_EXAMINE_CHANNEL 6 /{a=NR} /^TCPDUMP assoc $W snap=128 count=800 or=3/{b=NR} /^PINEAPPLE_EXAMINE_RESET/{if (b && !c) c=NR} END {exit !(a && b && c && a < b && b < c)}' $T/log"
+  check "assoc: the AP is read off the air and logged with the count and the lock state" \
+    "grep -qE 'assoc $W -> $WA n=3 recs=3 itmax=18 ch=6 lock=ok dwell=[0-9]+s' $LOOT/events.log"
+  check "assoc: Watch then runs on that client, locked to its AP" \
+    "grep -q 'PICKER\[STREAM 20:00:01\]' $T/log && grep -q '|$W|cli|$WA|6|' $LOOT/watch_*.tsv"
+  check "assoc: one lookup only, the resolved row is not looked up again" "[ \"\$(grep -c '^TCPDUMP assoc $W snap' $T/log)\" = 1 ]"
+  check "assoc: Disrupt from the client row is the targeted frame, measured on that one device" \
+    "grep -q '^PINEAPPLE_DEAUTH_CLIENT $WA $W 6\$' $T/log && grep -q 'scope=cli subjects=1' $LOOT/events.log"
+  check "assoc: the next cycle keeps the AP, so the inventory carries it" \
+    "awk -F'|' '\$4==\"$W\" && \$5==\"cli\" && \$15==\"$WA\"' $LOOT/inventory.tsv | grep -q ."
+  check "assoc: the report's AP-to-client tree lists the client under its AP" "grep -qE '^$WA HomeNet .*20:00:01' $LOOT/report_*.txt"
+  check "assoc: EXAMINE released, no lock file, no tcpdump left" \
+    "[ ! -e /tmp/cs_run.pid ] && [ -e /tmp/cs_harness_hop ] && [ \"\$(pgrep -x tcpdump | wc -l)\" = 0 ]"
+  # 2. the miss that is already in the fixtures: a camera last heard on 2437 MHz whose AP is on channel 36
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules asc2 '^CamHound' 'Scan,Exit' 'Review hits' '7,Exit' '^[0-9]+ REO' 'Watch (find AP first),Back' "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 run
+  check "assoc: a client last heard off its AP's channel is not found, and the miss is said as a channel" \
+    "grep -qE '^LOG yellow 00:00:1[12] not heard on ch 6 in 2s' $T/log && grep -qE 'assoc ec:71:db:00:00:1[12] none why=NO_FRAMES recs=0 itmax=0 trunc=0 ch=6 lock=ok' $LOOT/events.log"
+  check "assoc: a miss teaches nothing, the row still offers the lookup, and no Watch opens" \
+    "[ \"\$(grep -c 'items=Watch (find AP first);Disrupt (find AP first);' $T/log)\" = 2 ] && ! grep -q 'PICKER\[Watch ' $T/log && ! grep -q 'assoc .* -> ' $LOOT/events.log"
+  check "assoc: the radio is released after a miss" \
+    "awk '/^TCPDUMP assoc/{b=NR} /^PINEAPPLE_EXAMINE_RESET/{if (b) c=NR} END {exit !(b && c > b)}' $T/log && [ -e /tmp/cs_harness_hop ]"
+  # 3. a membership capture is the same fact read the other way: Disrupt on the NVR AP teaches both
+  #    cameras their AP, their cards then offer Watch outright, and kit detection wakes up
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules asc3 '^CamHound' 'Scan,Scan,Exit' 'Review hits' '6,7,Exit,Exit' '^[0-9]+ REO-OUI 00:00:10' 'Disrupt,Back' \
+    '^[0-9]+ REO-OUI 00:00:1[12]' 'Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
+  answers t t B B; HARNESS_NO_CLIENTS=1 run
+  check "assoc: a membership capture teaches each station it heard its AP" \
+    "grep -q 'assoc members of ec:71:db:00:00:10: 2 station(s), AP learned' $LOOT/events.log"
+  check "assoc: so that camera's card offers Watch and Disrupt outright, and no lookup runs" \
+    "grep -qE 'PICKER\[[0-9]+ REO-OUI 00:00:1[12]\] items=Watch;Disrupt' $T/log && ! grep -q '^TCPDUMP assoc' $T/log"
+  check "assoc: after the next cycle both cameras carry the AP in the inventory" \
+    "[ \"\$(awk -F'|' '\$5==\"cli\" && \$15==\"ec:71:db:00:00:10\"' $LOOT/inventory.tsv | grep -c .)\" = 2 ]"
+  check "assoc: and kit detection wakes up: the NVR is a kit AP, its cameras kit clients" \
+    "grep -q '|ec:71:db:00:00:10|ap|NVRKIT|.*KIT-AP' $LOOT/inventory.tsv && [ \"\$(grep -c '|cli|.*KIT-CL' $LOOT/inventory.tsv)\" = 2 ]"
+  check "assoc: the report's tree lists both cameras under the NVR" \
+    "grep -E '^ec:71:db:00:00:10 ReoKit ' $LOOT/report_*.txt | grep '00:00:11' | grep -q '00:00:12'"
+  # 4. EXAMINE_CHANNEL without EXAMINE_BSSID has never been measured on a device. If it does not
+  #    park, the lookup must still work: the capture runs across the hop, three windows long
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules asc4 '^CamHound' 'Scan,Exit' 'Review hits' '5,Exit' '^[0-9]+ WYZE' 'Watch (find AP first),Back' '^Watch ' 'Back' "${COMMON[@]}"
+  answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_NO_PARK=1 run
+  check "assoc: a radio that will not park is said so, and the hop is listened across instead" \
+    "grep -q '^LOG yellow wlan1mon not parked on ch 6 (samples 11/11/11)' $T/log && grep -q '^listening across the hop instead (~6 s)' $T/log"
+  check "assoc: and the AP is still found that way, labelled lock=hop" \
+    "grep -qE 'assoc $W -> $WA n=3 recs=3 itmax=18 ch=6 lock=hop dwell=[0-9]+s' $LOOT/events.log && grep -q 'PICKER\[Watch ' $T/log"
+  # 5. heard on two BSSIDs alike: no decision, nothing learned
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules asc5 '^CamHound' 'Scan,Exit' 'Review hits' '5,Exit' '^[0-9]+ WYZE' 'Watch (find AP first),Back' "${COMMON[@]}"
+  answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_ASSOC_TWO=1 run
+  check "assoc: a client heard on two BSSIDs alike is not decided, and nothing is learned" \
+    "grep -q 'assoc $W none why=AMBIGUOUS' $LOOT/events.log && grep -qE '^LOG yellow 20:00:01 talks to (11:22:33 \(3\) and 00:00:01|00:00:01 \(3\) and 11:22:33) \(3\): not deciding' $T/log && ! grep -q 'PICKER\[Watch ' $T/log"
+  # 6. the OR filter refused: the uplink alone still names the AP
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules asc6 '^CamHound' 'Scan,Exit' 'Review hits' '5,Exit' '^[0-9]+ WYZE' 'Watch (find AP first),Back' '^Watch ' 'Back' "${COMMON[@]}"
+  answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_NO_OR=1 run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "assoc: when the OR filter will not arm, the uplink alone still names the AP" \
+    "grep -q '^TCPDUMP assoc OR form refused' $T/log && grep -q '^TCPDUMP assoc $W snap=128 count=800 or=4' $T/log && grep -qE 'assoc $W -> $WA n=3 ' $LOOT/events.log"
+}
 case "${1:-all}" in
-  csainj) s_csainj ;; live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; members) s_members ;; cliscope) s_cliscope ;; blind) s_blind ;; noinj) s_noinj ;; persist) s_persist ;; settings) s_settings ;; bands) s_bands ;; devices) s_devices ;;
-  all) s_csainj; s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_members; s_cliscope; s_blind; s_noinj; s_persist; s_settings; s_bands; s_devices ;;
-  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|members|cliscope|csainj|blind|noinj|persist|settings|bands|devices|all]"; exit 2 ;;
+  csainj) s_csainj ;; live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; members) s_members ;; cliscope) s_cliscope ;; blind) s_blind ;; noinj) s_noinj ;; persist) s_persist ;; settings) s_settings ;; bands) s_bands ;; devices) s_devices ;; assoc) s_assoc ;;
+  all) s_csainj; s_live; s_stimulus; s_lock; s_nojq; s_locate; s_disrupt; s_members; s_cliscope; s_blind; s_noinj; s_persist; s_settings; s_bands; s_devices; s_assoc ;;
+  *) echo "usage: $0 [live|stimulus|lock|nojq|locate|disrupt|members|cliscope|csainj|blind|noinj|persist|settings|bands|devices|assoc|all]"; exit 2 ;;
 esac
 printf '== harness: %s failure(s); temp dir %s ==\n' "$FAIL" "$T"
 exit $(( FAIL > 0 ))

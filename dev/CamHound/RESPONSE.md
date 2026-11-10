@@ -277,8 +277,10 @@ unable to fire:*
 So the *selection rule* is correct and the *data to feed it* does not exist on either firmware. The
 honest state as of 2026-11-03 was that **the response rung could not transmit on 1.1.3 or on
 2.0.0**, and the blocker was the association column rather than the firmware version. **§13a-i
-closed that for AP rows on 2026-11-04** by reading the association off the air; a user-payload
-client row still aborts in `resp_target`. See §13 and §13a-i. **[A]** *Falsified by:* `_pineap RECON
+closed that for AP rows on 2026-11-04** by reading the association off the air; ~~a user-payload
+client row still aborts in `resp_target`~~ *(amended 2026-11-10: the recon side's inverse lookup
+landed — a client row's card now offers `Disrupt (find AP first)`, which reads the client's AP off
+the air and then opens this menu; laptop-verified only, see §13a-i's bound)*. See §13 and §13a-i. **[A]** *Falsified by:* `_pineap RECON
 CLIENTS format=json | jq '.[0]|keys'` on a 2.0.0 Pager with an associated client returning any key
 that carries the BSSID.
 
@@ -681,6 +683,28 @@ BSSID from `addr1` on a ToDS frame, the same walker with the two addresses swapp
 than this change, because `AP_OF` gates five features. It is **recon-side** (`AP_OF` is filled by
 `record_seen`/`JQ_DEVCLI` at `:1226` and surfaces in `inventory.tsv`'s `ap_bssid` column and the
 report tree), so it is handed over with the parser proven rather than written here.
+
+**Bound amended 2026-11-10 — the inverse lookup landed, from the recon side, laptop-verified only.**
+What changed for this rung, and what did not:
+
+| row | before | since 2026-11-10 |
+|---|---|---|
+| user-payload **client** row, AP unknown | `Disrupt n/a (not associated)`; `resp_target` returns 1 | `Disrupt (find AP first)`: `assoc_lookup` parks on the client's channel, reads its BSSID from its own data frames, then `disrupt_menu` opens on it. `attack_scope` is `cli` for `DEAUTH`, so this is the one targeted frame the firmware sends |
+| user-payload client row, lookup hears nothing | — | the card is unchanged and the reason is logged (`assoc <mac> none why=…`); nothing transmits |
+| user-payload **AP** row | fires, membership from the air | unchanged — and `resp_members`' success path now hands the stations it heard to `assoc_learn_members` (behind `command -v`: the function is not in the hooks), so their client rows carry this AP afterwards |
+| both Recon **hooks** | association from `_RECON_SELECTED_*` | unchanged in behaviour. `CLI_AWK` gained a `mode=pairs` branch in the lib block, so the hooks' lib hash moved; the membership walk beside it is byte-for-byte the same decode and is pinned by the selftest's `pairs: the membership walk beside it is unchanged` |
+
+Three things in this rung are touched, all by agreement with this file's owner: the guarded line in
+`resp_members`, `disrupt_row`'s `Disrupt (find AP first)` label (guarded on `command -v assoc_can`,
+so a hook still prints `n/a`), and the `mode=pairs` branch in `CLI_AWK`. Nothing in `resp_fire`,
+`resp_snapshot`, `resp_verdict` or the lock changed.
+
+**What is NOT established, because nothing here has run on a device:** that
+`PINEAPPLE_EXAMINE_CHANNEL` parks the radio without a preceding `EXAMINE_BSSID` (every measured
+park issued both; the lookup reads the park back and falls back to listening across the hop), and
+that a camera's uplink is heard within the 6 s window. `dev/pager-day-one.md` 8d is the bench
+check. *Falsified by:* a client-row Disrupt whose loot row names a BSSID the client is not
+associated to.
 
 Needs a Pager:
 

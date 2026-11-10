@@ -115,6 +115,47 @@ found and fixed one over-permissive defect (`dev/pager-prearrival.md` §5).
   either reading; the answer decides whether a name is worth passing and whether the scan loop must
   ever restart a session that ended on its own.
 
+**8d. The find-AP lookup, first device run** — CamHound installed, no receiver, nothing transmits.
+
+CamHound reads a client's AP off the air when a client card's `Watch (find AP first)` is picked
+(CLAUDE.md code map, "Association"). It is laptop-verified only, and its park is
+`PINEAPPLE_EXAMINE_CHANNEL` **without** `EXAMINE_BSSID`, which no session has issued on a Pager.
+Two steps; the first needs no CamHound at all. Every command below is quote-free on purpose.
+
+1. *Does the channel lock park on its own?* With Recon running, and `6` replaced by a channel that
+   has traffic:
+   ```sh
+   PINEAPPLE_EXAMINE_RESET
+   PINEAPPLE_EXAMINE_CHANNEL 6 20
+   iw dev wlan1mon info | grep channel
+   sleep 1
+   iw dev wlan1mon info | grep channel
+   sleep 1
+   iw dev wlan1mon info | grep channel
+   PINEAPPLE_EXAMINE_RESET
+   ```
+   Three lines reading channel 6 = it parks, and the lookup's `lock=ok` path is the live one. Three
+   different channels = it does not, and every lookup will log `lock=hop` and listen for 18 s
+   instead of 6; that still works, and is then worth replacing with a BSSID-less park that does.
+   Any stderr from the second command is worth copying: `hak5cmd` exits 0 on every path.
+2. *Does a lookup name the right AP?* Pick a client you know the AP of — a phone on the bench AP is
+   ideal, mid-download so it is transmitting — open its card from Review hits, pick
+   `Watch (find AP first)`, then:
+   ```sh
+   grep assoc /root/loot/CamHound/events.log
+   ```
+   | line | reads as |
+   |---|---|
+   | `assoc <mac> -> <bssid> n=N recs=R itmax=56 ch=C lock=ok dwell=Ns` | found; check the BSSID is the AP you expected. `itmax` should be 56 on this hardware (Second contact) |
+   | `… lock=hop …` | step 1's negative answer, seen from inside the payload |
+   | `assoc <mac> none why=NO_FRAMES … ch=C` | not heard on channel C. If the phone was transmitting and C is its AP's channel, that is a defect in the filter or the window, and the raw material is worth keeping: repeat with `tcpdump -i wlan1mon -c 20 -e type data and wlan addr2 <mac>` under the same lock |
+   | `EXAMINE_CHANNEL C said: …` | the firmware refused the channel lock and said why |
+   Then check `grep -c OR.filter.did.not.arm /root/loot/CamHound/events.log` — a non-zero count
+   means this tcpdump refuses the two-address filter and the uplink-only retry is what ran.
+
+*Falsified by:* a `->` line naming a BSSID the client is not associated to. That one matters more
+than the rest together, because a client-row Disrupt transmits at whatever this names.
+
 **8c. The band write, before trusting `BAND6`** — bare firmware, no receiver, reversible.
 
 ```sh

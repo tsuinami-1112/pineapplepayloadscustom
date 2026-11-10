@@ -13,11 +13,54 @@ case "$filt" in *"subtype beacon"*)
   printf 'TCPDUMP beacon %s -> %s\n' "$bss" "$out" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; exit 0 ;;
 esac
 mem=0
-if [ "${cnt:-0}" -gt 0 ]; then      # only capture_bss passes -c here; the Watch captures never do
+if [ "${cnt:-0}" -gt 0 ]; then      # only capture_bss and assoc_capture pass -c here; the Watch captures never do
   case "$filt" in
-    *"(wlan addr1"*) mem=1 ;;       # the OR form
-    *"type data"*)   mem=2 ;;       # the uplink-only fallback
+    *"(wlan addr2"*) mem=3 ;;       # the inverse lookup (assoc_capture): ONE client's MAC, addr2 first
+    *"(wlan addr1"*) mem=1 ;;       # the membership capture (capture_bss), the OR form
+    *"type data and wlan addr2"*) mem=4 ;;   # the inverse lookup's uplink-only fallback
+    *"type data"*)   mem=2 ;;       # the membership capture's uplink-only fallback
   esac
+fi
+if [ "$mem" = 3 ] || [ "$mem" = 4 ]; then
+  # The inverse lookup: frames to or from ONE client, from which CLI_AWK's pairs mode names its
+  # BSSID. Who is associated to whom is fix/cli.json's ap_mac column -- the stand-in for what no
+  # shipped firmware supplies -- so the fixture stays the single source of truth, and a client with
+  # no ap_mac there is heard talking to nobody. The radio has to be where the client is: parked on
+  # another channel it hears nothing (ec:71:db:00:00:11 and :12 are last heard on 2437 MHz while
+  # their AP is on channel 36, the "last-heard frequency is not the association channel" case that
+  # is already in the fixtures), and while it is hopping (/tmp/cs_harness_hop exists) every channel
+  # is visited, so the client is heard.
+  L="${HARNESS_LOG:-/tmp/cs_harness.log}"
+  sta=$(printf '%s' "$filt" | sed -n 's/.*addr2 \([0-9a-fA-F:]*\).*/\1/p' | tr 'A-F' 'a-f')
+  printf 'TCPDUMP assoc %s snap=%s count=%s or=%s\n' "$sta" "$snap" "$cnt" "$mem" >> "$L"
+  # HARNESS_NO_ARM=1: tcpdump refuses the filter outright -> NO_CAPTURE
+  [ -n "${HARNESS_NO_ARM:-}" ] && { printf 'TCPDUMP assoc refused to arm\n' >> "$L"; exit 1; }
+  # HARNESS_NO_OR=1: only the OR form is refused, so the uplink-only fallback is exercised
+  [ -n "${HARNESS_NO_OR:-}" ] && [ "$mem" = 3 ] && { printf 'TCPDUMP assoc OR form refused\n' >> "$L"; exit 1; }
+  le32h() { printf '%02x%02x%02x%02x' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 )); }
+  hex="d4c3b2a1020004000000000000000000$(le32h "${snap:-128}")$(le32h 127)"
+  ap=$(jq -r --arg m "${sta^^}" '.[] | select(.mac == $m) | (.ap_mac // "-")' "${HARNESS_FIX}/cli.json" 2>/dev/null | head -1)
+  apch=$(jq -r --arg m "$ap" '.[] | select(.mac == $m) | .beacon[0].channel' "${HARNESS_FIX}/aps.json" 2>/dev/null | head -1)
+  heard=0
+  if [ -n "$ap" ] && [ "$ap" != - ]; then
+    if [ -e /tmp/cs_harness_hop ]; then heard=1
+    elif [ "$(cat /tmp/cs_harness_chan 2>/dev/null)" = "$apch" ]; then heard=1; fi
+  fi
+  # HARNESS_ASSOC_NONE=1: armed, on the right channel, and the client stayed silent -> NO_FRAMES
+  [ -n "${HARNESS_ASSOC_NONE:-}" ] && heard=0
+  if [ "$heard" = 1 ]; then
+    rt="000012000000000000000000000000000000"          # radiotap it_len 18, as the membership arm below writes
+    s12=$(printf '%s' "$sta" | tr -d ':'); b12=$(printf '%s' "$ap" | tr -d ':' | tr 'A-F' 'a-f')
+    blist="$b12 $b12 $b12"
+    # HARNESS_ASSOC_TWO=1: the client is heard talking to a second BSSID as often -> AMBIGUOUS
+    [ -n "${HARNESS_ASSOC_TWO:-}" ] && blist="$blist b0a7b9000001 b0a7b9000001 b0a7b9000001"
+    for b in $blist; do
+      fr="${rt}08010000${b}${s12}${b}0000"; fl=$(( ${#fr} / 2 ))      # ToDS: addr1 the BSSID, addr2 the client
+      hex+="$(le32h 0)$(le32h 0)$(le32h $fl)$(le32h $fl)$fr"
+    done
+  fi
+  for ((i = 0; i < ${#hex}; i += 2)); do printf "\\x${hex:$i:2}"; done > "$out"
+  printf 'TCPDUMP assoc %s -> %s heard=%s\n' "$sta" "$out" "$heard" >> "$L"; exit 0
 fi
 if [ "$mem" != 0 ]; then
   L="${HARNESS_LOG:-/tmp/cs_harness.log}"

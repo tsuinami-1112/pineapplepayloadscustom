@@ -1,2 +1,7 @@
 #!/bin/bash
-printf 'PINEAPPLE_EXAMINE_CHANNEL %s\n' "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; echo "$1" > /tmp/cs_harness_chan; exit 0
+printf 'PINEAPPLE_EXAMINE_CHANNEL %s\n' "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"
+# HARNESS_NO_PARK=1: the command is accepted and the radio does not park -- it reads back on another
+# channel and goes on hopping. Whether EXAMINE_CHANNEL parks without an EXAMINE_BSSID before it has
+# never been measured on a device, so the payload's fallback for that outcome has to be drivable.
+if [ -n "${HARNESS_NO_PARK:-}" ]; then [ "$1" = 11 ] && echo 1 > /tmp/cs_harness_chan || echo 11 > /tmp/cs_harness_chan; exit 0; fi
+echo "$1" > /tmp/cs_harness_chan; rm -f /tmp/cs_harness_hop; exit 0

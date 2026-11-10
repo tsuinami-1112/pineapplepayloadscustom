@@ -102,6 +102,11 @@ BCN_CAP_COUNT=5         # beacons to capture per posture read (first usable one 
 CLI_CAP_SECS=4          # listen this long for who is talking to the target BSS
 CLI_CAP_COUNT=800       # frame cap for that capture (bounds the parse; the window bounds the dwell)
 CLI_CAP_SNAP=128        # MUST clear radiotap it_len + 16 to reach addr2: -s 32 cannot (18+16=34)
+# The inverse lookup (assoc_lookup): which BSSID ONE client talks to, read off the air when the
+# operator picks Watch or Disrupt on a client the firmware gave no AP for. It parks the radio for
+# the listen window, so Recon pauses meanwhile; it reuses CLI_CAP_SNAP and CLI_CAP_COUNT above.
+ASSOC_CAP_SECS=6        # * listen this long for one client's own frames when finding its AP (floor 2)
+ASSOC_TTL=300           # * seconds an AP learned off the air is trusted before Watch/Disrupt looks again (0 = look every time)
 FIRE_ERR="/tmp/cs_fire_$$.err"   # the attack command's stderr: a refusal must not read as a measurement
 # The CSA injector. A CSA from THIS firmware cannot work, for two independent reasons, neither
 # reachable by any setting: pineapd hardcodes Channel Switch Count 0 (li s1,0 at 0x4bee6c, which
@@ -229,6 +234,8 @@ load_overrides() {
     RSSI_MIN=$(cfg RSSI_MIN "$RSSI_MIN" -100)
     SOUND=$(cfg SOUND "$SOUND" 0)
     BAND6=$(cfg BAND6 "$BAND6" 0)
+    ASSOC_CAP_SECS=$(cfg ASSOC_CAP_SECS "$ASSOC_CAP_SECS" 2)
+    ASSOC_TTL=$(cfg ASSOC_TTL "$ASSOC_TTL" 0)
     THR_STREAM_UP=$(cfg THR_STREAM_UP "$THR_STREAM_UP" 1)
     RESPONSE=$(cfg RESPONSE "$RESPONSE" 0)
     RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
@@ -819,6 +826,11 @@ pcap_stream() { if command -v hexdump >/dev/null 2>&1; then hexdump -v -e '1/1 "
 # would enter the AP as its own client and break resp_snapshot's invariant that the AP is never a
 # subject -- and one AP subject reading NO_EFFECT drags the whole attempt to NO_EFFECT.
 # Emits keyed lines for the caller to read IN THE PARENT SHELL: ITMAX/RECS/SHORT/CLI.
+# With -v mode=pairs it answers the INVERSE question -- which BSSID each station talks to, or only
+# -v sta=<mac> -- as "PAIR <sta> <bssid> <n>" for every pair seen at least twice (assoc_lookup). It
+# is the same DS-bit decode with nothing held fixed: no bss is needed, a group-addressed or own
+# address on either side is never a pair, and neither is a frame whose two addresses are equal.
+# With mode unset the membership walk below is untouched.
 CLI_AWK='
 function mac(o) { return sprintf("%02x:%02x:%02x:%02x:%02x:%02x", p[o], p[o+1], p[o+2], p[o+3], p[o+4], p[o+5]) }
 function u16(a, b) { return be ? a * 256 + b : b * 256 + a }
@@ -859,8 +871,16 @@ BEGIN { st = 0; i = 0; itmax = 0; recs = 0; short = 0 }
     if (ds == 1) { bo = rt + 4; co = rt + 10 }
     else if (ds == 2) { bo = rt + 10; co = rt + 4 }
     else break
-    if (mac(bo) != bss) break
-    c = mac(co)
+    b = mac(bo); c = mac(co)
+    if (mode == "pairs") {
+      if (sta != "" && c != sta) break
+      if (b == c) break
+      if (p[bo] % 2 == 1 || p[co] % 2 == 1) break
+      if (index(own, " " c " ") > 0 || index(own, " " b " ") > 0) break
+      pair[c " " b]++
+      break
+    }
+    if (b != bss) break
     if (c == bss) break
     if (p[co] % 2 == 1) break
     if (index(own, " " c " ") > 0) break
@@ -872,7 +892,8 @@ END { if (bad) exit 1
   if (st == 0) { print "ERR truncated header"; exit 1 }   # never reached the magic: not a pcap at all
   print "ITMAX " itmax; print "RECS " recs; print "SHORT " short
   print "TRUNC " trunc + 0; print "RUNT " runt + 0; print "SNAP " snap + 0
-  for (c in seen) if (seen[c] >= 2) print "CLI " c }'
+  for (c in seen) if (seen[c] >= 2) print "CLI " c
+  for (k in pair) if (pair[k] >= 2) print "PAIR " k " " pair[k] }'
 
 # bss_clients <pcap> <bssid> -> keyed lines on stdout; rc 1 when the file is unreadable or not a pcap.
 # PARSE IT IN THE PARENT SHELL: the counts have to reach the caller, and a pipe or < <(...) would
@@ -945,7 +966,7 @@ cleanup() {
   if [ "$WATCH_LOCKED" = 1 ]; then _pineap EXAMINE CANCEL >/dev/null 2>&1; PINEAPPLE_EXAMINE_RESET >/dev/null 2>&1; fi
   [ -n "$RUN_ID" ] && [ "$REPORT_DONE_AT_EXIT" != 1 ] && write_report quiet
   command -v bands_restore >/dev/null 2>&1 && bands_restore         # user payload only; the hooks never change bands
-  rm -f "$LOCK_FILE" "$CHILD_FILE" "$CHILD_FILE.n" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap "/tmp/cs_mem_$$.pcap" "/tmp/cs_bcn_$$.pcap" "$FIRE_ERR" /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
+  rm -f "$LOCK_FILE" "$CHILD_FILE" "$CHILD_FILE.n" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap "/tmp/cs_mem_$$.pcap" "/tmp/cs_asc_$$.pcap" "/tmp/cs_bcn_$$.pcap" "$FIRE_ERR" /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
   log run "exit cycles=$CYCLE"
   ui_ok && set_state FINISH
 }
@@ -1021,6 +1042,12 @@ jq_works() {
   command -v jq >/dev/null 2>&1 || return 1
   [ "$(printf '%s' '[{"mac":"aa","probe":{"1":{"ssid":"c,d"}}}]' | jq -r "$JQ_CLI" 2>/dev/null)" \
     = 'aa|-|0|-|c_d|0|0|0' ] || return 1
+  # JQ_APS too. It needs sort_by, max, last, any and a string slice that JQ_CLI never touches, so a
+  # jq could pass the client probe above and still emit no AP rows: the gsub failure again, one
+  # program over. Two beacon entries and a response, so the best-signal pick and the empty-SSID
+  # skip both run. The expected row is what the program printed for this fixture, not a reading of it.
+  [ "$(printf '%s' '[{"mac":"cc","packets":9,"beacon":{"1":{"ssid":"","signal":-70,"channel":1,"freq":2412,"hidden":false,"time":3},"2":{"ssid":"Net;A","signal":-40,"channel":11,"freq":2462,"hidden":false,"time":9}},"response":{"3":{"ssid":"Net;A","signal":-45,"channel":11,"freq":2462,"time":8}}}]' | jq -r "$JQ_APS" 2>/dev/null)" \
+    = 'cc|9|Net_A|11|2462|-40|0|9' ] || return 1
   return 0
 }
 # 1.1.3 has no RECON CLIENTS verb (measured 2026-11-03: "Unknown recon command", rc 255) but RECON DEVICES lists every
@@ -1967,6 +1994,9 @@ resp_members() {
     return 1
   fi
   RESP_MEMBERS_BSS="$bss"
+  # The same fact read the other way: every station heard here talks to this BSSID. The user payload
+  # keeps it as each of those client rows' AP (assoc_learn_members); the hooks carry no such function.
+  command -v assoc_learn_members >/dev/null 2>&1 && assoc_learn_members "$bss"
   return 0
 }
 resp_snapshot() {
@@ -2357,6 +2387,9 @@ disrupt_row() {   # a cached badge is free to show; an uncached one is not worth
   # the card redraws unchanged - which reads as a dead button. Safe to call resp_target here:
   # disrupt_row always runs inside $( ), so the globals it sets die with the subshell.
   if [ "${ROLE[$mac]}" = cli ] && { [ -z "${AP_OF[$mac]}" ] || [ "${AP_OF[$mac]}" = - ]; }; then
+    # The user payload can read the AP off the air (assoc_lookup), and its card turns this row into
+    # that lookup. The hooks carry no such function, so there the row stays n/a.
+    if command -v assoc_can >/dev/null 2>&1 && assoc_can "$mac"; then printf 'Disrupt (find AP first)'; return 0; fi
     printf 'Disrupt n/a (not associated)'; return 0     # no BSS to announce from
   fi
   resp_target "$mac" || { printf 'Disrupt n/a (no channel)'; return 0; }

@@ -39,13 +39,32 @@ take (with `AUTO_WATCH=0` that is every new CONFIRMED device). The offer is a di
 - A battery/event camera that is asleep looks idle in Watch. Use the Stimulus test.
 - INCONCLUSIVE is about the measurement (lock, band, distance), not about the device.
 
-**Which AP a client is associated to.** `_pineap RECON CLIENTS` is new in 2.0.0; on 1.1.3 it is
-`Unknown recon command` (measured 2026-11-03), so CamHound reads clients from `RECON DEVICES` there
-(a device that neither beacons nor answers probes). Both verbs return the same object, which carries
-probed SSIDs but **no association field** (CLAUDE.md §"2.0.0-stable, analysed"). Until the day-one
-spike finds a source — the Go UI's recon API carries `ap_mac`, `_pineap` does not — every client
-reads as unassociated: kit detection, client Watch and Stimulus, and per-client Disrupt stay dormant,
-and the `ap_bssid` column reads `-`.
+**Which AP a client is associated to — until you ask.** `_pineap RECON CLIENTS` is new in 2.0.0; on
+1.1.3 it is `Unknown recon command` (measured 2026-11-03), so CamHound reads clients from
+`RECON DEVICES` there (a device that neither beacons nor answers probes). Both verbs return the same
+object, which carries probed SSIDs but **no association field** (CLAUDE.md §"2.0.0-stable,
+analysed"). So every client starts out unassociated: its `ap_bssid` column reads `-`, and kit
+detection, client Watch and Stimulus, and per-client Disrupt are dormant for it.
+
+CamHound can read the AP off the air instead, one client at a time, when you ask for it. A client
+card with no AP offers **`Watch (find AP first)`** and **`Disrupt (find AP first)`**: picking either
+pauses Recon for about nine seconds, parks the radio on the channel the client was last heard on,
+listens for the client's own data frames, and reads the BSSID from them. Then it carries on into the
+menu you picked. The answer is kept for the run — the inventory, the kit tags and the report's
+AP→client tree pick it up at the next cycle — and it is looked at again before use once it is older
+than `ASSOC_TTL`. An AP-row Disrupt does the same for every client it hears on that AP. When the
+lookup finds nothing it says why and the card is unchanged:
+
+| It says | It means |
+|---|---|
+| `not heard on ch N in 6s` | no data frame from the client on that channel in the window. An idle or sleeping camera, or a client last heard off its AP's channel. **Not** "unassociated". Try again while it is busy |
+| `heard on ch N (k frames) but no AP twice` | too little to name an AP from. Try again |
+| `talks to X (n) and Y (m): not deciding` | two BSSIDs, neither clearly ahead (a roam, or a mesh). Nothing is recorded |
+| `not parked on ch N` then `listening across the hop instead` | the radio would not hold the channel, so it listens while hopping for three times as long. Slower and less likely to hear a quiet client, not broken |
+| `snap … too small for radiotap …` | raise `CLI_CAP_SNAP` |
+
+*Laptop-verified only: none of this has run on a Pager yet. There is no background pass — the
+lookup parks the radio, so it happens only on a row you pick.*
 
 ## How it works: four tiers
 
@@ -117,7 +136,9 @@ and the `ap_bssid` column reads `-`.
   STREAM or EVENT verdict is followed by **Locate?**. That is the whole flow: two presses.
 - **B** during a scan opens **Review hits** (hold it up to one cycle). Rows read
   `conf tags prox role rssi`, e.g. `90 HIK-OUI NA-58` = confidence 90, Hikvision OUI, NEAR, AP, -58 dBm.
-  Pick a row for the detail card: `Watch`, `Locate`, `Ignore for session`, `Back`.
+  Pick a row for the detail card: `Watch`, `Disrupt`, `Locate`, `Ignore for session`, `Back`. On a
+  client whose AP is not known the first two read `Watch (find AP first)` and
+  `Disrupt (find AP first)` — see "What it cannot see".
 - **Unidentified modules: check these** lists Espressif/Realtek/Liteon-class clients sorted busy-first.
   They are not cameras until Watched.
 - **Mode**: `ROOM` (default: vibrate on everything LIKELY, proximity -60/-75 dBm) or `SITE` (floor
@@ -203,13 +224,14 @@ Edit the config block at the top of `payload.sh`. Starred keys can also be set w
 survive updates: `PAYLOAD_SET_CONFIG camhound CYCLE_SECS 10` (`PAYLOAD_DEL_CONFIG camhound CYCLE_SECS`
 removes it). Overrides are counted on the start screen and listed in `events.log`. The **Settings**
 menu item does the same from the device, on two pages. **Recon settings** holds CYCLE_SECS,
-THR_STREAM_UP, COOLDOWN_SECS, DEDUPE_H, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH, AUTO_LOCATE and BAND6
-(the last two sit on the second page, behind `More...`, because `Back` takes the first slot);
-**Response settings** holds RESPONSE, RESPONSE_CONFIRM, AUTO_RESPOND, RESP_LOCK_SECS, RESP_SETTLE_SECS
-and POSTURE_TTL. Numbers go through NUMBER_PICKER, switches are On/Off. Switching RESPONSE_CONFIRM off
+THR_STREAM_UP, COOLDOWN_SECS, DEDUPE_H, RECON_FRESH, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH,
+AUTO_LOCATE, BAND6, ASSOC_CAP_SECS and ASSOC_TTL (everything past the first eight sits behind
+`More...`, because `Back` takes the first slot of a nine-row page);
+**Response settings** holds RESPONSE, RESPONSE_CONFIRM, AUTO_RESPOND, SWEEP_TARGETED, RESP_LOCK_SECS,
+RESP_SETTLE_SECS and POSTURE_TTL. Numbers go through NUMBER_PICKER, switches are On/Off. Switching RESPONSE_CONFIRM off
 asks a second time, because it is the key that keeps every transmit behind a dialog; a lock shorter
 than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows what is in force.
-`Reset defaults` deletes the saved overrides of all sixteen keys. Changes apply at once and persist.
+`Reset defaults` deletes the saved overrides of all twenty keys. Changes apply at once and persist.
 
 | Key | Default | Persist | Meaning |
 |---|---|---|---|
@@ -221,6 +243,8 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 | AUTO_WATCH_RSSI | -72 | | minimum last RSSI to auto-offer Watch |
 | RSSI_MIN | 0 | * | optional list gate, dBm, on the best RSSI known for the MAC, carried-over best included (0 = widest net; a kit AP passes when a kit client does) |
 | BAND6 | 0 | * | also scan 6 GHz: writes the device's bands plus 6 for this run, trusted only when the radio is then seen on a 6 GHz channel (or uci reads it back); every issued write is put back at exit, by the watchdog if the run is killed, or at the next start; 2.4 GHz dwell drops to about a third. On bare 1.1.3 the write was a no-op with pineapd running (day-one 8c), and the status line says so |
+| ASSOC_CAP_SECS | 6 | * | how long the find-AP lookup listens for one client's own frames (floor 2); three times this when the radio will not park |
+| ASSOC_TTL | 300 | * | seconds an AP learned off the air is trusted before Watch or Disrupt looks again (0 = look every time) |
 | SOUND | 0 | * | ringtone on CONFIRMED |
 | SHOW_MODULES | 1 | | modules list in the menu |
 | MODULE_HINT_RSSI | -55 | | one-time "module strong+busy: Watch?" hint |
