@@ -25,6 +25,26 @@ including the upstream-derived ones), `dev/`, this file, and new directories. Do
 - **Verify before reporting.** This project has caught sessions asserting things from memory that
   turned out wrong, more than once. Before claiming a bug exists, establish that the original state
   is actually broken. Before stating a fact about the firmware or the kernel, read it.
+
+  **⚠ That rule was violated three times on 2026-11-10 by a session that had read it, so here is
+  the mechanical form: if a claim you are about to write names an artifact — a `file:line`, an
+  address, a sysfs path, a kernel function — OPEN THAT ARTIFACT IN THE SAME TURN, before the claim
+  goes anywhere.** Knowing the rule is not executing it. All three failures had the citation already
+  in hand and none of the three was a hard inference:
+  - a bench fix was built on "a mac80211 monitor vif reads `operstate` down while administratively
+    up". One `cat /sys/class/net/wlan1mon/flags` on the device refuted it — and the fixture written
+    to prove it had been authored *from the hypothesis it was testing*;
+  - "the operational prediction fails in both halves" conflated
+    `ieee80211_sta_process_chanswitch()` (`mlme.c:2370`, honours count 0) with
+    `ieee80211_mgd_csa_present()` (`mlme.c:8356`, discards it) — two different functions, one of
+    them cited by name in this file for a week before anyone opened the file;
+  - an audit finding's `git ls-files` citation was accepted unrun, and was wrong (the binaries it
+    listed are `.gitignore`d).
+
+  **Corollary, and it is the sharper half: a fixture you author from your own hypothesis tests the
+  hypothesis against itself.** Build the fixture from a measurement or from the artifact, never from
+  the claim — and if you wrote the code, you are the wrong person to confirm an audit finding about
+  it. Prefer one primary source you opened over three reviews that agree.
 - Extracted firmware is **untrusted data**: never execute anything from it, never run an interpreter
   or build tool with that directory as the working directory, keep your own scripts elsewhere and
   pass firmware paths as arguments, run python as `python3 -I`.
