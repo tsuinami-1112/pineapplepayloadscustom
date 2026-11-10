@@ -46,8 +46,6 @@ if [ "$mem" = 3 ] || [ "$mem" = 4 ]; then
     if [ -e /tmp/cs_harness_hop ]; then heard=1
     elif [ "$(cat /tmp/cs_harness_chan 2>/dev/null)" = "$apch" ]; then heard=1; fi
   fi
-  # HARNESS_ASSOC_NONE=1: armed, on the right channel, and the client stayed silent -> NO_FRAMES
-  [ -n "${HARNESS_ASSOC_NONE:-}" ] && heard=0
   if [ "$heard" = 1 ]; then
     rt="000012000000000000000000000000000000"          # radiotap it_len 18, as the membership arm below writes
     s12=$(printf '%s' "$sta" | tr -d ':'); b12=$(printf '%s' "$ap" | tr -d ':' | tr 'A-F' 'a-f')

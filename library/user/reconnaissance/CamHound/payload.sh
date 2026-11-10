@@ -4316,6 +4316,17 @@ IWFIX
     [ "$(sed -n "s/^ *$_k=\$(cfg $_k \"\$$_k\" \(-\{0,1\}[0-9]*\)).*/\1/p" "${BASH_SOURCE[0]}")" = "$_f" ] || _miss+=" $_k"
   done <<<"$SETTINGS_TABLE"
   st "settings: every table key is read by load_overrides with the table's floor" "${_miss:-none}" "none"
+  # ...and the other direction, which the check above cannot see: it walks the TABLE, so a starred
+  # constant with no row passes it. Such a key can be set with PAYLOAD_SET_CONFIG and is then
+  # invisible on the device: not shown in Settings, not put back by Reset defaults. A row for an
+  # unstarred constant is the same lie told the other way. Found by a mutation that deleted one row
+  # and left every check green.
+  local _stars _rows
+  _stars=$(sed -n '/^PAYLOAD_REL=/,/end config block ---/p' "${BASH_SOURCE[0]}" | sed -n 's/^\([A-Z][A-Z0-9_]*\)=[^#]*# \* .*/\1/p' | sort | tr '\n' ' ')
+  _rows=$(printf '%s\n' "$SETTINGS_TABLE" | cut -d'|' -f1 | sort | tr '\n' ' ')
+  st "settings: the starred constants of the config block and the table's keys are the same set" "$_stars" "$_rows"
+  st "settings: twenty of them (when this moves, so do CLAUDE.md's code map and the README's Configuration section)" \
+     "$(printf '%s' "$_stars" | wc -w | tr -d ' ')" "20"
   # 7j band write: plan from the uci value, trust the write only on read-back, restore what was there
   st "bands plan: adds 6"             "$(bands_plan 2,5)"   "2 5 6"
   st "bands plan: already has 6"      "$(bands_plan 2,5,6)" ""
