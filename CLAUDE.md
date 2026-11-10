@@ -329,14 +329,20 @@ asking it.** Everything below was derived from static analysis of firmware 1.1.3
 source, as of commit `07916df`. Full working and citations are in the docs above, and each claim
 carries the thing that would falsify it.
 
-**⚠ THE SIX "CONTACT" SECTIONS EACH CONTAIN WITHDRAWN CLAIMS, STRUCK IN PLACE ON PURPOSE.** Text in
-`~~strikethrough~~` is wrong and is kept because the *shape* of the error is the useful part — four
-of the withdrawals are the same shape, a correct reading composed into a wrong inference, and three
-of those were withdrawn by the session that wrote them within hours. So: read a struck claim as a
-warning, never as a fact, and when two sections disagree the LATER one supersedes. Second contact is
-superseded by Third on the deauth commands, Fourth by Fifth on the count byte, and Fifth by Sixth on
-what the control arms established. If you find a third answer anywhere, that is a bug in this file
-and worth a commit on its own.
+**⚠ THE SEVEN "CONTACT" SECTIONS EACH CONTAIN WITHDRAWN CLAIMS, STRUCK IN PLACE ON PURPOSE.** Text
+in `~~strikethrough~~` is wrong and is kept because the *shape* of the error is the useful part —
+five of the withdrawals are the same shape, a correct reading composed into a wrong inference, and
+four of those were withdrawn by the session that wrote them, three within hours. So: read a struck
+claim as a warning, never as a fact, and when two sections disagree the **later one supersedes**:
+
+| question | superseded | by |
+|---|---|---|
+| the three deauth commands | Second contact | **Third** |
+| the count byte's effect | Fourth contact | **Fifth** |
+| what the control arms established | Fifth contact | **Sixth** |
+| why the feed froze | Fourth contact | **Seventh** (the captures) |
+
+If you find a third answer anywhere, that is a bug in this file and worth a commit on its own.
 
 **The device arrived on 2026-11-02, and a first read-only session checked much of it.** What that
 confirmed, and the one thing it corrected, is in "First contact" immediately below. Claims not
@@ -683,9 +689,11 @@ camera AP `FC:58:5A:08:42:15` on ch 8, announcing ch 1. **Day-one step 17a has n
      only the AIRTIME half of this confound is eliminated. See "Fifth contact".**
 - **⭐ What is new and positive: a CSA-bearing cloned beacon from `pagerinj` disrupts a live
   client.** "Whether CSA moves a real client at all" was listed as open and unanswerable through
-  the firmware commands. Something in that frame reaches this client — most plausibly the CSA,
+  the firmware commands. Something in that frame reaches this client — ~~most plausibly the CSA,
   since the feed recovered the moment injection stopped, which is what honouring a switch to an
-  empty channel then falling back looks like. ~~*Falsified by:* the same freeze from `pagerinj`
+  empty channel then falling back looks like.~~ **REFUTED 2026-11-10 by the captures: this arm and
+  every other mode-1 arm contains ZERO auth and assoc frames, so the client never switched and
+  never fell back — it was quiesced in place by Channel Switch Mode 1. See "Seventh contact".** ~~*Falsified by:* the same freeze from `pagerinj`
   injecting the cloned beacon with the CSA element omitted.~~ **That falsifier was spent on
   2026-11-10 — two `--clone` runs did nothing to the feed — but it turned out to be a WEAK
   falsifier: a verbatim clone hashes to the same `beacon_crc` as the AP's own beacons and mac80211
@@ -850,13 +858,82 @@ Compare Fourth contact's `mode=1` + announce ch 1 arm, `sent=97 failed=0`: a **c
   with the `addr1 or addr2` filter. The first on-device 17a captures that could see the client at
   all, and they contain the observation that separates "disconnected, then re-associated" from
   "quiesced and never left": whether the feed's return is preceded by an auth/assoc exchange.
-  **Not yet read — and no further transmission is needed to read them.**
+  ~~Not yet read.~~ **READ 2026-11-10 — see "Seventh contact". Only the mode-0 arm contains auth/assoc;
+  every mode-1 arm contains none, which separates quiesce-in-place from a real switch and refutes
+  Fourth contact's mechanism.**
 - **`wlan1mon` flapped in two of the three arms** (`failed=5` of 98, `failed=7` of 91, `failed=0`
   in the third). Third and fourth instances in a day; `!! PARTIAL RUN` now names it, which is how
   the 2a confound above was visible at all.
 - *Fixed the same day:* the `> 24`-byte capture branch printed "pineapd HOPS wlan1mon" over 2600
   packets captured on the interface EXAMINE had just parked. The caveat is now scoped to a watch
   interface that is **not** the parked one.
+
+### Seventh contact — the captures separate the two mechanisms, and refute Fourth contact's, 2026-11-10
+
+Not a new transmission: this is the **read** of Sixth contact's captures, which is where the answer
+had been sitting. Eight pcaps, one filter:
+`tcpdump -r $f -nn -e type mgt | grep -i -e assoc -e authentication -e deauth`.
+
+| arm | mode | announced | auth/assoc in the capture |
+|---|---|---|---|
+| Fourth contact count 0 (no transmit) | 1 | ch 1 | **none** |
+| Fourth contact count 0 | 1 | ch 1 | **none** |
+| Fourth contact count 3 | 1 | ch 1 | **none** |
+| Fourth contact count-3 `--count-dec` | 1 | ch 1 | **none** |
+| two earlier count-3 runs | 1 | ch 1 | **none** |
+| Sixth contact `--elem=32:00` | — | nothing | **none** |
+| Sixth contact quiet-only | 1 | ch 8 = current | **none** |
+| **Sixth contact move-only** | **0** | **ch 1** | **TWO complete cycles** |
+
+The one arm that produced them, twice, ~3 s apart:
+
+```
+02:37:23  SA:3a:57:cb:46:8b:77 -> Authentication (Open System)-1: Successful
+02:37:23  SA:fc:58:5a:08:42:15 -> Authentication (Open System)-2:
+02:37:23  SA:3a:57:cb:46:8b:77 -> ReAssoc Request (bebird-R1-038686) AP : fc:58:5a:08:42:15
+02:37:23  SA:fc:58:5a:08:42:15 -> ReAssoc Response AID(1) :: Successful
+02:37:26  … the same four again, with a retried Authentication-1
+```
+
+- **⭐ THE TWO MECHANISMS ARE SEPARATED, and the oracle that could not see them was the whole
+  problem.** `[V]` from the captures:
+  - **Channel Switch Mode 1 quiesces the client IN PLACE.** Zero auth, zero assoc, zero deauth
+    across *six* mode-1 arms. The client never left the BSS and never had to come back.
+  - **Mode 0 produces a real switch and a real return.** The client went to ch 1, found nothing, came
+    back and re-associated — twice inside one 10-second run.
+  Both present to an operator as a frozen video feed, which is exactly why three bench sessions
+  could not tell them apart.
+- **⭐ So Fourth contact's mechanism is REFUTED, not merely weakened.** It read the freeze as "what
+  honouring a switch to an empty channel then falling back looks like". Its arms were all mode 1 and
+  **none of them contains a single auth or assoc frame** — the client did not switch and did not
+  fall back. It was quiesced. The adversarial pass proposed this and the captures confirm it.
+- **⭐ The count ≥ 1 DENIAL prediction is finally tested, and it FAILED.** `ReAssoc Response AID(1)
+  :: Successful`, twice, **while count-3 CSAs were still being injected**. `csa_present()` should
+  have made `csa_in_process()` true and had `ieee80211_mgd_assoc()` (`mlme.c:8827`) return
+  `-EINVAL`. It did not. The mechanism candidate is the one the adversarial pass named: the genuine
+  AP's own CSA-free beacons refresh `bss->beacon_ies` between our injected ones, so the refusal
+  window is ~100 ms at roughly 50% duty and the client simply lands in a gap. **If that is right,
+  17a cannot test the denial path at all against an AP that is still on the air** — and this AP
+  cannot be silenced. That is a structural limit on the experiment, not a missing arm. **[A]** on
+  the mechanism; `[V]` that the re-association succeeded under injection.
+- **⚠ An open tension, left open rather than explained away.** The adversarial pass predicted
+  (`mlme.c:2452`) that the genuine AP's beacons abort a pending switch ~10/s, so a count-3 switch
+  would lose the race and never complete. **It completed twice.** Both readings are sound and the
+  composition does not work, which is precisely the shape this file warns about — so no mechanism is
+  invented here. *Resolved by:* a capture read for the ordering of our CSA beacons against the AP's
+  own around 02:37:23, which the same pcap already contains.
+- **The quiet arm's uplink dipped but never stopped.** Client→AP frames per second across the
+  mode-1 run: `6, 83, 93, 263, 224, 93, 12, 237, 162, 256, 132, 32`. One deep trough — 12 frames in
+  a second against a 100-260 baseline — then full recovery. So mode 1 is a *partial, repeated*
+  quiesce, matching the operator's "froze for seconds, briefly unfroze, repeating" and the
+  block/unblock thrash the abort race implies, rather than a clean 10-second stop.
+- **The client carries a RANDOMISED MAC** — `3a:57:cb:46:8b:77`, second character `a`. That is the
+  case `is_rand` keys on, and the case that silenced CamHound's response rung for seven attempts
+  (see "Third contact"). Worth knowing that the only station on this AP is one of those.
+
+**What 17a has actually produced, in one line:** the channel-switch element reaches this client and
+does two separable things — mode 1 quiesces it in place, mode 0 moves it — and the count byte's
+denial half cannot be measured here because the target AP keeps beaconing.
 
 **`2.0.0-stable` was released 2026-10-29** and is now what `latest` serves. Everything here remains
 pinned to 1.1.3; versioned downloads still work
@@ -1228,7 +1305,7 @@ the question is open.
 
 Listed in `dev/CamHound/RESPONSE.md` §13, `dev/pager-day-one.md` and — for what has already been
 closed without hardware — `dev/pager-prearrival.md`. The ones most worth knowing: whether Recon's
-packet counters move the way `resp_verdict` assumes. **The count-byte experiment (day-one step 17a) has RUN — 2026-11-10, see "Fourth contact" and then "Fifth contact", which withdraws its headline.** **Both instruments were run too (`--clone` and `--count-dec`, 2026-11-10), and an adversarial pass then showed the OBSERVABLE was the weak half** — see "Fifth contact", which is the state of record. What survives: the five appended bytes are what disrupt this client. What does not: `--clone` is a near-tautological control on a mac80211 client (a verbatim clone hashes to the same `beacon_crc` and is dropped at `mlme.c:6929`), Channel Switch **Mode 1** freezes the client count-independently (`mlme.c:2610`), the real AP's own beacons abort a pending switch ~10/s (`mlme.c:2452`), and the `--count-dec` arm transmitted count 0 on 23 of 92 frames. **The count byte's effect is un-measured, not null.** **All three next-steps were then run — see "Sixth contact", which is the state of record.** `--elem=32:00` did nothing, so C1 holds in the strong form: it is the channel-switch element, not beacon churn. The mode arms gave a both-matter answer rather than either/or. **The next step needs no transmission at all: three captures totalling ~10,000 packets on the parked primary are sitting in `/root/loot` unread, and they carry the auth/assoc observation that separates "disconnected" from "quiesced".** Whether a frame reaches the air on **5 GHz DFS or 6 GHz** still needs an external receiver.
+packet counters move the way `resp_verdict` assumes. **The count-byte experiment (day-one step 17a) has RUN — 2026-11-10, see "Fourth contact" and then "Fifth contact", which withdraws its headline.** **Both instruments were run too (`--clone` and `--count-dec`, 2026-11-10), and an adversarial pass then showed the OBSERVABLE was the weak half** — see "Fifth contact", which is the state of record. What survives: the five appended bytes are what disrupt this client. What does not: `--clone` is a near-tautological control on a mac80211 client (a verbatim clone hashes to the same `beacon_crc` and is dropped at `mlme.c:6929`), Channel Switch **Mode 1** freezes the client count-independently (`mlme.c:2610`), the real AP's own beacons abort a pending switch ~10/s (`mlme.c:2452`), and the `--count-dec` arm transmitted count 0 on 23 of 92 frames. **The count byte's effect is un-measured, not null.** **All three next-steps were then run — see "Sixth contact", which is the state of record.** `--elem=32:00` did nothing, so C1 holds in the strong form: it is the channel-switch element, not beacon churn. The mode arms gave a both-matter answer rather than either/or. **Those captures have been read — see "Seventh contact".** Only the mode-0 arm contains auth/assoc; all six mode-1 arms contain none, so mode 1 quiesces the client in place while mode 0 moves it, and Fourth contact's "honoured a switch then fell back" is refuted. The count >= 1 denial prediction was tested at last and FAILED — the client re-associated successfully while count-3 CSAs were in the air — and the likely reason is structural: the target AP's own beacons keep refreshing the cached IEs, so **17a cannot test the denial path against an AP that is still on the air.** Whether a frame reaches the air on **5 GHz DFS or 6 GHz** still needs an external receiver.
 (`inj_parse_channels` is **no longer** on this list — it ran against a live radio on 2026-11-02 and
 was correct; see "First contact". Nor is *"the three `PINEAPPLE_DEAUTH_CLIENT*` commands are
 documented only by `hak5cmd`'s help text"* — they are now read from pineapd's own handler, see
