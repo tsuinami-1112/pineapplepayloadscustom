@@ -16,7 +16,7 @@ facts that are settled so they do not get re-derived.
 | `gen_hooks.sh` | regenerates `library/recon/{client,access_point}/CamHound/` from the user payload (header + config + lib block + watch-core block + `hook_main.sh`) |
 | `check_sync.sh` | fails when the shared blocks differ between the user payload and the hooks |
 | `hook_header.sh`, `hook_main.sh` | the hook-only parts |
-| `harness/run_harness.sh` | laptop harness: stub DuckyScript commands, fake `_pineap`/`tcpdump`/`iwinfo`/`iw` (US-like channel table for a fixture phy dir), stub `NUMBER_PICKER`/`PAYLOAD_SET_CONFIG`/`PAYLOAD_DEL_CONFIG`, RECON fixtures (the client fixture is in the 2.0.0 `probe`-object shape, with `ap_mac` kept as a stand-in for the association the firmware does not expose; a net tree under `NET_SYSFS` names phy0 as wlan1mon's phy; `HARNESS_NO_BEACON=1` makes the fake tcpdump capture nothing, `HARNESS_NO_CLIENTS=1` refuses `RECON CLIENTS` as 1.1.3 does and serves `fix/devices.json`, the measured `RECON DEVICES` shape with sorted keys, and `HARNESS_BANDS_NOOP=1` makes the band write change nothing, as measured); scenarios live, stimulus, lock, nojq (both parsers, over CLIENTS and over DEVICES), locate, disrupt, members (the real-firmware shape -- no association at all, membership read off the air; `HARNESS_NO_MEMBERS` / `HARNESS_NO_ARM` / `HARNESS_NO_OR` / `HARNESS_SHORT_SNAP` / `HARNESS_BAD_PCAP` / `HARNESS_ALIEN_MEMBERS` drive the capture reasons (`NO_CAPTURE`, `SNAP_SHORT`, `NO_CLIENTS` — since 2026-11-10 reasons that fire the broadcast and loot `INCONCLUSIVE`, not refusals) and the uplink-only fallback filter), cliscope (the client-row Disrupt: both scopes in one menu), blind, noinj, persist, settings, bands (the write, the measured no-op, the Settings toggle, a record left by a killed run, the killed run's own watchdog), devices, assoc (the inverse lookup on the real-firmware shape, six arms: a client's AP found from its card, then Watch and a targeted Disrupt on it; the miss already in the fixtures, a camera last heard on 2437 MHz whose AP is on channel 36; a membership capture teaching both cameras their NVR, which wakes kit detection; `HARNESS_NO_PARK` (EXAMINE_CHANNEL does not park: the hop is listened across), `HARNESS_ASSOC_TWO` (two BSSIDs alike: no decision) and `HARNESS_NO_OR` (uplink-only retry). The fake tcpdump answers the lookup only when the radio could have heard the client: hopping, or parked on its AP's channel, which the EXAMINE stubs track in `/tmp/cs_harness_hop` and `/tmp/cs_harness_chan`) |
+| `harness/run_harness.sh` | laptop harness: stub DuckyScript commands, fake `_pineap`/`tcpdump`/`iwinfo`/`iw` (US-like channel table for a fixture phy dir), stub `NUMBER_PICKER`/`PAYLOAD_SET_CONFIG`/`PAYLOAD_DEL_CONFIG`, RECON fixtures (the client fixture is in the 2.0.0 `probe`-object shape, with `ap_mac` kept as a stand-in for the association the firmware does not expose; a net tree under `NET_SYSFS` names phy0 as wlan1mon's phy; `HARNESS_NO_BEACON=1` makes the fake tcpdump capture nothing, `HARNESS_NO_CLIENTS=1` refuses `RECON CLIENTS` as 1.1.3 does and serves `fix/devices.json`, the measured `RECON DEVICES` shape with sorted keys, and `HARNESS_BANDS_NOOP=1` makes the band write change nothing, as measured); scenarios live, stimulus, lock, nojq (both parsers, over CLIENTS and over DEVICES), locate, disrupt, members (the real-firmware shape -- no association at all, membership read off the air; `HARNESS_NO_MEMBERS` / `HARNESS_NO_ARM` / `HARNESS_NO_OR` / `HARNESS_SHORT_SNAP` / `HARNESS_BAD_PCAP` / `HARNESS_ALIEN_MEMBERS` drive the capture reasons, and `HARNESS_FIRE_REFUSE` makes the fake deauth commands refuse the way `hak5cmd` does (rc 0, the error on stderr), which must loot `CMD_REFUSED` and never a verdict (`NO_CAPTURE`, `SNAP_SHORT`, `NO_CLIENTS` — since 2026-11-10 reasons that fire the broadcast and loot `INCONCLUSIVE`, not refusals) and the uplink-only fallback filter), cliscope (the client-row Disrupt: both scopes in one menu), csainj (the optional CSA injector, on a second copy of the payload with `CSA_INJECTOR` set in its config block; `HARNESS_INJ_FAIL` makes the fake `pagerinj` fail to clone a beacon), blind, noinj, persist, settings, bands (the write, the measured no-op, the Settings toggle, a record left by a killed run, the killed run's own watchdog), devices, assoc (the inverse lookup on the real-firmware shape, six arms: a client's AP found from its card, then Watch and a targeted Disrupt on it; the miss already in the fixtures, a camera last heard on 2437 MHz whose AP is on channel 36; a membership capture teaching both cameras their NVR, which wakes kit detection; `HARNESS_NO_PARK` (EXAMINE_CHANNEL does not park: the hop is listened across), `HARNESS_ASSOC_TWO` (two BSSIDs alike: no decision) and `HARNESS_NO_OR` (uplink-only retry). The fake tcpdump answers the lookup only when the radio could have heard the client: hopping, or parked on its AP's channel, which the EXAMINE stubs track in `/tmp/cs_harness_hop` and `/tmp/cs_harness_chan`) |
 
 Rule: edit the user payload, then `gen_hooks.sh`, then `check_sync.sh`, then `payload.sh --selftest`
 and `harness/run_harness.sh`. The lib block (`# --- camhound lib begin/end ---`) and the watch-core
@@ -25,15 +25,29 @@ lives inside them.
 
 ## Status
 
-Coded and verified on a laptop only (selftest ends `0 failed` and prints its own count, harness scenarios green, shellcheck
-clean). The v1.1 Recon hooks are generated and checked the same way.
+Coded and gated on a laptop (selftest ends `0 failed` and prints its own count, harness scenarios green, shellcheck
+clean), with the v1.1 Recon hooks generated and checked the same way — and, since 2026-11-05, **partly
+run on the device**. What has and has not run there, with the citation for each:
+
+| what | on the device? | record |
+|---|---|---|
+| `--selftest` | yes, 259/0 on 2026-11-04 | below |
+| a live scan from the user payload | yes, 2026-11-05 | CLAUDE.md "Second contact": `inventory.tsv` rows, the OUI-table hang it found |
+| a Disrupt from the user payload (AP row), with the membership capture | yes, 2026-11-05 | CLAUDE.md "Second contact": the `responses.tsv` row and `resp members … n=1 why=ok itmax=56` |
+| seven Disrupt attempts that refused with `NO_MATCH` | yes, 2026-11-09 | CLAUDE.md "Third contact"; the transmit-set fix came from them |
+| Watch (Live view, Stimulus) and Locate | no record in this repo | `grep -rn -i -e live.view -e stimulus -e locate CLAUDE.md dev/` finds no device run of any of the three |
+| the inverse association lookup, and so client-row Watch and Disrupt | no | landed 2026-11-10; `dev/pager-day-one.md` 8d is its first run |
+
+*This table replaces a paragraph that still said nothing but `--selftest` had run on a device; a
+review on 2026-11-10 caught it disagreeing with `RESPONSE.md`'s header.*
 
 **First device run, 2026-11-04: `--selftest` passes on the operator's 1.1.3 Pager — 259 checks, 0
 failed.** That is the first CamHound code to execute on hardware, and it is a narrow slice: the
 selftest stubs every device-changing command, so it exercises the parsers, the pcap walkers and the
 scoring against the device's real `jq`, `hexdump`, `awk`, `bash` and busybox, and **nothing about the
 radio**. It earned its keep immediately: the first attempt was 255 checks / **4 failed**, which is
-how the `gsub` defect below was found. No live scan, Watch, Locate or Disrupt has run yet.
+how the `gsub` defect below was found. ~~No live scan, Watch, Locate or Disrupt has run yet.~~
+*(True on 2026-11-04; a scan and a Disrupt ran the next day — see the table above.)*
 
 **Status of the response rung, 2026-11-04:** it fires from a user-payload **AP** row and from both
 Recon hooks, with the subject set recovered from a BSSID-filtered capture, because no shipped
@@ -61,13 +75,26 @@ the firmware primitives it calls and the list of what remains unverified are in 
 
 **Everything described here is on `master`** as of PR #21 (2026-11-04); take it from there rather
 than from a feature branch, and check `git log --oneline -1` against the tip before copying, because
-a half-updated device is the one failure mode none of the gates can see. Nothing in CamHound has
+a half-updated device is the one failure mode none of the gates can see. ~~Nothing in CamHound has
 run on a device beyond `--selftest`, which passed on 2026-11-04 (259/0, after it caught the `gsub`
-defect at 255/4); everything else is laptop-verified.
+defect at 255/4); everything else is laptop-verified.~~ *Superseded: the Status table above lists
+what has run on the device since. The inverse lookup is on `claude/clever-wozniak-hn3xyn` until it
+is merged, so until then take the three `payload.sh` copies from that branch, not from `master`.*
 
-**Three directories, nine files.** Each needs `payload.sh` and `cam_signatures.txt` beside it; the
+**Three directories, six files.** Each needs `payload.sh` and `cam_signatures.txt` beside it; the
 signature file is byte-identical in all three, and so are the two hooks (`cmp` them — that is the
-edit contract, not a mistake).
+edit contract, not a mistake). *(This line said "nine files" until 2026-11-11; three directories of
+two files each is six.)* The loop below is POSIX shell. From PowerShell, where `for … do` does not
+exist, the same copy is six plain lines that need no quoting — run them from the repo root:
+
+```
+scp library/user/reconnaissance/CamHound/payload.sh root@172.16.52.1:/root/payloads/user/reconnaissance/CamHound/
+scp library/user/reconnaissance/CamHound/cam_signatures.txt root@172.16.52.1:/root/payloads/user/reconnaissance/CamHound/
+scp library/recon/client/CamHound/payload.sh root@172.16.52.1:/root/payloads/recon/client/CamHound/
+scp library/recon/client/CamHound/cam_signatures.txt root@172.16.52.1:/root/payloads/recon/client/CamHound/
+scp library/recon/access_point/CamHound/payload.sh root@172.16.52.1:/root/payloads/recon/access_point/CamHound/
+scp library/recon/access_point/CamHound/cam_signatures.txt root@172.16.52.1:/root/payloads/recon/access_point/CamHound/
+```
 
 ```sh
 ssh root@172.16.52.1 'mkdir -p /root/payloads/user/reconnaissance/CamHound \
@@ -151,7 +178,7 @@ and `RESPONSE_CONFIRM`). For a recon-only first run:
 `--selftest` is safe to run on the device — every device-changing command is stubbed, and since
 2026-11-04 so is every display and dialog command, so it no longer paints the Pager's screen nor can
 it block on a button press. The cheapest first step is `bash payload.sh --selftest` on the Pager
-itself. Expect `== 405 checks, 0 failed ==` (the count as of 2026-11-10; it grows with every case added) and
+itself. Expect `== 417 checks, 0 failed ==` (the count as of 2026-11-10; it grows with every case added) and
 the two block hashes; a lower count means the copy
 on the device is older than the repo's.
 
@@ -180,7 +207,7 @@ present on a Pager but has no Oniguruma, so the parsers compiled to nothing and 
 | `re-armed <bssid> Ns for the measurement` | the lock was re-armed after the capture, so the parse cannot eat the verdict window |
 | `assoc <mac> -> <bssid> n=N recs=R itmax=I ch=C lock=ok dwell=Ns` | a client's AP was read off the air: N frames to that BSSID out of R records, radiotap I bytes, parked on channel C. **`lock=` is the first-run answer to whether `EXAMINE_CHANNEL` alone parks:** `ok` it did, `unverified` the channel could not be read back, `hop` it did not and the capture ran across the hop |
 | `assoc <mac> none why=NO_FRAMES\|NO_PAIR\|AMBIGUOUS\|SNAP_SHORT\|NO_CAPTURE … ch=C lock=…` | the lookup found no AP and the card is unchanged. `NO_FRAMES` means not heard on channel C in the window — the client may be idle, or its AP may be on another channel than the one it was last heard on; it is not evidence that the client is unassociated |
-| `assoc members of <bssid>: N station(s), AP learned` | an AP-row Disrupt's membership capture taught N stations their AP; their cards then offer Watch and Disrupt outright |
+| `assoc members of <bssid>: N heard, M client row(s) now carry this AP` | an AP-row Disrupt's membership capture heard N stations on that AP; M of them have a client row that now carries it, and those cards offer Watch and Disrupt outright. The other N − M have no Recon row yet (remembered, applied when one appears) or an AP the firmware supplied |
 | `no-members <bssid> why=NO_CAPTURE\|SNAP_SHORT\|NO_CLIENTS` then `fired … broadcast with no members recovered` | an AP-row Disrupt recovered nobody and **fired the broadcast anyway** (operator-decided 2026-11-10, "nuclear blast"); `responses.tsv` has one `INCONCLUSIVE` row for `ff:ff:ff:ff:ff:ff`. These tokens are no longer loot verdicts — `SNAP_SHORT` still names `CLI_CAP_SNAP` as the knob |
 
 Known-inert on 1.1.3, so do not read these as faults: client association **until a client is

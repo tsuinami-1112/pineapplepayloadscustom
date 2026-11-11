@@ -150,6 +150,7 @@ Two steps; the first needs no CamHound at all. Every command below is quote-free
    | `… lock=hop …` | step 1's negative answer, seen from inside the payload |
    | `assoc <mac> none why=NO_FRAMES … ch=C` | not heard on channel C. If the phone was transmitting and C is its AP's channel, that is a defect in the filter or the window, and the raw material is worth keeping: repeat with `tcpdump -i wlan1mon -c 20 -e type data and wlan addr2 <mac>` under the same lock |
    | `EXAMINE_CHANNEL C said: …` | the firmware refused the channel lock and said why |
+   | the card then reads `Watch n/a (no channel)` | the lookup ran across the hop (`lock=hop`) and named an AP Recon has not listed yet, so no channel is known for it. Expected on a fresh Recon session; one more scan cycle should list the AP and clear it |
    Then check `grep -c OR.filter.did.not.arm /root/loot/CamHound/events.log` — a non-zero count
    means this tcpdump refuses the two-address filter and the uplink-only retry is what ran.
 

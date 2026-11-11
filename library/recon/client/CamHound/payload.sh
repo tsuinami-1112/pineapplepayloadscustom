@@ -105,7 +105,7 @@ CLI_CAP_SNAP=128        # MUST clear radiotap it_len + 16 to reach addr2: -s 32 
 # The inverse lookup (assoc_lookup): which BSSID ONE client talks to, read off the air when the
 # operator picks Watch or Disrupt on a client the firmware gave no AP for. It parks the radio for
 # the listen window, so Recon pauses meanwhile; it reuses CLI_CAP_SNAP and CLI_CAP_COUNT above.
-ASSOC_CAP_SECS=6        # * listen this long for one client's own frames when finding its AP (floor 2)
+ASSOC_CAP_SECS=6        # * listen this long for one client's own frames when finding its AP (2-30; x3 across the hop)
 ASSOC_TTL=300           # * seconds an AP learned off the air is trusted before Watch/Disrupt looks again (0 = look every time)
 FIRE_ERR="/tmp/cs_fire_$$.err"   # the attack command's stderr: a refusal must not read as a measurement
 # The CSA injector. A CSA from THIS firmware cannot work, for two independent reasons, neither
@@ -213,6 +213,18 @@ rssi_min_clamp() {
   fi
   return 0
 }
+# assoc_clamp: the find-AP lookup parks the radio and holds the screen for ASSOC_CAP_SECS -- three times
+# that when the park is refused and it listens across the hop -- with no button check while it listens.
+# cfg() and the Settings menu enforce a floor and nothing above it, so a mistyped or hand-edited value
+# would turn one pick into minutes of a blind Recon. 30 s parked, 90 s across the hop, is the ceiling.
+assoc_clamp() {
+  if (( ASSOC_CAP_SECS > 30 )); then
+    log warn "ASSOC_CAP_SECS $ASSOC_CAP_SECS capped at 30"; ui_ok && LOG yellow "ASSOC_CAP_SECS capped at 30"; ASSOC_CAP_SECS=30
+  elif (( ASSOC_CAP_SECS < 2 )); then
+    log warn "ASSOC_CAP_SECS $ASSOC_CAP_SECS raised to 2"; ASSOC_CAP_SECS=2
+  fi
+  return 0
+}
 # cfg KEY DEFAULT [FLOOR] -> persisted integer override or the default
 cfg() {
   local v
@@ -247,8 +259,8 @@ load_overrides() {
     POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
     DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
   fi
-  # both clamps also cover a config-block edit, so they run whether or not the device offers persistence
-  resp_clamp_lock; rssi_min_clamp
+  # the clamps also cover a config-block edit, so they run whether or not the device offers persistence
+  resp_clamp_lock; rssi_min_clamp; assoc_clamp
 }
 
 # install dir: the UI runs a copy from /tmp, so look for the data file where it can live
@@ -1302,6 +1314,11 @@ watchable() {
   local mac="$1"
   [ "$HAVE_TCPDUMP" = 1 ] || return 1
   if [ "${ROLE[$mac]}" = cli ]; then [ -n "${AP_OF[$mac]}" ] && [ "${AP_OF[$mac]}" != "-" ] || return 1; fi
+  # User payload only (the hooks carry no such function and take AP and channel from the Recon UI):
+  # an AP read off the air whose channel is not known yet gives the lock nothing to verify against.
+  # lock_target treats a channel of 0 as "any channel is fine", so without this a Watch would park
+  # wherever the radio happened to be, say nothing, and loot a row for channel 0.
+  command -v assoc_nochan >/dev/null 2>&1 && assoc_nochan "$mac" && return 1
   return 0
 }
 is_setup_ap() { local s="${SSID_CLEAN[$1]}"; [ "${ROLE[$1]}" != cli ] && [ -n "$s" ] && [ "${SSIDSIG[$s]##*|}" = SSID ]; }
@@ -1816,6 +1833,9 @@ stimulus_test() {
 
 watch_menu() {
   local mac="$1"
+  # User payload only: an AP read off the air more than ASSOC_TTL ago is looked at again before it
+  # is acted on. Here rather than at the card, so the Watch offers of the scan funnel get it too.
+  command -v assoc_refresh >/dev/null 2>&1 && assoc_refresh "$mac"
   watchable "$mac" || { LOG "Watch n/a for ${mac:9}"; return 0; }
   WATCH_AGAIN=0; RUNS=()
   pick_list "Watch ${ID_LABEL[$mac]:-?} ${mac:9}" "Live view" "Live view" "Stimulus test (~90 s)" "Back" || return 0
@@ -2403,6 +2423,10 @@ disrupt_row() {   # a cached badge is free to show; an uncached one is not worth
 
 disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon says will work
   local mac="$1" badge opts k exp scope items=() pickmap=() i=0 choice
+  # User payload only (the hooks take the AP from the Recon selection): a client's AP that was read
+  # off the air more than ASSOC_TTL ago is looked at again before anything is aimed at it, on every
+  # path into this menu -- the card, the post-Watch funnel and AUTO_RESPOND alike.
+  command -v assoc_refresh >/dev/null 2>&1 && assoc_refresh "$mac"
   if ! resp_target "$mac"; then
     LOG red "nothing to attack: no associated BSS or no channel for $mac"; return 0
   fi

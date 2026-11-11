@@ -444,7 +444,7 @@ s_assoc() {   # the inverse lookup on the real-firmware shape: a client's AP rea
     '^[0-9]+ REO-OUI 00:00:1[12]' 'Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
   answers t t B B; HARNESS_NO_CLIENTS=1 run
   check "assoc: a membership capture teaches each station it heard its AP" \
-    "grep -q 'assoc members of ec:71:db:00:00:10: 2 station(s), AP learned' $LOOT/events.log"
+    "grep -q 'assoc members of ec:71:db:00:00:10: 2 heard, 2 client row(s) now carry this AP' $LOOT/events.log"
   check "assoc: so that camera's card offers Watch and Disrupt outright, and no lookup runs" \
     "grep -qE 'PICKER\[[0-9]+ REO-OUI 00:00:1[12]\] items=Watch;Disrupt' $T/log && ! grep -q '^TCPDUMP assoc' $T/log"
   check "assoc: after the next cycle both cameras carry the AP in the inventory" \

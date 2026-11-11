@@ -151,14 +151,27 @@ would blind Recon for as long as it ran.
   AP with no row drops the old AP's channel and SSID instead of carrying them over.
 - `assoc_learn_members` learns the same fact from a membership capture — `resp_members` calls it
   behind `command -v`, because that function is copied into the hooks and this one is not — so one
-  AP-row Disrupt teaches every station it heard, and kit detection wakes up for them.
+  AP-row Disrupt teaches every station it heard, and kit detection wakes up for them. Its log line
+  gives both numbers, `members of <bssid>: N heard, M client row(s) now carry this AP`: a station
+  with no Recon row is only remembered, and one whose AP the firmware supplied keeps it.
 - `run_cycle` re-applies `ASSOC_BSS` every cycle (the firmware's `-` would otherwise wipe it, and a
-  firmware-supplied AP still wins); `assoc_stale`/`assoc_refresh` look again before Watch or Disrupt
-  acts on an AP learned more than `ASSOC_TTL` ago, listening on the **row's** channel (its AP's),
-  not on the client's last-heard frequency.
+  firmware-supplied AP still wins — and the `ASSOC_CH` fallback applies only to the AP it was
+  recorded for, so a firmware-supplied AP never inherits another AP's channel);
+  `assoc_stale`/`assoc_refresh` look again before Watch or Disrupt acts on an AP learned more than
+  `ASSOC_TTL` ago, listening on the **row's** channel (its AP's), not on the client's last-heard
+  frequency. **The call sits at the top of `watch_menu` and `disrupt_menu`** (watch core, behind
+  `command -v`), not at the card, so the scan funnel's Watch offers, the post-Watch Disrupt offer
+  and `AUTO_RESPOND` get it too — the first version re-checked only from the card, which the
+  review of 2026-11-10 caught as a promise the docs made and the code did not keep.
 - The card says `Watch (find AP first)` / `Disrupt (find AP first)` (`detail_card`; `disrupt_row`
-  in the watch core, guarded on `command -v assoc_can` so the hooks keep `n/a`). Two starred keys,
-  `ASSOC_CAP_SECS` and `ASSOC_TTL`, wired in `load_overrides` and `SETTINGS_TABLE`.
+  in the watch core, guarded on `command -v assoc_can` so the hooks keep `n/a`). **An AP that was
+  heard without its channel gives `Watch n/a (no channel)` / `Disrupt n/a (no channel)`**
+  (`assoc_nochan`; `watchable` in the lib asks it behind `command -v`): `lock_target` reads a
+  channel of 0 as "any channel will do", so a Watch there would park wherever the radio happened
+  to be and loot a row for channel 0. The state clears when Recon lists the AP. Two starred keys,
+  `ASSOC_CAP_SECS` (clamped to 2–30 by `assoc_clamp`, from `load_overrides` and `settings_apply`:
+  the window is slept on, tripled across the hop, with no button check) and `ASSOC_TTL`, wired in
+  `load_overrides` and `SETTINGS_TABLE`.
 - Selftest block `7m association`; harness scenario `assoc` (six arms on the `HARNESS_NO_CLIENTS=1`
   shape; `HARNESS_NO_PARK`, `HARNESS_ASSOC_TWO` and `HARNESS_NO_OR` drive the refused park, the
   ambiguous pair and the refused OR filter; the miss is the fixtures' own — a camera last heard on

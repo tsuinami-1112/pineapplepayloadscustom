@@ -115,7 +115,7 @@ CLI_CAP_SNAP=128        # MUST clear radiotap it_len + 16 to reach addr2: -s 32 
 # The inverse lookup (assoc_lookup): which BSSID ONE client talks to, read off the air when the
 # operator picks Watch or Disrupt on a client the firmware gave no AP for. It parks the radio for
 # the listen window, so Recon pauses meanwhile; it reuses CLI_CAP_SNAP and CLI_CAP_COUNT above.
-ASSOC_CAP_SECS=6        # * listen this long for one client's own frames when finding its AP (floor 2)
+ASSOC_CAP_SECS=6        # * listen this long for one client's own frames when finding its AP (2-30; x3 across the hop)
 ASSOC_TTL=300           # * seconds an AP learned off the air is trusted before Watch/Disrupt looks again (0 = look every time)
 FIRE_ERR="/tmp/cs_fire_$$.err"   # the attack command's stderr: a refusal must not read as a measurement
 # The CSA injector. A CSA from THIS firmware cannot work, for two independent reasons, neither
@@ -223,6 +223,18 @@ rssi_min_clamp() {
   fi
   return 0
 }
+# assoc_clamp: the find-AP lookup parks the radio and holds the screen for ASSOC_CAP_SECS -- three times
+# that when the park is refused and it listens across the hop -- with no button check while it listens.
+# cfg() and the Settings menu enforce a floor and nothing above it, so a mistyped or hand-edited value
+# would turn one pick into minutes of a blind Recon. 30 s parked, 90 s across the hop, is the ceiling.
+assoc_clamp() {
+  if (( ASSOC_CAP_SECS > 30 )); then
+    log warn "ASSOC_CAP_SECS $ASSOC_CAP_SECS capped at 30"; ui_ok && LOG yellow "ASSOC_CAP_SECS capped at 30"; ASSOC_CAP_SECS=30
+  elif (( ASSOC_CAP_SECS < 2 )); then
+    log warn "ASSOC_CAP_SECS $ASSOC_CAP_SECS raised to 2"; ASSOC_CAP_SECS=2
+  fi
+  return 0
+}
 # cfg KEY DEFAULT [FLOOR] -> persisted integer override or the default
 cfg() {
   local v
@@ -257,8 +269,8 @@ load_overrides() {
     POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
     DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
   fi
-  # both clamps also cover a config-block edit, so they run whether or not the device offers persistence
-  resp_clamp_lock; rssi_min_clamp
+  # the clamps also cover a config-block edit, so they run whether or not the device offers persistence
+  resp_clamp_lock; rssi_min_clamp; assoc_clamp
 }
 
 # install dir: the UI runs a copy from /tmp, so look for the data file where it can live
@@ -1312,6 +1324,11 @@ watchable() {
   local mac="$1"
   [ "$HAVE_TCPDUMP" = 1 ] || return 1
   if [ "${ROLE[$mac]}" = cli ]; then [ -n "${AP_OF[$mac]}" ] && [ "${AP_OF[$mac]}" != "-" ] || return 1; fi
+  # User payload only (the hooks carry no such function and take AP and channel from the Recon UI):
+  # an AP read off the air whose channel is not known yet gives the lock nothing to verify against.
+  # lock_target treats a channel of 0 as "any channel is fine", so without this a Watch would park
+  # wherever the radio happened to be, say nothing, and loot a row for channel 0.
+  command -v assoc_nochan >/dev/null 2>&1 && assoc_nochan "$mac" && return 1
   return 0
 }
 is_setup_ap() { local s="${SSID_CLEAN[$1]}"; [ "${ROLE[$1]}" != cli ] && [ -n "$s" ] && [ "${SSIDSIG[$s]##*|}" = SSID ]; }
@@ -1533,7 +1550,9 @@ run_cycle() {
     [ "$ap" = - ] && [ -n "${ASSOC_BSS[$mac]}" ] && ap="${ASSOC_BSS[$mac]}"
     [ "$fr" = 0 ] && [ "$ap" != "-" ] && fr=${FREQ[$ap]:-0}
     [ "$ch" = 0 ] && [ "$ap" != "-" ] && ch=${CH[$ap]:-0}
-    [ "$ch" = 0 ] && [ "$ap" != "-" ] && ch=${ASSOC_CH[$mac]:-0}    # an AP Recon never listed has no CH of its own
+    # an AP Recon never listed has no CH of its own. ONLY for the AP that channel was recorded for: a
+    # firmware-supplied AP must not inherit the channel of a different AP that was once heard off the air
+    [ "$ch" = 0 ] && [ "$ap" != "-" ] && [ "$ap" = "${ASSOC_BSS[$mac]:-}" ] && ch=${ASSOC_CH[$mac]:-0}
     record_seen "$mac" cli "${SSID_CLEAN[$ap]}" "$ch" "$fr" "$sig"
     AP_OF[$mac]="$ap"; PROBES[$mac]="$probes"
     [[ $pk =~ ^[0-9]+$ ]] && rate_update "$mac" "$pk"
@@ -1920,6 +1939,19 @@ assoc_can() {   # a client row with no AP, and a capture tool to find one with
   [ "$HAVE_TCPDUMP" = 1 ]
 }
 
+# assoc_nochan <mac>: this client's AP was read off the air and no channel is known for it -- the AP
+# has no Recon row yet, and the capture that named it was not behind a verified park. Watch and
+# Disrupt both need a channel to lock on, so both rows say "n/a (no channel)" until Recon lists the
+# AP, at which point run_cycle gives the row its AP's channel.
+assoc_nochan() {
+  local mac="$1" ap="${AP_OF[$1]:--}" c
+  [ "${ROLE[$mac]}" = cli ] && [ "$ap" != - ] && [ "$ap" = "${ASSOC_BSS[$mac]:-}" ] || return 1
+  for c in "${CH[$mac]:-0}" "${CH[$ap]:-0}"; do
+    [[ $c =~ ^[0-9]+$ ]] && (( 10#$c > 0 )) && return 1
+  done
+  return 0
+}
+
 # assoc_stale <mac>: its AP was learned off the air, and neither that nor the last look is newer than
 # ASSOC_TTL. An AP the firmware supplied is never stale here: it is re-read every cycle already.
 assoc_stale() {
@@ -1961,12 +1993,16 @@ assoc_learn() {
 # which is the same fact read the other way. Called from resp_members' success path, behind
 # `command -v` there because that function is copied into the hooks and this one is not.
 assoc_learn_members() {
-  local bss="${1,,}" m n=0
+  local bss="${1,,}" m heard=0 given=0
   [ -n "$bss" ] && [ "$RESP_MEMBERS_BSS" = "$bss" ] || return 0
   for m in "${!RESP_MEMBERS[@]}"; do
-    assoc_learn "$m" "$bss" "${CH[$bss]:-0}" members && n=$((n + 1))
+    assoc_learn "$m" "$bss" "${CH[$bss]:-0}" members || continue
+    heard=$((heard + 1))
+    # only these have a card that changed: a station with no row is remembered for later, and one
+    # whose AP the firmware supplied keeps it
+    [ "${ROLE[$m]}" = cli ] && [ "${AP_OF[$m]}" = "$bss" ] && given=$((given + 1))
   done
-  (( n > 0 )) && log assoc "members of $bss: $n station(s), AP learned"
+  (( heard > 0 )) && log assoc "members of $bss: $heard heard, $given client row(s) now carry this AP"
   return 0
 }
 
@@ -2084,18 +2120,22 @@ detail_card() {
     age=$(( EPOCHSECONDS - ${LAST_SEEN[$mac]:-$EPOCHSECONDS} ))
     tag_lines "$mac"
     LOG "[$MODE] ${CONF[$mac]} ${BANDNAME[$mac]} ${ROLE[$mac]} $mac"$'\n'"cat: ${CAT[$mac]} ${VENDOR[$mac]:--}"$'\n'"ssid: ${SSID_CLEAN[$mac]:--} ch${CH[$mac]:-?} ${BAND[$mac]:-?}GHz"$'\n'"rssi ${RSSI_LAST[$mac]:--} best ${RSSI_BEST[$mac]:--} ${PROX[$mac]:-?} ${age}s ago"$'\n'"${TAGTXT%$'\n'}"
-    if watchable "$mac"; then wrow="Watch"; elif [ "$HAVE_TCPDUMP" != 1 ]; then wrow="Watch (no tcpdump)"; elif assoc_can "$mac"; then wrow="Watch (find AP first)"; else wrow="Watch n/a (not associated)"; fi
+    if watchable "$mac"; then wrow="Watch"; elif [ "$HAVE_TCPDUMP" != 1 ]; then wrow="Watch (no tcpdump)"; elif assoc_can "$mac"; then wrow="Watch (find AP first)"; elif assoc_nochan "$mac"; then wrow="Watch n/a (no channel)"; else wrow="Watch n/a (not associated)"; fi
     [ "$def" = watch ] && def="$wrow" || def="Back"
     drow=""; [ "$RESPONSE" = 1 ] && drow=$(disrupt_row "$mac")
     pick_list "${CONF[$mac]} ${ID_LABEL[$mac]:-${TAGS[$mac]%% *}} ${mac:9}" "$def" "$wrow" ${drow:+"$drow"} "Locate" "Ignore for session" "Back" || return 0
     case "$PICK" in
-      "Disrupt n/a"*) LOG yellow "no associated BSS or no channel for ${mac:9}: nothing to attack from this row" ;;
+      # the AP was heard and its channel was not: say which, and what changes it, instead of "n/a"
+      "Watch n/a (no channel)"|"Disrupt n/a (no channel)")
+        if assoc_nochan "$mac"; then LOG yellow "AP ${AP_OF[$mac]:9} of ${mac:9} was heard, its channel was not: Recon has not listed that AP yet"$'\n'"resume the scan: the row gets its channel when the AP appears"
+        else LOG yellow "no channel known for ${mac:9}: nothing to lock on from this row"; fi ;;
+      "Disrupt n/a"*) LOG yellow "no associated BSS for ${mac:9}: nothing to attack from this row" ;;
       # A client the firmware gave no AP for: read it off the air first, then carry on into the menu
       # the operator asked for. A lookup that fails has said why, and the card redraws unchanged.
       "Disrupt (find AP"*) assoc_lookup "$mac" && disrupt_menu "$mac" ;;
       "Watch (find AP"*) assoc_lookup "$mac" && watch_menu "$mac" ;;
-      "Disrupt"*) assoc_refresh "$mac"; disrupt_menu "$mac" ;;
-      "Watch") assoc_refresh "$mac"; watch_menu "$mac" ;;
+      "Disrupt"*) disrupt_menu "$mac" ;;      # both menus look again first when the AP was learned a while ago
+      "Watch") watch_menu "$mac" ;;
       "Watch n/a"*) LOG "probe-only: identity + Locate only; Locate updates on probe bursts (15-60 s) and the MAC may rotate" ;;
       "Watch (no tcpdump)") LOG "tcpdump missing: opkg update; opkg install tcpdump" ;;
       "Locate") if [ "${ROLE[$mac]}" = cli ] && is_rand "$mac" && [ "${AP_OF[$mac]:--}" = "-" ]; then LOG "randomised probe-only MAC: Locate not offered"; else locate_target "$mac"; fi ;;
@@ -2129,7 +2169,7 @@ SOUND|bool|0|recon|ringtone on CONFIRMED
 AUTO_WATCH|bool|0|recon|offer Watch
 AUTO_LOCATE|bool|0|recon|offer Locate
 BAND6|bool|0|recon|also scan 6 GHz (restored at exit)
-ASSOC_CAP_SECS|int|2|recon|find-AP listen window, s
+ASSOC_CAP_SECS|int|2|recon|find-AP listen window, s (max 30)
 ASSOC_TTL|int|0|recon|learned AP trusted, s (0 = re-check)
 RESPONSE|bool|0|response|Disrupt rung (master switch)
 RESPONSE_CONFIRM|bool|0|response|confirm before any transmit
@@ -2161,6 +2201,13 @@ settings_apply() {   # settings_apply KEY VALUE -> live variable + persisted ove
   case "$key" in
     DEDUPE_H) DEDUPE_RUN=1 ;;
     BAND6) if [ "$val" = 1 ]; then bands_apply; else bands_restore; fi ;;   # takes effect now, not at the next start
+    ASSOC_CAP_SECS)                    # capped: persist what is in force so the menu and the next start agree
+      before=$ASSOC_CAP_SECS; assoc_clamp
+      if [ "$ASSOC_CAP_SECS" != "$before" ]; then
+        cfg_note_set ASSOC_CAP_SECS "$ASSOC_CAP_SECS"
+        command -v PAYLOAD_SET_CONFIG >/dev/null 2>&1 && PAYLOAD_SET_CONFIG "$PAYLOAD_NAME" ASSOC_CAP_SECS "$ASSOC_CAP_SECS" >/dev/null 2>&1
+        log cfg "set ASSOC_CAP_SECS=$ASSOC_CAP_SECS (clamp)"
+      fi ;;
     RESP_LOCK_SECS|RESP_SETTLE_SECS)   # the lock must outlast fire + settle: re-clamp, and if the clamp moved the lock
       before=$RESP_LOCK_SECS; resp_clamp_lock   # persist what is in force so the menu, the footer and the next start agree
       if [ "$RESP_LOCK_SECS" != "$before" ]; then
@@ -2737,6 +2784,9 @@ stimulus_test() {
 
 watch_menu() {
   local mac="$1"
+  # User payload only: an AP read off the air more than ASSOC_TTL ago is looked at again before it
+  # is acted on. Here rather than at the card, so the Watch offers of the scan funnel get it too.
+  command -v assoc_refresh >/dev/null 2>&1 && assoc_refresh "$mac"
   watchable "$mac" || { LOG "Watch n/a for ${mac:9}"; return 0; }
   WATCH_AGAIN=0; RUNS=()
   pick_list "Watch ${ID_LABEL[$mac]:-?} ${mac:9}" "Live view" "Live view" "Stimulus test (~90 s)" "Back" || return 0
@@ -3324,6 +3374,10 @@ disrupt_row() {   # a cached badge is free to show; an uncached one is not worth
 
 disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon says will work
   local mac="$1" badge opts k exp scope items=() pickmap=() i=0 choice
+  # User payload only (the hooks take the AP from the Recon selection): a client's AP that was read
+  # off the air more than ASSOC_TTL ago is looked at again before anything is aimed at it, on every
+  # path into this menu -- the card, the post-Watch funnel and AUTO_RESPOND alike.
+  command -v assoc_refresh >/dev/null 2>&1 && assoc_refresh "$mac"
   if ! resp_target "$mac"; then
     LOG red "nothing to attack: no associated BSS or no channel for $mac"; return 0
   fi
@@ -3403,7 +3457,7 @@ write_report() {
     printf '\n== vendor census (type: vendor count) ==\n'
     for mac in "${!ROLE[@]}"; do c="${VEND_TYPE[$mac]:-NONE}: ${VENDOR[$mac]:--}"; census[$c]=$(( ${census[$c]:-0} + 1 )); done
     for c in "${!census[@]}"; do printf '%s %s\n' "${census[$c]}" "$c"; done | sort -rn 2>/dev/null | head -60
-    printf '\n== AP -> clients (top 20 per AP; module clients marked *; BASE? = hidden AP with 1-4 clients on a module/mixed OUI) ==\n'
+    printf '\n== AP -> clients (top 20 per AP; module clients marked *; BASE? = hidden AP with 1-4 clients on a module/mixed OUI; <not listed> = an AP read off the air that Recon has not listed) ==\n'
     for mac in "${!AP_OF[@]}"; do ap="${AP_OF[$mac]}"; [ "$ap" != "-" ] && tree[$ap]+=" $mac"; done
     for ap in "${!tree[@]}"; do
       n2=0; line=""; local nonrand=0 base=""
@@ -3413,7 +3467,10 @@ write_report() {
         l="${mac:9}"; [ "${VEND_TYPE[$mac]}" = VENDOR_MODULE ] && l="*$l"; line+=" $l(${VENDOR[$mac]:0:6})"
       done
       if [ "${HIDDEN[$ap]}" = 1 ] && (( nonrand >= 1 && nonrand <= 4 )) && { [ "${VEND_TYPE[$ap]}" = VENDOR_MODULE ] || [ "${VEND_TYPE[$ap]}" = VENDOR_WEAK ]; }; then base=" BASE?"; fi
-      printf '%s %s %s [%s]%s:%s\n' "$ap" "${SSID_CLEAN[$ap]:-<hidden>}" "${VENDOR[$ap]:--}" "${BANDNAME[$ap]:-none}" "$base" "$line"
+      # <hidden> means Recon listed the AP and its SSID is empty; an AP with no row at all was named
+      # by a client's own frames and its beacon was never heard, which is a different finding
+      if [ -n "${ROLE[$ap]}" ]; then l="${SSID_CLEAN[$ap]:-<hidden>}"; else l='<not listed>'; fi
+      printf '%s %s %s [%s]%s:%s\n' "$ap" "$l" "${VENDOR[$ap]:--}" "${BANDNAME[$ap]:-none}" "$base" "$line"
     done | sort 2>/dev/null
     printf '\n== modules (check these) ==\n'
     for mac in "${!ROLE[@]}"; do [ "${BANDNAME[$mac]}" = MODULE ] && printf '%s %s %s %s%s\n' "$mac" "${VENDOR[$mac]:--}" "${PROX[$mac]:-?}" "${RSSI_LAST[$mac]:--}" "${BUSY[$mac]:+ busy}"; done | sort 2>/dev/null
@@ -4542,6 +4599,14 @@ IWFIX
      "$?:${AP_OF[aa:00:00:00:00:52]}:${CH[aa:00:00:00:00:52]:-none}:${ASSOC_CH[aa:00:00:00:00:52]:-none}" "0:aa:00:00:00:00:97:none:none"
   st "assoc lookup: so its Disrupt row says there is no channel, instead of transmitting on a guess" \
      "$(disrupt_row aa:00:00:00:00:52)" "Disrupt n/a (no channel)"
+  # lock_target takes a channel of 0 as "any channel will do", so a Watch here would park wherever
+  # the radio happened to be, warn about nothing, and loot a row for channel 0
+  st "assoc lookup: nor is Watch offered on it: with no channel the lock has nothing to verify against" \
+     "$(assoc_nochan aa:00:00:00:00:52 && echo nochan):$(watchable aa:00:00:00:00:52 && echo watchable)" "nochan:"
+  ROLE[aa:00:00:00:00:97]=ap; CH[aa:00:00:00:00:97]=11
+  st "assoc lookup: once Recon lists that AP the row has a channel again, and both come back" \
+     "$(assoc_nochan aa:00:00:00:00:52 && echo nochan):$(watchable aa:00:00:00:00:52 && echo watchable):$(disrupt_row aa:00:00:00:00:52)" ":watchable:Disrupt"
+  unset "ROLE[aa:00:00:00:00:97]" "CH[aa:00:00:00:00:97]"
   AP_OF[aa:00:00:00:00:52]=-; unset "ASSOC_BSS[aa:00:00:00:00:52]"; ST_LRC=3
   assoc_lookup aa:00:00:00:00:52 >/dev/null 2>&1
   st "assoc lookup: nor is one recorded behind a park that could not be read back" \
@@ -4549,7 +4614,7 @@ IWFIX
   AP_OF[aa:00:00:00:00:52]=-; unset "ASSOC_BSS[aa:00:00:00:00:52]"; ST_LRC=0
   assoc_lookup aa:00:00:00:00:52 >/dev/null 2>&1
   st "assoc lookup: a verified park is the one case where the channel listened on is the BSS's" \
-     "$?:${AP_OF[aa:00:00:00:00:52]}:${CH[aa:00:00:00:00:52]:-none}" "0:aa:00:00:00:00:97:6"
+     "$?:${AP_OF[aa:00:00:00:00:52]}:${CH[aa:00:00:00:00:52]:-none}:$(watchable aa:00:00:00:00:52 && echo watchable)" "0:aa:00:00:00:00:97:6:watchable"
   ST_LRC=2; assoc_lookup aa:00:00:00:00:52 >/dev/null 2>&1
   st "assoc lookup: the same AP heard again across the hop keeps the channel that was verified" \
      "$?:${AP_OF[aa:00:00:00:00:52]}:${CH[aa:00:00:00:00:52]:-none}:${ASSOC_CH[aa:00:00:00:00:52]:-none}" "0:aa:00:00:00:00:97:6:6"
@@ -4569,6 +4634,9 @@ IWFIX
   assoc_learn aa:00:00:00:00:31 "$ASB" 36 air
   st "assoc learn: an AP the firmware supplied is not overwritten" \
      "${AP_OF[aa:00:00:00:00:31]}:${ASSOC_BSS[aa:00:00:00:00:31]}" "aa:00:00:00:00:30:$ASB"
+  unset "CH[aa:00:00:00:00:31]" "CH[aa:00:00:00:00:30]"
+  st "assoc: a firmware-supplied AP with no channel is not the no-channel state: Watch locks by BSSID there, as in the hooks" \
+     "$(assoc_nochan aa:00:00:00:00:31 && echo nochan):$(watchable aa:00:00:00:00:31 && echo watchable)" ":watchable"
   assoc_learn aa:00:00:00:00:32 "$ASB" 0 members
   st "assoc learn: a station with no row is remembered for run_cycle, and no row is invented" \
      "${ASSOC_BSS[aa:00:00:00:00:32]}:${ROLE[aa:00:00:00:00:32]:-none}" "$ASB:none"
@@ -4591,7 +4659,9 @@ IWFIX
   RESP_MEMBERS=(); RESP_MEMBERS[ec:71:db:00:00:12]=1; RESP_MEMBERS[aa:00:00:00:00:33]=1; RESP_MEMBERS_BSS="$ASB"
   rm -f "$tmp/events.log"; assoc_learn_members "$ASB"
   st "assoc members: a membership capture gives each client row it heard its AP" \
-     "${AP_OF[ec:71:db:00:00:12]}:${CH[ec:71:db:00:00:12]}:${ASSOC_SRC[ec:71:db:00:00:12]}:$(grep -c "members of $ASB: 2 station" "$tmp/events.log")" "$ASB:36:members:1"
+     "${AP_OF[ec:71:db:00:00:12]}:${CH[ec:71:db:00:00:12]}:${ASSOC_SRC[ec:71:db:00:00:12]}" "$ASB:36:members"
+  st "assoc members: the log says how many were heard and how many client rows now carry the AP (one of the two has no row)" \
+     "$(grep -c "members of $ASB: 2 heard, 1 client row(s) now carry this AP" "$tmp/events.log")" "1"
   AP_OF[ec:71:db:00:00:12]=-; unset "ASSOC_BSS[ec:71:db:00:00:12]"
   assoc_learn_members aa:00:00:00:00:99
   st "assoc members: a set gathered for another BSSID teaches nothing" "${AP_OF[ec:71:db:00:00:12]}" "-"
@@ -4616,18 +4686,57 @@ IWFIX
   ASSOC_TTL=0
   st "assoc refresh: ASSOC_TTL=0 looks every time" "$(assoc_stale "$AS1" && echo stale)" "stale"
   ASSOC_TTL=300
+  # The re-check lives in the two menus, not at the card, so the scan funnel's Watch offers, the
+  # post-Watch Disrupt offer and AUTO_RESPOND get it as well. LIST_PICKER is stubbed to cancel, so
+  # watch_menu returns at its picker; the AP row has no channel, so disrupt_menu returns at resp_target.
+  local _orf; _orf=$(declare -f assoc_refresh)
+  assoc_refresh() { printf '%s ' "$1" >>"$tmp/refresh"; }
+  st_device aa:00:00:00:00:70 ap "Acme" "NoChan" 0; unset "CH[aa:00:00:00:00:70]"
+  rm -f "$tmp/refresh"; watch_menu "$AS1" >/dev/null 2>&1; disrupt_menu aa:00:00:00:00:70 >/dev/null 2>&1
+  st "assoc refresh: Watch and Disrupt both look again on the way in, whichever path opened them" \
+     "$(cat "$tmp/refresh" 2>/dev/null)" "$AS1 aa:00:00:00:00:70 "
+  eval "$_orf"
+  # the listen window has a ceiling as well as a floor: it parks the radio and holds the screen
+  local _cn="$CFG_NOTE" _co=$CFG_OVERRIDES
+  ASSOC_CAP_SECS=500; assoc_clamp >/dev/null 2>&1; st "assoc clamp: a listen window above the ceiling is capped" "$ASSOC_CAP_SECS" "30"
+  ASSOC_CAP_SECS=1; assoc_clamp >/dev/null 2>&1;   st "assoc clamp: one below the floor is raised" "$ASSOC_CAP_SECS" "2"
+  ASSOC_CAP_SECS=6; assoc_clamp >/dev/null 2>&1;   st "assoc clamp: one in range is left alone" "$ASSOC_CAP_SECS" "6"
+  settings_apply ASSOC_CAP_SECS 500 >/dev/null 2>&1
+  st "settings: a capped listen window is what is in force, and what the override note says" \
+     "$ASSOC_CAP_SECS:$(printf '%s' "$CFG_NOTE" | grep -c 'ASSOC_CAP_SECS=30')" "30:1"
+  ASSOC_CAP_SECS=500; load_overrides >/dev/null 2>&1
+  st "assoc clamp: runs from load_overrides too, so a config-block edit is covered" "$ASSOC_CAP_SECS" "30"
+  CFG_NOTE="$_cn"; CFG_OVERRIDES=$_co; ASSOC_CAP_SECS=4
+  # the card's two rows, for the three states a client row can be in. LIST_PICKER records what it was
+  # handed and cancels, so detail_card draws once and returns.
+  local _resp=$RESPONSE; RESPONSE=1
+  LIST_PICKER() { printf '%s\n' "$*" >>"$tmp/picker"; return 1; }
+  st_device aa:00:00:00:00:53 cli "Acme" "" 0; unset "CH[aa:00:00:00:00:53]" "FREQ[aa:00:00:00:00:53]"
+  assoc_learn aa:00:00:00:00:53 aa:00:00:00:00:94 0 air          # heard across the hop, on an AP Recon has not listed
+  rm -f "$tmp/picker"
+  detail_card aa:00:00:00:00:21 >/dev/null 2>&1; detail_card aa:00:00:00:00:53 >/dev/null 2>&1; detail_card "$AS1" >/dev/null 2>&1
+  st "card: no AP offers the lookup on both rows; an AP with no channel says so on both; a resolved client gets Watch and Disrupt" \
+     "$(grep -c ' 00:00:21 Watch (find AP first) Disrupt (find AP first) Locate ' "$tmp/picker" 2>/dev/null):$(grep -c ' 00:00:53 Watch n/a (no channel) Disrupt n/a (no channel) Locate ' "$tmp/picker" 2>/dev/null):$(grep -c " ${AS1:9} Watch Disrupt Locate " "$tmp/picker" 2>/dev/null)" "1:1:1"
+  LIST_PICKER() { return 1; }; RESPONSE=$_resp
+  # the report: an AP named only by a client's own frames is not a hidden-SSID AP
+  _f2=$( RUN_ID=st7m; CYCLE=1; RUN_T0=$EPOCHSECONDS; write_report quiet >/dev/null 2>&1      # a quiet report is skipped before the first cycle
+         printf '%s:%s' "$(grep -c '^aa:00:00:00:00:97 <not listed> ' "$tmp/report_st7m.txt" 2>/dev/null)" "$(grep -c "^$ASB ReoKit " "$tmp/report_st7m.txt" 2>/dev/null)" )
+  st "report: an AP read off the air that Recon never listed is <not listed>, not <hidden>; a listed one keeps its SSID" "$_f2" "1:1"
+  rm -f "$tmp/report_st7m.txt"
   # run_cycle: the firmware's client row says "-" every cycle, so the learned AP is re-applied there
   _f2=$( recon_lines() { case "$1" in
            APS) printf '%s|9|ReoKit|36|5180|-50|0|5\n' "$ASB" ;;
-           CLIENTS) printf '%s|-|7|-60||2437|5|0\naa:00:00:00:00:31|aa:00:00:00:00:30|7|-60||2437|5|0\naa:00:00:00:00:41|-|7|-60||2437|5|0\n' "$AS4" ;;
+           CLIENTS) printf '%s|-|7|-60||2437|5|0\naa:00:00:00:00:31|aa:00:00:00:00:30|7|-60||2437|5|0\naa:00:00:00:00:41|-|7|-60||2437|5|0\naa:00:00:00:00:61|aa:00:00:00:00:60|7|-60||2437|5|0\n' "$AS4" ;;
          esac; }
          gps_tick() { :; }; battery_tick() { :; }; upsert_inventory() { :; }; write_report() { :; }
          ASSOC_BSS=(); ASSOC_CH=(); AP_OF=(); CH=()
          assoc_learn "$AS4" "$ASB" 36 air; assoc_learn aa:00:00:00:00:31 "$ASB" 36 air; assoc_learn aa:00:00:00:00:41 aa:00:00:00:00:40 44 air
+         assoc_learn aa:00:00:00:00:61 aa:00:00:00:00:62 44 air      # heard on one AP; the firmware then names another, with no row of its own
          run_cycle >/dev/null 2>&1
-         printf '%s|%s|%s|%s|%s|%s' "${AP_OF[$AS4]}" "${CH[$AS4]}" "${CLIENTS_OF[$ASB]}" "${AP_OF[aa:00:00:00:00:31]}" "${AP_OF[aa:00:00:00:00:41]}" "${CH[aa:00:00:00:00:41]}" )
-  st "run_cycle: a learned AP survives the firmware's '-', feeds the kit list, yields to a firmware one, and brings its channel" \
-     "$_f2" "$ASB|36| $AS4|aa:00:00:00:00:30|aa:00:00:00:00:40|44"
+         printf '%s|%s|%s|%s|%s|%s|%s|%s' "${AP_OF[$AS4]}" "${CH[$AS4]}" "${CLIENTS_OF[$ASB]}" "${AP_OF[aa:00:00:00:00:31]}" "${AP_OF[aa:00:00:00:00:41]}" "${CH[aa:00:00:00:00:41]}" \
+                "${AP_OF[aa:00:00:00:00:61]}" "${CH[aa:00:00:00:00:61]:-none}" )
+  st "run_cycle: a learned AP survives the firmware's '-', feeds the kit list, yields to a firmware one, and brings its channel only to its own AP" \
+     "$_f2" "$ASB|36| $AS4|aa:00:00:00:00:30|aa:00:00:00:00:40|44|aa:00:00:00:00:60|none"
   # the real capture, once, against a tcpdump that writes a file: the filter and the bookkeeping
   eval "$_oc"; unset -f sleep; CHILD_FILE="$tmp/children"; : >"$CHILD_FILE"
   tcpdump() { local o=''; printf '%s\n' "$*" >>"$tmp/tcpargs"; while [ $# -gt 0 ]; do [ "$1" = -w ] && o="$2"; shift; done; printf 'x' >"$o"; sleep 2; }

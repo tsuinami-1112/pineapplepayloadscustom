@@ -51,9 +51,10 @@ card with no AP offers **`Watch (find AP first)`** and **`Disrupt (find AP first
 pauses Recon for about nine seconds, parks the radio on the channel the client was last heard on,
 listens for the client's own data frames, and reads the BSSID from them. Then it carries on into the
 menu you picked. The answer is kept for the run — the inventory, the kit tags and the report's
-AP→client tree pick it up at the next cycle — and it is looked at again before use once it is older
-than `ASSOC_TTL`. An AP-row Disrupt does the same for every client it hears on that AP. When the
-lookup finds nothing it says why and the card is unchanged:
+AP→client tree pick it up at the next cycle — and once it is older than `ASSOC_TTL` it is looked at
+again whenever Watch or Disrupt opens on that client, from the card or from one of the automatic
+offers. An AP-row Disrupt does the same for every client it hears on that AP. When the lookup finds
+nothing it says why and the card is unchanged:
 
 | It says | It means |
 |---|---|
@@ -62,6 +63,11 @@ lookup finds nothing it says why and the card is unchanged:
 | `talks to X (n) and Y (m): not deciding` | two BSSIDs, neither clearly ahead (a roam, or a mesh). Nothing is recorded |
 | `not parked on ch N` then `listening across the hop instead` | the radio would not hold the channel, so it listens while hopping for three times as long. Slower and less likely to hear a quiet client, not broken |
 | `snap … too small for radiotap …` | raise `CLI_CAP_SNAP` |
+
+One more state follows a lookup that had to listen across the hop: the AP was heard, but Recon has
+not listed it yet, so its channel is not known. The card then reads `Watch n/a (no channel)` and
+`Disrupt n/a (no channel)` rather than acting on a guess. Resume the scan; the row gets its
+channel as soon as Recon lists that AP.
 
 *Laptop-verified only: none of this has run on a Pager yet. There is no background pass — the
 lookup parks the radio, so it happens only on a row you pick.*
@@ -243,7 +249,7 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 | AUTO_WATCH_RSSI | -72 | | minimum last RSSI to auto-offer Watch |
 | RSSI_MIN | 0 | * | optional list gate, dBm, on the best RSSI known for the MAC, carried-over best included (0 = widest net; a kit AP passes when a kit client does) |
 | BAND6 | 0 | * | also scan 6 GHz: writes the device's bands plus 6 for this run, trusted only when the radio is then seen on a 6 GHz channel (or uci reads it back); every issued write is put back at exit, by the watchdog if the run is killed, or at the next start; 2.4 GHz dwell drops to about a third. On bare 1.1.3 the write was a no-op with pineapd running (day-one 8c), and the status line says so |
-| ASSOC_CAP_SECS | 6 | * | how long the find-AP lookup listens for one client's own frames (floor 2); three times this when the radio will not park |
+| ASSOC_CAP_SECS | 6 | * | how long the find-AP lookup listens for one client's own frames (2 to 30; a larger value is capped); three times this when the radio will not park |
 | ASSOC_TTL | 300 | * | seconds an AP learned off the air is trusted before Watch or Disrupt looks again (0 = look every time) |
 | SOUND | 0 | * | ringtone on CONFIRMED |
 | SHOW_MODULES | 1 | | modules list in the menu |
