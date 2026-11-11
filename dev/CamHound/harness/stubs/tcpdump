@@ -54,7 +54,11 @@ if [ "$mem" = 3 ] || [ "$mem" = 4 ]; then
     # HARNESS_ASSOC_TWO=1: the client is heard talking to a second BSSID as often -> AMBIGUOUS
     [ -n "${HARNESS_ASSOC_TWO:-}" ] && blist="$blist b0a7b9000001 b0a7b9000001 b0a7b9000001"
     for b in $blist; do
-      fr="${rt}08010000${b}${s12}${b}0000"; fl=$(( ${#fr} / 2 ))      # ToDS: addr1 the BSSID, addr2 the client
+      fr="${rt}08010000${b}${s12}${b}0000"                           # ToDS: addr1 the BSSID, addr2 the client
+      # HARNESS_ASSOC_DOWN=1: only the AP is heard, sending TO the client (FromDS: addr1 the client, addr2 the
+      # BSSID) -- what is on the air after the client has left and before the AP gives up on it -> NO_UPLINK
+      [ -n "${HARNESS_ASSOC_DOWN:-}" ] && fr="${rt}08020000${s12}${b}${b}0000"
+      fl=$(( ${#fr} / 2 ))
       hex+="$(le32h 0)$(le32h 0)$(le32h $fl)$(le32h $fl)$fr"
     done
   fi

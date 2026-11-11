@@ -6,7 +6,7 @@ disconnection. `PLAN_v2.md` covers the recon side; this covers everything downst
 Status: coded, laptop-verified, and **transmitting on hardware since 2026-11-05** — a Disrupt ran the
 whole chain from the user payload on the 1.1.3 unit (CLAUDE.md "Second contact"), and since
 2026-11-10 an AP row fires even when the capture recovers nobody (below). `--selftest` last passed on
-the Pager at 259/0 (2026-11-04); the suite is 430 checks on the laptop as of 2026-11-11. The selftest
+the Pager at 259/0 (2026-11-04); the suite is 454 checks on the laptop as of 2026-11-11. The selftest
 still stubs every device-changing command, so section [What is unverified](#what-is-unverified)
 remains the honest list of what the bench has not measured.
 
@@ -693,7 +693,7 @@ What changed for this rung, and what did not:
 | user-payload client row, lookup hears nothing | — | the card is unchanged and the reason is logged (`assoc <mac> none why=…`); nothing transmits |
 | user-payload client row, AP heard but its channel not known | — | `Disrupt n/a (no channel)`: across the hop, or behind a park that could not be read back, the channel listened on is not recorded, and an AP Recon has not listed has none of its own. `resp_target` returns 1 as it always did for a row with no channel; the row gets one when Recon lists the AP |
 | a learned AP older than `ASSOC_TTL`, any path into this menu | — | `disrupt_menu` calls `assoc_refresh` first (behind `command -v`), so the card, the post-Watch funnel and `AUTO_RESPOND` all look again before anything is aimed at it |
-| user-payload **AP** row | fires, membership from the air | unchanged — and `resp_members`' success path now hands the stations it heard to `assoc_learn_members` (behind `command -v`: the function is not in the hooks), so their client rows carry this AP afterwards |
+| user-payload **AP** row | fires, membership from the air | unchanged — and `resp_members`' success path now hands the stations it heard to `assoc_learn_members` (behind `command -v`: the function is not in the hooks), so the client rows of those it heard **transmitting** carry this AP afterwards; a member the AP was only sending to stays a member for the attack and is not taught (2026-11-11: it may have left, and after a Disrupt that worked it has) |
 | both Recon **hooks** | association from `_RECON_SELECTED_*` | unchanged in behaviour. `CLI_AWK` gained a `mode=pairs` branch in the lib block, so the hooks' lib hash moved; the membership walk beside it is byte-for-byte the same decode and is pinned by the selftest's `pairs: the membership walk beside it is unchanged` |
 
 Four things in this rung are touched. Three were agreed with this file's owner beforehand: the
@@ -706,7 +706,8 @@ re-checks a stale learned AP. All four are no-ops in the hooks. Nothing in `resp
 
 **What is NOT established, because nothing here has run on a device:** that
 `PINEAPPLE_EXAMINE_CHANNEL` parks the radio without a preceding `EXAMINE_BSSID` (every measured
-park issued both; the lookup reads the park back and falls back to listening across the hop), and
+park began with `EXAMINE_BSSID`, and `lock_target` adds the channel command only when the BSSID step
+did not already land on the channel; the lookup reads the park back and falls back to listening across the hop), and
 that a camera's uplink is heard within the 6 s window. `dev/pager-day-one.md` 8d is the bench
 check. *Falsified by:* a client-row Disrupt whose loot row names a BSSID the client is not
 associated to.

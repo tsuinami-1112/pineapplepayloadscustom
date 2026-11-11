@@ -839,10 +839,15 @@ pcap_stream() { if command -v hexdump >/dev/null 2>&1; then hexdump -v -e '1/1 "
 # subject -- and one AP subject reading NO_EFFECT drags the whole attempt to NO_EFFECT.
 # Emits keyed lines for the caller to read IN THE PARENT SHELL: ITMAX/RECS/SHORT/CLI.
 # With -v mode=pairs it answers the INVERSE question -- which BSSID each station talks to, or only
-# -v sta=<mac> -- as "PAIR <sta> <bssid> <n>" for every pair seen at least twice (assoc_lookup). It
-# is the same DS-bit decode with nothing held fixed: no bss is needed, a group-addressed or own
+# -v sta=<mac> -- as "PAIR <sta> <bssid> <n> <up>" for every pair seen at least twice (assoc_lookup).
+# It is the same DS-bit decode with nothing held fixed: no bss is needed, a group-addressed or own
 # address on either side is never a pair, and neither is a frame whose two addresses are equal.
-# With mode unset the membership walk below is untouched.
+# <up> is how many of the <n> frames the STATION transmitted (ToDS). The other direction is the AP
+# transmitting to it, which an AP goes on doing after the station has left, so a caller that asks
+# "where is this station NOW" must not take <n> alone for an answer. The membership walk admits the
+# same stations it always did (CLI lines, either direction) and adds one "UP <sta> <up>" line for
+# each of them that was heard transmitting, for the same reason; a caller that reads only CLI lines
+# sees no difference.
 CLI_AWK='
 function mac(o) { return sprintf("%02x:%02x:%02x:%02x:%02x:%02x", p[o], p[o+1], p[o+2], p[o+3], p[o+4], p[o+5]) }
 function u16(a, b) { return be ? a * 256 + b : b * 256 + a }
@@ -890,6 +895,7 @@ BEGIN { st = 0; i = 0; itmax = 0; recs = 0; short = 0 }
       if (p[bo] % 2 == 1 || p[co] % 2 == 1) break
       if (index(own, " " c " ") > 0 || index(own, " " b " ") > 0) break
       pair[c " " b]++
+      if (ds == 1) pup[c " " b]++
       break
     }
     if (b != bss) break
@@ -897,6 +903,7 @@ BEGIN { st = 0; i = 0; itmax = 0; recs = 0; short = 0 }
     if (p[co] % 2 == 1) break
     if (index(own, " " c " ") > 0) break
     seen[c]++
+    if (ds == 1) sup[c]++
   } while (0)
   st = 1; i = 0
 }
@@ -905,7 +912,8 @@ END { if (bad) exit 1
   print "ITMAX " itmax; print "RECS " recs; print "SHORT " short
   print "TRUNC " trunc + 0; print "RUNT " runt + 0; print "SNAP " snap + 0
   for (c in seen) if (seen[c] >= 2) print "CLI " c
-  for (k in pair) if (pair[k] >= 2) print "PAIR " k " " pair[k] }'
+  for (c in sup) if (seen[c] >= 2) print "UP " c " " sup[c]
+  for (k in pair) if (pair[k] >= 2) print "PAIR " k " " pair[k] " " pup[k] + 0 }'
 
 # bss_clients <pcap> <bssid> -> keyed lines on stdout; rc 1 when the file is unreadable or not a pcap.
 # PARSE IT IN THE PARENT SHELL: the counts have to reach the caller, and a pipe or < <(...) would
@@ -2022,7 +2030,7 @@ resp_members() {
   RESP_MEMBERS_BSS="$bss"
   # The same fact read the other way: every station heard here talks to this BSSID. The user payload
   # keeps it as each of those client rows' AP (assoc_learn_members); the hooks carry no such function.
-  command -v assoc_learn_members >/dev/null 2>&1 && assoc_learn_members "$bss"
+  command -v assoc_learn_members >/dev/null 2>&1 && assoc_learn_members "$bss" "$out"
   return 0
 }
 resp_snapshot() {

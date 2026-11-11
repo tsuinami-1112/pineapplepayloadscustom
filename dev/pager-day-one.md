@@ -146,7 +146,8 @@ Two steps; the first needs no CamHound at all. Every command below is quote-free
    ```
    | line | reads as |
    |---|---|
-   | `assoc <mac> -> <bssid> n=N recs=R itmax=56 ch=C lock=ok dwell=Ns` | found; check the BSSID is the AP you expected. `itmax` should be 56 on this hardware (Second contact) |
+   | `assoc <mac> -> <bssid> n=N up=U recs=R itmax=56 ch=C lock=ok dwell=Ns` | found; check the BSSID is the AP you expected. `itmax` should be 56 on this hardware (Second contact). `up` is how many of the N frames the client itself sent; it is never 0 on this line |
+   | `assoc <mac> none why=NO_UPLINK … down=<bssid>/K` | that AP was heard sending K frames to the client and the client itself was not heard, so nothing was named. For a phone that is mid-download on the bench this would be a finding worth keeping the capture for: it means the Pager hears the AP and not the client, and the own-frames rule is costing a real answer |
    | `… lock=hop …` | step 1's negative answer, seen from inside the payload |
    | `assoc <mac> none why=NO_FRAMES … ch=C` | not heard on channel C. If the phone was transmitting and C is its AP's channel, that is a defect in the filter or the window, and the raw material is worth keeping: repeat with `tcpdump -i wlan1mon -c 20 -e type data and wlan addr2 <mac>` under the same lock |
    | `EXAMINE_CHANNEL C said: …` | the firmware refused the channel lock and said why |

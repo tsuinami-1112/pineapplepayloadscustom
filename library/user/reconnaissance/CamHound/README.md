@@ -53,14 +53,17 @@ listens for the client's own data frames, and reads the BSSID from them. Then it
 menu you picked. The answer is kept for the run — the inventory, the kit tags and the report's
 AP→client tree pick it up at the next cycle — and once it is older than `ASSOC_TTL` it is looked at
 again whenever Watch or Disrupt opens on that client, from the card or from one of the automatic
-offers. An AP-row Disrupt does the same for every client it hears on that AP. When the lookup finds
-nothing it says why and the card is unchanged:
+offers. An AP-row Disrupt does the same for every client it hears transmitting to that AP. Only the
+client's own frames count as evidence of where it is: an AP keeps sending to a client for a while
+after the client has gone, which is exactly what is on the air after a Disrupt that worked. When the
+lookup finds nothing it says why and the card is unchanged:
 
 | It says | It means |
 |---|---|
 | `not heard on ch N in 6s` | no data frame from the client on that channel in the window. An idle or sleeping camera, or a client last heard off its AP's channel. **Not** "unassociated". Try again while it is busy |
 | `heard on ch N (k frames) but no AP twice` | too little to name an AP from. Try again |
-| `talks to X (n) and Y (m): not deciding` | two BSSIDs, neither clearly ahead (a roam, or a mesh). Nothing is recorded |
+| `itself not heard on ch N: only X sending to it (k frames)` | AP X is transmitting to the client and the client is not answering: it has left X, moved channel, or is out of earshot. Nothing is recorded. If you have just disconnected it, rescan and look again |
+| `talks to X (n) and Y (m): not deciding` | the client sent n frames to X and m to Y, neither clearly ahead (a roam, or a mesh). Nothing is recorded |
 | `not parked on ch N` then `listening across the hop instead` | the radio would not hold the channel, so it listens while hopping for three times as long. Slower and less likely to hear a quiet client, not broken |
 | `snap … too small for radiotap …` | raise `CLI_CAP_SNAP` |
 
