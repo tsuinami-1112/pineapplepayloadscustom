@@ -132,8 +132,16 @@ lookup parks the radio, so it happens only on a row you pick.*
    Watch is greyed, and a BSS-wide Disrupt from an AP row cannot list the clients it hits — it still
    fires its broadcast frame and records `INCONCLUSIVE`), `/lib/hak5/oui.txt`.
 7. Worth doing once, before anything else: `bash payload.sh --selftest` **on the Pager**. It
-   transmits nothing and changes nothing, and it is the only run that exercises the `od` parsing
-   path the device actually uses — a laptop with `hexdump` never takes that branch.
+   transmits nothing and changes nothing — every device command is stubbed, and its loot and its
+   child list live in a temp directory of its own — and it is the one run that puts the parsers
+   through the device's own BusyBox `awk`, `hexdump` and `jq`, which a laptop only imitates. (An
+   earlier version of this step said it exercised an `od` path: there is no `od` on a Pager, and
+   that fallback exists for laptops without `hexdump`.)
+8. With `RECON_FRESH` at its default, launching asks Recon for a **fresh session**, so the lists
+   show what is transmitting now rather than everything heard since boot. The start screen says
+   `fresh Recon session requested`; if the firmware refuses it says `not confirmed` with the
+   firmware's reason, and the run may list what Recon already held. This wipes the Recon session
+   for anything else using it; `RECON_FRESH 0` leaves it alone.
 
 ## Quick start, the two-button flow
 
@@ -149,7 +157,19 @@ lookup parks the radio, so it happens only on a row you pick.*
   client whose AP is not known the first two read `Watch (find AP first)` and
   `Disrupt (find AP first)` — see "What it cannot see".
 - **Unidentified modules: check these** lists Espressif/Realtek/Liteon-class clients sorted busy-first.
-  They are not cameras until Watched.
+  They are not cameras until Watched. Rows read `mac vendor proximity`, with ` busy` and ` KIT?`
+  when they apply: `c0ffee000003 Espress N`. The MAC is whole because it is what the row is picked
+  by; the vendor name is what gives way, so the proximity and the two markers always fit.
+- **Other devices** lists what was heard in the room and is in neither list above: an AP no
+  signature names, a module AP, an unscored client. Rows read `A|c label proximity rssi`, e.g.
+  `A bebird-R1-0386 N-26` = an AP, fourteen characters of its SSID (else its vendor, else its MAC), NEAR, -26 dBm. FAR and
+  unheard devices are left out, so it is the room and not the building, and two devices that
+  would draw the same row get the tail of their MAC appended. Picking a row opens the same card
+  with the cursor on Watch; a device Watched into a STREAM verdict scores its way into Review hits
+  and leaves this list, so it drains as you work through it.
+- **Proximity in all three lists is as of the last scan cycle.** A device reads `?` once it has
+  gone 90 s without being heard, counted up to that cycle and not while you are reading a list —
+  the lists are only ever drawn with the scan paused. The card's `Ns ago` is the wall-clock age.
 - **Mode**: `ROOM` (default: vibrate on everything LIKELY, proximity -60/-75 dBm) or `SITE` (floor
   walk: FAR rows do not vibrate, -70/-85 dBm). Mode never changes what is listed.
 - **Write report** renders `/root/loot/CamHound/report_<run>.txt` now; it is also written every 15

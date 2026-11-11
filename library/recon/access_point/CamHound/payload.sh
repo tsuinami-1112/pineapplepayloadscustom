@@ -1260,7 +1260,11 @@ rssi_gate_own() { [[ ${RSSI_BEST[$1]:-x} =~ ^-?[0-9]+$ ]] || return 0; (( ${RSSI
 prox_of() {
   local mac="$1" best=-999 r near=$NEAR_DBM far=$FAR_DBM
   for r in ${RSSI_HIST[$mac]}; do [ "$r" = "-" ] && continue; (( r > best )) && best=$r; done
-  if (( best == -999 )) || (( EPOCHSECONDS - ${LAST_SEEN[$mac]:-0} > 90 )); then PROX[$mac]="?"; return; fi
+  # Stale = unheard for 90 s AS OF THE LAST SCAN CYCLE. Against the wall clock, every device went
+  # stale together 90 s after scanning stopped -- which is whenever the operator is in a menu, the
+  # only place the lists are drawn -- and "Other devices", which keeps N and M only, drew empty.
+  # LAST_CYCLE_TS is run_cycle's; unset (no cycle yet, the Recon hooks) the wall clock stands in.
+  if (( best == -999 )) || (( ${LAST_CYCLE_TS:-$EPOCHSECONDS} - ${LAST_SEEN[$mac]:-0} > 90 )); then PROX[$mac]="?"; return; fi
   [ "${BAND[$mac]}" = 5 ] || [ "${BAND[$mac]}" = 6 ] && { near=$((near - 7)); far=$((far - 7)); }
   [ "${ROLE[$mac]}" = cli ] && { near=$((near - 6)); far=$((far - 6)); }
   if (( best >= near )); then PROX[$mac]="N"; elif (( best < far )); then PROX[$mac]="F"; else PROX[$mac]="M"; fi

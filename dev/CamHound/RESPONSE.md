@@ -6,7 +6,7 @@ disconnection. `PLAN_v2.md` covers the recon side; this covers everything downst
 Status: coded, laptop-verified, and **transmitting on hardware since 2026-11-05** — a Disrupt ran the
 whole chain from the user payload on the 1.1.3 unit (CLAUDE.md "Second contact"), and since
 2026-11-10 an AP row fires even when the capture recovers nobody (below). `--selftest` last passed on
-the Pager at 259/0 (2026-11-04); the suite is 454 checks on the laptop as of 2026-11-11. The selftest
+the Pager at 259/0 (2026-11-04); the suite is 468 checks on the laptop as of 2026-11-11. The selftest
 still stubs every device-changing command, so section [What is unverified](#what-is-unverified)
 remains the honest list of what the bench has not measured.
 

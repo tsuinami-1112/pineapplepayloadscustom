@@ -72,6 +72,10 @@ s_live() {   # Live view on the Reolink NVR AP -> STREAM, conf 80 -> 100
   check "live: EXAMINE lock released" "grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log"
   check "live: no lock file, no tcpdump left" "[ ! -e /tmp/cs_run.pid ] && [ \"\$(pgrep -x tcpdump | wc -l)\" = 0 ]"
   check "live: watched row reaches 100 in inventory" "grep -q '|ec:71:db:00:00:10|ap|NVRKIT|[^|]*|REO-OUI|100|' $LOOT/inventory.tsv"
+  # RECON_FRESH (default 1): one request at launch, logged as a request. It used to be logged as "previous recon
+  # list discarded", which the payload cannot know: the command's stderr was thrown away and its rc is always 0.
+  check "live: a fresh Recon session is asked for once at launch, and logged as asked for, not as done" \
+    "[ \"\$(grep -c '^PINEAPPLE_RECON_NEW' $T/log)\" = 1 ] && grep -q ' recon RECON_FRESH: new session requested at start\$' $LOOT/events.log && ! grep -q 'discarded' $LOOT/events.log"
 }
 s_stimulus() {   # Stimulus test on the Wyze client -> EVENT
   reset; rules stim '^CamHound' 'Scan,Exit' 'Review hits' '8,Exit' '^[0-9]+ WYZE' 'Watch,Back' '^Watch ' 'Stimulus test (~90 s)' '^(STREAM|EVENT|NONE|IDLE|DOWN|QUIET)' 'Back' "${COMMON[@]}"

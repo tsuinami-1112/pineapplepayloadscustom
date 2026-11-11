@@ -71,7 +71,7 @@ bash dev/CamHound/harness/run_harness.sh                            # ALL 16 sce
 ```
 
 **The harness argument is a scenario filter, not a mode.** `run_harness.sh live` runs the `live`
-scenario alone - 5 checks of 138 - and still prints `0 failure(s)`, which reads exactly like a full
+scenario alone - 6 checks of 139 - and still prints `0 failure(s)`, which reads exactly like a full
 pass. This gate list said `live` until 2026-11-04 and every session that copied it was running a
 fourteenth of the suite (sixteenth now). No argument (or `all`) runs them all; a scenario name runs one,
 which is what you want while iterating, never for the gate.
@@ -121,6 +121,28 @@ beacon nor answer probes) where `RECON CLIENTS` is refused, as on 1.1.3; `bands_
 the write is trusted only when 6 GHz is seen there or in uci — on bare 1.1.3 it was a no-op with
 pineapd running, day-one 8c; every issued write is restored in `cleanup`, by the watchdog, or by
 `bands_recover` at the next start from `BANDS_STATE`; not copied into the hooks); `raw_up_rows` feeds `--replay` a `raw_<run>.txt`.
+
+**The three lists** — `sort_macs hits|modules|other` feeds `review_list`, `modules_list` and
+`other_list` ("Other devices": the complement of the first two, gated on proximity, added
+2026-11-09 because an AP no signature names was in no list and so could not be Watched). All three
+dispatch on the row's *text*, so a row must be unique: `review_list` and, since 2026-11-11,
+`other_list` append the MAC tail to a repeat (two APs under one SSID at one RSSI drew one row
+there, and the second could not be opened); `modules_list` rows begin with the whole MAC, and its
+vendor name gives way to the suffix — a fixed eight characters put the row at 23 against
+`ROW_W` = 22 and cut the proximity letter, `busy` and `KIT?` off every "Espressi" row.
+**`prox_of` goes stale against the last scan cycle (`LAST_CYCLE_TS`, set by `run_cycle`), not
+the wall clock**: the lists are only drawn with the scan paused, so against the wall clock every
+row read `?` together 90 s after the last cycle and "Other devices", which keeps N and M only,
+drew empty. Unset (no cycle yet; the Recon hooks) the wall clock stands in. *Falsified by:* a
+device that left the room staying N or M across cycles — the stamp moves each cycle, so it should
+not. `vendor_prefetch` resolves a cycle's vendors in one `awk` pass over the OUI table (one failed
+`grep` per device was the 33-81 minute cycle of Second contact); the selftest's "structural gate"
+on that counts greps in a **file**, because the grep runs inside `$( )` and the shell-variable
+counter it used until 2026-11-11 read 0 whatever the code did. `recon_fresh_start` is
+`RECON_FRESH`'s one call: it reads the command's stderr and logs that a session was *requested*,
+or what the firmware said instead — the line it replaces logged "previous recon list discarded",
+which the payload could not know. These five are findings 0, 1, 2, 6 and 13 of the review of
+`cd5d279..4762790`; 0, 1 and 6 survived all three lenses.
 
 **Association, station → BSSID, read off the air — landed 2026-11-10, LAPTOP-VERIFIED ONLY.** No
 firmware names a client's AP, so `AP_OF` was `-` on every client row and five features slept (see

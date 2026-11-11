@@ -1270,7 +1270,11 @@ rssi_gate_own() { [[ ${RSSI_BEST[$1]:-x} =~ ^-?[0-9]+$ ]] || return 0; (( ${RSSI
 prox_of() {
   local mac="$1" best=-999 r near=$NEAR_DBM far=$FAR_DBM
   for r in ${RSSI_HIST[$mac]}; do [ "$r" = "-" ] && continue; (( r > best )) && best=$r; done
-  if (( best == -999 )) || (( EPOCHSECONDS - ${LAST_SEEN[$mac]:-0} > 90 )); then PROX[$mac]="?"; return; fi
+  # Stale = unheard for 90 s AS OF THE LAST SCAN CYCLE. Against the wall clock, every device went
+  # stale together 90 s after scanning stopped -- which is whenever the operator is in a menu, the
+  # only place the lists are drawn -- and "Other devices", which keeps N and M only, drew empty.
+  # LAST_CYCLE_TS is run_cycle's; unset (no cycle yet, the Recon hooks) the wall clock stands in.
+  if (( best == -999 )) || (( ${LAST_CYCLE_TS:-$EPOCHSECONDS} - ${LAST_SEEN[$mac]:-0} > 90 )); then PROX[$mac]="?"; return; fi
   [ "${BAND[$mac]}" = 5 ] || [ "${BAND[$mac]}" = 6 ] && { near=$((near - 7)); far=$((far - 7)); }
   [ "${ROLE[$mac]}" = cli ] && { near=$((near - 6)); far=$((far - 6)); }
   if (( best >= near )); then PROX[$mac]="N"; elif (( best < far )); then PROX[$mac]="F"; else PROX[$mac]="M"; fi
@@ -1537,7 +1541,7 @@ band_rank() { case "$1" in CONFIRMED) RANK_V=3 ;; LIKELY) RANK_V=2 ;; STREAM|POS
 run_cycle() {
   local line mac pk ssid ch fr sig hid t ap pap probes k=0 top=0 u=0 bz=0 r prev now_rank
   SEEN_THIS_CYCLE=(); NEW_LIKELY=(); NEW_CONFIRMED=(); NEW_LANE=(); CLIENTS_OF=(); SCORED=(); KITCL=(); KITAP=(); NOALERT=(); RSSI_IMPROVED=()
-  CYCLE=$((CYCLE + 1))
+  CYCLE=$((CYCLE + 1)); LAST_CYCLE_TS=$EPOCHSECONDS      # prox_of's reference for "unheard for 90 s"
   mapfile -t AP_LINES < <(recon_lines APS)
   mapfile -t CLI_LINES < <(recon_lines CLIENTS)
   # One OUI table pass for the whole cycle, BEFORE the loops below: record_seen resolves the vendor
@@ -1770,7 +1774,7 @@ sort_macs() {   # by band rank desc, then prox N>M>F>?, then conf desc
   for mac in "${!CONF[@]}"; do
     [ -n "${IGNORED[$mac]}" ] && continue
     rssi_gate_ok "$mac" || continue
-    prox_of "$mac"                                       # staleness: unseen > 90 s reads ? here, not its last bucket
+    prox_of "$mac"                                       # staleness: unheard for 90 s as of the last cycle reads ? here, not its last bucket
     case "$kind" in
       hits)    (( ${CONF[$mac]} >= 20 )) || continue; [ "${BANDNAME[$mac]}" = MODULE ] && continue ;;
       modules) { [[ ${TAGS[$mac]} =~ (^| )MODULE( |$) ]] && (( ${CONF[$mac]} < 45 )); } || continue; [ "${ROLE[$mac]}" = ap ] && continue ;;
@@ -1833,12 +1837,21 @@ review_list() {
 }
 
 modules_list() {
-  local mac i rows=0
+  local mac i rows=0 sfx room v
   sort_macs modules
   ROW_TEXT=("not cameras until Watched"); ROW_MAC=("")
   for mac in "${SORTED[@]}"; do
-    ROW=$(printf '%s %s %s%s' "${mac//:/}" "${VENDOR[$mac]:0:8}" "${PROX[$mac]:-?}" "${BUSY[$mac]:+ busy}")
-    [ "${KITAP[${AP_OF[$mac]:--}]}" = "?" ] && ROW+=" KIT?"
+    # The MAC is the row's identity (the pick is matched on text) and the suffix is what the list is
+    # read for, so the VENDOR is what gives way. It used to be a fixed eight characters, which with
+    # a twelve-character MAC is 23 before the suffix is complete: ROW_W cut the proximity letter off
+    # every row whose vendor name ran to eight characters ("Espressi"), and "busy" and "KIT?" with
+    # it. No $( ) either: this was the one fork per row left on a list path.
+    sfx=" ${PROX[$mac]:-?}${BUSY[$mac]:+ busy}"
+    [ "${KITAP[${AP_OF[$mac]:--}]}" = "?" ] && sfx+=" KIT?"
+    (( 12 + ${#sfx} > ROW_W )) && sfx="${sfx/ busy/*}"          # MAC + both markers do not fit: busy shrinks to a star
+    room=$(( ROW_W - 13 - ${#sfx} )); v=""
+    (( room >= 4 )) && v="${VENDOR[$mac]:0:$(( room < 8 ? room : 8 ))}"
+    ROW="${mac//:/}${v:+ $v}$sfx"
     ROW_TEXT+=("${ROW:0:$ROW_W}"); ROW_MAC+=("$mac"); rows=$((rows + 1))
   done
   ROW_TEXT+=("Back"); ROW_MAC+=("")
@@ -1848,7 +1861,7 @@ modules_list() {
 }
 
 other_list() {   # heard, but in neither Review hits nor the modules list - see sort_macs "other"
-  local mac i rows=0 glyph lbl r
+  local mac i rows=0 glyph lbl r; local -A rowseen=()
   sort_macs other
   ROW_TEXT=("heard, no camera signature"); ROW_MAC=("")
   for mac in "${SORTED[@]}"; do
@@ -1858,7 +1871,13 @@ other_list() {   # heard, but in neither Review hits nor the modules list - see 
     r="${RSSI_LAST[$mac]:-}"; [ -n "$r" ] && printf -v r '%d' "$r" 2>/dev/null
     printf -v ROW '%s %s %s%s' "$glyph" "${lbl:0:$(( ROW_W - 5 - ${#r} ))}" "${PROX[$mac]:-?}" "$r"
     [ "${BUSY[$mac]}" = 1 ] && ROW+=" busy"
-    ROW_TEXT+=("${ROW:0:$ROW_W}"); ROW_MAC+=("$mac"); rows=$((rows + 1))
+    ROW="${ROW:0:$ROW_W}"
+    # The pick is resolved by the FIRST row whose text matches, and this row carries no MAC: two APs
+    # under one SSID at one RSSI drew the same row, the second could not be opened at all, and the
+    # card that did open was not the device highlighted. As review_list does: a repeat takes the MAC tail.
+    [ -n "${rowseen[$ROW]}" ] && ROW="${ROW:0:$((ROW_W - 5))} ${mac:13}"
+    rowseen[$ROW]=1
+    ROW_TEXT+=("$ROW"); ROW_MAC+=("$mac"); rows=$((rows + 1))
   done
   ROW_TEXT+=("Back"); ROW_MAC+=("")
   pick_list "[$MODE] Other devices ($rows)" "" "${ROW_TEXT[@]}" || return 0
@@ -1894,7 +1913,8 @@ TAGTXT=""
 # Recon selection (hook_target).
 # Two things here are NOT measured on a device yet, and are written to degrade rather than assume:
 #  - PINEAPPLE_EXAMINE_CHANNEL has never been issued on the bench without an EXAMINE_BSSID before
-#    it (every measured park issued both; the lookup has no BSSID to give). lock_channel therefore
+#    it (every measured park began with EXAMINE_BSSID, and lock_target adds the channel command
+#    only when that step did not land on the channel; the lookup has no BSSID to give). lock_channel therefore
 #    reads the channel back, and when the radio is not parked the capture still runs, across the
 #    hop, for three times the window: a lower yield, but it needs no lock at all.
 #  - a client row's frequency is the device-level LAST-HEARD one, which need not be its association
@@ -3769,15 +3789,22 @@ selftest() {
   # THE STRUCTURAL GATE. Every gate runs on a fast x86 host with GNU grep and a 2-line fixture, so no
   # timing assertion here can ever catch a per-device file scan. Count the table reads instead: N
   # devices must cost ONE pass, not N. Without this, a regression to per-MAC grep is invisible.
-  local _gn=0
-  grep() { _gn=$((_gn + 1)); command grep "$@"; }
+  # The count is kept in a FILE. It was a shell variable, and vendor_of's grep runs inside $( ), so
+  # every increment happened in a subshell and the parent read 0 whatever the code did: with
+  # vendor_prefetch reduced to a no-op both checks below still passed (two review finders, one on
+  # Mythos and one on Opus 5, reported it independently). The third check is the counter proving it
+  # can count.
+  : >"$tmp/greps"
+  grep() { printf 'g' >>"$tmp/greps"; command grep "$@"; }
   local _d; for _d in 01 02 03 04 05 06 07 08 09 10; do unset "VLOW[ec:71:db:00:20:$_d]"; done
   vendor_prefetch ec:71:db:00:20:01 ec:71:db:00:20:02 ec:71:db:00:20:03 ec:71:db:00:20:04 ec:71:db:00:20:05 \
                   ec:71:db:00:20:06 ec:71:db:00:20:07 ec:71:db:00:20:08 ec:71:db:00:20:09 ec:71:db:00:20:10
-  st "oui batch: 10 devices cost 0 greps, not 10" "$_gn" "0"
+  st "oui batch: 10 devices cost 0 greps, not 10" "$(wc -c <"$tmp/greps" | tr -d ' ')" "0"
   for _d in 01 02 03 04 05 06 07 08 09 10; do vendor_of "ec:71:db:00:20:$_d"; done
-  st "oui batch: and the prefetch leaves nothing for vendor_of to grep" "$_gn" "0"
-  unset -f grep
+  st "oui batch: and the prefetch leaves nothing for vendor_of to grep" "$(wc -c <"$tmp/greps" | tr -d ' ')" "0"
+  unset "VLOW[ec:71:db:00:20:01]" "VENDOR[ec:71:db:00:20:01]"; vendor_of ec:71:db:00:20:01
+  st "oui batch: a device the prefetch never saw DOES cost one, so the count above can tell 0 from 10" "$(wc -c <"$tmp/greps" | tr -d ' ')" "1"
+  unset -f grep; rm -f "$tmp/greps"
   for _d in 01 02 03 04 05 06 07 08 09 10; do unset "VLOW[ec:71:db:00:20:$_d]" "VENDOR[ec:71:db:00:20:$_d]"; done
   # band_of / band_rank set globals now; a $( ) at either call site is a fork per device per cycle.
   band_of 2437; local _b2=$BAND_V; band_of 5180; local _b5=$BAND_V; band_of 6135; local _b6=$BAND_V; band_of 100; local _bq=$BAND_V
@@ -3857,6 +3884,52 @@ selftest() {
   # The drain property: Watch it, find it streaming, and it scores its way into Review hits. If this
   # ever fails the list accumulates instead of emptying as the operator works through it.
   st "other: Watched into STREAM, it promotes into Review hits and leaves this list" "$(st_other_has $_ost)" "no"
+  # The list is opened from the main menu, so with no cycle running, and proximity went stale against
+  # the WALL CLOCK: 90 s after the last scan cycle every row read '?' at once and the list drew empty,
+  # with nothing saying why. One Watch from it is 60 s. Stale means unheard for 90 s AS OF THE LAST
+  # CYCLE (finding 0 of the review of cd5d279..4762790, confirmed by all three lenses).
+  LAST_CYCLE_TS=$((EPOCHSECONDS - 100)); LAST_SEEN[$_oap]=$LAST_CYCLE_TS
+  st "other: a device heard in the last scan cycle is still listed 100 s after that cycle" "$(st_other_has $_oap)" "yes"
+  LAST_SEEN[$_oap]=$((LAST_CYCLE_TS - 100))
+  st "other: one that had already gone unheard for 100 s by the last cycle is not" "$(st_other_has $_oap)" "no"
+  unset LAST_CYCLE_TS; LAST_SEEN[$_oap]=$((EPOCHSECONDS - 100))
+  st "other: and before any cycle has run, the wall clock is still the reference" "$(st_other_has $_oap)" "no"
+  LAST_SEEN[$_oap]=$EPOCHSECONDS
+  # Two devices that draw the same row: one SSID, one proximity, one RSSI (a mesh, both radios of one
+  # AP). The pick is resolved by the FIRST text match, so the second could not be opened from the
+  # only list that reaches it, and the card that did open was for a device the operator had not
+  # highlighted (finding 1, all three lenses). Review hits has always appended the MAC tail on a repeat.
+  local _od1=cc:00:00:00:00:11 _od2=cc:00:00:00:00:12 _odc _oi _ot1="" _ot2=""
+  st_device $_od1 ap "Shenzhen Nobody Ltd" "CorpNet" 0; RSSI_HIST[$_od1]="-48"; RSSI_LAST[$_od1]=-48; BAND[$_od1]=2; score_device $_od1
+  st_device $_od2 ap "Shenzhen Nobody Ltd" "CorpNet" 0; RSSI_HIST[$_od2]="-48"; RSSI_LAST[$_od2]=-48; BAND[$_od2]=2; score_device $_od2
+  local _olp; _olp=$(declare -f LIST_PICKER)
+  _odc=$(declare -f detail_card); detail_card() { printf '%s ' "$1" >>"$tmp/opened"; }
+  other_list >/dev/null 2>&1                           # LIST_PICKER declines: the rows are built and nothing opens
+  for ((_oi = 0; _oi < ${#ROW_MAC[@]}; _oi++)); do
+    [ "${ROW_MAC[_oi]}" = "$_od1" ] && _ot1="${ROW_TEXT[_oi]}"; [ "${ROW_MAC[_oi]}" = "$_od2" ] && _ot2="${ROW_TEXT[_oi]}"
+  done
+  st "other: two devices that would draw the same row get rows that differ" "$([ -n "$_ot1" ] && [ -n "$_ot2" ] && [ "$_ot1" != "$_ot2" ] && echo differ)" "differ"
+  LIST_PICKER() { printf '%s' "$ST_ROW"; }
+  rm -f "$tmp/opened"; ST_ROW="$_ot1"; other_list >/dev/null 2>&1; ST_ROW="$_ot2"; other_list >/dev/null 2>&1
+  st "other: and each of those rows opens its own device" "$(cat "$tmp/opened" 2>/dev/null)" "$_od1 $_od2 "
+  eval "$_olp"; unset ST_ROW; eval "$_odc"
+  unset "RSSI_HIST[$_od1]" "RSSI_HIST[$_od2]" "RSSI_LAST[$_od1]" "RSSI_LAST[$_od2]" "CONF[$_od1]" "CONF[$_od2]"
+  # modules_list's row. The MAC is its identity and the suffix is what the list is read for, so the
+  # vendor gives way. It was a fixed eight characters, which put the row at 23 before the suffix was
+  # complete: ROW_W (22) cut the proximity letter off every row whose vendor ran to eight characters,
+  # and "busy" and "KIT?" with it. This fixture's "Espressif Inc" is such a vendor; the row it drew
+  # before the fix was "cc0000000003 Espressi " (seen here, 2026-11-11).
+  st_modrow() { local i; modules_list >/dev/null 2>&1; for ((i = 0; i < ${#ROW_MAC[@]}; i++)); do [ "${ROW_MAC[i]}" = "$1" ] && printf '%s' "${ROW_TEXT[i]}"; done; }
+  RSSI_LAST[$_omc]=-30
+  st "modules: a long vendor name gives way to the proximity letter" "$(st_modrow $_omc)" "cc0000000003 Espress N"
+  BUSY[$_omc]=1
+  st "modules: busy is shown, and the vendor is dropped when four characters of it would not fit" "$(st_modrow $_omc)" "cc0000000003 N busy"
+  unset "BUSY[$_omc]"; KITAP[aa:00:00:00:00:99]="?"
+  st "modules: so is KIT?" "$(st_modrow $_omc)" "cc0000000003 N KIT?"
+  BUSY[$_omc]=1
+  st "modules: and when both markers and the MAC cannot fit, busy shrinks to a star rather than KIT? being cut" "$(st_modrow $_omc)" "cc0000000003 N* KIT?"
+  st "modules: no row is longer than the row budget" "$(( $(st_modrow $_omc | wc -c) <= ROW_W ))" "1"
+  unset "BUSY[$_omc]" "KITAP[aa:00:00:00:00:99]" "RSSI_LAST[$_omc]"; unset -f st_modrow
   unset "RSSI_HIST[$_oap]" "RSSI_HIST[$_osc]" "RSSI_HIST[$_omc]" "RSSI_HIST[$_oma]" "RSSI_HIST[$_ofa]" "RSSI_HIST[$_ocl]" "RSSI_HIST[$_ost]"
   unset "CONF[$_oap]" "CONF[$_osc]" "CONF[$_omc]" "CONF[$_oma]" "CONF[$_ofa]" "CONF[$_ocl]" "CONF[$_ost]"
   unset "BEH[$_ost]" "BEH_GATE[$_ost]" "BEH_VERDICT[$_ost]"
@@ -3866,6 +3939,24 @@ selftest() {
   _me=$(sed -n 's/.*menu+=("\(Other devices\)").*/\1/p' "${BASH_SOURCE[0]}" | head -1)
   _mc=$(sed -n 's/.*"\(Other devices\)") other_list.*/\1/p' "${BASH_SOURCE[0]}" | head -1)
   st "other: the menu entry and its dispatch label are the same string" "[$_me][$_mc]" "[Other devices][Other devices]"
+  # 4c the fresh Recon session at launch (RECON_FRESH). hak5cmd exits 0 on its error paths and says
+  # why on stderr, so the call that threw stderr away could not know whether a session had started,
+  # and told the operator and events.log that the old list was discarded either way (finding 6).
+  local _orn _olog _oui _rf=$RECON_FRESH; _orn=$(declare -f PINEAPPLE_RECON_NEW); _olog=$(declare -f LOG); _oui=$(declare -f ui_ok)
+  LOG() { printf '%s\n' "$*" >>"$tmp/freshlog"; }; ui_ok() { return 0; }
+  PINEAPPLE_RECON_NEW() { printf 'new\n' >>"$tmp/freshcalls"; }
+  rm -f "$tmp/events.log" "$tmp/freshlog" "$tmp/freshcalls"; RECON_FRESH=1; recon_fresh_start
+  st "fresh session: asked for once, and logged as asked for, not as done" \
+     "$(grep -c . "$tmp/freshcalls" 2>/dev/null):$(grep -c 'RECON_FRESH: new session requested at start$' "$tmp/events.log" 2>/dev/null):$(cat "$tmp/events.log" "$tmp/freshlog" 2>/dev/null | grep -c 'discarded')" "1:1:0"
+  PINEAPPLE_RECON_NEW() { printf 'ERROR: recon is not running\n' >&2; return 0; }          # the measured hak5cmd error shape: rc 0, reason on stderr
+  rm -f "$tmp/events.log" "$tmp/freshlog"; recon_fresh_start
+  st "fresh session: a refusal is said on screen and in the log, with the firmware's own words" \
+     "$(grep -c 'RECON_FRESH: RECON_NEW said: ERROR: recon is not running' "$tmp/events.log" 2>/dev/null):$(grep -c 'fresh Recon session not confirmed: ERROR: recon is not running' "$tmp/freshlog" 2>/dev/null)" "1:1"
+  PINEAPPLE_RECON_NEW() { printf 'new\n' >>"$tmp/freshcalls"; }
+  rm -f "$tmp/events.log" "$tmp/freshcalls"; RECON_FRESH=0; recon_fresh_start
+  st "fresh session: RECON_FRESH=0 asks for nothing and logs nothing" \
+     "$(grep -c . "$tmp/freshcalls" 2>/dev/null):$(grep -c RECON_FRESH "$tmp/events.log" 2>/dev/null)" ":"
+  RECON_FRESH=$_rf; eval "$_orn"; eval "$_olog"; eval "$_oui"; rm -f "$tmp/events.log" "$tmp/freshlog" "$tmp/freshcalls"
   # 5 proximity
   RSSI_HIST[aa:00:00:00:00:01]="-70 -58 -65"; BAND[aa:00:00:00:00:01]=2; MODE=ROOM; apply_mode; prox_of aa:00:00:00:00:01; st "prox ROOM -58 best = N" "${PROX[aa:00:00:00:00:01]}" N
   RSSI_HIST[aa:00:00:00:00:01]="-79"; prox_of aa:00:00:00:00:01; st "prox ROOM -79 = F" "${PROX[aa:00:00:00:00:01]}" F
@@ -4999,9 +5090,10 @@ IWFIX
          assoc_learn aa:00:00:00:00:71 aa:00:00:00:00:67 0 members       # heard on another AP, unlisted: the firmware's word stands
          _fw=-; run_cycle >/dev/null 2>&1                                # then the firmware stops naming one
          printf '%s|%s/%s/%s|%s|%s' "$_a" "${AP_OF[aa:00:00:00:00:71]}" "${CH[aa:00:00:00:00:71]:-none}" "${SSID_CLEAN[aa:00:00:00:00:71]:-none}" \
-                "$(assoc_nochan aa:00:00:00:00:71 && echo nochan)" "$(watchable aa:00:00:00:00:71 && echo watchable)" )
-  st "run_cycle: when the AP a row carries changes to one with no channel or SSID, the old AP's do not stay on the row" \
-     "$_f2" "aa:00:00:00:00:66/1/Fnet|aa:00:00:00:00:67/none/none|nochan|"
+                "$(assoc_nochan aa:00:00:00:00:71 && echo nochan)" "$(watchable aa:00:00:00:00:71 && echo watchable)"
+         printf '|%s' "$(( EPOCHSECONDS - ${LAST_CYCLE_TS:-0} <= 5 ))" )
+  st "run_cycle: when the AP a row carries changes to one with no channel or SSID, the old AP's do not stay on the row; and the cycle stamps the time proximity goes stale against" \
+     "$_f2" "aa:00:00:00:00:66/1/Fnet|aa:00:00:00:00:67/none/none|nochan||1"
   # the real capture, once, against a tcpdump that writes a file: the filter and the bookkeeping
   eval "$_oc"; unset -f sleep; CHILD_FILE="$tmp/children"; : >"$CHILD_FILE"
   # The fake tcpdump notes, 0.4 s into its run, how many pids are registered and whether its own is
@@ -5063,6 +5155,24 @@ replay() {   # --replay <pcap, bucket or raw file>
 # ============================================================================== preflight ===
 
 
+# recon_fresh_start: RECON_FRESH's one call. hak5cmd exits 0 on its error paths and says why on stderr,
+# so stderr is read, and what is logged and shown is that a session was ASKED for: what the bare
+# command does to the list on 1.1.3 is an open bench item (dev/pager-day-one.md), and the older call
+# site in the empty-list prompt already says only "requested" for that reason.
+recon_fresh_start() {
+  local err
+  [ "$RECON_FRESH" = 1 ] && command -v PINEAPPLE_RECON_NEW >/dev/null 2>&1 || return 0
+  err=$(PINEAPPLE_RECON_NEW 2>&1 >/dev/null)
+  if [ -n "$err" ]; then
+    log recon "RECON_FRESH: RECON_NEW said: ${err:0:120}"
+    ui_ok && LOG yellow "fresh Recon session not confirmed: ${err:0:60}"$'\n'"this run may list what Recon already held"
+  else
+    log recon "RECON_FRESH: new session requested at start"
+    ui_ok && LOG yellow "fresh Recon session requested: the list restarts from what is transmitting now"
+  fi
+  return 0
+}
+
 # =================================================================================== main ===
 case "${1:-}" in
   --selftest) selftest; exit $? ;;
@@ -5081,11 +5191,7 @@ bands_recover; [ "$BAND6" = 1 ] && bands_apply
 # daemon has accumulated since boot. It also keeps the device count low, which matters because the
 # per-cycle cost scales with it. Side effect worth being loud about: this wipes the Recon session
 # for anything ELSE using it, so it is starred and can be turned off in Settings -> Recon.
-if [ "$RECON_FRESH" = 1 ] && command -v PINEAPPLE_RECON_NEW >/dev/null 2>&1; then
-  PINEAPPLE_RECON_NEW >/dev/null 2>&1
-  log recon "RECON_FRESH: new session requested at start (previous recon list discarded)"
-  ui_ok && LOG yellow "fresh Recon session: this run shows what is transmitting now"
-fi
+recon_fresh_start
 (( CFG_OVERRIDES > 0 )) && { LOG yellow "cfg: $CFG_OVERRIDES overrides"; log cfg "$CFG_NOTE"; }
 log run "start v$VERSION run=$RUN_ID sigs=$SIG_COUNT($SIG_SOURCE) jq=$HAVE_JQ tcpdump=$HAVE_TCPDUMP bands=${BANDS_LINE:-?} mode=$MODE loaded=$LOADED_ROWS dedupe_h=$DEDUPE_H"
 LOG "CamHound $VERSION [$MODE]"$'\n'"sigs: $SIG_COUNT ($SIG_SOURCE)$( [ "$HAVE_JQ" = 1 ] || printf ' no-jq')$( [ "$HAVE_TCPDUMP" = 1 ] || printf ' no-tcpdump')"$'\n'"bands: ${BANDS_LINE:-?}"$'\n'"prox: uncal"

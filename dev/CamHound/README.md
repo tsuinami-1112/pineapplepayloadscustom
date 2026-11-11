@@ -178,7 +178,7 @@ and `RESPONSE_CONFIRM`). For a recon-only first run:
 `--selftest` is safe to run on the device — every device-changing command is stubbed, and since
 2026-11-04 so is every display and dialog command, so it no longer paints the Pager's screen nor can
 it block on a button press. The cheapest first step is `bash payload.sh --selftest` on the Pager
-itself. Expect `== 454 checks, 0 failed ==` (the count as of 2026-11-11; it grows with every case added) and
+itself. Expect `== 468 checks, 0 failed ==` (the count as of 2026-11-11; it grows with every case added) and
 the two block hashes; a lower count means the copy
 on the device is older than the repo's.
 
@@ -201,6 +201,7 @@ present on a Pager but has no Oniguruma, so the parsers compiled to nothing and 
 | marker | means |
 |---|---|
 | `start v… jq=1 tcpdump=1` | the run-start line. **`jq=1` is worth one look after the 2026-11-10 upload:** `jq_works` now also runs the AP program (`JQ_APS`) on a fixture and wants the exact row, pinned from this repo's jq 1.7. Any jq ≥ 1.5 should print the same row; if the device's does not, this reads `jq=0`, the start screen says `no-jq` and the regex fallback parsers are in use. The device `--selftest` says so first — its `aps jq:` and `jq probe: a working jq is accepted` cases fail and print what the device's jq produced |
+| `recon RECON_FRESH: new session requested at start`, or `RECON_FRESH: RECON_NEW said: …` | the launch request for a fresh Recon session went out and the firmware said nothing, or it answered on stderr and the run may be listing what Recon already held. The first is a request, not a confirmation: what the bare command does to the list on 1.1.3 is still a bench item (`dev/pager-day-one.md`, "What `PINEAPPLE_RECON_NEW`'s parameter is") |
 | `client verb: DEVICES` | the `RECON CLIENTS` probe got rc 255 and fell back, as 1.1.3 requires |
 | `inj probe: tx phy phy1` | the injection gate read the transmitting phy, not a merge of all of them |
 | `members <bssid> n=N ... dwell=Ns lock=Ns` | a `bss`-scope Disrupt recovered N stations off the air; **this is the dwell figure `resp_clamp_lock`'s floor needs** |
