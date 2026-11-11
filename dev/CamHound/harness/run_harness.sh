@@ -536,6 +536,16 @@ s_assoc() {   # the inverse lookup on the real-firmware shape: a client's AP rea
   answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_ASSOC_DOWN=1 run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   check "assoc: an AP heard only sending TO the client names nothing: NO_UPLINK, said on screen, nothing learned, no Watch, and the row still offers the lookup" \
     "grep -q 'assoc $W none why=NO_UPLINK recs=3 .* down=$WA/3' $LOOT/events.log && grep -q '^LOG yellow 20:00:01 itself not heard on ch 6: only 11:22:33 sending to it (3 frames)' $T/log && ! grep -q 'assoc .* -> ' $LOOT/events.log && ! grep -q 'PICKER\[Watch ' $T/log && [ \"\$(grep -c 'items=Watch (find AP first);Disrupt (find AP first);' $T/log)\" = 2 ]"
+  # 11. the run is KILLED while the lookup is listening. cleanup never runs for a killed run, so its watchdog is what
+  #     releases the radio and tidies up -- and it removed the lock and the child list only, leaving the pid-named
+  #     capture file in /tmp until reboot. Kill it the moment the capture is on record, then give the watchdog its 3 s.
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules asc11 '^CamHound' 'Scan,Exit' 'Review hits' '5,Exit' '^[0-9]+ WYZE' 'Watch (find AP first),Back' "${COMMON[@]}"; answers t t B
+  HARNESS_NO_CLIENTS=1 PATH="$PATHX" bash "$T/payload_fast.sh" >/dev/null 2>&1 & local pk=$!
+  for _ in $(seq 1 120); do grep -q '^TCPDUMP assoc .* heard=' "$T/log" 2>/dev/null && break; sleep 0.25; done
+  kill -9 $pk 2>/dev/null; sleep 6; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "assoc: a run killed mid-listen has its radio released and its capture file removed by its own watchdog" \
+    "grep -q '^TCPDUMP assoc $W -> ' $T/log && ! grep -q 'assoc $W ' $LOOT/events.log && [ ! -e /tmp/cs_run.pid ] && [ -e /tmp/cs_harness_hop ] && own_capture_gone"
 }
 case "${1:-all}" in
   csainj) s_csainj ;; live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; members) s_members ;; cliscope) s_cliscope ;; blind) s_blind ;; noinj) s_noinj ;; persist) s_persist ;; settings) s_settings ;; bands) s_bands ;; devices) s_devices ;; assoc) s_assoc ;;

@@ -53,7 +53,9 @@ listens for the client's own data frames, and reads the BSSID from them. Then it
 menu you picked. The answer is kept for the run — the inventory, the kit tags and the report's
 AP→client tree pick it up at the next cycle — and once it is older than `ASSOC_TTL` it is looked at
 again whenever Watch or Disrupt opens on that client, from the card or from one of the automatic
-offers. An AP-row Disrupt does the same for every client it hears transmitting to that AP. Only the
+offers. A look that does **not** re-confirm the AP keeps the old answer and is not repeated for
+another `ASSOC_TTL`, so the picks in between open the menu straight away with nothing said; with
+`ASSOC_TTL=0` every pick looks again. An AP-row Disrupt does the same for every client it hears transmitting to that AP. Only the
 client's own frames count as evidence of where it is: an AP keeps sending to a client for a while
 after the client has gone, which is exactly what is on the air after a Disrupt that worked. When the
 lookup finds nothing it says why and the card is unchanged:
@@ -61,7 +63,8 @@ lookup finds nothing it says why and the card is unchanged:
 | It says | It means |
 |---|---|
 | `not heard on ch N in 6s` | no data frame from the client on that channel in the window. An idle or sleeping camera, or a client last heard off its AP's channel. **Not** "unassociated". Try again while it is busy |
-| `heard on ch N (k frames) but no AP twice` | too little to name an AP from. Try again |
+| `heard on ch N (k of its own frames) but no AP twice` | the client was heard, but too little to name an AP from. Try again |
+| `itself not heard on ch N (k records, none of its own)` | frames addressed to the client were captured and none it sent: it has left, moved channel, or is out of earshot. Nothing is recorded |
 | `itself not heard on ch N: only X sending to it (k frames)` | AP X is transmitting to the client and the client is not answering: it has left X, moved channel, or is out of earshot. Nothing is recorded. If you have just disconnected it, rescan and look again |
 | `talks to X (n) and Y (m): not deciding` | the client sent n frames to X and m to Y, neither clearly ahead (a roam, or a mesh). Nothing is recorded |
 | `not parked on ch N` then `listening across the hop instead` | the radio would not hold the channel, so it listens while hopping for three times as long. Slower and less likely to hear a quiet client, not broken |
@@ -102,11 +105,13 @@ lookup parks the radio, so it happens only on a row you pick.*
    `/root/payloads/recon/client/CamHound/` and `library/recon/access_point/CamHound/` to
    `/root/payloads/recon/access_point/CamHound/`, each with its own `cam_signatures.txt`. They are
    byte-identical to each other and are what adds CamHound to the Pager's **Recon** menu, so you can
-   act on a device you selected there. On current firmware that is the **only** way to reach
-   per-client Disrupt: the Recon UI tells the hook which AP a client belongs to, and nothing in
-   `_pineap`'s output does, so a client row in CamHound's own Review list has no BSSID to aim from
-   (see "Which AP a client is associated to"). Skipping this step is not a partial install — it
-   removes a whole capability.
+   act on a device you selected there. The Recon UI tells the hook which AP a client belongs to, and
+   nothing in `_pineap`'s output does, so this is the route that has been measured on a device.
+   *Amended 2026-11-11:* it is no longer the only one — a client row in CamHound's own Review list
+   now reaches the same targeted frame through `Disrupt (find AP first)`, which reads the BSSID off
+   the air first (see "Which AP a client is associated to"); that path is laptop-verified only, and
+   a client is refused only when no lookup has named an AP for it. Skipping this step still costs
+   you the Recon menu entry.
 3. **If you cloned on Windows, fix the line endings — this one bites.** Git for Windows defaults
    `core.autocrlf=true`, so your working tree gets CRLF even though the repo stores LF, and the
    device then fails with `$'\r': command not found` and `not a valid identifier`. The repo carries
@@ -291,12 +296,14 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 | REPORT_EVERY | 15 | | cycles between report rewrites |
 | GPS | 0 | | closest-approach GPS stamping |
 | KEEP_PCAP / KEEP_RAW | 0 / 0 | | keep Watch pcaps / per-second bucket lines in loot |
+| RECON_FRESH | 1 | * | ask Recon for a fresh session at launch, so a run shows what is transmitting now (a new session replaces the Recon list for anything else using it too; the start screen says whether the request was refused) |
 | DEDUPE_H | 0 | * | hours: a device stored in inventory.tsv within this horizon is not alerted again unless its band rose or it is 10 dB closer; `Scan (fresh)` ignores it for one run |
 | INVENTORY_KEEP_DAYS | 30 | | inventory.tsv rows older than this are pruned at start (0 = never) |
 | ROW_W | 22 | | list row budget (36-40 expected after Phase 0 item 19) |
 | RESPONSE | 1 | * | master switch for the Disrupt rung; 0 = recon only, nothing transmits |
 | RESPONSE_CONFIRM | 1 | * | blocking confirmation before any transmit (Settings asks twice before switching it off) |
 | AUTO_RESPOND | 0 | * | let the funnel raise Disrupt by itself (needs RESPONSE=1) |
+| SWEEP_TARGETED | 1 | * | after a BSS-wide deauth, also send one targeted deauth per recovered member |
 | POSTURE_TTL | 300 | * | seconds a posture badge stays cached per BSSID |
 | RESP_SETTLE_SECS | 6 | * | wait after transmitting before re-reading the target to judge the effect |
 | BCN_CAP_SECS / BCN_CAP_COUNT | 4 / 5 | | beacon capture window and frame count for a posture read |
@@ -360,8 +367,10 @@ overridden:
 | `BOTH` | `PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]` | all three | whole BSS |
 
 An AP target is attacked broadcast (`ff:ff:ff:ff:ff:ff`); a client target is attacked through its
-own AP's BSSID on that AP's channel. An unassociated client has no BSS to announce from and is
-refused. CSA takes no target because it rides in a beacon.
+own AP's BSSID on that AP's channel. A client with no AP known has no BSS to announce from and is
+refused — but *amended 2026-11-11*: its card offers `Disrupt (find AP first)` instead of a dead end,
+and one lookup that hears the client is enough to make the row attackable. CSA takes no target
+because it rides in a beacon.
 
 **3 · Verdict.** Every kernel-side drop path reports success, so "we sent it" proves nothing. The
 channel is locked with the same `lock_target` Watch uses (verified read-back, falling back to a

@@ -6,7 +6,7 @@ disconnection. `PLAN_v2.md` covers the recon side; this covers everything downst
 Status: coded, laptop-verified, and **transmitting on hardware since 2026-11-05** — a Disrupt ran the
 whole chain from the user payload on the 1.1.3 unit (CLAUDE.md "Second contact"), and since
 2026-11-10 an AP row fires even when the capture recovers nobody (below). `--selftest` last passed on
-the Pager at 259/0 (2026-11-04); the suite is 468 checks on the laptop as of 2026-11-11. The selftest
+the Pager at 259/0 (2026-11-04); the suite is 485 checks on the laptop as of 2026-11-11. The selftest
 still stubs every device-changing command, so section [What is unverified](#what-is-unverified)
 remains the honest list of what the bench has not measured.
 
@@ -495,7 +495,10 @@ Unit coverage:
 §13a-i), 2026-11-05 (a Disrupt transmitted from the user payload, CLAUDE.md "Second contact"), and
 2026-11-10 (an AP row fires even when the capture recovers nobody — operator-decided,
 *"I'll accept nuclear blast. Let the AP row fire broadcast frames."*). The `NO_CLIENTS` outcomes in the table below no longer happen on an AP row.
-What still holds is the user-payload **client** row aborting in `resp_target`.*
+~~What still holds is the user-payload **client** row aborting in `resp_target`.~~ *Amended
+2026-11-11:* `resp_target` does still return 1 for a row whose AP is `-`, but the card no longer
+reaches it that way — it offers `Disrupt (find AP first)`, which runs `assoc_lookup` and opens
+`disrupt_menu` on the answer (2026-11-10, laptop-verified only; see the bound table at §13a-i).*
 
 **⚠ First, the floor — and it applies to the USER PAYLOAD only.** From the user payload this rung
 cannot transmit on any shipped firmware, and flashing does not fix that. The Recon hooks reach the
@@ -692,13 +695,14 @@ What changed for this rung, and what did not:
 | user-payload **client** row, AP unknown | `Disrupt n/a (not associated)`; `resp_target` returns 1 | `Disrupt (find AP first)`: `assoc_lookup` parks on the client's channel, reads its BSSID from its own data frames, then `disrupt_menu` opens on it. `attack_scope` is `cli` for `DEAUTH`, so this is the one targeted frame the firmware sends |
 | user-payload client row, lookup hears nothing | — | the card is unchanged and the reason is logged (`assoc <mac> none why=…`); nothing transmits |
 | user-payload client row, AP heard but its channel not known | — | `Disrupt n/a (no channel)`: across the hop, or behind a park that could not be read back, the channel listened on is not recorded, and an AP Recon has not listed has none of its own. `resp_target` returns 1 as it always did for a row with no channel; the row gets one when Recon lists the AP |
-| a learned AP older than `ASSOC_TTL`, any path into this menu | — | `disrupt_menu` calls `assoc_refresh` first (behind `command -v`), so the card, the post-Watch funnel and `AUTO_RESPOND` all look again before anything is aimed at it |
+| a learned AP older than `ASSOC_TTL`, any path into this menu | — | `disrupt_menu` calls `assoc_refresh` first (behind `command -v`), so the card, the post-Watch funnel and `AUTO_RESPOND` all look again before anything is aimed at it. A look that does **not** re-confirm the AP keeps it and counts as the look: `assoc_stale` takes the later of the learn time and the last attempt, so the next look is another `ASSOC_TTL` away and the picks in between open the menu with no listen and nothing said. `ASSOC_TTL=0` looks on every pick |
 | user-payload **AP** row | fires, membership from the air | unchanged — and `resp_members`' success path now hands the stations it heard to `assoc_learn_members` (behind `command -v`: the function is not in the hooks), so the client rows of those it heard **transmitting** carry this AP afterwards; a member the AP was only sending to stays a member for the attack and is not taught (2026-11-11: it may have left, and after a Disrupt that worked it has) |
-| both Recon **hooks** | association from `_RECON_SELECTED_*` | unchanged in behaviour. `CLI_AWK` gained a `mode=pairs` branch in the lib block, so the hooks' lib hash moved; the membership walk beside it is byte-for-byte the same decode and is pinned by the selftest's `pairs: the membership walk beside it is unchanged` |
+| both Recon **hooks** | association from `_RECON_SELECTED_*` | unchanged in behaviour. `CLI_AWK` gained a `mode=pairs` branch in the lib block, so the hooks' lib hash moved. *Amended 2026-11-11:* the membership walk beside it is no longer byte-for-byte what it was — since 2026-11-11 (`9fd8b6c`) it counts each member's own transmissions and prints one `UP <sta> <n>` line per member heard transmitting, in the hooks' copy too. The **admitted set** is unchanged, which is what matters here, and is pinned by the selftest's `pairs: the membership walk beside it admits the same three stations as before` with `pairs: and says which of them were heard transmitting, which is not all of them` beside it. The hooks' `resp_members` reads only the `CLI` lines, so the extra output changes nothing there |
 
 Four things in this rung are touched. Three were agreed with this file's owner beforehand: the
 guarded line in `resp_members`, `disrupt_row`'s `Disrupt (find AP first)` label (guarded on
-`command -v assoc_can`, so a hook still prints `n/a`), and the `mode=pairs` branch in `CLI_AWK`.
+`command -v assoc_can`, so a hook still prints `n/a`), and the `mode=pairs` branch in `CLI_AWK`
+together with the `UP` lines the membership walk beside it now prints.
 The fourth came out of the review of the lookup and is reported to the owner rather than agreed in
 advance: one guarded line at the top of `disrupt_menu` (and its twin in `watch_menu`) that
 re-checks a stale learned AP. All four are no-ops in the hooks. Nothing in `resp_fire`,

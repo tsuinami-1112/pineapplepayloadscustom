@@ -822,6 +822,13 @@ posture_read_pcap() {   # posture_read_pcap <pcap> <band> <channel> -> badge (st
   printf '%s' "$POSTURE_BADGE"
 }
 
+# main_gone: the run this code belongs to has been killed. The three capture helpers are called in
+# $( ), so each is a CHILD of the run and outlives a SIGKILL by up to its listen window, while the
+# run's watchdog releases the radio and removes its files within 3 s. Left alone, the orphan wrote
+# its file back afterwards -- and where the first-second check found the file gone and its tcpdump
+# dead, it took that for a filter that had not armed and started the retry. Each helper asks this
+# once a second, stops, and removes its own file. $$ is the run's pid in a subshell too.
+main_gone() { [ -n "$MAIN_PID" ] && ! kill -0 "$MAIN_PID" 2>/dev/null; }
 capture_beacon() {   # capture_beacon <bssid> -> pcap path on stdout, rc 1 on failure
   local bssid="$1" out="/tmp/cs_bcn_$$.pcap" p w=0
   [ "$HAVE_TCPDUMP" = 1 ] || return 1
@@ -829,8 +836,9 @@ capture_beacon() {   # capture_beacon <bssid> -> pcap path on stdout, rc 1 on fa
   tcpdump -i "$RECON_IF" -nn -s 0 -c "$BCN_CAP_COUNT" -w "$out" \
     "type mgt subtype beacon and wlan addr2 $bssid" >/dev/null 2>&1 & p=$!
   child_add "$p"
-  while (( w < BCN_CAP_SECS )); do kill -0 "$p" 2>/dev/null || break; sleep 1; w=$(( w + 1 )); done
+  while (( w < BCN_CAP_SECS )); do kill -0 "$p" 2>/dev/null || break; main_gone && break; sleep 1; w=$(( w + 1 )); done
   kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null; child_del "$p"
+  main_gone && { rm -f "$out"; return 1; }
   [ -s "$out" ] || { rm -f "$out"; return 1; }
   printf '%s' "$out"
 }
@@ -852,6 +860,8 @@ pcap_stream() { if command -v hexdump >/dev/null 2>&1; then hexdump -v -e '1/1 "
 # -v sta=<mac> -- as "PAIR <sta> <bssid> <n> <up>" for every pair seen at least twice (assoc_lookup).
 # It is the same DS-bit decode with nothing held fixed: no bss is needed, a group-addressed or own
 # address on either side is never a pair, and neither is a frame whose two addresses are equal.
+# It also prints "OWN <sta> <n>", every frame that station transmitted whether or not any pair reached
+# two sightings, so the caller can tell "it was heard, to no AP twice" from "it was not heard at all".
 # <up> is how many of the <n> frames the STATION transmitted (ToDS). The other direction is the AP
 # transmitting to it, which an AP goes on doing after the station has left, so a caller that asks
 # "where is this station NOW" must not take <n> alone for an answer. The membership walk admits the
@@ -905,7 +915,7 @@ BEGIN { st = 0; i = 0; itmax = 0; recs = 0; short = 0 }
       if (p[bo] % 2 == 1 || p[co] % 2 == 1) break
       if (index(own, " " c " ") > 0 || index(own, " " b " ") > 0) break
       pair[c " " b]++
-      if (ds == 1) pup[c " " b]++
+      if (ds == 1) { pup[c " " b]++; own[c]++ }
       break
     }
     if (b != bss) break
@@ -923,6 +933,7 @@ END { if (bad) exit 1
   print "TRUNC " trunc + 0; print "RUNT " runt + 0; print "SNAP " snap + 0
   for (c in seen) if (seen[c] >= 2) print "CLI " c
   for (c in sup) if (seen[c] >= 2) print "UP " c " " sup[c]
+  for (c in own) print "OWN " c " " own[c]
   for (k in pair) if (pair[k] >= 2) print "PAIR " k " " pair[k] " " pup[k] + 0 }'
 
 # bss_clients <pcap> <bssid> -> keyed lines on stdout; rc 1 when the file is unreadable or not a pcap.
@@ -950,15 +961,16 @@ capture_bss() {
   filt="type data and (wlan addr1 $bss or wlan addr2 $bss)"
   tcpdump -i "$RECON_IF" -nn -s "$CLI_CAP_SNAP" -c "$CLI_CAP_COUNT" -w "$out" "$filt" >/dev/null 2>&1 & p=$!
   child_add "$p"; sleep 1; w=1
-  if [ ! -s "$out" ] && ! kill -0 "$p" 2>/dev/null; then
+  if [ ! -s "$out" ] && ! kill -0 "$p" 2>/dev/null && ! main_gone; then
     child_del "$p"
     log resp "member capture: OR filter did not arm, retrying uplink-only"
     filt="type data and wlan addr1 $bss"
     tcpdump -i "$RECON_IF" -nn -s "$CLI_CAP_SNAP" -c "$CLI_CAP_COUNT" -w "$out" "$filt" >/dev/null 2>&1 & p=$!
     child_add "$p"; sleep 1; w=1
   fi
-  while (( w < CLI_CAP_SECS )); do kill -0 "$p" 2>/dev/null || break; sleep 1; w=$(( w + 1 )); done
+  while (( w < CLI_CAP_SECS )); do kill -0 "$p" 2>/dev/null || break; main_gone && break; sleep 1; w=$(( w + 1 )); done
   kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null; child_del "$p"
+  main_gone && { rm -f "$out"; return 1; }
   [ -s "$out" ] || { rm -f "$out"; return 1; }
   printf '%s' "$out"
 }
@@ -1462,6 +1474,9 @@ run_lock() {
     while read -r p; do [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done <"$CHILD_FILE" 2>/dev/null
     _pineap EXAMINE CANCEL; PINEAPPLE_EXAMINE_RESET
     [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ] && rm -f "$LOCK_FILE" "$CHILD_FILE"
+    # cleanup never ran for a killed run, and these carry its pid in their names, so nothing else
+    # would ever remove them: they stayed in /tmp, which is RAM on the device, until reboot
+    rm -f "/tmp/cs_mem_$MAIN_PID.pcap" "/tmp/cs_asc_$MAIN_PID.pcap" "/tmp/cs_bcn_$MAIN_PID.pcap" "/tmp/cs_fire_$MAIN_PID.err" "/tmp/cs_oui_keys.$MAIN_PID"
     bands_watchdog_restore ) >/dev/null 2>&1 &
 }
 # A band write the dead run issued is undone by its own watchdog. Keyed on the record, not on the lock: the record
@@ -1539,7 +1554,7 @@ busy_eval() {
 band_rank() { case "$1" in CONFIRMED) RANK_V=3 ;; LIKELY) RANK_V=2 ;; STREAM|POSSIBLE) RANK_V=1 ;; *) RANK_V=0 ;; esac; }
 
 run_cycle() {
-  local line mac pk ssid ch fr sig hid t ap pap probes k=0 top=0 u=0 bz=0 r prev now_rank
+  local line mac pk ssid ch fr sig hid t ap pap och probes k=0 top=0 u=0 bz=0 r prev now_rank
   SEEN_THIS_CYCLE=(); NEW_LIKELY=(); NEW_CONFIRMED=(); NEW_LANE=(); CLIENTS_OF=(); SCORED=(); KITCL=(); KITAP=(); NOALERT=(); RSSI_IMPROVED=()
   CYCLE=$((CYCLE + 1)); LAST_CYCLE_TS=$EPOCHSECONDS      # prox_of's reference for "unheard for 90 s"
   mapfile -t AP_LINES < <(recon_lines APS)
@@ -1562,10 +1577,14 @@ run_cycle() {
     [[ $OWN_MACS == *" $mac "* ]] && continue
     ap=${ap,,}; case "$ap" in ""|-|00:00:00:00:00:00|ff:ff:ff:ff:ff:ff) ap="-" ;; esac
     [[ $ap =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || ap="-"
+    # Whether this row's AP came from the firmware is recorded here, where it is known, rather than
+    # inferred later from the value: assoc_learn, assoc_stale and assoc_nochan read the mark.
+    if [ "$ap" = - ]; then unset "ASSOC_FW[$mac]"; else ASSOC_FW[$mac]=1; fi
     # No firmware names a client's AP, so this is "-" on every row. An AP read off the air for this
     # client (assoc_lookup, or a membership capture) is re-applied here every cycle, or the
     # AP_OF assignment below would wipe it. An association the firmware does supply always wins.
     [ "$ap" = - ] && [ -n "${ASSOC_BSS[$mac]}" ] && ap="${ASSOC_BSS[$mac]}"
+    och="$ch"                       # the line's own channel, before the AP's stands in for it
     [ "$fr" = 0 ] && [ "$ap" != "-" ] && fr=${FREQ[$ap]:-0}
     [ "$ch" = 0 ] && [ "$ap" != "-" ] && ch=${CH[$ap]:-0}
     # an AP Recon never listed has no CH of its own. ONLY for the AP that channel was recorded for: a
@@ -1576,6 +1595,11 @@ run_cycle() {
     # not listed, taking over when a firmware stops naming the AP it named before -- the previous
     # AP's must not stay on the row: it would be watchable, and Disrupt would lock and transmit on
     # a channel nothing observed for this BSS.
+    # A row whose channel is its AP's takes its frequency and band from the AP too (ap_freq). A row
+    # with a channel of its own, from the firmware's line, keeps its own frequency beside it.
+    if [ "$och" = 0 ] && [ "$ap" != - ] && [ "$ch" != 0 ]; then
+      ap_freq "$ap" "$ch"; (( FREQ_V > 0 )) && fr=$FREQ_V
+    fi
     pap="${AP_OF[$mac]:--}"
     if [ "$pap" != - ] && [ "$pap" != "$ap" ]; then
       [ "$ch" = 0 ] && unset "CH[$mac]"
@@ -1909,9 +1933,9 @@ TAGTXT=""
 # pauses Recon's hop for the listen window; never in the scan loop. What it learns is kept for the
 # run in ASSOC_BSS and re-applied by run_cycle, which otherwise overwrites AP_OF with the
 # firmware's "-" every cycle. A membership capture teaches the same fact for every station it
-# heard (assoc_learn_members). Not copied into the hooks: a hook's one row takes its AP from the
-# Recon selection (hook_target).
-# Two things here are NOT measured on a device yet, and are written to degrade rather than assume:
+# heard transmitting (assoc_learn_members). Not copied into the hooks: a hook's one row takes its
+# AP from the Recon selection (hook_target).
+# Three things here are NOT measured on a device yet, and are written to degrade rather than assume:
 #  - PINEAPPLE_EXAMINE_CHANNEL has never been issued on the bench without an EXAMINE_BSSID before
 #    it (every measured park began with EXAMINE_BSSID, and lock_target adds the channel command
 #    only when that step did not land on the channel; the lookup has no BSSID to give). lock_channel therefore
@@ -1927,7 +1951,13 @@ TAGTXT=""
 #    was kicked from. Downlink frames corroborate a pair the client was heard in; they never make one.
 # Falsified by: a lookup naming a BSSID the client is not associated to, or NO_FRAMES on the right
 # channel for a client that is passing traffic there.
-declare -A ASSOC_BSS ASSOC_CH ASSOC_TS ASSOC_TRY ASSOC_SRC
+# ASSOC_FW[mac] is set for the rows whose AP came from the firmware's own recon line THIS cycle, and
+# cleared for the rest (run_cycle, both ways, every cycle). The three rules that must tell a
+# firmware-supplied AP from one read off the air read this mark. They used to infer it -- "the row's
+# AP differs from the last thing we learned" -- which stops being true the moment the two agree: a
+# membership capture on the AP a firmware names made the row look learned, and the next BSSID heard
+# off the air then replaced it. Not reachable on 1.1.3 or 2.0.0, neither of which supplies one.
+declare -A ASSOC_BSS ASSOC_CH ASSOC_TS ASSOC_TRY ASSOC_SRC ASSOC_FW
 ASSOC_WHY=''; ASSOC_TEXT=''; ASSOC_N=0; ASSOC_UP=0; ASSOC_RECS=0; ASSOC_ITMAX=0; ASSOC_TRUNC=0; CHAN_V=0
 ASSOC_JUST=''      # set by the card's find-AP rows between their lookup and the menu it opens; spent by assoc_refresh
 
@@ -1942,6 +1972,34 @@ chan_of_freq() {
   elif (( f >= 2412 && f <= 2472 && (f - 2407) % 5 == 0 )); then CHAN_V=$(( (f - 2407) / 5 ))
   elif (( f >= 5160 && f <= 5885 && f % 5 == 0 )); then CHAN_V=$(( (f - 5000) / 5 ))
   fi
+  return 0
+}
+
+# freq_of_chan <ch> <band> -> sets FREQ_V, the centre of a 2.4 or 5 GHz channel number; 0 for anything
+# else. chan_of_freq's inverse, for the one case that needs it: an AP Recon has not listed, whose
+# channel a park verified.
+freq_of_chan() {
+  local c="$1" b="$2"; FREQ_V=0
+  [[ $c =~ ^[0-9]+$ ]] || return 0
+  c=$((10#$c))
+  if [ "$b" = 2 ]; then
+    if (( c == 14 )); then FREQ_V=2484; elif (( c >= 1 && c <= 13 )); then FREQ_V=$(( 2407 + 5 * c )); fi
+  elif [ "$b" = 5 ]; then
+    if (( c >= 32 && c <= 177 )); then FREQ_V=$(( 5000 + 5 * c )); fi
+  fi
+  return 0
+}
+# ap_freq <ap> <ch> -> sets FREQ_V to the frequency a client on that AP is on: the AP's own row's when
+# Recon lists it, else the centre of <ch> in the band assoc_learn recorded for it; 0 when neither.
+# A client row describes the BSS it is on. Its channel is its AP's, so its frequency and band have
+# to be too: they used to stay where the CLIENT was last heard, and a camera heard scanning on
+# 2437 MHz with its AP on channel 36 went to the inventory, the Watch loot and the card as band 2,
+# channel 36.
+FREQ_V=0
+ap_freq() {
+  local ap="$1" ch="$2"; FREQ_V=0
+  if [[ ${FREQ[$ap]:-0} =~ ^[0-9]+$ ]] && (( 10#${FREQ[$ap]:-0} > 0 )); then FREQ_V=${FREQ[$ap]}
+  elif [ -n "${BAND[$ap]:-}" ]; then freq_of_chan "$ch" "${BAND[$ap]}"; fi
   return 0
 }
 
@@ -1970,14 +2028,15 @@ assoc_capture() {
   rm -f "$out"
   tcpdump -i "$RECON_IF" -nn -s "$CLI_CAP_SNAP" -c "$CLI_CAP_COUNT" -w "$out" "type data and (wlan addr2 $mac or wlan addr1 $mac)" >/dev/null 2>&1 & p=$!
   child_add "$p"; sleep 1; w=1
-  if [ ! -s "$out" ] && ! kill -0 "$p" 2>/dev/null; then     # the OR form did not arm: the uplink alone still names the BSSID
+  if [ ! -s "$out" ] && ! kill -0 "$p" 2>/dev/null && ! main_gone; then     # the OR form did not arm: the uplink alone still names the BSSID
     child_del "$p"
     log assoc "capture: OR filter did not arm, retrying uplink-only"
     tcpdump -i "$RECON_IF" -nn -s "$CLI_CAP_SNAP" -c "$CLI_CAP_COUNT" -w "$out" "type data and wlan addr2 $mac" >/dev/null 2>&1 & p=$!
     child_add "$p"; sleep 1; w=1
   fi
-  while (( w < secs )); do kill -0 "$p" 2>/dev/null || break; sleep 1; w=$((w + 1)); done
+  while (( w < secs )); do kill -0 "$p" 2>/dev/null || break; main_gone && break; sleep 1; w=$((w + 1)); done
   kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null; child_del "$p"
+  main_gone && { rm -f "$out"; return 1; }       # the run was killed: see main_gone
   [ -s "$out" ] || { rm -f "$out"; return 1; }
   printf '%s' "$out"
 }
@@ -1995,7 +2054,7 @@ assoc_can() {   # a client row with no AP, and a capture tool to find one with
 # AP, at which point run_cycle gives the row its AP's channel.
 assoc_nochan() {
   local mac="$1" ap="${AP_OF[$1]:--}" c
-  [ "${ROLE[$mac]}" = cli ] && [ "$ap" != - ] && [ "$ap" = "${ASSOC_BSS[$mac]:-}" ] || return 1
+  [ "${ROLE[$mac]}" = cli ] && [ "$ap" != - ] && [ "$ap" = "${ASSOC_BSS[$mac]:-}" ] && [ -z "${ASSOC_FW[$mac]:-}" ] || return 1
   for c in "${CH[$mac]:-0}" "${CH[$ap]:-0}"; do
     [[ $c =~ ^[0-9]+$ ]] && (( 10#$c > 0 )) && return 1
   done
@@ -2007,6 +2066,7 @@ assoc_nochan() {
 assoc_stale() {
   local mac="$1" t
   [ "${ROLE[$mac]}" = cli ] && [ -n "${ASSOC_BSS[$mac]}" ] && [ "${AP_OF[$mac]}" = "${ASSOC_BSS[$mac]}" ] || return 1
+  [ -z "${ASSOC_FW[$mac]:-}" ] || return 1      # the firmware's: re-read every cycle, never looked up again
   [ "$HAVE_TCPDUMP" = 1 ] || return 1
   t=${ASSOC_TS[$mac]:-0}; (( ${ASSOC_TRY[$mac]:-0} > t )) && t=${ASSOC_TRY[$mac]}
   (( EPOCHSECONDS - t >= ASSOC_TTL ))
@@ -2036,12 +2096,16 @@ assoc_learn() {
   elif [ "$prev" != "$b" ]; then unset "ASSOC_CH[$m]"; fi      # another AP, channel unknown: the old AP's says nothing about it
   [ "${ROLE[$m]}" = cli ] || return 0       # no client row for it (yet): run_cycle applies it when one appears, and no row is invented
   cur="${AP_OF[$m]:--}"
-  if [ "$cur" != - ] && [ "$cur" != "$prev" ] && [ "$cur" != "$b" ]; then return 0; fi   # the firmware named another AP: its word stands
+  # the firmware named another AP: its word stands. Which rows those are is run_cycle's ASSOC_FW
+  # mark, not a comparison with what was learned before -- see the array's own comment.
+  if [ -n "${ASSOC_FW[$m]:-}" ] && [ "$cur" != - ] && [ "$cur" != "$b" ]; then return 0; fi
   AP_OF[$m]="$b"
   # The row takes the new AP's channel and SSID, as run_cycle's record_seen does for an associated
   # client. When it MOVED to an AP that has neither, the old AP's are dropped, not carried over: a
   # Disrupt row built on the previous AP's channel would lock and transmit somewhere this BSS is not.
   if [ -n "${ASSOC_CH[$m]}" ]; then CH[$m]="${ASSOC_CH[$m]}"
+    ap_freq "$b" "${CH[$m]}"          # ...and its frequency and band with it: see ap_freq
+    if (( FREQ_V > 0 )); then FREQ[$m]=$FREQ_V; band_of "$FREQ_V"; BAND[$m]=$BAND_V; fi
   elif [ "$cur" != - ] && [ "$cur" != "$b" ]; then unset "CH[$m]"; fi
   if [ -n "${SSID_CLEAN[$b]}" ]; then SSID_CLEAN[$m]="${SSID_CLEAN[$b]}"
   elif [ "$cur" != - ] && [ "$cur" != "$b" ]; then unset "SSID_CLEAN[$m]"; fi
@@ -2086,8 +2150,8 @@ assoc_learn_members() {
 #   SNAP_SHORT  records were cut below the addresses (raise CLI_CAP_SNAP)
 # A lookup that fails teaches nothing and leaves an earlier answer in place.
 assoc_lookup() {
-  local mac="$1" ch lch secs=$ASSOC_CAP_SECS lock=none lrc f out rc kk v1 v2 v3 v4 t0=$EPOCHSECONDS where ap
-  local best='' bn=0 bu=0 second='' su=0 dbest='' dn=0 prev="${ASSOC_BSS[$1]:-}"
+  local mac="$1" ch lch secs=$ASSOC_CAP_SECS lock=none lrc f out rc kk v1 v2 v3 v4 t0=$EPOCHSECONDS where ap six=0
+  local best='' bn=0 bu=0 second='' su=0 dbest='' dn=0 own=0 cand='' prev="${ASSOC_BSS[$1]:-}"
   ASSOC_WHY=''; ASSOC_TEXT=''; ASSOC_N=0; ASSOC_UP=0; ASSOC_RECS=0; ASSOC_ITMAX=0; ASSOC_TRUNC=0
   if [ "${ROLE[$mac]}" != cli ]; then ASSOC_WHY=NOT_CLIENT; ASSOC_TEXT="${mac:9} is not a client row"; return 1; fi
   ASSOC_TRY[$mac]=$EPOCHSECONDS
@@ -2106,10 +2170,14 @@ assoc_lookup() {
   # With no band known for the AP -- or no AP -- the row's own band is all there is to go on.
   if (( ch > 0 )); then
     ap="${AP_OF[$mac]:--}"
-    if [ -n "${BAND[$ap]:-}" ]; then [ "${BAND[$ap]}" = 6 ] && ch=0
-    elif [ "${BAND[$mac]:-}" = 6 ]; then ch=0; fi
+    if [ -n "${BAND[$ap]:-}" ]; then [ "${BAND[$ap]}" = 6 ] && { ch=0; six=1; }
+    elif [ "${BAND[$mac]:-}" = 6 ]; then ch=0; six=1; fi
   fi
-  if (( ch == 0 )); then chan_of_freq "${FREQ[$mac]:-0}"; ch=$CHAN_V; fi
+  # The last-heard frequency is the fallback for a row with no channel of its own -- but never for a
+  # row whose channel was dropped by the rule above. A 6 GHz client heard scanning on 2.4 GHz has a
+  # 2.4 GHz frequency on its row, and parking there to listen for a 6 GHz association hears nothing
+  # and reports the AP "not re-confirmed": the very symptom the rule exists to prevent.
+  if (( ch == 0 && six == 0 )); then chan_of_freq "${FREQ[$mac]:-0}"; ch=$CHAN_V; fi
   set_state WATCH
   if (( ch > 0 )); then
     LOG "finding the AP of ${mac:9} on ch $ch (~$((secs + 3)) s)"$'\n'"Recon paused while listening"
@@ -2121,6 +2189,7 @@ assoc_lookup() {
     esac
   else
     lock=hop; LOCK_TEXT="no channel known for ${mac:9}"
+    (( six )) && LOCK_TEXT="the AP of ${mac:9} is on 6 GHz: no channel to park on"
   fi
   if [ "$lock" = hop ]; then
     secs=$((secs * 3)); where="across the hop"
@@ -2137,6 +2206,7 @@ assoc_lookup() {
       while read -r kk v1 v2 v3 v4; do       # a here-string, so these land in THIS shell
         case "$kk" in
           ITMAX) ASSOC_ITMAX="$v1" ;; RECS) ASSOC_RECS="$v1" ;; TRUNC) ASSOC_TRUNC="$v1" ;;
+          OWN)   [ "$v1" = "$mac" ] && [[ $v2 =~ ^[0-9]+$ ]] && own=$v2 ;;      # every frame it sent, paired or not
           PAIR)  [ "$v1" = "$mac" ] && [[ $v3 =~ ^[0-9]+$ ]] || continue
                  [[ $v4 =~ ^[0-9]+$ ]] || v4=0
                  # v3 frames between the two, v4 of them the client's own. A pair with none of its
@@ -2154,13 +2224,18 @@ assoc_lookup() {
           ASSOC_WHY=SNAP_SHORT; ASSOC_TEXT="snap $CLI_CAP_SNAP too small for radiotap $ASSOC_ITMAX: raise CLI_CAP_SNAP"
         elif (( ASSOC_RECS == 0 )); then
           ASSOC_WHY=NO_FRAMES; ASSOC_TEXT="${mac:9} not heard $where in ${secs}s"
-        elif [ -n "$dbest" ]; then
-          ASSOC_WHY=NO_UPLINK; ASSOC_TEXT="${mac:9} itself not heard $where: only ${dbest:9} sending to it ($dn frames)"
+        elif (( own == 0 )); then
+          # Whether the client was heard is its own-frame total, not whether a pair formed: records
+          # exist here, and none of them is a frame it sent.
+          ASSOC_WHY=NO_UPLINK
+          if [ -n "$dbest" ]; then ASSOC_TEXT="${mac:9} itself not heard $where: only ${dbest:9} sending to it ($dn frames)"
+          else ASSOC_TEXT="${mac:9} itself not heard $where ($ASSOC_RECS records, none of its own)"; fi
         else
-          ASSOC_WHY=NO_PAIR; ASSOC_TEXT="${mac:9} heard $where ($ASSOC_RECS frames) but no AP twice"
+          ASSOC_WHY=NO_PAIR; ASSOC_TEXT="${mac:9} heard $where ($own of its own frames) but no AP twice"
         fi
       elif [ -n "$second" ] && (( su * 2 >= bu )); then
         ASSOC_WHY=AMBIGUOUS; ASSOC_TEXT="${mac:9} talks to ${best:9} ($bu) and ${second:9} ($su): not deciding"
+        cand=" cand=$best/$bu,$second/$su"       # whole, for the log: the screen line cuts both to three octets
       fi
     fi
   else
@@ -2172,7 +2247,7 @@ assoc_lookup() {
   set_state SCAN
   if [ -n "$ASSOC_WHY" ]; then
     LOG yellow "$ASSOC_TEXT"
-    log assoc "$mac none why=$ASSOC_WHY recs=$ASSOC_RECS itmax=$ASSOC_ITMAX trunc=$ASSOC_TRUNC ch=$ch lock=$lock dwell=$((EPOCHSECONDS - t0))s${dbest:+ down=$dbest/$dn}${prev:+ kept=$prev}"
+    log assoc "$mac none why=$ASSOC_WHY recs=$ASSOC_RECS itmax=$ASSOC_ITMAX trunc=$ASSOC_TRUNC ch=$ch lock=$lock dwell=$((EPOCHSECONDS - t0))s own=$own${dbest:+ down=$dbest/$dn}$cand${prev:+ kept=$prev}"
     return 1
   fi
   ASSOC_N=$bn; ASSOC_UP=$bu
@@ -3619,6 +3694,8 @@ st_stubs_intact() {   # -> the stubs a teardown destroyed, or "none". A teardown
 st_device() {   # st_device mac role "vendor text" "ssid" hidden ap_of
   local m="$1"
   ROLE[$m]="$2"; VLOW[$m]="${3,,}"; VENDOR[$m]="${3:0:14}"; unset "VEND_TYPE[$m]"; SSID_CLEAN[$m]="$4"; HIDDEN[$m]="$5"; AP_OF[$m]="${6:--}"
+  # an AP given here is one the firmware named, which is what run_cycle marks on such a row
+  if [ -n "${6:-}" ] && [ "$6" != - ]; then ASSOC_FW[$m]=1; else unset "ASSOC_FW[$m]"; fi
   LAST_SEEN[$m]=$EPOCHSECONDS; N_SEEN[$m]=1; FIRST_SEEN[$m]=$EPOCHSECONDS; KITAP[$m]=""; unset "KITCL[$m]" "BEH[$m]" "BEH_GATE[$m]" "BEH_VERDICT[$m]" "EVENT_FLAG[$m]" "BUSY[$m]" "PROBES[$m]"
 }
 st_other_has() {   # st_other_has mac -> yes|no: is this MAC in the "Other devices" list?
@@ -4709,7 +4786,7 @@ IWFIX
   unlock_target() { printf 'u' >>"$tmp/unlocks"; }
   assoc_capture() { printf '%s %s\n' "$1" "$2" >>"$tmp/caps"; [ -s "${ST_PCAP:-}" ] || return 1; cp "$ST_PCAP" "$tmp/asc_run.pcap"; printf '%s' "$tmp/asc_run.pcap"; }
   HAVE_TCPDUMP=1; ASSOC_CAP_SECS=4; ASSOC_TTL=300
-  ASSOC_BSS=(); ASSOC_CH=(); ASSOC_TS=(); ASSOC_TRY=(); ASSOC_SRC=()
+  ASSOC_BSS=(); ASSOC_CH=(); ASSOC_TS=(); ASSOC_TRY=(); ASSOC_SRC=(); ASSOC_FW=()
   st_device "$ASB" ap "Reolink Innovation Limited" "ReoKit" 0; CH[$ASB]=36
   st_device "$AS1" cli "Reolink Innovation Limited" "" 0; FREQ[$AS1]=5180; unset "CH[$AS1]"
   st "assoc: a client the firmware gave no AP for can be looked up" "$(assoc_can "$AS1" && echo yes)" "yes"
@@ -4762,6 +4839,8 @@ IWFIX
   assoc_lookup "$AS3" >/dev/null 2>&1
   st "assoc lookup: two BSSIDs, the second with half the first's count, is AMBIGUOUS" \
      "$?:$ASSOC_WHY:${AP_OF[$AS3]}" "1:AMBIGUOUS:-"
+  st "assoc lookup: and the log keeps both candidates whole, with their counts: the screen cuts them to three octets" \
+     "$(grep -c "assoc $AS3 none why=AMBIGUOUS .* cand=$ASB/4,aa:00:00:00:00:99/2" "$tmp/events.log")" "1"
   # the same two BSSIDs with the counts exchanged: awk's for-in order is fixed per key, so between
   # them these two cases meet the runner-up both before and after the leader
   st_assoc_pcap "$tmp/asc_two_b.pcap" ec71db000013 "$ASH:2" aa0000000099:4; ST_PCAP="$tmp/asc_two_b.pcap"
@@ -4782,6 +4861,21 @@ IWFIX
      "$?:$ASSOC_WHY:${AP_OF[ec:71:db:00:00:12]}:${ASSOC_BSS[ec:71:db:00:00:12]:-none}" "1:NO_UPLINK:-:none"
   st "assoc lookup: and it says which AP was heard sending, and that the client was not" \
      "$(printf '%s' "$ASSOC_TEXT" | grep -c "00:00:12 itself not heard on ch 36: only ${ASB:9} sending to it (2 frames)"):$(grep -c "assoc ec:71:db:00:00:12 none why=NO_UPLINK .* down=$ASB/2" "$tmp/events.log")" "1:1"
+  # The two reasons are told apart by whether the client sent ANYTHING, counted before the
+  # two-sightings gate. The walk used to report only pairs seen twice, so one frame of the client's
+  # own to one AP, with another AP sending to it three times, read "itself not heard" although it
+  # was; and a single frame sent TO it read "heard" although it sent nothing (third review pass, L2).
+  st_device aa:00:00:00:00:2b cli "Acme" "" 0; FREQ[aa:00:00:00:00:2b]=5180; unset "CH[aa:00:00:00:00:2b]"
+  st_assoc_pcap "$tmp/asc_1u3d.pcap" aa000000002b "$ASH:1" aa0000000099:3:down; ST_PCAP="$tmp/asc_1u3d.pcap"; rm -f "$tmp/events.log"
+  assoc_lookup aa:00:00:00:00:2b >/dev/null 2>&1
+  st "assoc lookup: one frame of its own, and another AP sending to it, is NO_PAIR: the text says it WAS heard" \
+     "$?:$ASSOC_WHY:$(printf '%s' "$ASSOC_TEXT" | grep -c '00:00:2b heard on ch 36 (1 of its own frames) but no AP twice'):$(grep -c 'why=NO_PAIR .* own=1 down=aa:00:00:00:00:99/3' "$tmp/events.log")" "1:NO_PAIR:1:1"
+  st_assoc_pcap "$tmp/asc_1d.pcap" aa000000002b "$ASH:1:down"; ST_PCAP="$tmp/asc_1d.pcap"; rm -f "$tmp/events.log"
+  assoc_lookup aa:00:00:00:00:2b >/dev/null 2>&1
+  st "assoc lookup: one frame sent TO it is NO_UPLINK: the text does not say it was heard" \
+     "$?:$ASSOC_WHY:$(printf '%s' "$ASSOC_TEXT" | grep -c '00:00:2b itself not heard on ch 36 (1 records, none of its own)'):$(grep -c 'why=NO_UPLINK .* own=0' "$tmp/events.log")" "1:NO_UPLINK:1:1"
+  st "pairs: the walk says how many frames each station sent, before the two-sightings gate" \
+     "$(pcap_stream "$tmp/asc.pcap" | awk -v mode=pairs -v sta="" -v own="$OWN_MACS" "$CLI_AWK" | awk '$1 == "OWN" { print $2 "=" $3 }' | sort | tr '\n' ' ')" "$AS1=3 $AS3=1 $AS4=2 "
   st_device aa:00:00:00:00:27 cli "Acme" "" 0; FREQ[aa:00:00:00:00:27]=5180; unset "CH[aa:00:00:00:00:27]"
   st_assoc_pcap "$tmp/asc_ud.pcap" aa0000000027 "$ASH:2" aa0000000099:6:down; ST_PCAP="$tmp/asc_ud.pcap"
   assoc_lookup aa:00:00:00:00:27 >/dev/null 2>&1
@@ -4816,8 +4910,10 @@ IWFIX
   st_device aa:00:00:00:00:21 cli "Acme" "" 0; unset "FREQ[aa:00:00:00:00:21]" "CH[aa:00:00:00:00:21]"
   rm -f "$tmp/caps" "$tmp/locks"; ST_LRC=0; BASELINE_NEXT=0; PREV_PKT=(); PREV_PKT[$ASB]=5
   assoc_lookup aa:00:00:00:00:21 >/dev/null 2>&1
+  # (the reason: the stand-in capture is the shared fixture, which holds frames and none of this
+  # client's, so it is "itself not heard". It read NO_PAIR until the own-frame total decided it.)
   st "assoc lookup: no channel known means no lock is tried, and the hop is listened across" \
-     "$?:$ASSOC_WHY:$([ -e "$tmp/locks" ] && echo locked):$(cat "$tmp/caps")" "1:NO_PAIR::aa:00:00:00:00:21 12"
+     "$?:$ASSOC_WHY:$([ -e "$tmp/locks" ] && echo locked):$(cat "$tmp/caps")" "1:NO_UPLINK::aa:00:00:00:00:21 12"
   st "assoc lookup: and with the hop never held, the cycle after it is an ordinary one" "$BASELINE_NEXT:${#PREV_PKT[@]}" "0:1"
   BASELINE_NEXT=1; PREV_PKT=()
   # heard across the hop, on an AP Recon never listed: the AP is learned, its channel is not guessed
@@ -4861,6 +4957,16 @@ IWFIX
   assoc_refresh aa:00:00:00:00:23 >/dev/null 2>&1
   st "assoc refresh: the re-check of a 6 GHz AP does not park on its channel number, which 2.4 GHz has too: it listens across the hop" \
      "$(cat "$tmp/locks" 2>/dev/null):$(cat "$tmp/caps" 2>/dev/null)" ":aa:00:00:00:00:23 12"
+  # ...and the frequency the client was last heard on is no fallback there: a 6 GHz client heard
+  # scanning on 2.4 GHz would park the radio on channel 6 to listen for an association that cannot
+  # be there, hear nothing, and report its AP "not re-confirmed" -- the symptom the rule above
+  # exists to prevent, reached by the other road.
+  FREQ[aa:00:00:00:00:23]=2437; BAND[aa:00:00:00:00:23]=2
+  ASSOC_TS[aa:00:00:00:00:23]=$((EPOCHSECONDS - 400)); ASSOC_TRY[aa:00:00:00:00:23]=$((EPOCHSECONDS - 400)); rm -f "$tmp/locks" "$tmp/caps"
+  assoc_refresh aa:00:00:00:00:23 >/dev/null 2>&1
+  st "assoc refresh: nor does it fall back to the channel the client was last heard scanning on" \
+     "$(cat "$tmp/locks" 2>/dev/null):$(cat "$tmp/caps" 2>/dev/null)" ":aa:00:00:00:00:23 12"
+  FREQ[aa:00:00:00:00:23]=5975; BAND[aa:00:00:00:00:23]=6
   st_device aa:00:00:00:00:24 cli "Acme" "" 0; FREQ[aa:00:00:00:00:24]=5975; BAND[aa:00:00:00:00:24]=6; CH[aa:00:00:00:00:24]=5
   rm -f "$tmp/locks"; ST_PCAP="$tmp/asc_hdr.pcap"; assoc_lookup aa:00:00:00:00:24 >/dev/null 2>&1
   st "assoc lookup: nor on a channel number a firmware put on a 6 GHz client row itself" "$(cat "$tmp/locks" 2>/dev/null)" ""
@@ -4902,6 +5008,20 @@ IWFIX
   assoc_learn aa:00:00:00:00:31 "$ASB" 36 air
   st "assoc learn: an AP the firmware supplied is not overwritten" \
      "${AP_OF[aa:00:00:00:00:31]}:${ASSOC_BSS[aa:00:00:00:00:31]}" "aa:00:00:00:00:30:$ASB"
+  # ...and goes on not being overwritten once a capture has named that same AP. Which source a row's
+  # AP came from used to be inferred -- "it differs from the last thing we learned" -- and the two
+  # agreeing is exactly when that inference fails: a membership capture on the AP the firmware names
+  # made the row look learned, and the next BSSID heard off the air replaced the firmware's.
+  st_device aa:00:00:00:00:34 cli "Acme" "" 0 aa:00:00:00:00:30
+  assoc_learn aa:00:00:00:00:34 aa:00:00:00:00:30 0 members
+  ASSOC_TS[aa:00:00:00:00:34]=$((EPOCHSECONDS - 400)); ASSOC_TRY[aa:00:00:00:00:34]=$((EPOCHSECONDS - 400))
+  st "assoc refresh: an AP the firmware supplied is still not re-checked after a capture names the same one" \
+     "$(assoc_stale aa:00:00:00:00:34 && echo stale)" ""
+  st "assoc: nor is it the no-channel state, whatever channel is or is not known for it" \
+     "$(unset "CH[aa:00:00:00:00:34]" "CH[aa:00:00:00:00:30]"; assoc_nochan aa:00:00:00:00:34 && echo nochan)" ""
+  assoc_learn aa:00:00:00:00:34 aa:00:00:00:00:35 0 air
+  st "assoc learn: nor is it overwritten by the next BSSID heard off the air" \
+     "${AP_OF[aa:00:00:00:00:34]}:${ASSOC_BSS[aa:00:00:00:00:34]}" "aa:00:00:00:00:30:aa:00:00:00:00:35"
   unset "CH[aa:00:00:00:00:31]" "CH[aa:00:00:00:00:30]"
   st "assoc: a firmware-supplied AP with no channel is not the no-channel state: Watch locks by BSSID there, as in the hooks" \
      "$(assoc_nochan aa:00:00:00:00:31 && echo nochan):$(watchable aa:00:00:00:00:31 && echo watchable)" ":watchable"
@@ -4909,6 +5029,16 @@ IWFIX
   st "assoc learn: a station with no row is remembered for run_cycle, and no row is invented" \
      "${ASSOC_BSS[aa:00:00:00:00:32]}:${ROLE[aa:00:00:00:00:32]:-none}" "$ASB:none"
   assoc_learn "$ASB" "$ASB" 36 air; st "assoc learn: a station is never its own AP" "$?" 1
+  st_device aa:00:00:00:00:83 ap "Acme" "FiveG" 0; CH[aa:00:00:00:00:83]=149; FREQ[aa:00:00:00:00:83]=5745; BAND[aa:00:00:00:00:83]=5
+  st_device aa:00:00:00:00:75 cli "Acme" "" 0; FREQ[aa:00:00:00:00:75]=2437; BAND[aa:00:00:00:00:75]=2; unset "CH[aa:00:00:00:00:75]"
+  assoc_learn aa:00:00:00:00:75 aa:00:00:00:00:83 0 air
+  st "assoc learn: the row takes its AP's frequency and band at once, with its channel" \
+     "${CH[aa:00:00:00:00:75]}/${FREQ[aa:00:00:00:00:75]}/${BAND[aa:00:00:00:00:75]}" "149/5745/5"
+  local _q1 _q2 _q3; _bad=""
+  for _a in 1:2:2412 6:2:2437 13:2:2472 14:2:2484 36:5:5180 165:5:5825 5:6:0 0:2:0 15:2:0 20:5:0 x:2:0; do
+    IFS=: read -r _q1 _q2 _q3 <<<"$_a"; freq_of_chan "$_q1" "$_q2"; [ "$FREQ_V" = "$_q3" ] || _bad+=" $_q1/$_q2->$FREQ_V"
+  done
+  st "freq_of_chan: 2.4 and 5 GHz channel numbers map to their centre; 6 GHz, off-grid and junk stay 0" "${_bad:-none}" "none"
   assoc_learn "$ASB" aa:00:00:00:00:30 36 air
   st "assoc learn: an AP row is never given an AP" "${AP_OF[$ASB]:--}" "-"
   assoc_learn junk "$ASB" 36 air; st "assoc learn: a malformed MAC is refused" "$?" 1
@@ -5071,9 +5201,10 @@ IWFIX
          assoc_learn aa:00:00:00:00:61 aa:00:00:00:00:62 44 air      # heard on one AP; the firmware then names another, with no row of its own
          run_cycle >/dev/null 2>&1
          printf '%s|%s|%s|%s|%s|%s|%s|%s' "${AP_OF[$AS4]}" "${CH[$AS4]}" "${CLIENTS_OF[$ASB]}" "${AP_OF[aa:00:00:00:00:31]}" "${AP_OF[aa:00:00:00:00:41]}" "${CH[aa:00:00:00:00:41]}" \
-                "${AP_OF[aa:00:00:00:00:61]}" "${CH[aa:00:00:00:00:61]:-none}" )
-  st "run_cycle: a learned AP survives the firmware's '-', feeds the kit list, yields to a firmware one, and brings its channel only to its own AP" \
-     "$_f2" "$ASB|36| $AS4|aa:00:00:00:00:30|aa:00:00:00:00:40|44|aa:00:00:00:00:60|none"
+                "${AP_OF[aa:00:00:00:00:61]}" "${CH[aa:00:00:00:00:61]:-none}"
+         printf '|fw=%s%s%s' "${ASSOC_FW[$AS4]:-0}" "${ASSOC_FW[aa:00:00:00:00:31]:-0}" "${ASSOC_FW[aa:00:00:00:00:61]:-0}" )
+  st "run_cycle: a learned AP survives the firmware's '-', feeds the kit list, yields to a firmware one, and brings its channel only to its own AP; and the cycle marks which rows the firmware named an AP for" \
+     "$_f2" "$ASB|36| $AS4|aa:00:00:00:00:30|aa:00:00:00:00:40|44|aa:00:00:00:00:60|none|fw=011"
   # The row's channel and SSID are its AP's, and record_seen only ever SETS them. A firmware that
   # names an AP and later stops, with another AP heard off the air in between, left the new AP on
   # the row with the old AP's channel and SSID: watchable, and a Disrupt aimed at a channel nothing
@@ -5092,6 +5223,26 @@ IWFIX
          printf '%s|%s/%s/%s|%s|%s' "$_a" "${AP_OF[aa:00:00:00:00:71]}" "${CH[aa:00:00:00:00:71]:-none}" "${SSID_CLEAN[aa:00:00:00:00:71]:-none}" \
                 "$(assoc_nochan aa:00:00:00:00:71 && echo nochan)" "$(watchable aa:00:00:00:00:71 && echo watchable)"
          printf '|%s' "$(( EPOCHSECONDS - ${LAST_CYCLE_TS:-0} <= 5 ))" )
+  # A client row describes the BSS it is on. Its channel was already its AP's, while its frequency and
+  # band stayed where the CLIENT was last heard: the fixtures' own camera, heard scanning on 2437 MHz
+  # with its AP on channel 36, went to the inventory as band 2, channel 36, 2437 MHz, and the card
+  # read "ch36 2GHz" (third review pass, L6). An AP Recon lists gives its own frequency; one it does
+  # not gives the frequency of the channel a park verified.
+  local _f3
+  _f3=$( recon_lines() { case "$1" in
+           APS) printf '%s|9|ReoKit|36|5180|-50|0|5\n' "$ASB" ;;
+           CLIENTS) printf '%s|-|7|-60||2437|5|0\naa:00:00:00:00:72|-|7|-60||2437|5|0\naa:00:00:00:00:74|%s|7|-60||2437|5|11\n' "$AS4" "$ASB" ;;
+         esac; }
+         gps_tick() { :; }; battery_tick() { :; }; upsert_inventory() { :; }; write_report() { :; }
+         ASSOC_BSS=(); ASSOC_CH=(); ASSOC_FW=(); AP_OF=(); CH=(); FREQ=(); BAND=()
+         assoc_learn "$AS4" "$ASB" 0 members
+         assoc_learn aa:00:00:00:00:72 aa:00:00:00:00:73 44 air
+         run_cycle >/dev/null 2>&1
+         printf '%s/%s/%s|%s/%s/%s|%s/%s/%s' "${CH[$AS4]}" "${FREQ[$AS4]}" "${BAND[$AS4]}" \
+                "${CH[aa:00:00:00:00:72]}" "${FREQ[aa:00:00:00:00:72]}" "${BAND[aa:00:00:00:00:72]}" \
+                "${CH[aa:00:00:00:00:74]}" "${FREQ[aa:00:00:00:00:74]}" "${BAND[aa:00:00:00:00:74]}" )
+  st "run_cycle: a client row that carries an AP takes its frequency and band from that AP, like its channel; a row with a channel of its own keeps its own" \
+     "$_f3" "36/5180/5|44/5220/5|11/2437/2"
   st "run_cycle: when the AP a row carries changes to one with no channel or SSID, the old AP's do not stay on the row; and the cycle stamps the time proximity goes stale against" \
      "$_f2" "aa:00:00:00:00:66/1/Fnet|aa:00:00:00:00:67/none/none|nochan||1"
   # the real capture, once, against a tcpdump that writes a file: the filter and the bookkeeping
@@ -5114,15 +5265,40 @@ IWFIX
   rm -f "$tmp/tcpargs" "$tmp/children_mid"; _f2=$(assoc_capture "$AS1" 1)
   st "assoc capture: when the OR filter will not arm it retries on the uplink alone, same interface, and only the retry is registered" \
      "$?:$(grep -c -- "^-i $RECON_IF -nn -s $CLI_CAP_SNAP -c $CLI_CAP_COUNT -w [^ ]* type data and wlan addr2 $AS1\$" "$tmp/tcpargs"):$(tr '\n' ' ' <"$tmp/children_mid" 2>/dev/null)" "0:1:1 1 "
-  rm -f "$_f2"; unset -f tcpdump; CHILD_FILE="$_cf"
+  rm -f "$_f2"
+  # A run that is KILLED leaves a capture helper running: each is called in $( ), so it is a child
+  # of the run and outlives it by up to its listen window. The run's watchdog tidies up within 3 s,
+  # and the orphan then wrote its file back -- seen in the harness, where the first-second check
+  # found the file gone and its tcpdump dead, took that for a filter that had not armed, and started
+  # the uplink-only retry after the radio had been released. Each helper now asks once a second
+  # whether the run is still there (main_gone), stops, and removes its own file.
+  local _mp=$MAIN_PID _dead; ( : ) & _dead=$!; wait "$_dead" 2>/dev/null
+  tcpdump() { local o=''; printf '%s\n' "$*" >>"$tmp/tcpargs"; while [ $# -gt 0 ]; do [ "$1" = -w ] && o="$2"; shift; done; printf 'x' >"$o"; sleep 3; }
+  MAIN_PID=$_dead; rm -f "$tmp/tcpargs"; _f2=$(assoc_capture "$AS1" 4)
+  st "assoc capture: with the run gone it stops and leaves no capture file" "$?:$([ -e "/tmp/cs_asc_$$.pcap" ] && echo left)" "1:"
+  tcpdump() { printf '%s\n' "$*" >>"$tmp/tcpargs"; return 1; }
+  rm -f "$tmp/tcpargs"; _f2=$(assoc_capture "$AS1" 4)
+  st "assoc capture: and it does not take a capture that vanished for a filter that did not arm: no retry once the run is gone" \
+     "$?:$(grep -c . "$tmp/tcpargs" 2>/dev/null)" "1:1"
+  tcpdump() { local o=''; while [ $# -gt 0 ]; do [ "$1" = -w ] && o="$2"; shift; done; printf 'x' >"$o"; sleep 3; }
+  _f2=$(capture_bss "$ASB"); st "member capture: the same, for the membership capture's file" "$?:$([ -e "/tmp/cs_mem_$$.pcap" ] && echo left)" "1:"
+  _f2=$(capture_beacon "$ASB"); st "beacon capture: and for the beacon capture's" "$?:$([ -e "/tmp/cs_bcn_$$.pcap" ] && echo left)" "1:"
+  MAIN_PID=$_mp
+  _f2=$(assoc_capture "$AS1" 1); st "assoc capture: with the run alive it is unaffected" "$?:$([ -s "$_f2" ] && echo file)" "0:file"
+  rm -f "$_f2" "/tmp/cs_mem_$$.pcap" "/tmp/cs_bcn_$$.pcap"; unset -f tcpdump; CHILD_FILE="$_cf"
   # T10 of the tests review: reading the function, because RUNNING cleanup here would delete a live run's files
   st "cleanup: its removal list names the lookup's capture file, for a run that dies mid-listen" "$(declare -f cleanup | grep -c 'cs_asc_')" "1"
+  # ...and a run that is KILLED never reaches cleanup: its watchdog is what tidies up, and it removed
+  # the lock and the child list only, so the capture file stayed in /tmp until reboot (L4). Read from
+  # the function, as above; harness scenario assoc kills a run mid-listen and looks for the file.
+  st "watchdog: it removes the dead run's own capture files too, by the pid in their names" \
+     "$(declare -f run_lock | grep -c 'cs_asc_\$MAIN_PID')" "1"
   eval "$_ol"; eval "$_ou"
   if [ -n "$_oi" ]; then eval "$_oi"; else unset -f iwinfo; fi
   if [ -n "$_ow" ]; then eval "$_ow"; else unset -f iw; fi
   PINEAPPLE_EXAMINE_CHANNEL() { :; }
   HAVE_TCPDUMP=$_tcp; ASSOC_CAP_SECS=$_secs; ASSOC_TTL=$_ttl; unset ST_PCAP ST_LRC
-  ASSOC_BSS=(); ASSOC_CH=(); ASSOC_TS=(); ASSOC_TRY=(); ASSOC_SRC=()
+  ASSOC_BSS=(); ASSOC_CH=(); ASSOC_TS=(); ASSOC_TRY=(); ASSOC_SRC=(); ASSOC_FW=()
   st "7m: sleep, iwinfo, iw, tcpdump, pcap_stream, score_device and capture_bss are what they were before this block" \
      "$(type -t sleep):$(type -t iwinfo):$(type -t iw):$(type -t tcpdump):$(type -t pcap_stream):$(type -t score_device):$(type -t capture_bss)" "$_t0"
   st "stubs: still stubbed after the last case, so no teardown exposed a real command" "$(st_stubs_intact)" "none"

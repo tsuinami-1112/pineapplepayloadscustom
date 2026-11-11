@@ -104,8 +104,10 @@ found and fixed one over-permissive defect (`dev/pager-prearrival.md` §5).
   associated client run `_pineap RECON CLIENTS format=json | jq '.[0]|keys'` and look for any key
   carrying the BSSID. If none, look at what the Go UI's recon API returns for clients — `hak5cmd`
   reaches it over `/tmp/api.sock`, and that binary is where `ap_mac` lives — and record the route and
-  one raw object. Until this is answered CamHound treats every client as unassociated (kit detection,
-  client Watch and per-client Disrupt dormant). On the 1.1.3 unit only the negative half is testable:
+  one raw object. Until this is answered the firmware supplies no association, so a client stays
+  unresolved — kit detection, client Watch and per-client Disrupt dormant for that row — until it is
+  looked up from its own card or heard transmitting in a membership capture (8d).
+  On the 1.1.3 unit only the negative half is testable:
   `_pineap RECON CLIENTS format=json` should return an error, not rows.
 - **What `PINEAPPLE_RECON_NEW`'s parameter is.** The firmware session reads it as the session *name*
   (`_pineap RECON NEW {name=} {hop=} {channel=}`, no duration), while CamHound and two upstream
@@ -128,6 +130,7 @@ Two steps; the first needs no CamHound at all. Every command below is quote-free
    ```sh
    PINEAPPLE_EXAMINE_RESET
    PINEAPPLE_EXAMINE_CHANNEL 6 20
+   sleep 1
    iw dev wlan1mon info | grep channel
    sleep 1
    iw dev wlan1mon info | grep channel
@@ -135,12 +138,22 @@ Two steps; the first needs no CamHound at all. Every command below is quote-free
    iw dev wlan1mon info | grep channel
    PINEAPPLE_EXAMINE_RESET
    ```
-   Three lines reading channel 6 = it parks, and the lookup's `lock=ok` path is the live one. Three
-   different channels = it does not, and every lookup will log `lock=hop` and listen for 18 s
-   instead of 6; that still works, and is then worth replacing with a BSSID-less park that does.
+   The first `sleep` is there because `lock_channel` has one: it samples at about 1.0, 1.5 and 2.0 s
+   after the command, never immediately, so a park that takes a moment to settle is not what it
+   reads. Read the result as the code does — **every sample that reads a channel at all reads 6**
+   means `lock=ok`, and **any other channel among them** means `lock=hop`; a sample that prints
+   nothing is ignored, and two or three such samples are the `lock=unverified` case, which still
+   proceeds. `lock=hop` throughout means every lookup listens for 18 s instead of 6; that still
+   works, and is then worth replacing with a park that does hold the channel.
    Any stderr from the second command is worth copying: `hak5cmd` exits 0 on every path.
 2. *Does a lookup name the right AP?* Pick a client you know the AP of — a phone on the bench AP is
-   ideal, mid-download so it is transmitting — open its card from Review hits, pick
+   ideal, mid-download so it is transmitting. **A phone is not in Review hits**: it carries no camera
+   signature and a randomised MAC costs it 40 points, so it scores 0 and that list keeps rows of 20
+   and over. Reach it from the main menu instead — press B during the scan, pick `Exit` at the
+   bottom of Review hits, then `Other devices`, which is where a score of 0 lands while the device
+   is Near or Mid (a device not heard for 90 s of scanning drops to `?` and leaves that list too, so
+   pick it while the scan has been running). A camera-vendor client does appear in Review hits,
+   if one is associated to the bench AP and is the subject you want. Open the card, pick
    `Watch (find AP first)`, then:
    ```sh
    grep assoc /root/loot/CamHound/events.log
@@ -148,11 +161,12 @@ Two steps; the first needs no CamHound at all. Every command below is quote-free
    | line | reads as |
    |---|---|
    | `assoc <mac> -> <bssid> n=N up=U recs=R itmax=56 ch=C lock=ok dwell=Ns` | found; check the BSSID is the AP you expected. `itmax` should be 56 on this hardware (Second contact). `up` is how many of the N frames the client itself sent; it is never 0 on this line |
-   | `assoc <mac> none why=NO_UPLINK … down=<bssid>/K` | that AP was heard sending K frames to the client and the client itself was not heard, so nothing was named. For a phone that is mid-download on the bench this would be a finding worth keeping the capture for: it means the Pager hears the AP and not the client, and the own-frames rule is costing a real answer |
+   | `assoc <mac> none why=NO_UPLINK … down=<bssid>/K` | that AP was heard sending K frames to the client and the client itself was not heard, so nothing was named. For a phone that is mid-download on the bench that is a finding: the Pager hears the AP and not the client, and the own-frames rule is costing a real answer. The lookup's own capture is deleted as soon as it is parsed, so there is nothing to keep from it: repeat the listen by hand instead, `PINEAPPLE_EXAMINE_CHANNEL C 20` and then `tcpdump -i wlan1mon -c 20 -e type data and wlan addr2 <mac>`, and copy what it prints. No frames from the client while it is downloading confirms the finding; frames there mean the lookup's own window or filter is what missed them |
    | `… lock=hop …` | step 1's negative answer, seen from inside the payload |
    | `assoc <mac> none why=NO_FRAMES … ch=C` | not heard on channel C. If the phone was transmitting and C is its AP's channel, that is a defect in the filter or the window, and the raw material is worth keeping: repeat with `tcpdump -i wlan1mon -c 20 -e type data and wlan addr2 <mac>` under the same lock |
    | `EXAMINE_CHANNEL C said: …` | the firmware refused the channel lock and said why |
    | the card then reads `Watch n/a (no channel)` | the lookup ran across the hop (`lock=hop`) and named an AP Recon has not listed yet, so no channel is known for it. Expected on a fresh Recon session; one more scan cycle should list the AP and clear it |
+   | `resp lock-failed …` or the screen says `still hopping … lock failed` after Watch or Disrupt on a row the lookup has just resolved | the lookup named an AP Recon had not listed, and the BSSID lock those two use did not hold the radio for it. Record the line: it answers whether `PINEAPPLE_EXAMINE_BSSID` parks for a BSSID Recon does not know. One more scan cycle should list the AP, after which the lock has a row to work from |
    Then check `grep -c OR.filter.did.not.arm /root/loot/CamHound/events.log` — a non-zero count
    means this tcpdump refuses the two-address filter and the uplink-only retry is what ran.
 

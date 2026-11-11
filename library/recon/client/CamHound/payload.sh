@@ -812,6 +812,13 @@ posture_read_pcap() {   # posture_read_pcap <pcap> <band> <channel> -> badge (st
   printf '%s' "$POSTURE_BADGE"
 }
 
+# main_gone: the run this code belongs to has been killed. The three capture helpers are called in
+# $( ), so each is a CHILD of the run and outlives a SIGKILL by up to its listen window, while the
+# run's watchdog releases the radio and removes its files within 3 s. Left alone, the orphan wrote
+# its file back afterwards -- and where the first-second check found the file gone and its tcpdump
+# dead, it took that for a filter that had not armed and started the retry. Each helper asks this
+# once a second, stops, and removes its own file. $$ is the run's pid in a subshell too.
+main_gone() { [ -n "$MAIN_PID" ] && ! kill -0 "$MAIN_PID" 2>/dev/null; }
 capture_beacon() {   # capture_beacon <bssid> -> pcap path on stdout, rc 1 on failure
   local bssid="$1" out="/tmp/cs_bcn_$$.pcap" p w=0
   [ "$HAVE_TCPDUMP" = 1 ] || return 1
@@ -819,8 +826,9 @@ capture_beacon() {   # capture_beacon <bssid> -> pcap path on stdout, rc 1 on fa
   tcpdump -i "$RECON_IF" -nn -s 0 -c "$BCN_CAP_COUNT" -w "$out" \
     "type mgt subtype beacon and wlan addr2 $bssid" >/dev/null 2>&1 & p=$!
   child_add "$p"
-  while (( w < BCN_CAP_SECS )); do kill -0 "$p" 2>/dev/null || break; sleep 1; w=$(( w + 1 )); done
+  while (( w < BCN_CAP_SECS )); do kill -0 "$p" 2>/dev/null || break; main_gone && break; sleep 1; w=$(( w + 1 )); done
   kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null; child_del "$p"
+  main_gone && { rm -f "$out"; return 1; }
   [ -s "$out" ] || { rm -f "$out"; return 1; }
   printf '%s' "$out"
 }
@@ -842,6 +850,8 @@ pcap_stream() { if command -v hexdump >/dev/null 2>&1; then hexdump -v -e '1/1 "
 # -v sta=<mac> -- as "PAIR <sta> <bssid> <n> <up>" for every pair seen at least twice (assoc_lookup).
 # It is the same DS-bit decode with nothing held fixed: no bss is needed, a group-addressed or own
 # address on either side is never a pair, and neither is a frame whose two addresses are equal.
+# It also prints "OWN <sta> <n>", every frame that station transmitted whether or not any pair reached
+# two sightings, so the caller can tell "it was heard, to no AP twice" from "it was not heard at all".
 # <up> is how many of the <n> frames the STATION transmitted (ToDS). The other direction is the AP
 # transmitting to it, which an AP goes on doing after the station has left, so a caller that asks
 # "where is this station NOW" must not take <n> alone for an answer. The membership walk admits the
@@ -895,7 +905,7 @@ BEGIN { st = 0; i = 0; itmax = 0; recs = 0; short = 0 }
       if (p[bo] % 2 == 1 || p[co] % 2 == 1) break
       if (index(own, " " c " ") > 0 || index(own, " " b " ") > 0) break
       pair[c " " b]++
-      if (ds == 1) pup[c " " b]++
+      if (ds == 1) { pup[c " " b]++; own[c]++ }
       break
     }
     if (b != bss) break
@@ -913,6 +923,7 @@ END { if (bad) exit 1
   print "TRUNC " trunc + 0; print "RUNT " runt + 0; print "SNAP " snap + 0
   for (c in seen) if (seen[c] >= 2) print "CLI " c
   for (c in sup) if (seen[c] >= 2) print "UP " c " " sup[c]
+  for (c in own) print "OWN " c " " own[c]
   for (k in pair) if (pair[k] >= 2) print "PAIR " k " " pair[k] " " pup[k] + 0 }'
 
 # bss_clients <pcap> <bssid> -> keyed lines on stdout; rc 1 when the file is unreadable or not a pcap.
@@ -940,15 +951,16 @@ capture_bss() {
   filt="type data and (wlan addr1 $bss or wlan addr2 $bss)"
   tcpdump -i "$RECON_IF" -nn -s "$CLI_CAP_SNAP" -c "$CLI_CAP_COUNT" -w "$out" "$filt" >/dev/null 2>&1 & p=$!
   child_add "$p"; sleep 1; w=1
-  if [ ! -s "$out" ] && ! kill -0 "$p" 2>/dev/null; then
+  if [ ! -s "$out" ] && ! kill -0 "$p" 2>/dev/null && ! main_gone; then
     child_del "$p"
     log resp "member capture: OR filter did not arm, retrying uplink-only"
     filt="type data and wlan addr1 $bss"
     tcpdump -i "$RECON_IF" -nn -s "$CLI_CAP_SNAP" -c "$CLI_CAP_COUNT" -w "$out" "$filt" >/dev/null 2>&1 & p=$!
     child_add "$p"; sleep 1; w=1
   fi
-  while (( w < CLI_CAP_SECS )); do kill -0 "$p" 2>/dev/null || break; sleep 1; w=$(( w + 1 )); done
+  while (( w < CLI_CAP_SECS )); do kill -0 "$p" 2>/dev/null || break; main_gone && break; sleep 1; w=$(( w + 1 )); done
   kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null; child_del "$p"
+  main_gone && { rm -f "$out"; return 1; }
   [ -s "$out" ] || { rm -f "$out"; return 1; }
   printf '%s' "$out"
 }
@@ -1452,6 +1464,9 @@ run_lock() {
     while read -r p; do [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done <"$CHILD_FILE" 2>/dev/null
     _pineap EXAMINE CANCEL; PINEAPPLE_EXAMINE_RESET
     [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ] && rm -f "$LOCK_FILE" "$CHILD_FILE"
+    # cleanup never ran for a killed run, and these carry its pid in their names, so nothing else
+    # would ever remove them: they stayed in /tmp, which is RAM on the device, until reboot
+    rm -f "/tmp/cs_mem_$MAIN_PID.pcap" "/tmp/cs_asc_$MAIN_PID.pcap" "/tmp/cs_bcn_$MAIN_PID.pcap" "/tmp/cs_fire_$MAIN_PID.err" "/tmp/cs_oui_keys.$MAIN_PID"
     bands_watchdog_restore ) >/dev/null 2>&1 &
 }
 # A band write the dead run issued is undone by its own watchdog. Keyed on the record, not on the lock: the record
