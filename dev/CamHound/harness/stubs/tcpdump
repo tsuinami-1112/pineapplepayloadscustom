@@ -1,6 +1,6 @@
 #!/bin/bash
-out=""; filt=""; snap=0; cnt=0
-while [ $# -gt 0 ]; do case "$1" in -w) out="$2"; shift ;; -s) snap="$2"; shift ;; -c) cnt="$2"; shift ;; -i) shift ;; -nn) ;; *) filt="$filt $1" ;; esac; shift; done
+out=""; filt=""; snap=0; cnt=0; ifc=""
+while [ $# -gt 0 ]; do case "$1" in -w) out="$2"; shift ;; -s) snap="$2"; shift ;; -c) cnt="$2"; shift ;; -i) ifc="$2"; shift ;; -nn) ;; *) filt="$filt $1" ;; esac; shift; done
 case "$filt" in *"subtype beacon"*)
   bss=$(printf '%s' "$filt" | sed -n 's/.*addr2 \([0-9a-fA-F:]*\).*/\1/p' | tr -d ':' | tr 'A-F' 'a-f')
   # HARNESS_NO_BEACON=1: the target never beacons for us -- write nothing, so capture_beacon fails and the badge is ?
@@ -32,7 +32,8 @@ if [ "$mem" = 3 ] || [ "$mem" = 4 ]; then
   # is visited, so the client is heard.
   L="${HARNESS_LOG:-/tmp/cs_harness.log}"
   sta=$(printf '%s' "$filt" | sed -n 's/.*addr2 \([0-9a-fA-F:]*\).*/\1/p' | tr 'A-F' 'a-f')
-  printf 'TCPDUMP assoc %s snap=%s count=%s or=%s\n' "$sta" "$snap" "$cnt" "$mem" >> "$L"
+  # the interface is logged: a capture with no -i listens on whatever libpcap picks, not on the monitor radio
+  printf 'TCPDUMP assoc %s if=%s snap=%s count=%s or=%s\n' "$sta" "$ifc" "$snap" "$cnt" "$mem" >> "$L"
   # HARNESS_NO_ARM=1: tcpdump refuses the filter outright -> NO_CAPTURE
   [ -n "${HARNESS_NO_ARM:-}" ] && { printf 'TCPDUMP assoc refused to arm\n' >> "$L"; exit 1; }
   # HARNESS_NO_OR=1: only the OR form is refused, so the uplink-only fallback is exercised

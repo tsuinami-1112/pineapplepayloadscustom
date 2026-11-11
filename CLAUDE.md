@@ -71,7 +71,7 @@ bash dev/CamHound/harness/run_harness.sh                            # ALL 16 sce
 ```
 
 **The harness argument is a scenario filter, not a mode.** `run_harness.sh live` runs the `live`
-scenario alone - 5 checks of 132 - and still prints `0 failure(s)`, which reads exactly like a full
+scenario alone - 5 checks of 136 - and still prints `0 failure(s)`, which reads exactly like a full
 pass. This gate list said `live` until 2026-11-04 and every session that copied it was running a
 fourteenth of the suite (sixteenth now). No argument (or `all`) runs them all; a scenario name runs one,
 which is what you want while iterating, never for the gate.
@@ -172,10 +172,17 @@ would blind Recon for as long as it ran.
   `ASSOC_CAP_SECS` (clamped to 2–30 by `assoc_clamp`, from `load_overrides` and `settings_apply`:
   the window is slept on, tripled across the hop, with no button check) and `ASSOC_TTL`, wired in
   `load_overrides` and `SETTINGS_TABLE`.
-- Selftest block `7m association`; harness scenario `assoc` (six arms on the `HARNESS_NO_CLIENTS=1`
-  shape; `HARNESS_NO_PARK`, `HARNESS_ASSOC_TWO` and `HARNESS_NO_OR` drive the refused park, the
-  ambiguous pair and the refused OR filter; the miss is the fixtures' own — a camera last heard on
-  2437 MHz whose AP is on channel 36).
+- Selftest block `7m association`; harness scenario `assoc` (eight arms on the
+  `HARNESS_NO_CLIENTS=1` shape: the lookup from the Watch row and from the Disrupt row; the miss,
+  which is the fixtures' own — a camera last heard on 2437 MHz whose AP is on channel 36; a
+  membership capture teaching both cameras; and `HARNESS_NO_PARK`, `HARNESS_ASSOC_TWO`,
+  `HARNESS_NO_OR` and `HARNESS_NO_ARM` for the refused park, the ambiguous pair, the refused OR
+  filter and a tcpdump that will not arm). **Two things a review of these tests found, worth
+  keeping in mind when adding to them:** "a RESET follows the capture" does not show the lookup
+  released the radio, because `cleanup` emits one at exit whenever the radio was left held — the
+  harness helper `released_before_card` asks for the RESET *before the next picker is drawn*; and
+  "no pid left registered" is equally true of a capture that never registered, so the selftest's
+  fake tcpdump reports the child list *while it runs*.
 
 *Falsified by:* a lookup naming a BSSID the client is not associated to; `NO_FRAMES` on the right
 channel for a client that is passing traffic there; or `lock=hop` on every lookup, which would mean

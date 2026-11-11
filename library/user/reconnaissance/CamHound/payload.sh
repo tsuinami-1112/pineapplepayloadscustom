@@ -4494,12 +4494,15 @@ IWFIX
   st "pairs: the membership walk beside it is unchanged" "$(st_members "$tmp/asc.pcap" "$ASB")" "$AS1 ec:71:db:00:00:12 $AS4"
   # lock_channel: EXAMINE_CHANNEL alone has never been issued on a device, so the park is read back
   # and nothing is assumed. rc 3 is lock_target's rc 3: unverified, and the caller proceeds.
+  local _t0; _t0="$(type -t sleep):$(type -t iwinfo):$(type -t iw):$(type -t tcpdump):$(type -t pcap_stream):$(type -t score_device):$(type -t capture_bss)"
   _oi=$(declare -f iwinfo); _ow=$(declare -f iw)
   sleep() { :; }; iw() { :; }
   PINEAPPLE_EXAMINE_CHANNEL() { printf '%s\n' "$*" >>"$tmp/exch"; }
   iwinfo() { printf '          Channel: 6 (2.437 GHz)\n'; }
-  : >"$tmp/exch"; lock_channel 6 9 >/dev/null
+  WATCH_LOCKED=0; : >"$tmp/exch"; lock_channel 6 9 >/dev/null
   st "lock_channel: issues the channel lock, and three samples on it are a park" "$?:$(cat "$tmp/exch")" "0:6 9"
+  st "lock_channel: marks the radio as held, which is what has cleanup release it if the run dies mid-listen" "$WATCH_LOCKED" "1"
+  unlock_target; st "lock_channel: and the release clears the mark" "$WATCH_LOCKED" "0"
   iwinfo() { printf '          Channel: 1 (2.412 GHz)\n'; }
   lock_channel 6 9 >/dev/null
   st "lock_channel: a radio that is somewhere else is rc 2, with the samples it read" \
@@ -4511,11 +4514,12 @@ IWFIX
   : >"$tmp/chseq"
   iwinfo() { printf 'x' >>"$tmp/chseq"; [ "$(wc -c <"$tmp/chseq" | tr -d ' ')" = 3 ] && printf '          Channel: 6 (2.437 GHz)\n'; return 0; }
   lock_channel 6 9 >/dev/null
-  st "lock_channel: ONE readable sample is rc 3: unverified, and the caller proceeds" \
-     "$?:$(printf '%s' "$LOCK_TEXT" | grep -c unverified)" "3:1"
+  st "lock_channel: ONE readable sample (the third of three) is rc 3: unverified, and the caller proceeds" \
+     "$?:$(printf '%s' "$LOCK_TEXT" | grep -c 'read-back _/_/6, park on ch 6 unverified')" "3:1"
   iwinfo() { :; }
   lock_channel 6 9 >/dev/null
-  st "lock_channel: no read-back at all is rc 3, never a park" "$?" 3
+  st "lock_channel: no read-back at all is rc 3, never a park, and says all three samples were empty" \
+     "$?:$(printf '%s' "$LOCK_TEXT" | grep -c 'read-back _/_/_, park on ch 6 unverified')" "3:1"
   PINEAPPLE_EXAMINE_CHANNEL() { printf 'ERROR: bad channel\n' >&2; }
   rm -f "$tmp/events.log"; lock_channel 6 9 >/dev/null
   st "lock_channel: the command's stderr is logged, because its rc is 0 on every path" \
@@ -4523,7 +4527,7 @@ IWFIX
   PINEAPPLE_EXAMINE_CHANNEL() { :; }
   # assoc_lookup's decisions, with the lock and the capture stubbed so each case is one fixture
   _ol=$(declare -f lock_channel); _ou=$(declare -f unlock_target); _oc=$(declare -f assoc_capture)
-  lock_channel() { printf '%s\n' "$1" >>"$tmp/locks"; LOCK_TEXT="stub lock rc ${ST_LRC:-0}"; return "${ST_LRC:-0}"; }
+  lock_channel() { printf '%s %s\n' "$1" "$2" >>"$tmp/locks"; LOCK_TEXT="stub lock rc ${ST_LRC:-0}"; return "${ST_LRC:-0}"; }
   unlock_target() { printf 'u' >>"$tmp/unlocks"; }
   assoc_capture() { printf '%s %s\n' "$1" "$2" >>"$tmp/caps"; [ -s "${ST_PCAP:-}" ] || return 1; cp "$ST_PCAP" "$tmp/asc_run.pcap"; printf '%s' "$tmp/asc_run.pcap"; }
   HAVE_TCPDUMP=1; ASSOC_CAP_SECS=4; ASSOC_TTL=300
@@ -4533,14 +4537,23 @@ IWFIX
   st "assoc: a client the firmware gave no AP for can be looked up" "$(assoc_can "$AS1" && echo yes)" "yes"
   rm -f "$tmp/events.log" "$tmp/caps" "$tmp/unlocks" "$tmp/locks"; ST_PCAP="$tmp/asc.pcap"; ST_LRC=0
   BASELINE_NEXT=0; PREV_PKT=(); PREV_PKT[$ASB]=5
+  # two recorders for this one lookup: the pcap walk marks itself in the file the release writes
+  # to, so their ORDER is on record, and score_device notes who it was called for
+  local _ops _osd; _ops=$(declare -f pcap_stream); _osd=$(declare -f score_device)
+  eval "$(printf '%s\n' "$_ops" | sed '1s/^pcap_stream/st_pcap_stream_real/')"
+  pcap_stream() { printf 'p' >>"$tmp/unlocks"; st_pcap_stream_real "$@"; }
+  score_device() { printf '%s ' "$1" >>"$tmp/scored"; }
+  rm -f "$tmp/scored"
   assoc_lookup "$AS1" >/dev/null 2>&1
   st "assoc lookup: the BSSID is read off the air" "$?:${AP_OF[$AS1]}:$ASSOC_N" "0:$ASB:3"
+  eval "$_ops"; eval "$_osd"; unset -f st_pcap_stream_real
   st "assoc lookup: the radio was parked, so the next cycle is a baseline and the rate history restarts" \
      "$BASELINE_NEXT:${#PREV_PKT[@]}" "1:0"
-  st "assoc lookup: it parked on the channel of the client's last-heard frequency, for the configured window" \
-     "$(cat "$tmp/locks"):$(cat "$tmp/caps")" "36:$AS1 4"
+  st "assoc lookup: it parked on the channel of the client's last-heard frequency, held for the window plus 8 s of read-back and margin, and listened for the window" \
+     "$(cat "$tmp/locks"):$(cat "$tmp/caps")" "36 12:$AS1 4"
   st "assoc lookup: the row takes its AP's channel and SSID at once" "${CH[$AS1]}:${SSID_CLEAN[$AS1]}" "36:ReoKit"
-  st "assoc lookup: the lock is released, once" "$(cat "$tmp/unlocks")" "u"
+  st "assoc lookup: the lock is released once, and BEFORE the capture is parsed: the walk takes seconds on the device" "$(cat "$tmp/unlocks")" "up"
+  st "assoc lookup: the row is re-scored at once, now that it carries its AP" "$(cat "$tmp/scored" 2>/dev/null)" "$AS1 "
   st "assoc lookup: logged with the count, the channel and the lock state" \
      "$(grep -c "assoc $AS1 -> $ASB n=3 .* ch=36 lock=ok" "$tmp/events.log")" "1"
   st "assoc: a resolved client is not looked up again, and is watchable" \
@@ -4672,6 +4685,13 @@ IWFIX
   assoc_learn_members aa:00:00:00:00:99
   st "assoc members: a set gathered for another BSSID teaches nothing" "${AP_OF[ec:71:db:00:00:12]}" "-"
   RESP_MEMBERS=(); RESP_MEMBERS_BSS=''
+  # the call site, not only the function: resp_members itself hands on what its capture heard
+  local _ocb; _ocb=$(declare -f capture_bss)
+  capture_bss() { cp "$tmp/asc.pcap" "$tmp/mem_run.pcap"; printf '%s' "$tmp/mem_run.pcap"; }
+  resp_members "$ASB" >/dev/null 2>&1
+  st "assoc members: resp_members itself teaches the stations its capture heard" \
+     "$?:${AP_OF[ec:71:db:00:00:12]}:${ASSOC_SRC[ec:71:db:00:00:12]}" "0:$ASB:members"
+  eval "$_ocb"; RESP_MEMBERS=(); RESP_MEMBERS_BSS=''
   # a learned AP is looked at again before it is acted on, once it is older than ASSOC_TTL
   ASSOC_TS[$AS1]=$EPOCHSECONDS; ASSOC_TRY[$AS1]=$EPOCHSECONDS
   st "assoc refresh: a fresh answer is not looked up again" "$(assoc_stale "$AS1" && echo stale)" ""
@@ -4682,13 +4702,21 @@ IWFIX
      "${AP_OF[aa:00:00:00:00:31]}:$(assoc_stale aa:00:00:00:00:31 && echo stale)" "aa:00:00:00:00:30:"
   st_assoc_pcap "$tmp/asc_moved.pcap" ec71db000011 aa0000000098:3; ST_PCAP="$tmp/asc_moved.pcap"; ST_LRC=0; rm -f "$tmp/locks"
   FREQ[$AS1]=2437        # last heard on ch 6 (a scanning client is heard off-channel): the row's channel is its AP's, and wins
+  LOG() { printf '%s\n' "$*" >>"$tmp/reflog"; }; rm -f "$tmp/reflog"      # what the operator is told by each re-check
   assoc_refresh "$AS1" >/dev/null 2>&1
   st "assoc refresh: the re-check listens on the AP's channel, not where the client was last heard, and a different BSSID replaces the old one" \
-     "$(cat "$tmp/locks"):${AP_OF[$AS1]}:${CH[$AS1]}:${SSID_CLEAN[$AS1]:-none}" "36:aa:00:00:00:00:98:36:none"
-  ASSOC_TS[$AS1]=$((EPOCHSECONDS - 400)); ASSOC_TRY[$AS1]=$((EPOCHSECONDS - 400)); ST_PCAP="$tmp/asc_hdr.pcap"
+     "$(cat "$tmp/locks"):${AP_OF[$AS1]}:${CH[$AS1]}:${SSID_CLEAN[$AS1]:-none}" "36 12:aa:00:00:00:00:98:36:none"
+  st "assoc refresh: and the operator is told the client moved, from which AP to which" \
+     "$(grep -c "${AS1:9} moved: ${ASB:9} -> 00:00:98" "$tmp/reflog" 2>/dev/null)" "1"
+  ASSOC_TS[$AS1]=$((EPOCHSECONDS - 400)); ASSOC_TRY[$AS1]=$((EPOCHSECONDS - 400)); rm -f "$tmp/reflog"
   assoc_refresh "$AS1" >/dev/null 2>&1
-  st "assoc refresh: hearing nothing keeps the AP, and is not tried again at once" \
-     "${AP_OF[$AS1]}:$(assoc_stale "$AS1" && echo stale)" "aa:00:00:00:00:98:"
+  st "assoc refresh: the same AP heard again is confirmed without a word about moving, and is fresh again" \
+     "${AP_OF[$AS1]}:$(grep -c 'moved: ' "$tmp/reflog" 2>/dev/null):$(assoc_stale "$AS1" && echo stale)" "aa:00:00:00:00:98:0:"
+  ASSOC_TS[$AS1]=$((EPOCHSECONDS - 400)); ASSOC_TRY[$AS1]=$((EPOCHSECONDS - 400)); ST_PCAP="$tmp/asc_hdr.pcap"; rm -f "$tmp/reflog"
+  assoc_refresh "$AS1" >/dev/null 2>&1
+  st "assoc refresh: hearing nothing keeps the AP, says so, and is not tried again at once" \
+     "${AP_OF[$AS1]}:$(grep -c "AP of ${AS1:9} not re-confirmed: keeping 00:00:98" "$tmp/reflog" 2>/dev/null):$(assoc_stale "$AS1" && echo stale)" "aa:00:00:00:00:98:1:"
+  LOG() { :; }
   ASSOC_TTL=0
   st "assoc refresh: ASSOC_TTL=0 looks every time" "$(assoc_stale "$AS1" && echo stale)" "stale"
   ASSOC_TTL=300
@@ -4723,7 +4751,29 @@ IWFIX
   detail_card aa:00:00:00:00:21 >/dev/null 2>&1; detail_card aa:00:00:00:00:53 >/dev/null 2>&1; detail_card "$AS1" >/dev/null 2>&1
   st "card: no AP offers the lookup on both rows; an AP with no channel says so on both; a resolved client gets Watch and Disrupt" \
      "$(grep -c ' 00:00:21 Watch (find AP first) Disrupt (find AP first) Locate ' "$tmp/picker" 2>/dev/null):$(grep -c ' 00:00:53 Watch n/a (no channel) Disrupt n/a (no channel) Locate ' "$tmp/picker" 2>/dev/null):$(grep -c " ${AS1:9} Watch Disrupt Locate " "$tmp/picker" 2>/dev/null)" "1:1:1"
-  LIST_PICKER() { return 1; }; RESPONSE=$_resp
+  # ...and what each row DOES. LIST_PICKER now answers from a list, one row per redraw, then
+  # cancels; the lookup and the two menus are replaced by recorders, and LOG keeps what the card said.
+  local _oal _owm _odm; _oal=$(declare -f assoc_lookup); _owm=$(declare -f watch_menu); _odm=$(declare -f disrupt_menu)
+  LIST_PICKER() { local a; a=$(head -1 "$tmp/answers" 2>/dev/null); [ -n "$a" ] || return 1; sed -i 1d "$tmp/answers"; printf '%s' "$a"; }
+  assoc_lookup() { printf 'lookup:%s ' "${1:9}" >>"$tmp/calls"; return "${ST_ALRC:-0}"; }
+  watch_menu() { printf 'watch:%s ' "${1:9}" >>"$tmp/calls"; }
+  disrupt_menu() { printf 'disrupt:%s ' "${1:9}" >>"$tmp/calls"; }
+  LOG() { printf '%s\n' "$*" >>"$tmp/cardlog"; }
+  rm -f "$tmp/calls"; printf 'Watch (find AP first)\nDisrupt (find AP first)\n' >"$tmp/answers"; ST_ALRC=0
+  detail_card aa:00:00:00:00:21 >/dev/null 2>&1
+  st "card: each find-AP row runs the lookup and then the menu it names" \
+     "$(cat "$tmp/calls" 2>/dev/null)" "lookup:00:00:21 watch:00:00:21 lookup:00:00:21 disrupt:00:00:21 "
+  rm -f "$tmp/calls"; printf 'Watch (find AP first)\nDisrupt (find AP first)\n' >"$tmp/answers"; ST_ALRC=1
+  detail_card aa:00:00:00:00:21 >/dev/null 2>&1
+  st "card: a lookup that fails opens neither menu" "$(cat "$tmp/calls" 2>/dev/null)" "lookup:00:00:21 lookup:00:00:21 "
+  rm -f "$tmp/calls" "$tmp/cardlog"; printf 'Watch n/a (no channel)\nDisrupt n/a (no channel)\n' >"$tmp/answers"
+  detail_card aa:00:00:00:00:53 >/dev/null 2>&1
+  st "card: the no-channel rows open nothing, and say the AP was heard and its channel was not" \
+     "$(cat "$tmp/calls" 2>/dev/null):$(grep -c 'AP 00:00:94 of 00:00:53 was heard, its channel was not' "$tmp/cardlog" 2>/dev/null)" ":2"
+  rm -f "$tmp/calls"; printf 'Watch\nDisrupt\n' >"$tmp/answers"
+  detail_card "$AS1" >/dev/null 2>&1
+  st "card: on a resolved client the two rows open Watch and Disrupt directly" "$(cat "$tmp/calls" 2>/dev/null)" "watch:${AS1:9} disrupt:${AS1:9} "
+  eval "$_oal"; eval "$_owm"; eval "$_odm"; LOG() { :; }; LIST_PICKER() { return 1; }; unset ST_ALRC; RESPONSE=$_resp
   # the report: an AP named only by a client's own frames is not a hidden-SSID AP
   _f2=$( RUN_ID=st7m; CYCLE=1; RUN_T0=$EPOCHSECONDS; write_report quiet >/dev/null 2>&1      # a quiet report is skipped before the first cycle
          printf '%s:%s' "$(grep -c '^aa:00:00:00:00:97 <not listed> ' "$tmp/report_st7m.txt" 2>/dev/null)" "$(grep -c "^$ASB ReoKit " "$tmp/report_st7m.txt" 2>/dev/null)" )
@@ -4745,24 +4795,35 @@ IWFIX
      "$_f2" "$ASB|36| $AS4|aa:00:00:00:00:30|aa:00:00:00:00:40|44|aa:00:00:00:00:60|none"
   # the real capture, once, against a tcpdump that writes a file: the filter and the bookkeeping
   eval "$_oc"; unset -f sleep; CHILD_FILE="$tmp/children"; : >"$CHILD_FILE"
-  tcpdump() { local o=''; printf '%s\n' "$*" >>"$tmp/tcpargs"; while [ $# -gt 0 ]; do [ "$1" = -w ] && o="$2"; shift; done; printf 'x' >"$o"; sleep 2; }
-  rm -f "$tmp/tcpargs"; _f2=$(assoc_capture "$AS1" 1)
+  # The fake tcpdump notes, 0.4 s into its run, how many pids are registered and whether its own is
+  # one of them: "no pid left afterwards" is equally true of a capture that never registered, and
+  # that is the one a killed run could not reap.
+  tcpdump() { local o=''; printf '%s\n' "$*" >>"$tmp/tcpargs"; while [ $# -gt 0 ]; do [ "$1" = -w ] && o="$2"; shift; done; printf 'x' >"$o"
+              sleep 0.4; { grep -c . "$CHILD_FILE"; grep -c "^$BASHPID\$" "$CHILD_FILE"; } >"$tmp/children_mid" 2>/dev/null; sleep 2; }
+  rm -f "$tmp/tcpargs" "$tmp/children_mid"; _f2=$(assoc_capture "$AS1" 1)
   st "assoc capture: returns the file tcpdump wrote, and leaves no pid registered" \
      "$?:$([ -s "$_f2" ] && echo file):$(cat "$CHILD_FILE")" "0:file:"
-  st "assoc capture: filtered on the client, addr2 first, with the membership capture's snap and frame cap" \
-     "$(grep -c -- "-s $CLI_CAP_SNAP -c $CLI_CAP_COUNT .*type data and (wlan addr2 $AS1 or wlan addr1 $AS1)\$" "$tmp/tcpargs")" "1"
+  st "assoc capture: while it listens its tcpdump IS registered, alone, so a killed run can reap it" \
+     "$(tr '\n' ' ' <"$tmp/children_mid" 2>/dev/null)" "1 1 "
+  st "assoc capture: on the Recon interface, filtered on the client, addr2 first, with the membership capture's snap and frame cap" \
+     "$(grep -c -- "^-i $RECON_IF -nn -s $CLI_CAP_SNAP -c $CLI_CAP_COUNT -w [^ ]* type data and (wlan addr2 $AS1 or wlan addr1 $AS1)\$" "$tmp/tcpargs")" "1"
   rm -f "$_f2"
-  tcpdump() { local o='' a="$*"; printf '%s\n' "$a" >>"$tmp/tcpargs"; case "$a" in *"(wlan addr2"*) return 1 ;; esac; while [ $# -gt 0 ]; do [ "$1" = -w ] && o="$2"; shift; done; printf 'x' >"$o"; sleep 2; }
-  rm -f "$tmp/tcpargs"; _f2=$(assoc_capture "$AS1" 1)
-  st "assoc capture: when the OR filter will not arm it retries on the uplink alone" \
-     "$?:$(grep -c "type data and wlan addr2 $AS1\$" "$tmp/tcpargs")" "0:1"
+  tcpdump() { local o='' a="$*"; printf '%s\n' "$a" >>"$tmp/tcpargs"; case "$a" in *"(wlan addr2"*) return 1 ;; esac; while [ $# -gt 0 ]; do [ "$1" = -w ] && o="$2"; shift; done; printf 'x' >"$o"
+              sleep 0.4; { grep -c . "$CHILD_FILE"; grep -c "^$BASHPID\$" "$CHILD_FILE"; } >"$tmp/children_mid" 2>/dev/null; sleep 2; }
+  rm -f "$tmp/tcpargs" "$tmp/children_mid"; _f2=$(assoc_capture "$AS1" 1)
+  st "assoc capture: when the OR filter will not arm it retries on the uplink alone, same interface, and only the retry is registered" \
+     "$?:$(grep -c -- "^-i $RECON_IF -nn -s $CLI_CAP_SNAP -c $CLI_CAP_COUNT -w [^ ]* type data and wlan addr2 $AS1\$" "$tmp/tcpargs"):$(tr '\n' ' ' <"$tmp/children_mid" 2>/dev/null)" "0:1:1 1 "
   rm -f "$_f2"; unset -f tcpdump; CHILD_FILE="$_cf"
+  # T10 of the tests review: reading the function, because RUNNING cleanup here would delete a live run's files
+  st "cleanup: its removal list names the lookup's capture file, for a run that dies mid-listen" "$(declare -f cleanup | grep -c 'cs_asc_')" "1"
   eval "$_ol"; eval "$_ou"
   if [ -n "$_oi" ]; then eval "$_oi"; else unset -f iwinfo; fi
   if [ -n "$_ow" ]; then eval "$_ow"; else unset -f iw; fi
   PINEAPPLE_EXAMINE_CHANNEL() { :; }
   HAVE_TCPDUMP=$_tcp; ASSOC_CAP_SECS=$_secs; ASSOC_TTL=$_ttl; unset ST_PCAP ST_LRC
   ASSOC_BSS=(); ASSOC_CH=(); ASSOC_TS=(); ASSOC_TRY=(); ASSOC_SRC=()
+  st "7m: sleep, iwinfo, iw, tcpdump, pcap_stream, score_device and capture_bss are what they were before this block" \
+     "$(type -t sleep):$(type -t iwinfo):$(type -t iw):$(type -t tcpdump):$(type -t pcap_stream):$(type -t score_device):$(type -t capture_bss)" "$_t0"
   st "stubs: still stubbed after the last case, so no teardown exposed a real command" "$(st_stubs_intact)" "none"
   # 8 marked blocks
   if command -v md5sum >/dev/null 2>&1 && [ -f "${BASH_SOURCE[0]}" ]; then

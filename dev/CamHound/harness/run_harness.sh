@@ -43,7 +43,9 @@ mkdir -p "$T/phy/phy0"          # fallback-merge fixture only: with the net tree
 mkdir -p "$T/net/wlan1mon/phy80211"; printf 'phy0\n' >"$T/net/wlan1mon/phy80211/name"   # RECON_IF's phy: the probe reads this one, no merge
 printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
 PATHX="$HERE/stubs:$T/bin:$PATH"
-reset() { [ "${1:-}" = keep ] || rm -rf "$LOOT"; rm -rf "$T/log" "$T"/rules*.c* /tmp/cs_harness_chan /tmp/cs_harness_pps /tmp/cs_harness_bands /tmp/cs_run.pid /tmp/cs_children; mkdir -p "$LOOT"; echo 0 >/tmp/cs_harness_cycle; : >/tmp/cs_harness_hop; }   # cs_harness_hop: the radio starts out hopping, and the EXAMINE stubs park and release it
+reset() { [ "${1:-}" = keep ] || rm -rf "$LOOT"; rm -rf "$T/log" "$T"/rules*.c* /tmp/cs_harness_chan /tmp/cs_harness_pps /tmp/cs_harness_bands /tmp/cs_run.pid /tmp/cs_children /tmp/cs_asc_*.pcap; mkdir -p "$LOOT"; echo 0 >/tmp/cs_harness_cycle; : >/tmp/cs_harness_hop; }   # cs_harness_hop: the radio starts out hopping, and the EXAMINE stubs park and release it
+# (cs_asc_*.pcap: the lookup's capture file is pid-named, so one left by an EARLIER run that died would otherwise fail this
+# run's "no capture file left" check for a leak that is not its own)
 rules() { local f="$T/rules_$1"; shift; printf '%s\t%s\n' "$@" >"$f"; export HARNESS_RULES="$f"; }
 answers() { printf '%s\n' "$@" >"$HARNESS_ANSWERS"; }
 check() { if eval "$2"; then printf 'PASS %s\n' "$1"; else printf 'FAIL %s\n' "$1"; FAIL=$((FAIL + 1)); fi; }
@@ -412,11 +414,19 @@ s_members() {   # the real-firmware shape: clients with NO association, membersh
   check "members: the OR filter failing falls back to uplink-only and still fires" \
     "grep -q 'OR filter did not arm' $LOOT/events.log && grep -qE '^TCPDUMP members ec71db000010 snap=128 count=800 or=2' $T/log && grep -q 'scope=bss subjects=2' $LOOT/events.log"
 }
+# released_before_card <regex matching the capture's last log line>: the first EXAMINE_RESET after
+# that line comes BEFORE the next picker is drawn, i.e. the lookup released the radio itself. A
+# RESET at exit also follows the capture -- cleanup emits one whenever the radio was left held --
+# so "a RESET after the capture" passes in exactly the case it is meant to exclude.
+released_before_card() {
+  awk -v pat="$1" '$0 ~ pat {b=NR; c=0; p=0; next} b && !c && /^PINEAPPLE_EXAMINE_RESET/ {c=NR} b && !p && /^PICKER\[/ {p=NR} END {exit !(b && c && (!p || c < p))}' "$T/log"
+}
 s_assoc() {   # the inverse lookup on the real-firmware shape: a client's AP read off the air when Watch or Disrupt is picked
   # HARNESS_NO_CLIENTS=1 throughout: RECON DEVICES rows, no association anywhere, which is what both
   # shipped firmwares return. Review-list indices are for that shape (5 the Wyze client, 6 the
-  # Reolink NVR AP, 7 and 8 its two cameras); every check below pins the MAC it ran against, so an
-  # index that drifts fails loudly instead of testing another row. Who is associated to whom comes
+  # Reolink NVR AP, 7 and 8 its two cameras, 7 being 00:00:11 at -63 dBm); every check below pins the
+  # MAC it ran against, so an index that drifts fails loudly instead of testing another row. The fast
+  # copy listens for 2 s, so a park is asked for 10 (the window plus 8). Who is associated to whom comes
   # from fix/cli.json's ap_mac column, through the tcpdump stub's inverse arm.
   local W=a4:da:22:20:00:01 WA=9c:3d:cf:11:22:33
   local R=('^CamHound' 'Scan,Scan,Exit' 'Review hits' '5,Exit,Exit' '^[0-9]+ WYZE' 'Watch (find AP first),Disrupt,Back'
@@ -426,39 +436,39 @@ s_assoc() {   # the inverse lookup on the real-firmware shape: a client's AP rea
   rules asc1 "${R[@]}" "${COMMON[@]}"; answers t t B t t t t B; HARNESS_NO_CLIENTS=1 run
   check "assoc: an unresolved client's card offers the lookup where it used to say n/a" \
     "grep -q 'PICKER\[45 WYZE-OUI 20:00:01\] items=Watch (find AP first);Disrupt (find AP first);Locate;Ignore for session;Back;' $T/log"
-  check "assoc: the radio is parked on the client's channel, the capture runs, and the radio is released" \
-    "awk '/^PINEAPPLE_EXAMINE_CHANNEL 6 /{a=NR} /^TCPDUMP assoc $W snap=128 count=800 or=3/{b=NR} /^PINEAPPLE_EXAMINE_RESET/{if (b && !c) c=NR} END {exit !(a && b && c && a < b && b < c)}' $T/log"
+  check "assoc: the radio is parked on the client's channel for the window plus its margin, the capture runs on the Recon interface, and the lookup releases the radio itself" \
+    "awk '/^PINEAPPLE_EXAMINE_CHANNEL 6 10\$/{if (!a) a=NR} /^TCPDUMP assoc $W if=wlan1mon snap=128 count=800 or=3\$/{b=NR} END {exit !(a && b && a < b)}' $T/log && released_before_card '^TCPDUMP assoc $W -> .* heard=1'"
   check "assoc: the AP is read off the air and logged with the count and the lock state" \
     "grep -qE 'assoc $W -> $WA n=3 recs=3 itmax=18 ch=6 lock=ok dwell=[0-9]+s' $LOOT/events.log"
   check "assoc: Watch then runs on that client, locked to its AP" \
     "grep -q 'PICKER\[STREAM 20:00:01\]' $T/log && grep -q '|$W|cli|$WA|6|' $LOOT/watch_*.tsv"
-  check "assoc: one lookup only, the resolved row is not looked up again" "[ \"\$(grep -c '^TCPDUMP assoc $W snap' $T/log)\" = 1 ]"
+  check "assoc: one lookup only, the resolved row is not looked up again" "[ \"\$(grep -c '^TCPDUMP assoc $W if=' $T/log)\" = 1 ]"
   check "assoc: Disrupt from the client row is the targeted frame, measured on that one device" \
     "grep -q '^PINEAPPLE_DEAUTH_CLIENT $WA $W 6\$' $T/log && grep -q 'scope=cli subjects=1' $LOOT/events.log"
   check "assoc: the next cycle keeps the AP, so the inventory carries it" \
     "awk -F'|' '\$4==\"$W\" && \$5==\"cli\" && \$15==\"$WA\"' $LOOT/inventory.tsv | grep -q ."
   check "assoc: the report's AP-to-client tree lists the client under its AP" "grep -qE '^$WA HomeNet .*20:00:01' $LOOT/report_*.txt"
-  check "assoc: EXAMINE released, no lock file, no tcpdump left" \
-    "[ ! -e /tmp/cs_run.pid ] && [ -e /tmp/cs_harness_hop ] && [ \"\$(pgrep -x tcpdump | wc -l)\" = 0 ]"
+  check "assoc: EXAMINE released, no lock file, no tcpdump and no capture file left" \
+    "[ ! -e /tmp/cs_run.pid ] && [ -e /tmp/cs_harness_hop ] && [ \"\$(pgrep -x tcpdump | wc -l)\" = 0 ] && ! ls /tmp/cs_asc_*.pcap >/dev/null 2>&1"
   # 2. the miss that is already in the fixtures: a camera last heard on 2437 MHz whose AP is on channel 36
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
-  rules asc2 '^CamHound' 'Scan,Exit' 'Review hits' '7,Exit' '^[0-9]+ REO' 'Watch (find AP first),Back' "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 run
+  rules asc2 '^CamHound' 'Scan,Exit' 'Review hits' '7,Exit' '^[0-9]+ REO-OUI 00:00:11' 'Watch (find AP first),Back' "${COMMON[@]}"; answers t t B; HARNESS_NO_CLIENTS=1 run
   check "assoc: a client last heard off its AP's channel is not found, and the miss is said as a channel" \
-    "grep -qE '^LOG yellow 00:00:1[12] not heard on ch 6 in 2s' $T/log && grep -qE 'assoc ec:71:db:00:00:1[12] none why=NO_FRAMES recs=0 itmax=0 trunc=0 ch=6 lock=ok' $LOOT/events.log"
+    "grep -q '^LOG yellow 00:00:11 not heard on ch 6 in 2s' $T/log && grep -q 'assoc ec:71:db:00:00:11 none why=NO_FRAMES recs=0 itmax=0 trunc=0 ch=6 lock=ok' $LOOT/events.log"
   check "assoc: a miss teaches nothing, the row still offers the lookup, and no Watch opens" \
     "[ \"\$(grep -c 'items=Watch (find AP first);Disrupt (find AP first);' $T/log)\" = 2 ] && ! grep -q 'PICKER\[Watch ' $T/log && ! grep -q 'assoc .* -> ' $LOOT/events.log"
-  check "assoc: the radio is released after a miss" \
-    "awk '/^TCPDUMP assoc/{b=NR} /^PINEAPPLE_EXAMINE_RESET/{if (b) c=NR} END {exit !(b && c > b)}' $T/log && [ -e /tmp/cs_harness_hop ]"
+  check "assoc: the radio is released after a miss, by the lookup and not by the exit" \
+    "released_before_card '^TCPDUMP assoc ec:71:db:00:00:11 -> .* heard=0' && [ -e /tmp/cs_harness_hop ]"
   # 3. a membership capture is the same fact read the other way: Disrupt on the NVR AP teaches both
   #    cameras their AP, their cards then offer Watch outright, and kit detection wakes up
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules asc3 '^CamHound' 'Scan,Scan,Exit' 'Review hits' '6,7,Exit,Exit' '^[0-9]+ REO-OUI 00:00:10' 'Disrupt,Back' \
-    '^[0-9]+ REO-OUI 00:00:1[12]' 'Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
+    '^[0-9]+ REO-OUI 00:00:11' 'Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
   answers t t B B; HARNESS_NO_CLIENTS=1 run
   check "assoc: a membership capture teaches each station it heard its AP" \
     "grep -q 'assoc members of ec:71:db:00:00:10: 2 heard, 2 client row(s) now carry this AP' $LOOT/events.log"
   check "assoc: so that camera's card offers Watch and Disrupt outright, and no lookup runs" \
-    "grep -qE 'PICKER\[[0-9]+ REO-OUI 00:00:1[12]\] items=Watch;Disrupt' $T/log && ! grep -q '^TCPDUMP assoc' $T/log"
+    "grep -qE 'PICKER\[[0-9]+ REO-OUI 00:00:11\] items=Watch;Disrupt' $T/log && ! grep -q '^TCPDUMP assoc' $T/log"
   check "assoc: after the next cycle both cameras carry the AP in the inventory" \
     "[ \"\$(awk -F'|' '\$5==\"cli\" && \$15==\"ec:71:db:00:00:10\"' $LOOT/inventory.tsv | grep -c .)\" = 2 ]"
   check "assoc: and kit detection wakes up: the NVR is a kit AP, its cameras kit clients" \
@@ -485,7 +495,21 @@ s_assoc() {   # the inverse lookup on the real-firmware shape: a client's AP rea
   rules asc6 '^CamHound' 'Scan,Exit' 'Review hits' '5,Exit' '^[0-9]+ WYZE' 'Watch (find AP first),Back' '^Watch ' 'Back' "${COMMON[@]}"
   answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_NO_OR=1 run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   check "assoc: when the OR filter will not arm, the uplink alone still names the AP" \
-    "grep -q '^TCPDUMP assoc OR form refused' $T/log && grep -q '^TCPDUMP assoc $W snap=128 count=800 or=4' $T/log && grep -qE 'assoc $W -> $WA n=3 ' $LOOT/events.log"
+    "grep -q '^TCPDUMP assoc OR form refused' $T/log && grep -q '^TCPDUMP assoc $W if=wlan1mon snap=128 count=800 or=4\$' $T/log && grep -qE 'assoc $W -> $WA n=3 ' $LOOT/events.log"
+  # 7. the same lookup from the DISRUPT row: find the AP, then the attack menu, then the one targeted frame
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules asc7 '^CamHound' 'Scan,Exit' 'Review hits' '5,Exit' '^[0-9]+ WYZE' 'Disrupt (find AP first),Back' '^Disrupt \[' '1' ' ch ' '1' "${COMMON[@]}"
+  answers t t B; HARNESS_NO_CLIENTS=1 run
+  check "assoc: the Disrupt row runs the lookup first and only then the frame, aimed at that client through the AP the lookup named" \
+    "awk '/^TCPDUMP assoc $W if=wlan1mon snap=128 count=800 or=3\$/{a=NR} /^PINEAPPLE_DEAUTH_CLIENT $WA $W 6\$/{b=NR} END {exit !(a && b && a < b)}' $T/log && grep -q 'scope=cli subjects=1' $LOOT/events.log"
+  check "assoc: and it opened the attack menu, not Watch" "grep -q 'PICKER\[Disrupt \[' $T/log && ! grep -q 'PICKER\[Watch ' $T/log"
+  # 8. tcpdump will not arm at all: NO_CAPTURE after both filter forms, nothing learned, radio released
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules asc8 '^CamHound' 'Scan,Exit' 'Review hits' '5,Exit' '^[0-9]+ WYZE' 'Watch (find AP first),Back' "${COMMON[@]}"
+  answers t t B; HARNESS_NO_CLIENTS=1 HARNESS_NO_ARM=1 run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
+  check "assoc: a capture that will not arm is NO_CAPTURE once both filter forms are refused, and nothing is learned" \
+    "[ \"\$(grep -c '^TCPDUMP assoc refused to arm' $T/log)\" = 2 ] && grep -q 'assoc $W none why=NO_CAPTURE' $LOOT/events.log && ! grep -q 'assoc .* -> ' $LOOT/events.log && ! grep -q 'PICKER\[Watch ' $T/log"
+  check "assoc: and the radio is still released by the lookup itself" "released_before_card '^TCPDUMP assoc refused to arm' && [ -e /tmp/cs_harness_hop ]"
 }
 case "${1:-all}" in
   csainj) s_csainj ;; live) s_live ;; stimulus) s_stimulus ;; lock) s_lock ;; nojq) s_nojq ;; locate) s_locate ;; disrupt) s_disrupt ;; members) s_members ;; cliscope) s_cliscope ;; blind) s_blind ;; noinj) s_noinj ;; persist) s_persist ;; settings) s_settings ;; bands) s_bands ;; devices) s_devices ;; assoc) s_assoc ;;
