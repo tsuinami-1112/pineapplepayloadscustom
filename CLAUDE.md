@@ -122,6 +122,18 @@ the write is trusted only when 6 GHz is seen there or in uci — on bare 1.1.3 i
 pineapd running, day-one 8c; every issued write is restored in `cleanup`, by the watchdog, or by
 `bands_recover` at the next start from `BANDS_STATE`; not copied into the hooks); `raw_up_rows` feeds `--replay` a `raw_<run>.txt`.
 
+**Two helpers that set a global, and the jq probe** — added inside `cd5d279..4762790`, in this
+map since 2026-11-11. `band_of <freq>` (lib block, so the hooks carry it) and `band_rank <band name>`
+**set `BAND_V` and `RANK_V` and print nothing: call them directly, never inside `$( )`.** There the
+answer is an empty string with rc 0 and no error — `x=$(band_of 5180)` leaves `x` empty and
+`BAND_V` unset in the caller (run 2026-11-11) — which is the same trap as `posture_of` and
+`inj_probe` below. They stopped printing because each `$( )` was a fork per device per cycle.
+`jq_works` is what `HAVE_JQ` means: jq must run `JQ_CLI` and `JQ_APS` on a fixture and print the
+exact rows, or the regex fallback parsers are used. Presence is not enough — the 1.1.3 unit's jq
+has no Oniguruma, the parsers used `gsub` then, and they compiled to nothing while `HAVE_JQ` read 1
+(the comment above the function; measured 2026-11-04). `SHOW_OTHER`, unstarred like `SHOW_MODULES`
+beside it, is the menu switch for "Other devices".
+
 **The three lists** — `sort_macs hits|modules|other` feeds `review_list`, `modules_list` and
 `other_list` ("Other devices": the complement of the first two, gated on proximity, added
 2026-11-09 because an AP no signature names was in no list and so could not be Watched). All three
@@ -135,10 +147,14 @@ the wall clock**: the lists are only drawn with the scan paused, so against the 
 row read `?` together 90 s after the last cycle and "Other devices", which keeps N and M only,
 drew empty. Unset (no cycle yet; the Recon hooks) the wall clock stands in. *Falsified by:* a
 device that left the room staying N or M across cycles — the stamp moves each cycle, so it should
-not. `vendor_prefetch` resolves a cycle's vendors in one `awk` pass over the OUI table (one failed
-`grep` per device was the 33-81 minute cycle of Second contact); the selftest's "structural gate"
+not. `vendor_prefetch` resolves a cycle's vendors in one `awk` pass over the OUI table (`OUI_AWK`;
+one failed `grep` per device was the 33-81 minute cycle of Second contact); the selftest's "structural gate"
 on that counts greps in a **file**, because the grep runs inside `$( )` and the shell-variable
-counter it used until 2026-11-11 read 0 whatever the code did. `recon_fresh_start` is
+counter it used until 2026-11-11 read 0 whatever the code did. **The gate showed that the prefetch
+costs no grep, not that `run_cycle` calls it**: with that one call deleted every check still
+passed, so a whole cycle over six uncached devices now runs under the same counter. So does a
+randomised MAC's lookup, because the state `vendor_of` leaves is the same for a skip and for a
+full-table miss. `recon_fresh_start` is
 `RECON_FRESH`'s one call: it reads the command's stderr and logs that a session was *requested*,
 or what the firmware said instead — the line it replaces logged "previous recon list discarded",
 which the payload could not know. These five are findings 0, 1, 2, 6 and 13 of the review of

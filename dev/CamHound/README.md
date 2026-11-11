@@ -16,7 +16,7 @@ facts that are settled so they do not get re-derived.
 | `gen_hooks.sh` | regenerates `library/recon/{client,access_point}/CamHound/` from the user payload (header + config + lib block + watch-core block + `hook_main.sh`) |
 | `check_sync.sh` | fails when the shared blocks differ between the user payload and the hooks |
 | `hook_header.sh`, `hook_main.sh` | the hook-only parts |
-| `harness/run_harness.sh` | laptop harness: stub DuckyScript commands, fake `_pineap`/`tcpdump`/`iwinfo`/`iw` (US-like channel table for a fixture phy dir), stub `NUMBER_PICKER`/`PAYLOAD_SET_CONFIG`/`PAYLOAD_DEL_CONFIG`, RECON fixtures (the client fixture is in the 2.0.0 `probe`-object shape, with `ap_mac` kept as a stand-in for the association the firmware does not expose; a net tree under `NET_SYSFS` names phy0 as wlan1mon's phy; `HARNESS_NO_BEACON=1` makes the fake tcpdump capture nothing, `HARNESS_NO_CLIENTS=1` refuses `RECON CLIENTS` as 1.1.3 does and serves `fix/devices.json`, the measured `RECON DEVICES` shape with sorted keys, and `HARNESS_BANDS_NOOP=1` makes the band write change nothing, as measured); scenarios live, stimulus, lock (a second instance refused; a SIGKILLed run cleaned up by its watchdog; a SIGTERMed run ending instead of carrying on), nojq (both parsers, over CLIENTS and over DEVICES), locate, disrupt, members (the real-firmware shape -- no association at all, membership read off the air; `HARNESS_NO_MEMBERS` / `HARNESS_NO_ARM` / `HARNESS_NO_OR` / `HARNESS_SHORT_SNAP` / `HARNESS_BAD_PCAP` / `HARNESS_ALIEN_MEMBERS` drive the capture reasons, and `HARNESS_FIRE_REFUSE` makes the fake deauth commands refuse with rc 1 and the error on stderr (the rc-0-with-stderr shape `hak5cmd` really has is covered by the selftest's own refusing stub), which must loot `CMD_REFUSED` and never a verdict (`NO_CAPTURE`, `SNAP_SHORT`, `NO_CLIENTS` — since 2026-11-10 reasons that fire the broadcast and loot `INCONCLUSIVE`, not refusals) and the uplink-only fallback filter), cliscope (the client-row Disrupt: both scopes in one menu), csainj (the optional CSA injector, on a second copy of the payload with `CSA_INJECTOR` set in its config block; `HARNESS_INJ_FAIL` makes the fake `pagerinj` fail to clone a beacon), blind, noinj, persist, settings, bands (the write, the measured no-op, the Settings toggle, a record left by a killed run, the killed run's own watchdog), devices, assoc (the inverse lookup on the real-firmware shape, eleven arms, the last of which kills the run while it is listening and checks that its watchdog removed the capture file: a client's AP found from its card's Watch row, then Watch and a targeted Disrupt on it; the same lookup entered from the Disrupt row; that entry again with `ASSOC_TTL=0`, where the one pick must listen once and the next pick is the one that re-checks; `HARNESS_ASSOC_DOWN` (the AP is heard sending to a client that is itself silent: `NO_UPLINK`, nothing named); a tcpdump that will not arm (`HARNESS_NO_ARM`, which the fake honours for this capture as it does for the membership one); the miss already in the fixtures, a camera last heard on 2437 MHz whose AP is on channel 36; a membership capture teaching both cameras their NVR, which wakes kit detection; `HARNESS_NO_PARK` (EXAMINE_CHANNEL does not park: the hop is listened across), `HARNESS_ASSOC_TWO` (two BSSIDs alike: no decision) and `HARNESS_NO_OR` (uplink-only retry). The fake tcpdump answers the lookup only when the radio could have heard the client: hopping, or parked on its AP's channel, which the EXAMINE stubs track in `/tmp/cs_harness_hop` and `/tmp/cs_harness_chan`) |
+| `harness/run_harness.sh` | laptop harness: stub DuckyScript commands, fake `_pineap`/`tcpdump`/`iwinfo`/`iw` (US-like channel table for a fixture phy dir), stub `NUMBER_PICKER`/`PAYLOAD_SET_CONFIG`/`PAYLOAD_DEL_CONFIG`, RECON fixtures (the client fixture is in the 2.0.0 `probe`-object shape, with `ap_mac` kept as a stand-in for the association the firmware does not expose; a net tree under `NET_SYSFS` names phy0 as wlan1mon's phy; `HARNESS_NO_BEACON=1` makes the fake tcpdump capture nothing, `HARNESS_NO_CLIENTS=1` refuses `RECON CLIENTS` as 1.1.3 does and serves `fix/devices.json`, the measured `RECON DEVICES` shape with sorted keys, and `HARNESS_BANDS_NOOP=1` makes the band write change nothing, as measured); scenarios live, stimulus, lock (a second instance refused; a SIGKILLed run cleaned up by its watchdog; a SIGTERMed run ending instead of carrying on), nojq (both parsers, over CLIENTS and over DEVICES), locate, disrupt, members (the real-firmware shape -- no association at all, membership read off the air; `HARNESS_NO_MEMBERS` / `HARNESS_NO_ARM` / `HARNESS_NO_OR` / `HARNESS_SHORT_SNAP` / `HARNESS_BAD_PCAP` drive the capture reasons, `HARNESS_ALIEN_MEMBERS` the heard-but-unmeasurable arm (stations Recon has no row for: they are transmitted at and scored `INCONCLUSIVE`), and `HARNESS_FIRE_REFUSE` makes the fake deauth commands refuse with rc 1 and the error on stderr (the rc-0-with-stderr shape `hak5cmd` really has is covered by the selftest's own refusing stub), which must loot `CMD_REFUSED` and never a verdict (`NO_CAPTURE`, `SNAP_SHORT`, `NO_CLIENTS` — since 2026-11-10 reasons that fire the broadcast and loot `INCONCLUSIVE`, not refusals) and the uplink-only fallback filter), cliscope (the client-row Disrupt: both scopes in one menu), csainj (the optional CSA injector, on a second copy of the payload with `CSA_INJECTOR` set in its config block; `HARNESS_INJ_FAIL` makes the fake `pagerinj` fail to clone a beacon), blind, noinj, persist, settings, bands (the write, the measured no-op, the Settings toggle, a record left by a killed run, the killed run's own watchdog), devices, assoc (the inverse lookup on the real-firmware shape, eleven arms, the last of which kills the run while it is listening and checks that its watchdog removed the capture file: a client's AP found from its card's Watch row, then Watch and a targeted Disrupt on it; the same lookup entered from the Disrupt row; that entry again with `ASSOC_TTL=0`, where the one pick must listen once and the next pick is the one that re-checks; `HARNESS_ASSOC_DOWN` (the AP is heard sending to a client that is itself silent: `NO_UPLINK`, nothing named); a tcpdump that will not arm (`HARNESS_NO_ARM`, which the fake honours for this capture as it does for the membership one); the miss already in the fixtures, a camera last heard on 2437 MHz whose AP is on channel 36; a membership capture teaching both cameras their NVR, which wakes kit detection; `HARNESS_NO_PARK` (EXAMINE_CHANNEL does not park: the hop is listened across), `HARNESS_ASSOC_TWO` (two BSSIDs alike: no decision) and `HARNESS_NO_OR` (uplink-only retry). The fake tcpdump answers the lookup only when the radio could have heard the client: hopping, or parked on its AP's channel, which the EXAMINE stubs track in `/tmp/cs_harness_hop` and `/tmp/cs_harness_chan`) |
 
 Rule: edit the user payload, then `gen_hooks.sh`, then `check_sync.sh`, then `payload.sh --selftest`
 and `harness/run_harness.sh`. The lib block (`# --- camhound lib begin/end ---`) and the watch-core
@@ -85,15 +85,19 @@ is merged, so until then take the three `payload.sh` copies from that branch, no
 signature file is byte-identical in all three, and so are the two hooks (`cmp` them — that is the
 edit contract, not a mistake). *(This line said "nine files" until 2026-11-11; three directories of
 two files each is six.)* The loop below is POSIX shell. From PowerShell, where `for … do` does not
-exist, the same copy is six plain lines that need no quoting — run them from the repo root:
+exist, the same copy is six plain lines that need no quoting — run them from the repo root, with
+the `mkdir` line before them on a first install and the `chmod` line after them (both are the two
+`ssh` lines of the POSIX block written out without quotes or a glob):
 
 ```
+ssh root@172.16.52.1 mkdir -p /root/payloads/user/reconnaissance/CamHound /root/payloads/recon/client/CamHound /root/payloads/recon/access_point/CamHound
 scp library/user/reconnaissance/CamHound/payload.sh root@172.16.52.1:/root/payloads/user/reconnaissance/CamHound/
 scp library/user/reconnaissance/CamHound/cam_signatures.txt root@172.16.52.1:/root/payloads/user/reconnaissance/CamHound/
 scp library/recon/client/CamHound/payload.sh root@172.16.52.1:/root/payloads/recon/client/CamHound/
 scp library/recon/client/CamHound/cam_signatures.txt root@172.16.52.1:/root/payloads/recon/client/CamHound/
 scp library/recon/access_point/CamHound/payload.sh root@172.16.52.1:/root/payloads/recon/access_point/CamHound/
 scp library/recon/access_point/CamHound/cam_signatures.txt root@172.16.52.1:/root/payloads/recon/access_point/CamHound/
+ssh root@172.16.52.1 chmod +x /root/payloads/user/reconnaissance/CamHound/payload.sh /root/payloads/recon/client/CamHound/payload.sh /root/payloads/recon/access_point/CamHound/payload.sh
 ```
 
 ```sh
@@ -137,8 +141,12 @@ hooks; they are not starred because `cfg()` takes integers only, so a path canno
 `/sd/payloads/...` and `/mmc/root/payloads/...` work equally — `find_install_dir` probes
 `_PAYLOAD_HOME`, then the script's own directory, then all three roots, which is why each hook finds
 its own signature file despite all three copies carrying the same `PAYLOAD_REL`. From a Windows
-checkout: `sed -i 's/\r$//' payload.sh cam_signatures.txt` (the repo copies are LF; `file` will tell
-you).
+checkout the working tree can be CRLF although the repo stores LF (`file` will tell you): the
+operator README's install step 3 has the durable fix and the repair for a device that already holds
+CRLF copies, which uses `tr -d '\015'`. *(Until 2026-11-11 this line gave a `sed -i 's/\r$//'`
+one-liner. The operator README dropped that form on 2026-11-04, commit `92dc1b4`, saying this
+BusyBox build's `sed` does not reliably read `\r` in a pattern, and the two documents disagreed
+from then on.)*
 
 **Driving the device from PowerShell: single quotes outside, and no `"` character anywhere inside.**
 PowerShell's escape character is a backtick, not a backslash, so `\$x` and `\"` do not mean what a
@@ -178,7 +186,7 @@ and `RESPONSE_CONFIRM`). For a recon-only first run:
 `--selftest` is safe to run on the device — every device-changing command is stubbed, and since
 2026-11-04 so is every display and dialog command, so it no longer paints the Pager's screen nor can
 it block on a button press. The cheapest first step is `bash payload.sh --selftest` on the Pager
-itself. Expect `== 486 checks, 0 failed ==` (the count as of 2026-11-11; it grows with every case added) and
+itself. Expect `== 488 checks, 0 failed ==` (the count as of 2026-11-11; it grows with every case added) and
 the two block hashes; a lower count means the copy
 on the device is older than the repo's.
 
@@ -194,9 +202,11 @@ two machines take opposite branches and neither alone covers both.*
 Then start **Recon in continuous mode** in the GUI, run CamHound, and watch
 `/root/loot/CamHound/events.log` for these, in order:
 
-**Confirmed on the device, 2026-11-04:** the `gsub` row below is why `jq_works()` exists — jq is
-present on a Pager but has no Oniguruma, so the parsers compiled to nothing and `HAVE_JQ` lied.
-`--selftest` now reports 259/0 there.
+**Confirmed on the device, 2026-11-04:** what that day's run found is why `jq_works()` exists — jq
+is present on a Pager but has no Oniguruma, so the parsers, which used `gsub` then, compiled to
+nothing and `HAVE_JQ` lied. `--selftest` reported 259/0 there afterwards, which is still the last
+device count on record. *(This paragraph pointed at "the `gsub` row below" until 2026-11-11; the
+table has never had one. The probe's answer is the `jq=1` of its first row.)*
 
 | marker | means |
 |---|---|

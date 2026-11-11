@@ -1767,7 +1767,7 @@ declare -a ROW_TEXT ROW_MAC
 
 # pick_list "title" "default" items...  -> PICK (empty on B / cancel); items paginated by 10 with More...
 
-# row_for mac -> ROW (conf tags prox glyph rssi, cut to ROW_W, never a partial tag)
+# row_for mac -> ROW (glyph conf tags prox rssi, cut to ROW_W, never a partial tag)
 ROW=""
 row_for() {
   local mac="$1" t tags="" budget glyph="A" r
@@ -3856,10 +3856,12 @@ selftest() {
   unset "VLOW[00:11:22:00:10:04]"; vendor_prefetch "00:11:22:00:10:04"
   st "oui batch: a miss is cached, not left to fall through to the grep" "${VLOW[00:11:22:00:10:04]+set}:[${VLOW[00:11:22:00:10:04]}]" "set:[]"
   # The randomised skip must sit AFTER the cache guard: before it, st_device's injected vendors are
-  # overwritten and the scoring cases fail. This asserts both halves.
+  # overwritten and the scoring cases fail. This asserts both halves. What the first of the two shows
+  # is the cached state only: a skip and a full-table miss both leave "set:[]:-", so that the table
+  # is not opened is counted below, under the grep counter.
   unset "VLOW[4e:42:dc:3b:d1:33]" "VENDOR[4e:42:dc:3b:d1:33]"
   vendor_of "4e:42:dc:3b:d1:33"
-  st "vendor: a randomised MAC skips the table and caches the skip" "${VLOW[4e:42:dc:3b:d1:33]+set}:[${VLOW[4e:42:dc:3b:d1:33]}]:${VENDOR[4e:42:dc:3b:d1:33]}" "set:[]:-"
+  st "vendor: a randomised MAC is cached as having no vendor" "${VLOW[4e:42:dc:3b:d1:33]+set}:[${VLOW[4e:42:dc:3b:d1:33]}]:${VENDOR[4e:42:dc:3b:d1:33]}" "set:[]:-"
   VLOW[4e:42:dc:3b:d1:34]="injected vendor"; VENDOR[4e:42:dc:3b:d1:34]="injected"
   vendor_of "4e:42:dc:3b:d1:34"
   st "vendor: the skip is after the cache guard, so an injected vendor survives" "${VLOW[4e:42:dc:3b:d1:34]}" "injected vendor"
@@ -3881,6 +3883,11 @@ selftest() {
   st "oui batch: and the prefetch leaves nothing for vendor_of to grep" "$(wc -c <"$tmp/greps" | tr -d ' ')" "0"
   unset "VLOW[ec:71:db:00:20:01]" "VENDOR[ec:71:db:00:20:01]"; vendor_of ec:71:db:00:20:01
   st "oui batch: a device the prefetch never saw DOES cost one, so the count above can tell 0 from 10" "$(wc -c <"$tmp/greps" | tr -d ' ')" "1"
+  # A randomised MAC is the guaranteed full-file miss, 5.05 s on the device, so vendor_of must not
+  # open the table for it at all. Until 2026-11-11 only the cached state was checked, which a miss
+  # produces too: with the skip deleted from vendor_of all 486 checks passed (sceptic pass).
+  : >"$tmp/greps"; unset "VLOW[4e:42:dc:3b:d1:33]" "VENDOR[4e:42:dc:3b:d1:33]"; vendor_of "4e:42:dc:3b:d1:33"
+  st "vendor: and the skip is a skip - a randomised MAC costs no grep" "$(wc -c <"$tmp/greps" | tr -d ' ')" "0"
   unset -f grep; rm -f "$tmp/greps"
   for _d in 01 02 03 04 05 06 07 08 09 10; do unset "VLOW[ec:71:db:00:20:$_d]" "VENDOR[ec:71:db:00:20:$_d]"; done
   # band_of / band_rank set globals now; a $( ) at either call site is a fork per device per cycle.
@@ -5252,6 +5259,25 @@ IWFIX
      "$_f3" "36/5180/5|44/5220/5|11/2437/2"
   st "run_cycle: when the AP a row carries changes to one with no channel or SSID, the old AP's do not stay on the row; and the cycle stamps the time proximity goes stale against" \
      "$_f2" "aa:00:00:00:00:66/1/Fnet|aa:00:00:00:00:67/none/none|nochan||1"
+  # The cycle's one table pass. The structural gate shows that vendor_prefetch costs no grep; nothing
+  # showed that run_cycle CALLS it, and with that call deleted all 486 checks passed (sceptic pass,
+  # 2026-11-11) -- on the device that is one failed grep per device again, the 33-81 minute cycle of
+  # Second contact. Six devices no cache has seen, APs and clients, table hits and misses: the cycle
+  # must not grep the table once. The last number is the counter showing that it can count.
+  _f2=$( recon_lines() { case "$1" in
+           APS) printf 'ec:71:db:00:30:01|9|NetA|1|2412|-50|0|5\n00:11:22:00:30:02|9|NetB|6|2437|-50|0|5\n' ;;
+           CLIENTS) printf 'ec:71:db:00:30:03|-|7|-60||2412|5|0\n00:11:22:00:30:04|-|7|-60||2437|5|0\nec:71:db:00:30:05|-|7|-60||2412|5|0\n00:11:22:00:30:06|-|7|-60||2437|5|0\n' ;;
+         esac; }
+         gps_tick() { :; }; battery_tick() { :; }; upsert_inventory() { :; }; write_report() { :; }
+         OUI_FILE="$tmp/oui2.txt"; : >"$tmp/greps"
+         grep() { case " $* " in *" $OUI_FILE "*) printf 'g' >>"$tmp/greps" ;; esac; command grep "$@"; }
+         run_cycle >/dev/null 2>&1
+         printf '%s:%s:' "$(wc -c <"$tmp/greps" | tr -d ' ')" "${VLOW[ec:71:db:00:30:05]}"
+         vendor_of ec:71:db:00:30:99
+         printf '%s' "$(wc -c <"$tmp/greps" | tr -d ' ')" )
+  rm -f "$tmp/greps"
+  st "run_cycle: the cycle resolves its vendors in the one table pass - six new devices cost no grep, and one the cycle never saw costs one" \
+     "$_f2" "0:reolink innovation limited:1"
   # the real capture, once, against a tcpdump that writes a file: the filter and the bookkeeping
   eval "$_oc"; unset -f sleep; CHILD_FILE="$tmp/children"; : >"$CHILD_FILE"
   # The fake tcpdump notes, 0.4 s into its run, how many pids are registered and whether its own is

@@ -297,7 +297,7 @@ s_bands() {   # BAND6=1: the band write at start (trusted on read-back), the sta
   rules bands3 '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; HARNESS_BANDS_NOOP=1 run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   check "bands: a no-op write is reported, not claimed" "grep -q '^LOG yellow band write not applied: radio stayed on 2,5' $T/log && grep -q 'bands: write not applied' $LOOT/events.log && grep -q '6 GHz not scanned' $LOOT/report_*.txt"
   check "bands: an issued but untrusted write is still restored at exit" "[ \"\$(grep -c '^PINEAPPLE_SET_BANDS wlan1mon 2 5$' $T/log)\" = 1 ] && grep -q 'restored 2,5 (write was never trusted' $LOOT/events.log && [ ! -e $LOOT/.bands_orig ]"
-  # switched on from Settings (BAND6 is the tenth Recon key, behind More...): applied at once, restored at exit
+  # switched on from Settings (BAND6 is the eleventh of thirteen Recon keys, behind More...): applied at once, restored at exit
   reset; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   rules bands4 '^CamHound' 'Settings,Exit' '^Settings' 'Recon settings,Back' '^Recon settings' 'BAND6 = 0,Back' '^BAND6:' 'On' "${COMMON[@]}"; answers t; run; printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
   check "bands: Settings toggle applies the write now and persists the key" "grep -q 'PAYLOAD_SET_CONFIG camhound BAND6 1' $T/log && grep -q '^PINEAPPLE_SET_BANDS wlan1mon 2 5 6$' $T/log && grep -q '^LOG bands: 2,5,6' $T/log && grep -q '^PINEAPPLE_SET_BANDS wlan1mon 2 5$' $T/log"

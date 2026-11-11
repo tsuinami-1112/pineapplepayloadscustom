@@ -156,8 +156,13 @@ lookup parks the radio, so it happens only on a row you pick.*
   block with a triple vibe.
 - When something scores CONFIRMED or LIKELY you get one dialog: **Watch now?** (A = yes, B = no). A
   STREAM or EVENT verdict is followed by **Locate?**. That is the whole flow: two presses.
-- **B** during a scan opens **Review hits** (hold it up to one cycle). Rows read
-  `conf tags prox role rssi`, e.g. `90 HIK-OUI NA-58` = confidence 90, Hikvision OUI, NEAR, AP, -58 dBm.
+- **B** during a scan opens **Review hits**, in the window the screen announces: after every cycle
+  it prints `press B now to review (20s)` and waits that long (`CYCLE_SECS`) for the press. That
+  wait is the only time the payload is given the button — while a cycle is being worked through the
+  firmware keeps it, so press when the line appears, not before. Rows read
+  `role conf tags prox rssi`, e.g. `A 90 HIK-OUI N-58` = an AP (`c` is a client), confidence 90,
+  Hikvision OUI, NEAR, -58 dBm. *(Until 2026-11-11 this said "hold it up to one cycle" and gave
+  the row as `90 HIK-OUI NA-58`; the role letter leads the row now.)*
   Pick a row for the detail card: `Watch`, `Disrupt`, `Locate`, `Ignore for session`, `Back`. On a
   client whose AP is not known the first two read `Watch (find AP first)` and
   `Disrupt (find AP first)` — see "What it cannot see".
@@ -281,6 +286,7 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 | ASSOC_TTL | 300 | * | seconds an AP learned off the air is trusted before Watch or Disrupt looks again (0 = look every time) |
 | SOUND | 0 | * | ringtone on CONFIRMED |
 | SHOW_MODULES | 1 | | modules list in the menu |
+| SHOW_OTHER | 1 | | "Other devices" list in the menu |
 | MODULE_HINT_RSSI | -55 | | one-time "module strong+busy: Watch?" hint |
 | BUSY_PPS / BUSY_CYCLES | 10 / 2 | | BUSY = rate floor for N cycles and top-3 on the band |
 | WIN_SECS / LIVE_WINDOWS | 10 / 6 | | Watch window and count |
