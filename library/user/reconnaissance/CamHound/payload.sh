@@ -5082,6 +5082,13 @@ IWFIX
   st "assoc refresh: a fresh answer is not looked up again" "$(assoc_stale "$AS1" && echo stale)" ""
   ASSOC_TS[$AS1]=$((EPOCHSECONDS - 400)); ASSOC_TRY[$AS1]=$((EPOCHSECONDS - 400))
   st "assoc refresh: one older than ASSOC_TTL is" "$(assoc_stale "$AS1" && echo stale)" "stale"
+  # ...and only for a row that still CARRIES the AP it learned. Since the ASSOC_FW mark took over the
+  # firmware's case no check reached this clause: with it deleted all 485 passed (mutation
+  # firmware_ap_stale, 2026-11-11). No shipped path empties a learned row's AP, so this pins the
+  # function's own contract, not a state a device has been seen in.
+  local _sap0="${AP_OF[$AS1]}"; AP_OF[$AS1]=-
+  st "assoc refresh: a row that no longer carries the AP it learned is not re-checked as if it did" "$(assoc_stale "$AS1" && echo stale)" ""
+  AP_OF[$AS1]="$_sap0"
   ASSOC_TS[aa:00:00:00:00:31]=$((EPOCHSECONDS - 400)); ASSOC_TRY[aa:00:00:00:00:31]=$((EPOCHSECONDS - 400))
   st "assoc refresh: an AP the firmware supplied is never re-checked, however old the one heard beside it" \
      "${AP_OF[aa:00:00:00:00:31]}:$(assoc_stale aa:00:00:00:00:31 && echo stale)" "aa:00:00:00:00:30:"
@@ -5282,7 +5289,18 @@ IWFIX
      "$?:$(grep -c . "$tmp/tcpargs" 2>/dev/null)" "1:1"
   tcpdump() { local o=''; while [ $# -gt 0 ]; do [ "$1" = -w ] && o="$2"; shift; done; printf 'x' >"$o"; sleep 3; }
   _f2=$(capture_bss "$ASB"); st "member capture: the same, for the membership capture's file" "$?:$([ -e "/tmp/cs_mem_$$.pcap" ] && echo left)" "1:"
-  _f2=$(capture_beacon "$ASB"); st "beacon capture: and for the beacon capture's" "$?:$([ -e "/tmp/cs_bcn_$$.pcap" ] && echo left)" "1:"
+  # capture_beacon has no first-second wait, so with the run gone BEFORE it starts it kills its
+  # tcpdump before that has opened a file, and "no file left" held whatever the code did: with the
+  # helper's removal line deleted all 485 checks passed (mutation k_bcn_orphan_keeps_file,
+  # 2026-11-11). So here the run dies MID-listen, as it does on a device: alive when the capture
+  # starts, killed and reaped a second later, by which time the fake tcpdump has written its file.
+  local _krun _khp
+  sleep 30 & _krun=$!; MAIN_PID=$_krun
+  capture_beacon "$ASB" >"$tmp/bcn_path" & _khp=$!
+  sleep 1; kill "$_krun" 2>/dev/null; wait "$_krun" 2>/dev/null
+  wait "$_khp"
+  st "beacon capture: and a run that dies while the beacon capture is listening leaves no file and names none" \
+     "$?:$([ -e "/tmp/cs_bcn_$$.pcap" ] && echo left):$(cat "$tmp/bcn_path" 2>/dev/null)" "1::"
   MAIN_PID=$_mp
   _f2=$(assoc_capture "$AS1" 1); st "assoc capture: with the run alive it is unaffected" "$?:$([ -s "$_f2" ] && echo file)" "0:file"
   rm -f "$_f2" "/tmp/cs_mem_$$.pcap" "/tmp/cs_bcn_$$.pcap"; unset -f tcpdump; CHILD_FILE="$_cf"

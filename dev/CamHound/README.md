@@ -178,7 +178,7 @@ and `RESPONSE_CONFIRM`). For a recon-only first run:
 `--selftest` is safe to run on the device — every device-changing command is stubbed, and since
 2026-11-04 so is every display and dialog command, so it no longer paints the Pager's screen nor can
 it block on a button press. The cheapest first step is `bash payload.sh --selftest` on the Pager
-itself. Expect `== 485 checks, 0 failed ==` (the count as of 2026-11-11; it grows with every case added) and
+itself. Expect `== 486 checks, 0 failed ==` (the count as of 2026-11-11; it grows with every case added) and
 the two block hashes; a lower count means the copy
 on the device is older than the repo's.
 

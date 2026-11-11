@@ -270,7 +270,7 @@ would blind Recon for as long as it ran.
   filter and a tcpdump that will not arm; `ASSOC_TTL=0`, where one find-AP pick must listen once
   and the *next* pick is the one that re-checks; `HARNESS_ASSOC_DOWN`, the AP heard sending to
   a client that is itself silent; and an eleventh arm that kills the run mid-listen and looks for
-  the capture file its watchdog should have removed). **Three things about these tests, worth keeping in mind when
+  the capture file its watchdog should have removed). **Four things about these tests, worth keeping in mind when
   adding to them:** "a RESET follows the capture" does not show the lookup released the radio,
   because `cleanup` emits one at exit whenever the radio was left held — the harness helper
   `released_before_card` asks for the RESET *before the next picker is drawn*; "no pid left
@@ -280,6 +280,10 @@ would blind Recon for as long as it ran.
   behind, and clearing that glob in the harness's `reset()` to cure it then deleted the capture
   file out from under a selftest running beside the harness (both seen 2026-11-11, the second as a
   flaky selftest failure). `own_capture_gone` reads the path the tcpdump stub was handed instead.
+  Fourth: "no file left" is equally true of a capture killed before it opened one. `capture_beacon`
+  has no first-second wait, so with the stand-in run dead before the helper started, its check
+  passed with the helper's removal line deleted (mutation run, 2026-11-11); the stand-in run now
+  dies a second into the listen.
   The selftest itself is confined since the same day: `CHILD_FILE` points into its temp directory,
   where it used to rewrite the live run's `/tmp/cs_children` twelve times per run (traced).
 
