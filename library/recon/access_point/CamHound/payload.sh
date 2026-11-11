@@ -1428,7 +1428,13 @@ run_lock() {
   fi
   kill_children; pkill -f "^_pineap MONITOR" 2>/dev/null   # anchored: only a real MONITOR process
   printf '%s' "$$" >"$LOCK_FILE"; : >"$CHILD_FILE"
-  trap cleanup EXIT INT TERM
+  # INT and TERM must END the run, not merely tidy up after it. A handler that returns resumes the
+  # script, so `trap cleanup EXIT INT TERM` -- which this was until 2026-11-11 -- ran cleanup on a
+  # kill or a Ctrl-C (lock file gone, EXAMINE released, traps cleared, "run exit" logged) and then
+  # carried on with whatever was in flight, a transmit included, with nothing left to clean up after
+  # it. Exiting from the handler fires the EXIT trap, so cleanup still runs, once. Bash runs the
+  # handler when the foreground command returns, so the stop is prompt, not instant.
+  trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
   # watchdog: if the UI kills this process (SIGKILL), release children and the EXAMINE lock
   ( while kill -0 "$MAIN_PID" 2>/dev/null; do sleep 3; done
     while read -r p; do [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done <"$CHILD_FILE" 2>/dev/null

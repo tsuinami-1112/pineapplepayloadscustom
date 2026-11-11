@@ -89,6 +89,18 @@ s_lock() {   # second instance refused; SIGKILL of the first is cleaned by the w
   check "lock: watchdog removed the lock after SIGKILL" "[ ! -e /tmp/cs_run.pid ]"
   check "lock: watchdog cancelled EXAMINE" "grep -q 'EXAMINE CANCEL' $T/log"
   for p in $(pgrep -x sleep); do tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q ' 1000' && kill "$p" 2>/dev/null; done; true
+  # SIGTERM (and Ctrl-C) must END the run. With `trap cleanup EXIT INT TERM` the handler returned,
+  # so a kill ran cleanup -- lock file gone, EXAMINE released, traps cleared -- and the payload then
+  # carried on with whatever was in flight. Found by the review of 2026-11-10 and reproduced there
+  # with a transmit completing after the "run exit" line.
+  reset; rules lock2 '^CamHound' 'Scan' "${COMMON[@]}"; answers t t t t t t t t t t t t
+  PATH="$PATHX" bash "$T/payload_fast.sh" >/dev/null 2>&1 & local p2=$!; sleep 7
+  kill -TERM $p2 2>/dev/null; sleep 9
+  check "lock: SIGTERM ends the run, instead of running cleanup and carrying on" "! kill -0 $p2 2>/dev/null"
+  check "lock: and cleanup ran once: lock file gone, one exit line, no scan cycle after it" \
+    "[ ! -e /tmp/cs_run.pid ] && [ \"\$(grep -c ' run exit ' $LOOT/events.log)\" = 1 ] && ! awk '/ run exit /{e=1; next} e && / cycle c=/' $LOOT/events.log | grep -q ."
+  kill -9 $p2 2>/dev/null; sleep 4
+  for p in $(pgrep -x sleep); do tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q ' 1000' && kill "$p" 2>/dev/null; done; true
 }
 s_nojq() {   # fallback parser gives the same mac|conf rows as jq
   reset; rules nojq '^CamHound' 'Scan,Exit' 'Review hits' 'Exit' "${COMMON[@]}"; answers t t B; run

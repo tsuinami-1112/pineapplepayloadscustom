@@ -71,7 +71,7 @@ bash dev/CamHound/harness/run_harness.sh                            # ALL 16 sce
 ```
 
 **The harness argument is a scenario filter, not a mode.** `run_harness.sh live` runs the `live`
-scenario alone - 5 checks of 130 - and still prints `0 failure(s)`, which reads exactly like a full
+scenario alone - 5 checks of 132 - and still prints `0 failure(s)`, which reads exactly like a full
 pass. This gate list said `live` until 2026-11-04 and every session that copied it was running a
 fourteenth of the suite (sixteenth now). No argument (or `all`) runs them all; a scenario name runs one,
 which is what you want while iterating, never for the gate.
@@ -182,6 +182,17 @@ channel for a client that is passing traffic there; or `lock=hop` on every looku
 `EXAMINE_CHANNEL` alone does not park (bench check: `dev/pager-day-one.md` 8d). **What it does not
 buy:** there is no background pass, so a client nobody picked and no membership capture heard still
 reads `-`, and kit detection and the report tree cover only the clients that have been resolved.
+
+**Signals.** `run_lock` (lib, so both hooks carry it) installs `trap cleanup EXIT; trap 'exit 130'
+INT; trap 'exit 143' TERM`. **Until 2026-11-11 it was `trap cleanup EXIT INT TERM`, and a handler
+that returns resumes the script:** a `kill` or a Ctrl-C ran `cleanup` — lock file gone, EXAMINE
+released, traps cleared, `run exit` logged — and the payload then carried on with whatever was in
+flight. The review that found it reproduced a deauth command issued *after* the `run exit` line.
+Harness scenario `lock` pins it (a SIGTERM during the scan ends the process, with one exit line and
+no cycle after it), and that check was run against the old trap first and failed there. **What
+signal the Pager UI's stop sends is still unmeasured** (`PLAN_v2.md` Phase 0 item 20 G), so whether
+this was ever reachable from the UI is not known; the SIGKILL case is the watchdog's and is
+unchanged. *Falsified by:* a `cycle` or `resp` line after `run exit` in `events.log`.
 
 **Watch rung** (behaviour without identity) — `watch_menu`, `start_caps`/`stop_caps`,
 `pcap_words`/`pcap_bytes` (both have `od` fallbacks), `pcap_buckets`, `bucket_stats`
