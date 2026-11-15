@@ -915,7 +915,7 @@ BEGIN { st = 0; i = 0; itmax = 0; recs = 0; short = 0 }
       if (p[bo] % 2 == 1 || p[co] % 2 == 1) break
       if (index(own, " " c " ") > 0 || index(own, " " b " ") > 0) break
       pair[c " " b]++
-      if (ds == 1) { pup[c " " b]++; own[c]++ }
+      if (ds == 1) { pup[c " " b]++; sent[c]++ }
       break
     }
     if (b != bss) break
@@ -933,7 +933,7 @@ END { if (bad) exit 1
   print "TRUNC " trunc + 0; print "RUNT " runt + 0; print "SNAP " snap + 0
   for (c in seen) if (seen[c] >= 2) print "CLI " c
   for (c in sup) if (seen[c] >= 2) print "UP " c " " sup[c]
-  for (c in own) print "OWN " c " " own[c]
+  for (c in sent) print "OWN " c " " sent[c]
   for (k in pair) if (pair[k] >= 2) print "PAIR " k " " pair[k] " " pup[k] + 0 }'
 
 # bss_clients <pcap> <bssid> -> keyed lines on stdout; rc 1 when the file is unreadable or not a pcap.
@@ -4883,6 +4883,13 @@ IWFIX
      "$?:$ASSOC_WHY:$(printf '%s' "$ASSOC_TEXT" | grep -c '00:00:2b itself not heard on ch 36 (1 records, none of its own)'):$(grep -c 'why=NO_UPLINK .* own=0' "$tmp/events.log")" "1:NO_UPLINK:1:1"
   st "pairs: the walk says how many frames each station sent, before the two-sightings gate" \
      "$(pcap_stream "$tmp/asc.pcap" | awk -v mode=pairs -v sta="" -v own="$OWN_MACS" "$CLI_AWK" | awk '$1 == "OWN" { print $2 "=" $3 }' | sort | tr '\n' ' ')" "$AS1=3 $AS3=1 $AS4=2 "
+  # CLI_AWK takes mode, sta, bss and own as -v scalars. A name used as a scalar AND an array is refused by
+  # mawk and gawk at parse time and accepted by BusyBox awk, so a program that passed every gate run under
+  # BusyBox awk (the Pager's) was dead on a laptop: own[c]++ (6b5b3e1) compiled on BusyBox and failed 71
+  # checks under mawk on 2026-11-15 -- the membership walk and the lookup both, the whole program being one
+  # compilation unit. This fails on any awk; running the selftest under a POSIX awk as well is the other half.
+  st "CLI_AWK: no -v scalar (mode, sta, bss, own) is also used as an array" \
+     "$(printf '%s' "$CLI_AWK" | grep -oE '(^|[^a-z_])(mode|sta|bss|own)\[' | sed 's/^[^a-z]//' | sort -u | tr '\n' ' ')" ""
   st_device aa:00:00:00:00:27 cli "Acme" "" 0; FREQ[aa:00:00:00:00:27]=5180; unset "CH[aa:00:00:00:00:27]"
   st_assoc_pcap "$tmp/asc_ud.pcap" aa0000000027 "$ASH:2" aa0000000099:6:down; ST_PCAP="$tmp/asc_ud.pcap"
   assoc_lookup aa:00:00:00:00:27 >/dev/null 2>&1

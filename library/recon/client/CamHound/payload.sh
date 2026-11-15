@@ -905,7 +905,7 @@ BEGIN { st = 0; i = 0; itmax = 0; recs = 0; short = 0 }
       if (p[bo] % 2 == 1 || p[co] % 2 == 1) break
       if (index(own, " " c " ") > 0 || index(own, " " b " ") > 0) break
       pair[c " " b]++
-      if (ds == 1) { pup[c " " b]++; own[c]++ }
+      if (ds == 1) { pup[c " " b]++; sent[c]++ }
       break
     }
     if (b != bss) break
@@ -923,7 +923,7 @@ END { if (bad) exit 1
   print "TRUNC " trunc + 0; print "RUNT " runt + 0; print "SNAP " snap + 0
   for (c in seen) if (seen[c] >= 2) print "CLI " c
   for (c in sup) if (seen[c] >= 2) print "UP " c " " sup[c]
-  for (c in own) print "OWN " c " " own[c]
+  for (c in sent) print "OWN " c " " sent[c]
   for (k in pair) if (pair[k] >= 2) print "PAIR " k " " pair[k] " " pup[k] + 0 }'
 
 # bss_clients <pcap> <bssid> -> keyed lines on stdout; rc 1 when the file is unreadable or not a pcap.

@@ -70,6 +70,15 @@ shellcheck -S warning library/user/reconnaissance/CamHound/payload.sh   # must b
 bash dev/CamHound/harness/run_harness.sh                            # ALL 16 scenarios; must print "0 failure(s)"
 ```
 
+**Run the selftest under a POSIX awk (mawk or gawk) AND under BusyBox awk.** The Pager's awk is
+BusyBox's, and BusyBox awk accepts a name used as both a `-v` scalar and an array; mawk and gawk refuse
+the whole program at parse time. Every gate up to `3468acf` ran with BusyBox applets first on `PATH`,
+so `CLI_AWK`'s `own[c]++` (6b5b3e1, beside `-v own="$OWN_MACS"`) passed every one of them and failed 71
+checks under the host's mawk on 2026-11-15 — the membership walk and the lookup both, the program being
+one compilation unit. The array is `sent` now, and a selftest check pins that no `-v` name of `CLI_AWK`
+is also an array; the other half of the protection is running the suite under both awks, because a
+laptop that lacks BusyBox is where the next such program will be written.
+
 **The harness argument is a scenario filter, not a mode.** `run_harness.sh live` runs the `live`
 scenario alone - 6 checks of 140 - and still prints `0 failure(s)`, which reads exactly like a full
 pass. This gate list said `live` until 2026-11-04 and every session that copied it was running a
