@@ -67,13 +67,22 @@ bash dev/CamHound/gen_hooks.sh      # regenerate both hooks
 bash dev/CamHound/check_sync.sh     # must print "in sync: lib <md5> watch <md5>"
 bash library/user/reconnaissance/CamHound/payload.sh --selftest     # must end "0 failed"
 shellcheck -S warning library/user/reconnaissance/CamHound/payload.sh   # must be clean
-bash dev/CamHound/harness/run_harness.sh                            # ALL 15 scenarios; must print "0 failure(s)"
+bash dev/CamHound/harness/run_harness.sh                            # ALL 16 scenarios; must print "0 failure(s)"
 ```
 
+**Run the selftest under a POSIX awk (mawk or gawk) AND under BusyBox awk.** The Pager's awk is
+BusyBox's, and BusyBox awk accepts a name used as both a `-v` scalar and an array; mawk and gawk refuse
+the whole program at parse time. Every gate up to `3468acf` ran with BusyBox applets first on `PATH`,
+so `CLI_AWK`'s `own[c]++` (6b5b3e1, beside `-v own="$OWN_MACS"`) passed every one of them and failed 71
+checks under the host's mawk on 2026-11-15 — the membership walk and the lookup both, the program being
+one compilation unit. The array is `sent` now, and a selftest check pins that no `-v` name of `CLI_AWK`
+is also an array; the other half of the protection is running the suite under both awks, because a
+laptop that lacks BusyBox is where the next such program will be written.
+
 **The harness argument is a scenario filter, not a mode.** `run_harness.sh live` runs the `live`
-scenario alone - 5 checks of 91 - and still prints `0 failure(s)`, which reads exactly like a full
+scenario alone - 6 checks of 140 - and still prints `0 failure(s)`, which reads exactly like a full
 pass. This gate list said `live` until 2026-11-04 and every session that copied it was running a
-fourteenth of the suite (fifteenth now). No argument (or `all`) runs them all; a scenario name runs one,
+fourteenth of the suite (sixteenth now). No argument (or `all`) runs them all; a scenario name runs one,
 which is what you want while iterating, never for the gate.
 
 `gen_hooks.sh` copies three regions, delimited by markers in the user payload. Whether your edit
@@ -90,7 +99,12 @@ The selftest prints both hashes at the end, so a changed hash is visible without
 `check_sync.sh`. The harness needs `jq`; it stubs DuckyScript (`NUMBER_PICKER` and `PAYLOAD_SET/DEL_CONFIG` included),
 `_pineap`, `tcpdump`, `iwinfo`, `uci` and `iw` (a US-like channel table, answered for the fixture phy
 directory the fast copy points `INJ_SYSFS` at, so `inj_probe`'s success path runs) from
-`dev/CamHound/harness/stubs/`. Its `LIST_PICKER` answers only with items on the page it was handed: an
+`dev/CamHound/harness/stubs/`. The `tcpdump` stub tells the three BSS-shaped captures apart by their
+filter (`(wlan addr1 …` membership, `(wlan addr2 …` the inverse lookup, bare `wlan addr2` its
+uplink-only retry) and answers the lookup **only when the radio could have heard it**: the EXAMINE
+stubs keep a hop marker (`/tmp/cs_harness_hop`) and the parked channel, and a client is heard when
+the radio is hopping or parked on its AP's channel — so a lookup parked on the wrong channel misses
+in the harness for the reason it would miss on a device. Its `LIST_PICKER` answers only with items on the page it was handed: an
 answer further down the list makes it press `More...` first, as an operator would, and an answer that is
 on no page is refused (logged as `not on this page`).
 
@@ -105,7 +119,7 @@ Line numbers drift; find things by name (`grep -n '^name()' payload.sh`).
 **Recon rung** — `load_signatures`, `add_sig`, `vendor_of`, `score_device`, `clean_text`,
 `is_setup_ap`, `review_list`, `main_menu`, `preflight`, `write_report`; `rssi_gate_ok` (the RSSI_MIN
 list gate, kit-aware: a kit AP passes when a kit client does) with `rssi_min_clamp`; the Settings menu
-(`SETTINGS_TABLE` rows are `KEY|kind|floor|group|label` over all eighteen starred keys; `settings_menu`
+(`SETTINGS_TABLE` rows are `KEY|kind|floor|group|label` over all twenty starred keys; `settings_menu`
 is a short top page, `settings_group` one page per group, Recon and Response; `settings_apply` re-runs
 `resp_clamp_lock` for the two timing keys and persists a raised lock; RESPONSE_CONFIRM-off asks twice;
 `cfg_snapshot_defaults`/`settings_reset`; `cfg_note_set` keeps the override count honest);
@@ -116,6 +130,215 @@ beacon nor answer probes) where `RECON CLIENTS` is refused, as on 1.1.3; `bands_
 the write is trusted only when 6 GHz is seen there or in uci — on bare 1.1.3 it was a no-op with
 pineapd running, day-one 8c; every issued write is restored in `cleanup`, by the watchdog, or by
 `bands_recover` at the next start from `BANDS_STATE`; not copied into the hooks); `raw_up_rows` feeds `--replay` a `raw_<run>.txt`.
+
+**Two helpers that set a global, and the jq probe** — added inside `cd5d279..4762790`, in this
+map since 2026-11-11. `band_of <freq>` (lib block, so the hooks carry it) and `band_rank <band name>`
+**set `BAND_V` and `RANK_V` and print nothing: call them directly, never inside `$( )`.** There the
+answer is an empty string with rc 0 and no error — `x=$(band_of 5180)` leaves `x` empty and
+`BAND_V` unset in the caller (run 2026-11-11) — which is the same trap as `posture_of` and
+`inj_probe` below. They stopped printing because each `$( )` was a fork per device per cycle.
+`jq_works` is what `HAVE_JQ` means: jq must run `JQ_CLI` and `JQ_APS` on a fixture and print the
+exact rows, or the regex fallback parsers are used. Presence is not enough — the 1.1.3 unit's jq
+has no Oniguruma, the parsers used `gsub` then, and they compiled to nothing while `HAVE_JQ` read 1
+(the comment above the function; measured 2026-11-04). `SHOW_OTHER`, unstarred like `SHOW_MODULES`
+beside it, is the menu switch for "Other devices".
+
+**The three lists** — `sort_macs hits|modules|other` feeds `review_list`, `modules_list` and
+`other_list` ("Other devices": the complement of the first two, gated on proximity, added
+2026-11-09 because an AP no signature names was in no list and so could not be Watched). All three
+dispatch on the row's *text*, so a row must be unique: `review_list` and, since 2026-11-11,
+`other_list` append the MAC tail to a repeat (two APs under one SSID at one RSSI drew one row
+there, and the second could not be opened); `modules_list` rows begin with the whole MAC, and its
+vendor name gives way to the suffix — a fixed eight characters put the row at 23 against
+`ROW_W` = 22 and cut the proximity letter, `busy` and `KIT?` off every "Espressi" row.
+**`prox_of` goes stale against the last scan cycle (`LAST_CYCLE_TS`, set by `run_cycle`), not
+the wall clock**: the lists are only drawn with the scan paused, so against the wall clock every
+row read `?` together 90 s after the last cycle and "Other devices", which keeps N and M only,
+drew empty. Unset (no cycle yet; the Recon hooks) the wall clock stands in. *Falsified by:* a
+device that left the room staying N or M across cycles — the stamp moves each cycle, so it should
+not. `vendor_prefetch` resolves a cycle's vendors in one `awk` pass over the OUI table (`OUI_AWK`;
+one failed `grep` per device was the 33-81 minute cycle of Second contact); the selftest's "structural gate"
+on that counts greps in a **file**, because the grep runs inside `$( )` and the shell-variable
+counter it used until 2026-11-11 read 0 whatever the code did. **The gate showed that the prefetch
+costs no grep, not that `run_cycle` calls it**: with that one call deleted every check still
+passed, so a whole cycle over six uncached devices now runs under the same counter. So does a
+randomised MAC's lookup, because the state `vendor_of` leaves is the same for a skip and for a
+full-table miss. `recon_fresh_start` is
+`RECON_FRESH`'s one call: it reads the command's stderr and logs that a session was *requested*,
+or what the firmware said instead — the line it replaces logged "previous recon list discarded",
+which the payload could not know. These five are findings 0, 1, 2, 6 and 13 of the review of
+`cd5d279..4762790`; 0, 1 and 6 survived all three lenses.
+
+**Association, station → BSSID, read off the air — landed 2026-11-10, LAPTOP-VERIFIED ONLY.** No
+firmware names a client's AP, so `AP_OF` was `-` on every client row and five features slept (see
+"Open, and needs the hardware"). The user payload now reads it **when the operator picks Watch or
+Disrupt on such a row, never in the scan loop** — the lookup parks the radio, and a background pass
+would blind Recon for as long as it ran.
+- `assoc_lookup <client>` → rc 0 with `AP_OF` set and the row usable at once; rc 1 with `ASSOC_WHY`
+  one of `NOT_CLIENT`, `NO_CAPTURE`, `NO_FRAMES`, `NO_PAIR`, `NO_UPLINK`, `AMBIGUOUS` (runner-up at
+  least half the leader), `SNAP_SHORT`. A failed lookup teaches nothing and keeps an earlier answer.
+  `NO_FRAMES` is worded "not heard on ch N", never "not associated": a client row's frequency is the
+  device-level **last-heard** one, and a scanning client is heard off its AP's channel.
+- **Only the client's own frames name its AP (since 2026-11-11).** The capture also takes frames
+  addressed *to* the client, and an AP goes on sending those after the client has left it — retries,
+  then whatever the LAN still queues for it — until its inactivity timer expires. That is the state
+  a successful Disrupt leaves behind, so a lookup run just after one named the AP the client had
+  been kicked from. A pair with no frame of the client's own is never a candidate now (`NO_UPLINK`,
+  said as "itself not heard on ch N: only <ap> sending to it"); the candidates are ranked, and
+  `AMBIGUOUS` is judged, by the client's own frame counts; and downlink frames still count toward
+  the two sightings of a pair the client was heard in. The log line carries both numbers
+  (`n=<frames> up=<its own>`), and a failure with a downlink-only AP adds `down=<bssid>/<frames>`.
+  **`NO_UPLINK` and `NO_PAIR` are told apart by the client's own-frame total, not by whether a pair
+  formed** (third review pass, 2026-11-11): the walk prints `OWN <sta> <n>` for every frame the
+  station sent, before the two-sightings gate, and the failure line logs it as `own=<n>`. Without
+  it one frame of the client's own beside another AP's three read "itself not heard", and a single
+  frame sent *to* it read "heard (1 frames)". An `AMBIGUOUS` failure also logs
+  `cand=<bssid>/<n>,<bssid>/<n>`, because the screen line cuts both candidates to three octets.
+  *Reading:* the lookup fed three FromDS frames (one frame and its two retries, no uplink at all)
+  returned rc 0 with that BSSID — measured by a review finder's last probe before it was cut off,
+  and reproduced in the selftest against the shared fixture's downlink-only station before the fix.
+  *Inference, `[A]`:* that an AP keeps transmitting to a departed station is standard 802.11
+  behaviour, not something measured in the chamber. *Falsified by:* `NO_UPLINK` for a client that
+  is associated and passing traffic — then the Pager hears the AP and not the client, and this rule
+  costs a real answer.
+- `lock_channel <ch> <secs>` is the park: `PINEAPPLE_EXAMINE_CHANNEL` **alone**, read back three
+  times, with `lock_target`'s rc contract (0 parked, 3 unverified and PROCEED, 2 somewhere else).
+  `lock_target` cannot be used because it wants a BSSID and returns 2 without trying the channel
+  when the BSSID step does not park. **⚠ `EXAMINE_CHANNEL` without a preceding `EXAMINE_BSSID` has
+  never been issued on a Pager** — every measured park began with `EXAMINE_BSSID` (the hand-run
+  bench parks issued both commands; `lock_target` issues the channel command only when the BSSID
+  step did not already land on the wanted channel, so its `lock=ok` rows may be BSSID-only parks;
+  *corrected 2026-11-11, this line said "every measured park issued both"*) — so rc 2 does not fail the
+  lookup: it releases the radio and listens across the hop for three windows (`lock=hop`).
+- `assoc_capture` is `capture_bss` with the client in the BSSID's place:
+  `type data and (wlan addr2 <mac> or wlan addr1 <mac>)`, uplink-only retry when the OR form does
+  not arm. `CLI_AWK` (lib block) grew `mode=pairs` for the walk: the same DS-bit decode as the
+  membership walk, printing `PAIR <sta> <bssid> <n> <up>` for every pair seen twice (`<up>` of the
+  `<n>` frames being the station's own), group addresses and our own MACs dropped. The membership
+  walk admits the stations it always did and adds one `UP <sta> <up>` line for each of them that
+  was heard transmitting; `resp_members` reads only the `CLI` lines and is unaffected.
+- `assoc_learn` is the one place that decides what may be learned: never itself, never an AP row,
+  never over an AP the firmware supplied, and no row is invented for a station Recon has not listed.
+  **Which rows those are is `ASSOC_FW`, a mark `run_cycle` sets and clears on every client row from
+  its own recon line** (2026-11-11; `assoc_stale` and `assoc_nochan` read it too). It used to be
+  inferred — "the row's AP differs from the last thing we learned" — which is false exactly when
+  the two agree: a membership capture on the AP a firmware names made the row look learned, and the
+  next BSSID heard off the air replaced the firmware's, channel and all. Not reachable on 1.1.3 or
+  2.0.0, neither of which supplies an association; reachable with the harness fixtures' `ap_mac`.
+  The AP row's channel wins over the channel listened on; **the listening channel is recorded only
+  behind a verified park** (across the hop it is where the client was last heard and nothing more,
+  so such a row says `Disrupt n/a (no channel)` rather than transmitting on a guess); a move to an
+  AP with no row drops the old AP's channel and SSID instead of carrying them over. **An AP Recon
+  has not listed is given a band when its channel is verified** (`BAND[<ap>]`, 2 for channels up to
+  14, else 5 — the lookup never parks on 6 GHz): `resp_target` reads the AP's band, and with none
+  it fell back to the *client's* last-heard band, so a row learned on channel 36 and then heard
+  scanning on 2.4 GHz was "band 2, channel 36" and badged `NOINJ`. **The row itself is made
+  consistent too** (`ap_freq`, from `assoc_learn` and from `run_cycle`): a client row that carries
+  an AP takes its frequency and band from that AP along with its channel — the AP's own row's when
+  Recon lists it, else the centre of the verified channel (`freq_of_chan`). They used to stay where
+  the *client* was last heard, so the fixtures' own camera (heard on 2437 MHz, AP on channel 36)
+  went to `inventory.tsv`, the Watch loot and the card as band 2, channel 36, 2437 MHz. A row with
+  a channel of its own from the firmware's line keeps its own frequency beside it. The same entry tells
+  `assoc_lookup` whether a re-check may park on the row's channel.
+- `assoc_learn_members` learns the same fact from a membership capture — `resp_members` calls it
+  behind `command -v`, because that function is copied into the hooks and this one is not, and
+  hands it the walk's own lines — so one AP-row Disrupt teaches every station it heard
+  **transmitting**, and kit detection wakes up for them. A member the AP was only sending to stays
+  a member for the attack and its measurement and is not taught: the lookup's rule, same reason.
+  Its log line gives the numbers, `members of <bssid>: N heard, M client row(s) now carry this AP`
+  and, when there are any, `, K more only sent to (not taught)`: a station with no Recon row is
+  only remembered, and one whose AP the firmware supplied keeps it.
+- `run_cycle` re-applies `ASSOC_BSS` every cycle (the firmware's `-` would otherwise wipe it, and a
+  firmware-supplied AP still wins — and the `ASSOC_CH` fallback applies only to the AP it was
+  recorded for, so a firmware-supplied AP never inherits another AP's channel; and when the AP a
+  row carries *changes* to one that supplies no channel or SSID, the previous AP's are dropped,
+  because `record_seen` only ever sets them — reachable only with a firmware that names an AP and
+  later stops, which no shipped one does);
+  `assoc_stale`/`assoc_refresh` look again before Watch or Disrupt acts on an AP learned more than
+  `ASSOC_TTL` ago, listening on the **row's** channel (its AP's), not on the client's last-heard
+  frequency. **The call sits at the top of `watch_menu` and `disrupt_menu`** (watch core, behind
+  `command -v`), not at the card, so the scan funnel's Watch offers, the post-Watch Disrupt offer
+  and `AUTO_RESPOND` get it too — the first version re-checked only from the card, which the
+  review of 2026-11-10 caught as a promise the docs made and the code did not keep. **One pick is
+  one look:** the card's find-AP rows name the client in `ASSOC_JUST` between their lookup and the
+  menu they open, and `assoc_refresh` spends it. With `ASSOC_TTL=0` the menu's re-check called a
+  zero-second-old answer stale and parked the radio a second time for the same pick (measured by
+  both cut-off finders of the second review pass: two `EXAMINE_CHANNEL`s, 8.1 s against 4.1 s). The
+  mark is the card's and not `assoc_lookup`'s, so a lookup from anywhere else can never excuse a
+  re-check it was not followed by. **A 6 GHz channel number is never handed to `EXAMINE_CHANNEL`**:
+  the first lookup already listened across the hop there (`chan_of_freq`), and the re-check now
+  does too — it used to park on the row's channel number, which is the 2.4 GHz channel of the same
+  number, read back as parked, and report the AP "not re-confirmed". **Nor does it fall back to the
+  client's last-heard frequency once that rule has dropped the row's channel** (2026-11-11): a
+  6 GHz client heard scanning on 2.4 GHz carries a 2.4 GHz frequency, so the fallback parked the
+  radio there and produced the same "not re-confirmed" by the other road. A dropped channel now
+  means the hop, always.
+  **A look that does not re-confirm the AP keeps it and counts as the look**: `assoc_stale` takes
+  the later of `ASSOC_TS` and `ASSOC_TRY`, so the next one is a further `ASSOC_TTL` away and the
+  picks in between open the menu with no listen and no message; `ASSOC_TTL=0` looks on every pick.
+- The card says `Watch (find AP first)` / `Disrupt (find AP first)` (`detail_card`; `disrupt_row`
+  in the watch core, guarded on `command -v assoc_can` so the hooks keep `n/a`). **An AP that was
+  heard without its channel gives `Watch n/a (no channel)` / `Disrupt n/a (no channel)`**
+  (`assoc_nochan`; `watchable` in the lib asks it behind `command -v`): `lock_target` reads a
+  channel of 0 as "any channel will do", so a Watch there would park wherever the radio happened
+  to be and loot a row for channel 0. The state clears when Recon lists the AP. Two starred keys,
+  `ASSOC_CAP_SECS` (clamped to 2–30 by `assoc_clamp`, from `load_overrides`, `settings_apply` and
+  `settings_reset` — Reset restores the config block *as written*, the snapshot being taken before
+  `load_overrides`, so a hand-edited 500 came back unclamped until 2026-11-11: the window is slept
+  on, tripled across the hop, with no button check) and `ASSOC_TTL`, wired in `load_overrides` and
+  `SETTINGS_TABLE`.
+- Selftest block `7m association`; harness scenario `assoc` (eleven arms on the
+  `HARNESS_NO_CLIENTS=1` shape: the lookup from the Watch row and from the Disrupt row; the miss,
+  which is the fixtures' own — a camera last heard on 2437 MHz whose AP is on channel 36; a
+  membership capture teaching both cameras; `HARNESS_NO_PARK`, `HARNESS_ASSOC_TWO`,
+  `HARNESS_NO_OR` and `HARNESS_NO_ARM` for the refused park, the ambiguous pair, the refused OR
+  filter and a tcpdump that will not arm; `ASSOC_TTL=0`, where one find-AP pick must listen once
+  and the *next* pick is the one that re-checks; `HARNESS_ASSOC_DOWN`, the AP heard sending to
+  a client that is itself silent; and an eleventh arm that kills the run mid-listen and looks for
+  the capture file its watchdog should have removed). **Four things about these tests, worth keeping in mind when
+  adding to them:** "a RESET follows the capture" does not show the lookup released the radio,
+  because `cleanup` emits one at exit whenever the radio was left held — the harness helper
+  `released_before_card` asks for the RESET *before the next picker is drawn*; "no pid left
+  registered" is equally true of a capture that never registered, so the selftest's fake tcpdump
+  reports the child list *while it runs*; and **a check on a pid-named file must name the file, not
+  glob for it.** "No `/tmp/cs_asc_*.pcap` left" failed for six files a mutation run had left
+  behind, and clearing that glob in the harness's `reset()` to cure it then deleted the capture
+  file out from under a selftest running beside the harness (both seen 2026-11-11, the second as a
+  flaky selftest failure). `own_capture_gone` reads the path the tcpdump stub was handed instead.
+  Fourth: "no file left" is equally true of a capture killed before it opened one. `capture_beacon`
+  has no first-second wait, so with the stand-in run dead before the helper started, its check
+  passed with the helper's removal line deleted (mutation run, 2026-11-11); the stand-in run now
+  dies a second into the listen.
+  The selftest itself is confined since the same day: `CHILD_FILE` points into its temp directory,
+  where it used to rewrite the live run's `/tmp/cs_children` twelve times per run (traced).
+
+*Falsified by:* a lookup naming a BSSID the client is not associated to; `NO_FRAMES` on the right
+channel for a client that is passing traffic there; or `lock=hop` on every lookup, which would mean
+`EXAMINE_CHANNEL` alone does not park (bench check: `dev/pager-day-one.md` 8d). **What it does not
+buy:** there is no background pass, so a client nobody picked and no membership capture heard still
+reads `-`, and kit detection and the report tree cover only the clients that have been resolved.
+
+**Signals.** `run_lock` (lib, so both hooks carry it) installs `trap cleanup EXIT; trap 'exit 130'
+INT; trap 'exit 143' TERM`. **Until 2026-11-11 it was `trap cleanup EXIT INT TERM`, and a handler
+that returns resumes the script:** a `kill` or a Ctrl-C ran `cleanup` — lock file gone, EXAMINE
+released, traps cleared, `run exit` logged — and the payload then carried on with whatever was in
+flight. The review that found it reproduced a deauth command issued *after* the `run exit` line.
+Harness scenario `lock` pins it (a SIGTERM during the scan ends the process, with one exit line and
+no cycle after it), and that check was run against the old trap first and failed there. **What
+signal the Pager UI's stop sends is still unmeasured** (`PLAN_v2.md` Phase 0 item 20 G), so whether
+this was ever reachable from the UI is not known; the SIGKILL case is the watchdog's. **Since
+2026-11-11 the watchdog also removes the dead run's own pid-named files** (`cs_mem_`, `cs_asc_`,
+`cs_bcn_<pid>.pcap`, the fire-error file, the OUI key list): `cleanup` never runs for a killed run
+and nothing else would remove a file with that run's pid in its name, so they stayed in `/tmp` —
+RAM on the device — until reboot. **And the capture helpers stop when the run is gone**
+(`main_gone`, lib): `capture_beacon`, `capture_bss` and `assoc_capture` are each called in `$( )`,
+so each is a *child* of the run and outlives a SIGKILL by up to its listen window. The first
+version of the watchdog cleanup failed its own harness arm for that reason: the orphan found its
+file removed and its tcpdump dead, took that for a filter that had not armed, started the
+uplink-only retry after the radio had been released, and wrote the file back. Each helper now
+checks once a second, makes no retry once the run is gone, and removes its own file. Harness
+scenario `assoc` kills a run mid-listen and checks; the arm failed on both earlier versions.
+*Falsified by:* a `cycle` or `resp` line after `run exit` in `events.log`.
 
 **Watch rung** (behaviour without identity) — `watch_menu`, `start_caps`/`stop_caps`,
 `pcap_words`/`pcap_bytes` (both have `od` fallbacks), `pcap_buckets`, `bucket_stats`
@@ -229,11 +452,17 @@ are untouched. Selftest `zero members, AP row: …`; harness `nomem_fired`. `res
 Read `RESPONSE.md` §13a-i before changing any of it: three mechanics that look obvious are wrong
 there (`addr2` is the client only on a ToDS frame; `-s 32` cannot reach `addr2` at all; the bash
 substring walker is O(records x filesize)).
-**The honest bound — one fix did not buy five.** This recovers membership *without* populating
-`AP_OF`, so client Watch, Stimulus, kit detection and the AP→client tree stay inert, and a
-user-payload **client** row still aborts in `resp_target`'s client branch. What now fires: a
-user-payload **AP** row, the Recon **access_point** hook, and the Recon **client** hook's
-subject set — and since 2026-11-10 (operator-decided, "nuclear blast") an AP row fires its
+**The honest bound — one fix did not buy five, and the second fix is laptop-verified only.** The
+membership capture recovers who is on a BSS *without* naming a client's AP, so on its own it left
+client Watch, Stimulus, kit detection, the AP→client tree and a user-payload **client**-row Disrupt
+asleep. *Amended 2026-11-10:* the inverse lookup (code map, "Association") now fills `AP_OF` for a
+client the operator picks, and `resp_members` hands the stations a membership capture heard
+transmitting to `assoc_learn_members` (since 2026-11-11 a member the AP was only sending to is
+not taught: it may have left). So a client row is watchable and attackable **after one lookup that hears
+it**, and the other three wake up for the clients that have been resolved — not for the rest, there
+being no background pass. None of that has run on a device. What fires with no lookup at all is
+unchanged: a user-payload **AP** row, the Recon **access_point** hook, and the Recon **client**
+hook's subject set — and since 2026-11-10 (operator-decided, "nuclear blast") an AP row fires its
 broadcast frame **even when the capture recovers nobody**, looting one `INCONCLUSIVE` row for
 `ff:ff:ff:ff:ff:ff`. See `RESPONSE.md` §13a-i's bound table.
 
@@ -1450,10 +1679,16 @@ describes no longer exists for an AP row at all: operator-decided, *"I'll accept
 zero-member AP row fires and loots `INCONCLUSIVE`; see the Response rung paragraph of the code map.* What it says about the *cause* still holds and is
 measured: no shipped firmware supplies a client→AP association. What no longer holds is the
 conclusion that nothing can fire: an AP row, and both Recon hooks, now recover the subject set from
-a capture (`RESPONSE.md` §13a-i). **Still true:** a user-payload **client** row aborts in
+a capture (`RESPONSE.md` §13a-i). ~~**Still true:** a user-payload **client** row aborts in
 `resp_target`'s client branch, and client Watch, Stimulus, kit detection and the AP→client tree
 remain inert, all for the same missing `AP_OF`. The inverse lookup that would fix those is the
-recon side's and is worth more than the membership work.
+recon side's and is worth more than the membership work.~~ **AMENDED 2026-11-10 — that lookup has
+landed, laptop-verified only** (code map, "Association"). A client row no longer aborts: its card
+offers `Watch (find AP first)` / `Disrupt (find AP first)`, and one lookup that hears the client
+fills `AP_OF` for the rest of the run. **What is still true is narrower:** the firmware still
+supplies no association, so a client that has not been looked up, and was not heard in a membership
+capture, still reads `-` and still gates the same five features for that row; and none of the
+lookup has run on a device, where its park (`EXAMINE_CHANNEL` alone) has never been issued.
 The blocker is the **association column**, not the firmware version. On **1.1.3** `_pineap RECON
 CLIENTS` does not exist; since 2026-11-03 client rows come from `RECON DEVICES` instead, but that
 object carries no association either, so every client row has `AP_OF` `-` and `resp_target` refuses
@@ -1484,9 +1719,10 @@ on this axis. **[A]** — the byte counts and object shape are `[V]`; the code p
 composition is the inference. ~~*Falsified by:* a Disrupt transmitting **from the user payload** on
 either firmware.~~ **SPENT 2026-11-05 — that Disrupt happened.** See "Second contact" above for the
 loot row and the log. What the block above still describes correctly is the CAUSE (no firmware
-supplies an association) and the remainder (a user-payload **client** row still aborts in
-`resp_target`'s client branch, and client Watch, Stimulus, kit detection and the AP-to-client tree
-stay inert). The second falsifier is untouched and still live:
+supplies an association) and, **for a client row that has not been resolved off the air**, the
+remainder (it aborts in `resp_target`'s client branch, and client Watch, Stimulus, kit detection and
+the AP-to-client tree are inert for it — since 2026-11-10 the card turns that row into a lookup
+instead of a dead end; see the amendment above). The second falsifier is untouched and still live:
 `_pineap RECON CLIENTS format=json | jq '.[0]|keys'` on a 2.0.0 Pager returning a key with the BSSID.
 
 **Lead, half followed 2026-11-03:** 1.1.3 *does* have `RECON DEVICES`/`COUNT DEVICES` (only
@@ -1510,11 +1746,48 @@ blast")**: a zero-member AP row now fires the broadcast and loots `INCONCLUSIVE`
 BSSID-filtered capture (the filter shape at `:1804`, the radiotap-aware frame walker in
 `beacon_find`), which is firmware-independent and better evidence than Recon's cumulative counters.
 Full working, ranked options and the resolved mechanics are in `dev/CamHound/RESPONSE.md` §13a
-and §13a-i. **Implemented 2026-11-04** (`bss_clients`/`capture_bss`/`CLI_AWK`). ⚠ Three mechanics stated in §13a's first draft are
+and §13a-i. **Implemented 2026-11-04** (`bss_clients`/`capture_bss`/`CLI_AWK`), **and the inverse — one
+client's own frames, its BSSID read from them — on 2026-11-10** (`assoc_lookup`, same walker in
+`mode=pairs`), which is what fills `AP_OF` and so reaches the other four. ⚠ Three mechanics stated in §13a's first draft are
 **wrong** and are corrected in §13a-i, which is the build decision of record: `addr2` is the
 client only on a **ToDS** frame, `-s 32` cannot reach `addr2` at all, and the bash
 `pcap_bytes`/`hex_octet` walker beacon_find uses is **O(n²)** and cannot be reused at this
 file size.
+
+**The inverse lookup has five things only a device can answer** (`dev/pager-day-one.md` 8d has the
+commands). All are `[A]` until then; the design degrades rather than fails on each, which is why it
+shipped ahead of the measurement.
+1. **Does `PINEAPPLE_EXAMINE_CHANNEL` alone park the radio?** Never issued without `EXAMINE_BSSID`
+   on a Pager. If it does not, every lookup logs `lock=hop` and takes three windows; nothing breaks.
+   *Falsified (as a park) by:* three differing channel samples after it.
+2. **Is a camera's uplink heard inside `ASSOC_CAP_SECS` (6 s)?** A streaming camera sends tens of
+   frames a second; a sleeping battery camera may send none. `NO_FRAMES` on the right channel for a
+   device known to be streaming would mean the window or the filter is wrong, not the device.
+   *This question carries more weight since 2026-11-11:* the lookup now requires a frame of the
+   client's own, so a client whose AP is heard and which is itself not heard reads `NO_UPLINK`
+   instead of being given that AP. For a device known to be transmitting that is a finding about
+   reception — the Pager hears the AP and not the client. The lookup's own capture cannot be kept:
+   `assoc_lookup` deletes it as soon as the walk has parsed it, on every path, and `KEEP_PCAP`
+   copies Watch captures only. Repeat the listen by hand instead and keep what that prints
+   (`dev/pager-day-one.md` 8d's `NO_UPLINK` row carries the two commands).
+3. **Does the OR filter arm on the device's tcpdump?** `capture_bss` uses the same shape — two
+   `wlan addrN` terms joined by `or` inside `type data and (…)` — and its capture returned frames on
+   the device (Second contact), but **which of its two filter forms armed there is not recorded
+   here**, so this is likely, not known. The logs already taken can answer it for the membership
+   capture: `grep -c OR.filter.did.not.arm /root/loot/CamHound/events.log` — 0 means the OR form
+   armed. The lookup's own uplink-only retry exists for the other answer.
+4. **Is the client row's `freq` a usable guide to its AP's channel?** It is the device-level
+   last-heard frequency. For a camera that is associated and streaming it should be the AP's; the
+   fixtures already contain the counter-case (a client heard on 2437 MHz whose AP is on channel 36),
+   and the lookup reports that as "not heard on ch 6" rather than as an absence.
+5. **Does `EXAMINE_BSSID` hold the radio for a BSSID Recon has not listed?** A lookup behind a
+   verified park can name an AP that has no Recon row yet; the row is then offered Watch and
+   Disrupt, and both go through `lock_target`, which issues `EXAMINE_BSSID` and tries the channel
+   command only when its three samples already agree. *Read:* that control flow. *Inferred, `[A]`:*
+   that the BSSID step does not park for an unlisted BSSID — if so the row is offered and then
+   refused (`lock failed`, a `LOCK_FAILED` loot row) although its channel is known, until Recon
+   lists the AP. Raised by the third review pass; `lock_target` is the response-rung session's and
+   is unchanged here. *Falsified by:* `lock=ok` on a Watch of such a row.
 
 **Two 2.0.0 hazards in this repo's other payloads** — `wigle-toolkit` really deletes loot, and
 `wardrive_activate` is broken. Both are `[V]` from the rootfs trees and written up in full in

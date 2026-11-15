@@ -39,13 +39,44 @@ take (with `AUTO_WATCH=0` that is every new CONFIRMED device). The offer is a di
 - A battery/event camera that is asleep looks idle in Watch. Use the Stimulus test.
 - INCONCLUSIVE is about the measurement (lock, band, distance), not about the device.
 
-**Which AP a client is associated to.** `_pineap RECON CLIENTS` is new in 2.0.0; on 1.1.3 it is
-`Unknown recon command` (measured 2026-11-03), so CamHound reads clients from `RECON DEVICES` there
-(a device that neither beacons nor answers probes). Both verbs return the same object, which carries
-probed SSIDs but **no association field** (CLAUDE.md §"2.0.0-stable, analysed"). Until the day-one
-spike finds a source — the Go UI's recon API carries `ap_mac`, `_pineap` does not — every client
-reads as unassociated: kit detection, client Watch and Stimulus, and per-client Disrupt stay dormant,
-and the `ap_bssid` column reads `-`.
+**Which AP a client is associated to — until you ask.** `_pineap RECON CLIENTS` is new in 2.0.0; on
+1.1.3 it is `Unknown recon command` (measured 2026-11-03), so CamHound reads clients from
+`RECON DEVICES` there (a device that neither beacons nor answers probes). Both verbs return the same
+object, which carries probed SSIDs but **no association field** (CLAUDE.md §"2.0.0-stable,
+analysed"). So every client starts out unassociated: its `ap_bssid` column reads `-`, and kit
+detection, client Watch and Stimulus, and per-client Disrupt are dormant for it.
+
+CamHound can read the AP off the air instead, one client at a time, when you ask for it. A client
+card with no AP offers **`Watch (find AP first)`** and **`Disrupt (find AP first)`**: picking either
+pauses Recon for about nine seconds, parks the radio on the channel the client was last heard on,
+listens for the client's own data frames, and reads the BSSID from them. Then it carries on into the
+menu you picked. The answer is kept for the run — the inventory, the kit tags and the report's
+AP→client tree pick it up at the next cycle — and once it is older than `ASSOC_TTL` it is looked at
+again whenever Watch or Disrupt opens on that client, from the card or from one of the automatic
+offers. A look that does **not** re-confirm the AP keeps the old answer and is not repeated for
+another `ASSOC_TTL`, so the picks in between open the menu straight away with nothing said; with
+`ASSOC_TTL=0` every pick looks again. An AP-row Disrupt does the same for every client it hears transmitting to that AP. Only the
+client's own frames count as evidence of where it is: an AP keeps sending to a client for a while
+after the client has gone, which is exactly what is on the air after a Disrupt that worked. When the
+lookup finds nothing it says why and the card is unchanged:
+
+| It says | It means |
+|---|---|
+| `not heard on ch N in 6s` | no data frame from the client on that channel in the window. An idle or sleeping camera, or a client last heard off its AP's channel. **Not** "unassociated". Try again while it is busy |
+| `heard on ch N (k of its own frames) but no AP twice` | the client was heard, but too little to name an AP from. Try again |
+| `itself not heard on ch N (k records, none of its own)` | frames addressed to the client were captured and none it sent: it has left, moved channel, or is out of earshot. Nothing is recorded |
+| `itself not heard on ch N: only X sending to it (k frames)` | AP X is transmitting to the client and the client is not answering: it has left X, moved channel, or is out of earshot. Nothing is recorded. If you have just disconnected it, rescan and look again |
+| `talks to X (n) and Y (m): not deciding` | the client sent n frames to X and m to Y, neither clearly ahead (a roam, or a mesh). Nothing is recorded |
+| `not parked on ch N` then `listening across the hop instead` | the radio would not hold the channel, so it listens while hopping for three times as long. Slower and less likely to hear a quiet client, not broken |
+| `snap … too small for radiotap …` | raise `CLI_CAP_SNAP` |
+
+One more state follows a lookup that had to listen across the hop: the AP was heard, but Recon has
+not listed it yet, so its channel is not known. The card then reads `Watch n/a (no channel)` and
+`Disrupt n/a (no channel)` rather than acting on a guess. Resume the scan; the row gets its
+channel as soon as Recon lists that AP.
+
+*Laptop-verified only: none of this has run on a Pager yet. There is no background pass — the
+lookup parks the radio, so it happens only on a row you pick.*
 
 ## How it works: four tiers
 
@@ -74,11 +105,13 @@ and the `ap_bssid` column reads `-`.
    `/root/payloads/recon/client/CamHound/` and `library/recon/access_point/CamHound/` to
    `/root/payloads/recon/access_point/CamHound/`, each with its own `cam_signatures.txt`. They are
    byte-identical to each other and are what adds CamHound to the Pager's **Recon** menu, so you can
-   act on a device you selected there. On current firmware that is the **only** way to reach
-   per-client Disrupt: the Recon UI tells the hook which AP a client belongs to, and nothing in
-   `_pineap`'s output does, so a client row in CamHound's own Review list has no BSSID to aim from
-   (see "Which AP a client is associated to"). Skipping this step is not a partial install — it
-   removes a whole capability.
+   act on a device you selected there. The Recon UI tells the hook which AP a client belongs to, and
+   nothing in `_pineap`'s output does, so this is the route that has been measured on a device.
+   *Amended 2026-11-11:* it is no longer the only one — a client row in CamHound's own Review list
+   now reaches the same targeted frame through `Disrupt (find AP first)`, which reads the BSSID off
+   the air first (see "Which AP a client is associated to"); that path is laptop-verified only, and
+   a client is refused only when no lookup has named an AP for it. Skipping this step still costs
+   you the Recon menu entry.
 3. **If you cloned on Windows, fix the line endings — this one bites.** Git for Windows defaults
    `core.autocrlf=true`, so your working tree gets CRLF even though the repo stores LF, and the
    device then fails with `$'\r': command not found` and `not a valid identifier`. The repo carries
@@ -104,8 +137,16 @@ and the `ap_bssid` column reads `-`.
    Watch is greyed, and a BSS-wide Disrupt from an AP row cannot list the clients it hits — it still
    fires its broadcast frame and records `INCONCLUSIVE`), `/lib/hak5/oui.txt`.
 7. Worth doing once, before anything else: `bash payload.sh --selftest` **on the Pager**. It
-   transmits nothing and changes nothing, and it is the only run that exercises the `od` parsing
-   path the device actually uses — a laptop with `hexdump` never takes that branch.
+   transmits nothing and changes nothing — every device command is stubbed, and its loot and its
+   child list live in a temp directory of its own — and it is the one run that puts the parsers
+   through the device's own BusyBox `awk`, `hexdump` and `jq`, which a laptop only imitates. (An
+   earlier version of this step said it exercised an `od` path: there is no `od` on a Pager, and
+   that fallback exists for laptops without `hexdump`.)
+8. With `RECON_FRESH` at its default, launching asks Recon for a **fresh session**, so the lists
+   show what is transmitting now rather than everything heard since boot. The start screen says
+   `fresh Recon session requested`; if the firmware refuses it says `not confirmed` with the
+   firmware's reason, and the run may list what Recon already held. This wipes the Recon session
+   for anything else using it; `RECON_FRESH 0` leaves it alone.
 
 ## Quick start, the two-button flow
 
@@ -115,11 +156,30 @@ and the `ap_bssid` column reads `-`.
   block with a triple vibe.
 - When something scores CONFIRMED or LIKELY you get one dialog: **Watch now?** (A = yes, B = no). A
   STREAM or EVENT verdict is followed by **Locate?**. That is the whole flow: two presses.
-- **B** during a scan opens **Review hits** (hold it up to one cycle). Rows read
-  `conf tags prox role rssi`, e.g. `90 HIK-OUI NA-58` = confidence 90, Hikvision OUI, NEAR, AP, -58 dBm.
-  Pick a row for the detail card: `Watch`, `Locate`, `Ignore for session`, `Back`.
+- **B** during a scan opens **Review hits**, in the window the screen announces: after every cycle
+  it prints `press B now to review (20s)` and waits that long (`CYCLE_SECS`) for the press. That
+  wait is the only time the payload is given the button — while a cycle is being worked through the
+  firmware keeps it, so press when the line appears, not before. Rows read
+  `role conf tags prox rssi`, e.g. `A 90 HIK-OUI N-58` = an AP (`c` is a client), confidence 90,
+  Hikvision OUI, NEAR, -58 dBm. *(Until 2026-11-11 this said "hold it up to one cycle" and gave
+  the row as `90 HIK-OUI NA-58`; the role letter leads the row now.)*
+  Pick a row for the detail card: `Watch`, `Disrupt`, `Locate`, `Ignore for session`, `Back`. On a
+  client whose AP is not known the first two read `Watch (find AP first)` and
+  `Disrupt (find AP first)` — see "What it cannot see".
 - **Unidentified modules: check these** lists Espressif/Realtek/Liteon-class clients sorted busy-first.
-  They are not cameras until Watched.
+  They are not cameras until Watched. Rows read `mac vendor proximity`, with ` busy` and ` KIT?`
+  when they apply: `c0ffee000003 Espress N`. The MAC is whole because it is what the row is picked
+  by; the vendor name is what gives way, so the proximity and the two markers always fit.
+- **Other devices** lists what was heard in the room and is in neither list above: an AP no
+  signature names, a module AP, an unscored client. Rows read `A|c label proximity rssi`, e.g.
+  `A bebird-R1-0386 N-26` = an AP, fourteen characters of its SSID (else its vendor, else its MAC), NEAR, -26 dBm. FAR and
+  unheard devices are left out, so it is the room and not the building, and two devices that
+  would draw the same row get the tail of their MAC appended. Picking a row opens the same card
+  with the cursor on Watch; a device Watched into a STREAM verdict scores its way into Review hits
+  and leaves this list, so it drains as you work through it.
+- **Proximity in all three lists is as of the last scan cycle.** A device reads `?` once it has
+  gone 90 s without being heard, counted up to that cycle and not while you are reading a list —
+  the lists are only ever drawn with the scan paused. The card's `Ns ago` is the wall-clock age.
 - **Mode**: `ROOM` (default: vibrate on everything LIKELY, proximity -60/-75 dBm) or `SITE` (floor
   walk: FAR rows do not vibrate, -70/-85 dBm). Mode never changes what is listed.
 - **Write report** renders `/root/loot/CamHound/report_<run>.txt` now; it is also written every 15
@@ -203,13 +263,14 @@ Edit the config block at the top of `payload.sh`. Starred keys can also be set w
 survive updates: `PAYLOAD_SET_CONFIG camhound CYCLE_SECS 10` (`PAYLOAD_DEL_CONFIG camhound CYCLE_SECS`
 removes it). Overrides are counted on the start screen and listed in `events.log`. The **Settings**
 menu item does the same from the device, on two pages. **Recon settings** holds CYCLE_SECS,
-THR_STREAM_UP, COOLDOWN_SECS, DEDUPE_H, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH, AUTO_LOCATE and BAND6
-(the last two sit on the second page, behind `More...`, because `Back` takes the first slot);
-**Response settings** holds RESPONSE, RESPONSE_CONFIRM, AUTO_RESPOND, RESP_LOCK_SECS, RESP_SETTLE_SECS
-and POSTURE_TTL. Numbers go through NUMBER_PICKER, switches are On/Off. Switching RESPONSE_CONFIRM off
+THR_STREAM_UP, COOLDOWN_SECS, DEDUPE_H, RECON_FRESH, RSSI_MIN, ALERT_DIALOG, SOUND, AUTO_WATCH,
+AUTO_LOCATE, BAND6, ASSOC_CAP_SECS and ASSOC_TTL (everything past the first eight sits behind
+`More...`, because `Back` takes the first slot of a nine-row page);
+**Response settings** holds RESPONSE, RESPONSE_CONFIRM, AUTO_RESPOND, SWEEP_TARGETED, RESP_LOCK_SECS,
+RESP_SETTLE_SECS and POSTURE_TTL. Numbers go through NUMBER_PICKER, switches are On/Off. Switching RESPONSE_CONFIRM off
 asks a second time, because it is the key that keeps every transmit behind a dialog; a lock shorter
 than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows what is in force.
-`Reset defaults` deletes the saved overrides of all sixteen keys. Changes apply at once and persist.
+`Reset defaults` deletes the saved overrides of all twenty keys. Changes apply at once and persist.
 
 | Key | Default | Persist | Meaning |
 |---|---|---|---|
@@ -221,8 +282,11 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 | AUTO_WATCH_RSSI | -72 | | minimum last RSSI to auto-offer Watch |
 | RSSI_MIN | 0 | * | optional list gate, dBm, on the best RSSI known for the MAC, carried-over best included (0 = widest net; a kit AP passes when a kit client does) |
 | BAND6 | 0 | * | also scan 6 GHz: writes the device's bands plus 6 for this run, trusted only when the radio is then seen on a 6 GHz channel (or uci reads it back); every issued write is put back at exit, by the watchdog if the run is killed, or at the next start; 2.4 GHz dwell drops to about a third. On bare 1.1.3 the write was a no-op with pineapd running (day-one 8c), and the status line says so |
+| ASSOC_CAP_SECS | 6 | * | how long the find-AP lookup listens for one client's own frames (2 to 30; a larger value is capped); three times this when the radio will not park |
+| ASSOC_TTL | 300 | * | seconds an AP learned off the air is trusted before Watch or Disrupt looks again (0 = look every time) |
 | SOUND | 0 | * | ringtone on CONFIRMED |
 | SHOW_MODULES | 1 | | modules list in the menu |
+| SHOW_OTHER | 1 | | "Other devices" list in the menu |
 | MODULE_HINT_RSSI | -55 | | one-time "module strong+busy: Watch?" hint |
 | BUSY_PPS / BUSY_CYCLES | 10 / 2 | | BUSY = rate floor for N cycles and top-3 on the band |
 | WIN_SECS / LIVE_WINDOWS | 10 / 6 | | Watch window and count |
@@ -238,12 +302,14 @@ than RESP_SETTLE_SECS + 5 is raised to it and saved as raised, so the menu shows
 | REPORT_EVERY | 15 | | cycles between report rewrites |
 | GPS | 0 | | closest-approach GPS stamping |
 | KEEP_PCAP / KEEP_RAW | 0 / 0 | | keep Watch pcaps / per-second bucket lines in loot |
+| RECON_FRESH | 1 | * | ask Recon for a fresh session at launch, so a run shows what is transmitting now (a new session replaces the Recon list for anything else using it too; the start screen says whether the request was refused) |
 | DEDUPE_H | 0 | * | hours: a device stored in inventory.tsv within this horizon is not alerted again unless its band rose or it is 10 dB closer; `Scan (fresh)` ignores it for one run |
 | INVENTORY_KEEP_DAYS | 30 | | inventory.tsv rows older than this are pruned at start (0 = never) |
 | ROW_W | 22 | | list row budget (36-40 expected after Phase 0 item 19) |
 | RESPONSE | 1 | * | master switch for the Disrupt rung; 0 = recon only, nothing transmits |
 | RESPONSE_CONFIRM | 1 | * | blocking confirmation before any transmit (Settings asks twice before switching it off) |
 | AUTO_RESPOND | 0 | * | let the funnel raise Disrupt by itself (needs RESPONSE=1) |
+| SWEEP_TARGETED | 1 | * | after a BSS-wide deauth, also send one targeted deauth per recovered member |
 | POSTURE_TTL | 300 | * | seconds a posture badge stays cached per BSSID |
 | RESP_SETTLE_SECS | 6 | * | wait after transmitting before re-reading the target to judge the effect |
 | BCN_CAP_SECS / BCN_CAP_COUNT | 4 / 5 | | beacon capture window and frame count for a posture read |
@@ -307,8 +373,10 @@ overridden:
 | `BOTH` | `PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]` | all three | whole BSS |
 
 An AP target is attacked broadcast (`ff:ff:ff:ff:ff:ff`); a client target is attacked through its
-own AP's BSSID on that AP's channel. An unassociated client has no BSS to announce from and is
-refused. CSA takes no target because it rides in a beacon.
+own AP's BSSID on that AP's channel. A client with no AP known has no BSS to announce from and is
+refused — but *amended 2026-11-11*: its card offers `Disrupt (find AP first)` instead of a dead end,
+and one lookup that hears the client is enough to make the row attackable. CSA takes no target
+because it rides in a beacon.
 
 **3 · Verdict.** Every kernel-side drop path reports success, so "we sent it" proves nothing. The
 channel is locked with the same `lock_target` Watch uses (verified read-back, falling back to a

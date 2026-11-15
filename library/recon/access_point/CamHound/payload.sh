@@ -102,6 +102,11 @@ BCN_CAP_COUNT=5         # beacons to capture per posture read (first usable one 
 CLI_CAP_SECS=4          # listen this long for who is talking to the target BSS
 CLI_CAP_COUNT=800       # frame cap for that capture (bounds the parse; the window bounds the dwell)
 CLI_CAP_SNAP=128        # MUST clear radiotap it_len + 16 to reach addr2: -s 32 cannot (18+16=34)
+# The inverse lookup (assoc_lookup): which BSSID ONE client talks to, read off the air when the
+# operator picks Watch or Disrupt on a client the firmware gave no AP for. It parks the radio for
+# the listen window, so Recon pauses meanwhile; it reuses CLI_CAP_SNAP and CLI_CAP_COUNT above.
+ASSOC_CAP_SECS=6        # * listen this long for one client's own frames when finding its AP (2-30; x3 across the hop)
+ASSOC_TTL=300           # * seconds an AP learned off the air is trusted before Watch/Disrupt looks again (0 = look every time)
 FIRE_ERR="/tmp/cs_fire_$$.err"   # the attack command's stderr: a refusal must not read as a measurement
 # The CSA injector. A CSA from THIS firmware cannot work, for two independent reasons, neither
 # reachable by any setting: pineapd hardcodes Channel Switch Count 0 (li s1,0 at 0x4bee6c, which
@@ -208,6 +213,18 @@ rssi_min_clamp() {
   fi
   return 0
 }
+# assoc_clamp: the find-AP lookup parks the radio and holds the screen for ASSOC_CAP_SECS -- three times
+# that when the park is refused and it listens across the hop -- with no button check while it listens.
+# cfg() and the Settings menu enforce a floor and nothing above it, so a mistyped or hand-edited value
+# would turn one pick into minutes of a blind Recon. 30 s parked, 90 s across the hop, is the ceiling.
+assoc_clamp() {
+  if (( ASSOC_CAP_SECS > 30 )); then
+    log warn "ASSOC_CAP_SECS $ASSOC_CAP_SECS capped at 30"; ui_ok && LOG yellow "ASSOC_CAP_SECS capped at 30"; ASSOC_CAP_SECS=30
+  elif (( ASSOC_CAP_SECS < 2 )); then
+    log warn "ASSOC_CAP_SECS $ASSOC_CAP_SECS raised to 2"; ASSOC_CAP_SECS=2
+  fi
+  return 0
+}
 # cfg KEY DEFAULT [FLOOR] -> persisted integer override or the default
 cfg() {
   local v
@@ -229,6 +246,8 @@ load_overrides() {
     RSSI_MIN=$(cfg RSSI_MIN "$RSSI_MIN" -100)
     SOUND=$(cfg SOUND "$SOUND" 0)
     BAND6=$(cfg BAND6 "$BAND6" 0)
+    ASSOC_CAP_SECS=$(cfg ASSOC_CAP_SECS "$ASSOC_CAP_SECS" 2)
+    ASSOC_TTL=$(cfg ASSOC_TTL "$ASSOC_TTL" 0)
     THR_STREAM_UP=$(cfg THR_STREAM_UP "$THR_STREAM_UP" 1)
     RESPONSE=$(cfg RESPONSE "$RESPONSE" 0)
     RESPONSE_CONFIRM=$(cfg RESPONSE_CONFIRM "$RESPONSE_CONFIRM" 0)
@@ -240,8 +259,8 @@ load_overrides() {
     POSTURE_TTL=$(cfg POSTURE_TTL "$POSTURE_TTL" 0)
     DEDUPE_H=$(cfg DEDUPE_H "$DEDUPE_H" 0)
   fi
-  # both clamps also cover a config-block edit, so they run whether or not the device offers persistence
-  resp_clamp_lock; rssi_min_clamp
+  # the clamps also cover a config-block edit, so they run whether or not the device offers persistence
+  resp_clamp_lock; rssi_min_clamp; assoc_clamp
 }
 
 # install dir: the UI runs a copy from /tmp, so look for the data file where it can live
@@ -793,6 +812,13 @@ posture_read_pcap() {   # posture_read_pcap <pcap> <band> <channel> -> badge (st
   printf '%s' "$POSTURE_BADGE"
 }
 
+# main_gone: the run this code belongs to has been killed. The three capture helpers are called in
+# $( ), so each is a CHILD of the run and outlives a SIGKILL by up to its listen window, while the
+# run's watchdog releases the radio and removes its files within 3 s. Left alone, the orphan wrote
+# its file back afterwards -- and where the first-second check found the file gone and its tcpdump
+# dead, it took that for a filter that had not armed and started the retry. Each helper asks this
+# once a second, stops, and removes its own file. $$ is the run's pid in a subshell too.
+main_gone() { [ -n "$MAIN_PID" ] && ! kill -0 "$MAIN_PID" 2>/dev/null; }
 capture_beacon() {   # capture_beacon <bssid> -> pcap path on stdout, rc 1 on failure
   local bssid="$1" out="/tmp/cs_bcn_$$.pcap" p w=0
   [ "$HAVE_TCPDUMP" = 1 ] || return 1
@@ -800,8 +826,9 @@ capture_beacon() {   # capture_beacon <bssid> -> pcap path on stdout, rc 1 on fa
   tcpdump -i "$RECON_IF" -nn -s 0 -c "$BCN_CAP_COUNT" -w "$out" \
     "type mgt subtype beacon and wlan addr2 $bssid" >/dev/null 2>&1 & p=$!
   child_add "$p"
-  while (( w < BCN_CAP_SECS )); do kill -0 "$p" 2>/dev/null || break; sleep 1; w=$(( w + 1 )); done
+  while (( w < BCN_CAP_SECS )); do kill -0 "$p" 2>/dev/null || break; main_gone && break; sleep 1; w=$(( w + 1 )); done
   kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null; child_del "$p"
+  main_gone && { rm -f "$out"; return 1; }
   [ -s "$out" ] || { rm -f "$out"; return 1; }
   printf '%s' "$out"
 }
@@ -819,6 +846,18 @@ pcap_stream() { if command -v hexdump >/dev/null 2>&1; then hexdump -v -e '1/1 "
 # would enter the AP as its own client and break resp_snapshot's invariant that the AP is never a
 # subject -- and one AP subject reading NO_EFFECT drags the whole attempt to NO_EFFECT.
 # Emits keyed lines for the caller to read IN THE PARENT SHELL: ITMAX/RECS/SHORT/CLI.
+# With -v mode=pairs it answers the INVERSE question -- which BSSID each station talks to, or only
+# -v sta=<mac> -- as "PAIR <sta> <bssid> <n> <up>" for every pair seen at least twice (assoc_lookup).
+# It is the same DS-bit decode with nothing held fixed: no bss is needed, a group-addressed or own
+# address on either side is never a pair, and neither is a frame whose two addresses are equal.
+# It also prints "OWN <sta> <n>", every frame that station transmitted whether or not any pair reached
+# two sightings, so the caller can tell "it was heard, to no AP twice" from "it was not heard at all".
+# <up> is how many of the <n> frames the STATION transmitted (ToDS). The other direction is the AP
+# transmitting to it, which an AP goes on doing after the station has left, so a caller that asks
+# "where is this station NOW" must not take <n> alone for an answer. The membership walk admits the
+# same stations it always did (CLI lines, either direction) and adds one "UP <sta> <up>" line for
+# each of them that was heard transmitting, for the same reason; a caller that reads only CLI lines
+# sees no difference.
 CLI_AWK='
 function mac(o) { return sprintf("%02x:%02x:%02x:%02x:%02x:%02x", p[o], p[o+1], p[o+2], p[o+3], p[o+4], p[o+5]) }
 function u16(a, b) { return be ? a * 256 + b : b * 256 + a }
@@ -859,12 +898,22 @@ BEGIN { st = 0; i = 0; itmax = 0; recs = 0; short = 0 }
     if (ds == 1) { bo = rt + 4; co = rt + 10 }
     else if (ds == 2) { bo = rt + 10; co = rt + 4 }
     else break
-    if (mac(bo) != bss) break
-    c = mac(co)
+    b = mac(bo); c = mac(co)
+    if (mode == "pairs") {
+      if (sta != "" && c != sta) break
+      if (b == c) break
+      if (p[bo] % 2 == 1 || p[co] % 2 == 1) break
+      if (index(own, " " c " ") > 0 || index(own, " " b " ") > 0) break
+      pair[c " " b]++
+      if (ds == 1) { pup[c " " b]++; sent[c]++ }
+      break
+    }
+    if (b != bss) break
     if (c == bss) break
     if (p[co] % 2 == 1) break
     if (index(own, " " c " ") > 0) break
     seen[c]++
+    if (ds == 1) sup[c]++
   } while (0)
   st = 1; i = 0
 }
@@ -872,7 +921,10 @@ END { if (bad) exit 1
   if (st == 0) { print "ERR truncated header"; exit 1 }   # never reached the magic: not a pcap at all
   print "ITMAX " itmax; print "RECS " recs; print "SHORT " short
   print "TRUNC " trunc + 0; print "RUNT " runt + 0; print "SNAP " snap + 0
-  for (c in seen) if (seen[c] >= 2) print "CLI " c }'
+  for (c in seen) if (seen[c] >= 2) print "CLI " c
+  for (c in sup) if (seen[c] >= 2) print "UP " c " " sup[c]
+  for (c in sent) print "OWN " c " " sent[c]
+  for (k in pair) if (pair[k] >= 2) print "PAIR " k " " pair[k] " " pup[k] + 0 }'
 
 # bss_clients <pcap> <bssid> -> keyed lines on stdout; rc 1 when the file is unreadable or not a pcap.
 # PARSE IT IN THE PARENT SHELL: the counts have to reach the caller, and a pipe or < <(...) would
@@ -899,15 +951,16 @@ capture_bss() {
   filt="type data and (wlan addr1 $bss or wlan addr2 $bss)"
   tcpdump -i "$RECON_IF" -nn -s "$CLI_CAP_SNAP" -c "$CLI_CAP_COUNT" -w "$out" "$filt" >/dev/null 2>&1 & p=$!
   child_add "$p"; sleep 1; w=1
-  if [ ! -s "$out" ] && ! kill -0 "$p" 2>/dev/null; then
+  if [ ! -s "$out" ] && ! kill -0 "$p" 2>/dev/null && ! main_gone; then
     child_del "$p"
     log resp "member capture: OR filter did not arm, retrying uplink-only"
     filt="type data and wlan addr1 $bss"
     tcpdump -i "$RECON_IF" -nn -s "$CLI_CAP_SNAP" -c "$CLI_CAP_COUNT" -w "$out" "$filt" >/dev/null 2>&1 & p=$!
     child_add "$p"; sleep 1; w=1
   fi
-  while (( w < CLI_CAP_SECS )); do kill -0 "$p" 2>/dev/null || break; sleep 1; w=$(( w + 1 )); done
+  while (( w < CLI_CAP_SECS )); do kill -0 "$p" 2>/dev/null || break; main_gone && break; sleep 1; w=$(( w + 1 )); done
   kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null; child_del "$p"
+  main_gone && { rm -f "$out"; return 1; }
   [ -s "$out" ] || { rm -f "$out"; return 1; }
   printf '%s' "$out"
 }
@@ -945,7 +998,7 @@ cleanup() {
   if [ "$WATCH_LOCKED" = 1 ]; then _pineap EXAMINE CANCEL >/dev/null 2>&1; PINEAPPLE_EXAMINE_RESET >/dev/null 2>&1; fi
   [ -n "$RUN_ID" ] && [ "$REPORT_DONE_AT_EXIT" != 1 ] && write_report quiet
   command -v bands_restore >/dev/null 2>&1 && bands_restore         # user payload only; the hooks never change bands
-  rm -f "$LOCK_FILE" "$CHILD_FILE" "$CHILD_FILE.n" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap "/tmp/cs_mem_$$.pcap" "/tmp/cs_bcn_$$.pcap" "$FIRE_ERR" /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
+  rm -f "$LOCK_FILE" "$CHILD_FILE" "$CHILD_FILE.n" /tmp/cs_up_?.pcap /tmp/cs_dn_?.pcap /tmp/cs_ot_?.pcap "/tmp/cs_mem_$$.pcap" "/tmp/cs_asc_$$.pcap" "/tmp/cs_bcn_$$.pcap" "$FIRE_ERR" /tmp/cs_*.err /tmp/cs_signal "$LOOT_DIR/inventory.tsv.new" /tmp/cs_rows.tmp
   log run "exit cycles=$CYCLE"
   ui_ok && set_state FINISH
 }
@@ -1021,6 +1074,12 @@ jq_works() {
   command -v jq >/dev/null 2>&1 || return 1
   [ "$(printf '%s' '[{"mac":"aa","probe":{"1":{"ssid":"c,d"}}}]' | jq -r "$JQ_CLI" 2>/dev/null)" \
     = 'aa|-|0|-|c_d|0|0|0' ] || return 1
+  # JQ_APS too. It needs sort_by, max, last, any and a string slice that JQ_CLI never touches, so a
+  # jq could pass the client probe above and still emit no AP rows: the gsub failure again, one
+  # program over. Two beacon entries and a response, so the best-signal pick and the empty-SSID
+  # skip both run. The expected row is what the program printed for this fixture, not a reading of it.
+  [ "$(printf '%s' '[{"mac":"cc","packets":9,"beacon":{"1":{"ssid":"","signal":-70,"channel":1,"freq":2412,"hidden":false,"time":3},"2":{"ssid":"Net;A","signal":-40,"channel":11,"freq":2462,"hidden":false,"time":9}},"response":{"3":{"ssid":"Net;A","signal":-45,"channel":11,"freq":2462,"time":8}}}]' | jq -r "$JQ_APS" 2>/dev/null)" \
+    = 'cc|9|Net_A|11|2462|-40|0|9' ] || return 1
   return 0
 }
 # 1.1.3 has no RECON CLIENTS verb (measured 2026-11-03: "Unknown recon command", rc 255) but RECON DEVICES lists every
@@ -1213,7 +1272,11 @@ rssi_gate_own() { [[ ${RSSI_BEST[$1]:-x} =~ ^-?[0-9]+$ ]] || return 0; (( ${RSSI
 prox_of() {
   local mac="$1" best=-999 r near=$NEAR_DBM far=$FAR_DBM
   for r in ${RSSI_HIST[$mac]}; do [ "$r" = "-" ] && continue; (( r > best )) && best=$r; done
-  if (( best == -999 )) || (( EPOCHSECONDS - ${LAST_SEEN[$mac]:-0} > 90 )); then PROX[$mac]="?"; return; fi
+  # Stale = unheard for 90 s AS OF THE LAST SCAN CYCLE. Against the wall clock, every device went
+  # stale together 90 s after scanning stopped -- which is whenever the operator is in a menu, the
+  # only place the lists are drawn -- and "Other devices", which keeps N and M only, drew empty.
+  # LAST_CYCLE_TS is run_cycle's; unset (no cycle yet, the Recon hooks) the wall clock stands in.
+  if (( best == -999 )) || (( ${LAST_CYCLE_TS:-$EPOCHSECONDS} - ${LAST_SEEN[$mac]:-0} > 90 )); then PROX[$mac]="?"; return; fi
   [ "${BAND[$mac]}" = 5 ] || [ "${BAND[$mac]}" = 6 ] && { near=$((near - 7)); far=$((far - 7)); }
   [ "${ROLE[$mac]}" = cli ] && { near=$((near - 6)); far=$((far - 6)); }
   if (( best >= near )); then PROX[$mac]="N"; elif (( best < far )); then PROX[$mac]="F"; else PROX[$mac]="M"; fi
@@ -1275,6 +1338,11 @@ watchable() {
   local mac="$1"
   [ "$HAVE_TCPDUMP" = 1 ] || return 1
   if [ "${ROLE[$mac]}" = cli ]; then [ -n "${AP_OF[$mac]}" ] && [ "${AP_OF[$mac]}" != "-" ] || return 1; fi
+  # User payload only (the hooks carry no such function and take AP and channel from the Recon UI):
+  # an AP read off the air whose channel is not known yet gives the lock nothing to verify against.
+  # lock_target treats a channel of 0 as "any channel is fine", so without this a Watch would park
+  # wherever the radio happened to be, say nothing, and loot a row for channel 0.
+  command -v assoc_nochan >/dev/null 2>&1 && assoc_nochan "$mac" && return 1
   return 0
 }
 is_setup_ap() { local s="${SSID_CLEAN[$1]}"; [ "${ROLE[$1]}" != cli ] && [ -n "$s" ] && [ "${SSIDSIG[$s]##*|}" = SSID ]; }
@@ -1384,12 +1452,21 @@ run_lock() {
   fi
   kill_children; pkill -f "^_pineap MONITOR" 2>/dev/null   # anchored: only a real MONITOR process
   printf '%s' "$$" >"$LOCK_FILE"; : >"$CHILD_FILE"
-  trap cleanup EXIT INT TERM
+  # INT and TERM must END the run, not merely tidy up after it. A handler that returns resumes the
+  # script, so `trap cleanup EXIT INT TERM` -- which this was until 2026-11-11 -- ran cleanup on a
+  # kill or a Ctrl-C (lock file gone, EXAMINE released, traps cleared, "run exit" logged) and then
+  # carried on with whatever was in flight, a transmit included, with nothing left to clean up after
+  # it. Exiting from the handler fires the EXIT trap, so cleanup still runs, once. Bash runs the
+  # handler when the foreground command returns, so the stop is prompt, not instant.
+  trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
   # watchdog: if the UI kills this process (SIGKILL), release children and the EXAMINE lock
   ( while kill -0 "$MAIN_PID" 2>/dev/null; do sleep 3; done
     while read -r p; do [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done <"$CHILD_FILE" 2>/dev/null
     _pineap EXAMINE CANCEL; PINEAPPLE_EXAMINE_RESET
     [ "$(cat "$LOCK_FILE" 2>/dev/null)" = "$MAIN_PID" ] && rm -f "$LOCK_FILE" "$CHILD_FILE"
+    # cleanup never ran for a killed run, and these carry its pid in their names, so nothing else
+    # would ever remove them: they stayed in /tmp, which is RAM on the device, until reboot
+    rm -f "/tmp/cs_mem_$MAIN_PID.pcap" "/tmp/cs_asc_$MAIN_PID.pcap" "/tmp/cs_bcn_$MAIN_PID.pcap" "/tmp/cs_fire_$MAIN_PID.err" "/tmp/cs_oui_keys.$MAIN_PID"
     bands_watchdog_restore ) >/dev/null 2>&1 &
 }
 # A band write the dead run issued is undone by its own watchdog. Keyed on the record, not on the lock: the record
@@ -1789,6 +1866,9 @@ stimulus_test() {
 
 watch_menu() {
   local mac="$1"
+  # User payload only: an AP read off the air more than ASSOC_TTL ago is looked at again before it
+  # is acted on. Here rather than at the card, so the Watch offers of the scan funnel get it too.
+  command -v assoc_refresh >/dev/null 2>&1 && assoc_refresh "$mac"
   watchable "$mac" || { LOG "Watch n/a for ${mac:9}"; return 0; }
   WATCH_AGAIN=0; RUNS=()
   pick_list "Watch ${ID_LABEL[$mac]:-?} ${mac:9}" "Live view" "Live view" "Stimulus test (~90 s)" "Back" || return 0
@@ -1967,6 +2047,9 @@ resp_members() {
     return 1
   fi
   RESP_MEMBERS_BSS="$bss"
+  # The same fact read the other way: every station heard here talks to this BSSID. The user payload
+  # keeps it as each of those client rows' AP (assoc_learn_members); the hooks carry no such function.
+  command -v assoc_learn_members >/dev/null 2>&1 && assoc_learn_members "$bss" "$out"
   return 0
 }
 resp_snapshot() {
@@ -2357,6 +2440,9 @@ disrupt_row() {   # a cached badge is free to show; an uncached one is not worth
   # the card redraws unchanged - which reads as a dead button. Safe to call resp_target here:
   # disrupt_row always runs inside $( ), so the globals it sets die with the subshell.
   if [ "${ROLE[$mac]}" = cli ] && { [ -z "${AP_OF[$mac]}" ] || [ "${AP_OF[$mac]}" = - ]; }; then
+    # The user payload can read the AP off the air (assoc_lookup), and its card turns this row into
+    # that lookup. The hooks carry no such function, so there the row stays n/a.
+    if command -v assoc_can >/dev/null 2>&1 && assoc_can "$mac"; then printf 'Disrupt (find AP first)'; return 0; fi
     printf 'Disrupt n/a (not associated)'; return 0     # no BSS to announce from
   fi
   resp_target "$mac" || { printf 'Disrupt n/a (no channel)'; return 0; }
@@ -2370,6 +2456,10 @@ disrupt_row() {   # a cached badge is free to show; an uncached one is not worth
 
 disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon says will work
   local mac="$1" badge opts k exp scope items=() pickmap=() i=0 choice
+  # User payload only (the hooks take the AP from the Recon selection): a client's AP that was read
+  # off the air more than ASSOC_TTL ago is looked at again before anything is aimed at it, on every
+  # path into this menu -- the card, the post-Watch funnel and AUTO_RESPOND alike.
+  command -v assoc_refresh >/dev/null 2>&1 && assoc_refresh "$mac"
   if ! resp_target "$mac"; then
     LOG red "nothing to attack: no associated BSS or no channel for $mac"; return 0
   fi

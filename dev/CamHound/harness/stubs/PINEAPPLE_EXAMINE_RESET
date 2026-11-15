@@ -1,2 +1,2 @@
 #!/bin/bash
-printf '%s %s\n' "PINEAPPLE_EXAMINE_RESET" "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; exit 0
+printf '%s %s\n' "PINEAPPLE_EXAMINE_RESET" "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; : > /tmp/cs_harness_hop; exit 0   # released: the radio hops again
