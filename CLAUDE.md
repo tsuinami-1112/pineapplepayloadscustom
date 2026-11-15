@@ -695,7 +695,12 @@ command or the log line that produced it.
   the 2026-11-05 pair does still establish is narrower and was never stated: a recorded randomised
   MAC goes stale. `4e:42:dc:3b:d1:33` no longer drops the phone, because the phone rotated it.
 - ~~**The CSA question is NOT answered by that.**~~ **ANSWERED 2026-11-09, and not by a radio
-  result** — `_CSA` cannot construct a valid request at all. See "Third contact". The count-0 claim
+  result** — ~~`_CSA` cannot construct a valid request at all~~ `_CSA` sends a well-formed opcode-402
+  request whose `sta` is never read, so it queues a CSA record (channel 14, count 0) and builds no
+  deauth frame; whether the beacon race ever transmits that record is a separate open question. See
+  "Third contact". *Corrected 2026-11-15: the struck words were the withdrawn missing-`sta`
+  explanation, and they stood here for five days after this file's own "Open" parenthesis called it
+  withdrawn — a third answer, fixed as its own commit by the file's rule.* The count-0 claim
   is untouched and still `[A]`; it has simply never been reachable through this command.
 - **6 GHz is genuinely in the hop set** after the GUI toggle: 22 distinct 6 GHz centres in a
   40-sample window (6015 … 7115 MHz), plus seven 5 GHz DFS channels. **But nothing was heard there**
