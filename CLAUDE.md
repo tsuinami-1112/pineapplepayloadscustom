@@ -80,7 +80,7 @@ is also an array; the other half of the protection is running the suite under bo
 laptop that lacks BusyBox is where the next such program will be written.
 
 **The harness argument is a scenario filter, not a mode.** `run_harness.sh live` runs the `live`
-scenario alone - 6 checks of 140 - and still prints `0 failure(s)`, which reads exactly like a full
+scenario alone - 6 checks of 144 - and still prints `0 failure(s)`, which reads exactly like a full
 pass. This gate list said `live` until 2026-11-04 and every session that copied it was running a
 fourteenth of the suite (sixteenth now). No argument (or `all`) runs them all; a scenario name runs one,
 which is what you want while iterating, never for the gate.
