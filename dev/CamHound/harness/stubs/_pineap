@@ -1,9 +1,29 @@
 #!/bin/bash
+# HARNESS_PK_ADVANCE=<delta>: add delta to every "packets":N on each successive client read, so a
+# subject read twice looks like it is STILL TRANSMITTING -- resp_verdict scores p1 > p0 as NO_EFFECT
+# (payload.sh, resp_verdict: `(( p1 > p0 )) && printf 'NO_EFFECT'`). Unset, the counters are frozen
+# and every measured subject reads MOVED ("counter stalled, nothing newer seen"), which is what
+# every scenario before 2026-11-15 measured: NO_EFFECT was only ever asserted ABSENT (run_harness.sh
+# `no_effect=0`, and two `! grep -qE '|(MOVED|NO_EFFECT)$'`) and produced nowhere, so no scenario
+# could reach a path that only a NO_EFFECT reaches. Modelled on Recon's own counter, which is
+# cumulative, not on any hypothesis about the code under test.
+# Falsified by: a scenario that produced a NO_EFFECT loot row without this knob set.
+pk_bump() {
+  local n
+  [ -n "${HARNESS_PK_ADVANCE:-}" ] || { cat; return 0; }
+  n=$(cat /tmp/cs_harness_pkn 2>/dev/null || echo 0); echo $((n + 1)) >/tmp/cs_harness_pkn
+  awk -v add=$(( HARNESS_PK_ADVANCE * n )) '
+    { out = ""; rest = $0
+      while (match(rest, /"packets":[0-9]+/)) {
+        out = out substr(rest, 1, RSTART - 1) "\"packets\":" (substr(rest, RSTART + 10) + add)
+        rest = substr(rest, RSTART + RLENGTH) }
+      print out rest }'
+}
 case "$1 $2" in
   "RECON APS") n=$(cat /tmp/cs_harness_cycle 2>/dev/null || echo 0); f="${HARNESS_FIX}/aps_$n.json"; [ -f "$f" ] || f="${HARNESS_FIX}/aps.json"; cat "$f"; echo $((n+1)) > /tmp/cs_harness_cycle ;;
   "RECON CLIENTS") [ -n "${HARNESS_NO_CLIENTS:-}" ] && { echo "Unknown recon command"; exit 255; }   # 1.1.3 has no CLIENTS verb
-                   n=$(cat /tmp/cs_harness_cycle 2>/dev/null || echo 1); f="${HARNESS_FIX}/cli_$((n-1)).json"; [ -f "$f" ] || f="${HARNESS_FIX}/cli.json"; cat "$f" ;;
-  "RECON DEVICES") printf 'RECON DEVICES\n' >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; cat "${HARNESS_FIX}/devices.json" ;;   # every device, real 1.1.3 shape, no association
+                   n=$(cat /tmp/cs_harness_cycle 2>/dev/null || echo 1); f="${HARNESS_FIX}/cli_$((n-1)).json"; [ -f "$f" ] || f="${HARNESS_FIX}/cli.json"; pk_bump <"$f" ;;
+  "RECON DEVICES") printf 'RECON DEVICES\n' >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; pk_bump <"${HARNESS_FIX}/devices.json" ;;   # every device, real 1.1.3 shape, no association
   "MONITOR "*) printf 'MONITOR %s\n' "$*" >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; i=0; while :; do echo $(( -70 + (i % 10) )); i=$((i+1)); sleep 0.2; done ;;
   "EXAMINE CANCEL") printf 'EXAMINE CANCEL\n' >> "${HARNESS_LOG:-/tmp/cs_harness.log}"; : > /tmp/cs_harness_hop ;;   # released: the radio hops again
 esac

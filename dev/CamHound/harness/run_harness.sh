@@ -43,7 +43,7 @@ mkdir -p "$T/phy/phy0"          # fallback-merge fixture only: with the net tree
 mkdir -p "$T/net/wlan1mon/phy80211"; printf 'phy0\n' >"$T/net/wlan1mon/phy80211/name"   # RECON_IF's phy: the probe reads this one, no merge
 printf 'CYCLE_SECS=5\n' >"$HARNESS_CFG"
 PATHX="$HERE/stubs:$T/bin:$PATH"
-reset() { [ "${1:-}" = keep ] || rm -rf "$LOOT"; rm -rf "$T/log" "$T"/rules*.c* /tmp/cs_harness_chan /tmp/cs_harness_pps /tmp/cs_harness_bands /tmp/cs_run.pid /tmp/cs_children; mkdir -p "$LOOT"; echo 0 >/tmp/cs_harness_cycle; : >/tmp/cs_harness_hop; }   # cs_harness_hop: the radio starts out hopping, and the EXAMINE stubs park and release it
+reset() { [ "${1:-}" = keep ] || rm -rf "$LOOT"; rm -rf "$T/log" "$T"/rules*.c* /tmp/cs_harness_chan /tmp/cs_harness_pps /tmp/cs_harness_bands /tmp/cs_harness_pkn /tmp/cs_run.pid /tmp/cs_children; mkdir -p "$LOOT"; echo 0 >/tmp/cs_harness_cycle; : >/tmp/cs_harness_hop; }   # cs_harness_hop: the radio starts out hopping, and the EXAMINE stubs park and release it
 rules() { local f="$T/rules_$1"; shift; printf '%s\t%s\n' "$@" >"$f"; export HARNESS_RULES="$f"; }
 answers() { printf '%s\n' "$@" >"$HARNESS_ANSWERS"; }
 check() { if eval "$2"; then printf 'PASS %s\n' "$1"; else printf 'FAIL %s\n' "$1"; FAIL=$((FAIL + 1)); fi; }
@@ -165,6 +165,37 @@ s_csainj() {   # the optional CSA injector: pagerinj in place of the firmware CS
     "grep -q '^PINEAPPLE_DEAUTH_CLIENT ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff 36\$' $T/log && grep -q 'csa leg failed' $LOOT/events.log"
   check "csainj: a failed CSA leg is not recorded in the loot as a sent one" \
     "grep -q '|BOTH|PINEAPPLE_DEAUTH_CLIENT|' $LOOT/responses.tsv && ! grep -q '+pagerinj' $LOOT/responses.tsv && ! grep -q '|CMD_REFUSED\$' $LOOT/responses.tsv"
+  # csa_issue's THIRD answer, rc 3: the injector was capped or killed with NO sent= line on stderr,
+  # so nothing is KNOWN to have been transmitted. Neither a send (rc 2) nor a refusal (rc 1), and
+  # the distinction is the whole point -- CMD_REFUSED asserts "nothing was transmitted" and
+  # NO_EFFECT asserts "the frame landed and the camera ignored it", which is a firmware answer this
+  # rung exists to produce honestly. With nothing proven sent, "no frame left the radio" explains
+  # the same counters exactly as well, so the verdict is downgraded.
+  #
+  # Driven on the CSA key (the picker's THIRD item), not BOTH: that is the arm where the CSA is the
+  # only leg and so the only one whose verdict is downgraded. On BOTH the deauth has already left
+  # the radio, so NO_EFFECT keeps a frame behind it and is left standing.
+  #
+  # Run as a PAIR under HARNESS_PK_ADVANCE so the two arms differ in exactly ONE variable -- whether
+  # the injector could prove a send -- and the INCONCLUSIVE is a RESULT, not an artifact of whatever
+  # the fixture's counters happen to do. That advance had to be added to the _pineap stub: with the
+  # counters frozen, as every scenario before 2026-11-15 ran them, every measured subject reads
+  # MOVED ("counter stalled") and MOVED is deliberately NOT downgraded, so the pair would have
+  # agreed and the check would have asserted nothing. NO_EFFECT had never been produced here at all.
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules csainj3 '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '3' ' ch ' '1' "${COMMON[@]}"
+  answers t t B; HARNESS_PK_ADVANCE=500 PATH="$PATHX" timeout 300 bash "$T/payload_csa.sh" >/dev/null 2>"$T/stderr"
+  check "csainj: baseline -- an injector that proves a send is scored on the counters, NO_EFFECT" \
+    "grep -q 'csa inject pagerinj:ch40:n3 rc=0 issue=0' $LOOT/events.log && grep -q '|CSA|pagerinj:ch40:n3|ok|' $LOOT/responses.tsv && grep -qE '\|NO_EFFECT\$' $LOOT/responses.tsv && ! grep -qE '\|(MOVED|INCONCLUSIVE|CMD_REFUSED)\$' $LOOT/responses.tsv"
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules csainj4 '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '3' ' ch ' '1' "${COMMON[@]}"
+  answers t t B; HARNESS_INJ_CAP=1 HARNESS_PK_ADVANCE=500 PATH="$PATHX" timeout 300 bash "$T/payload_csa.sh" >/dev/null 2>"$T/stderr"
+  check "csainj: a capped injector with no sent= line is issue=3 in the log, not a refusal" \
+    "grep -q 'csa inject pagerinj:ch40:n3 rc=124 issue=3' $LOOT/events.log && grep -q 'csa capped-no-send injector capped with no send evidence (rc 124)' $LOOT/events.log"
+  check "csainj: rc 3 marks the leg ? and downgrades NO_EFFECT to INCONCLUSIVE, never CMD_REFUSED" \
+    "grep -q '|CSA|pagerinj:ch40:n3?|ok|' $LOOT/responses.tsv && grep -qE '\|INCONCLUSIVE\$' $LOOT/responses.tsv && ! grep -qE '\|(NO_EFFECT|MOVED|CMD_REFUSED)\$' $LOOT/responses.tsv"
+  check "csainj: rc 3 says on screen that nothing is claimed, and the deauth was never sent" \
+    "grep -q 'LOG yellow CSA injector was capped with no send evidence; measuring, but nothing is claimed' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT ' $T/log"
 }
 
 s_disrupt() {   # shipped default (RESPONSE=1 from the config block, nothing written to the saved config): Disrupt on the Reolink AP against log-only stubs; posture, lock, loot row
@@ -208,15 +239,21 @@ s_disrupt() {   # shipped default (RESPONSE=1 from the config block, nothing wri
   check "disrupt: cached badge shown on the card afterwards" "grep -q 'items=.*Disrupt \[D+C\]' $T/log"
   check "disrupt: EXAMINE released, no lock file" "grep -q 'PINEAPPLE_EXAMINE_RESET' $T/log && [ ! -e /tmp/cs_run.pid ]"
 }
-s_blind() {   # RESPONSE=1 with no beacon capturable: the ? badge asks before firing blind; accepted leads CSA, declined sends nothing
+s_blind() {   # RESPONSE=1 with no beacon capturable: the ? badge asks before firing blind; accepted fires the CSA (the picker's third item), declined sends nothing
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules blind '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' 'Fire blind' '1' '^Disrupt \[' '3' ' ch ' '1' "${COMMON[@]}"
   answers t t B; HARNESS_NO_BEACON=1 run
   check "blind: capture attempted under a lock, nothing captured, badge ?" "grep -q 'TCPDUMP beacon suppressed ec71db000010' $T/log && grep -q 'PINEAPPLE_EXAMINE_BSSID ec:71:db:00:00:10' $T/log && grep -q '^LOG \[[?]\] 00:00:10 ch36 5GHz' $T/log"
   check "blind: Fire blind confirm shown and accepted" "grep -q 'CONFIRM\[Posture unread on 00:00:10: no beacon captured. Fire blind[?]\] -> 1' $T/log"
-  # DEAUTH leads and is the only key the badge still speaks for; BOTH and CSA read fw-broken on
-  # every badge because neither can construct a valid pineapd request (see payload posture_expect).
-  check "blind: picker leads with DEAUTH, BOTH and CSA marked fw-broken, all bss-wide" "grep -q 'PICKER\[Disrupt \[[?]\] ff:ff:ff\] items=DEAUTH bss (unknown);BOTH bss (unknown);CSA bss (fw-broken);' $T/log"
+  # DEAUTH leads, and on the ? badge it reads `unknown` -- with no beacon the posture is unread, so
+  # nothing can be promised about a deauth. CSA is the ONE key that reads `fw-broken` here, and the
+  # ORDER in posture_expect is the mechanism: its fw-broken short-circuit for CSA sits AHEAD of the
+  # `?` test, because the firmware CSA's defect is in the COMMAND (opcode 402 queues a count-0 CSA
+  # naming channel 14) and not in the target, so an unread beacon cannot excuse it. BOTH is NOT
+  # fw-broken -- its deauth leg is the opcode-400 command, which transmits (see payload
+  # posture_expect). This comment and this check's name said "BOTH and CSA read fw-broken" until
+  # 2026-11-15, contradicting the string the check has always asserted.
+  check "blind: picker leads with DEAUTH, only CSA marked fw-broken, all bss-wide" "grep -q 'PICKER\[Disrupt \[[?]\] ff:ff:ff\] items=DEAUTH bss (unknown);BOTH bss (unknown);CSA bss (fw-broken);' $T/log"
   check "blind: the confirm names every client, not the broadcast target" "grep -q 'CONFIRM\[CSA on EVERY client of 00:00:10 ch 36[?]\] -> 1' $T/log"
   check "blind: CSA does not sweep, because the command takes no target" "! grep -qE '^PINEAPPLE_DEAUTH_CLIENT ' $T/log"
   check "blind: CSA fired with bssid and channel only, badge ? in the event" "grep -q '^PINEAPPLE_DEAUTH_CLIENT_CSA ec:71:db:00:00:10 36$' $T/log && grep -q 'fire CSA ec:71:db:00:00:10 ff:ff:ff:ff:ff:ff ch36 badge=? ' $LOOT/events.log"

