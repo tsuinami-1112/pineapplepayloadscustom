@@ -6,7 +6,8 @@ disconnection. `PLAN_v2.md` covers the recon side; this covers everything downst
 Status: coded, laptop-verified, and **transmitting on hardware since 2026-11-05** — a Disrupt ran the
 whole chain from the user payload on the 1.1.3 unit (CLAUDE.md "Second contact"), and since
 2026-11-10 an AP row fires even when the capture recovers nobody (below). `--selftest` last passed on
-the Pager at 259/0 (2026-11-04); the suite is 489 checks on the laptop as of 2026-11-15. The selftest
+the Pager at 259/0 (2026-11-04); on the laptop it is the count printed at the end, which grows with
+every case added. The selftest
 still stubs every device-changing command, so section [What is unverified](#what-is-unverified)
 remains the honest list of what the bench has not measured.
 
@@ -51,30 +52,65 @@ and times it out, meaning it waits for its own hopper to reach the target channe
 contention problem solves itself inside the daemon, because the same process owns both the hopping
 and the injection.
 
-Three DuckyScript commands expose it. Signatures confirmed from `hak5cmd`'s own help text, not
-inferred:
+**Two** DuckyScript commands reach it, and CamHound's three menu keys are built from those two.
+`PINEAPPLE_DEAUTH_CLIENT_ALL` is not one of them — read the correction under the table before
+trusting any older statement in this file about it:
 
 | Key | Command | Frames | Scope |
 |---|---|---|---|
 | `DEAUTH` | `PINEAPPLE_DEAUTH_CLIENT [bssid] [target] [channel]` | deauth + disassociation | one client |
 | `CSA` | `PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]` | channel-switch announcements | whole BSS |
-| `BOTH` | `PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]` | all three | whole BSS |
+| `BOTH` | `PINEAPPLE_DEAUTH_CLIENT [bssid] [target] [channel]`, **then a CSA as a second command** (`csa_issue`) | deauth + disassociation, then a channel-switch announcement | whole BSS |
+
+**⚠ Corrected 2026-11-09: `BOTH` is NOT `PINEAPPLE_DEAUTH_CLIENT_ALL`, and that command builds no
+deauth frame at all.** `[V]` from pineapd and the Go daemon, re-derived in CLAUDE.md "Third
+contact"; the addresses are there and are not repeated here. All three
+`PINEAPPLE_DEAUTH_CLIENT*` commands reach **one** pineapd function,
+`interface_tracker::command_send_deauth` @ `0x4733d8`, which dispatches on a numeric opcode and not
+on the payload: **400 = deauth only, 401 = deauth + CSA, 402 = CSA only.** The Go daemon emits
+`li a0,400` in `StartDeauth`, `li a0,402` in `StartDeauthCsa` and `li a0,402` in **`StartDeauthAll`**
+— `li`/`ori a0,401` occur **zero** times anywhere in the binary, so pineapd's deauth+CSA opcode is
+dead code that has never run. `_ALL` and `_CSA` are therefore **the same command on the wire**, and
+`_ALL` queues a CSA while building no deauth frame; the `ff:ff:ff:ff:ff:ff` it writes into `sta` is
+dead data the 402 path never reads. Measured beside it on one address, one channel, one BSSID,
+minutes apart: `PINEAPPLE_DEAUTH_CLIENT <bssid> ff:ff:ff:ff:ff:ff 8` **dropped** the client while
+`PINEAPPLE_DEAUTH_CLIENT_ALL <bssid> ff:ff:ff:ff:ff:ff 8` did nothing.
+
+So `response_cmd BOTH` returns **`PINEAPPLE_DEAUTH_CLIENT`** — the opcode-400 deauth, the one frame
+this firmware actually builds — and `resp_fire` issues the CSA itself as a **second** command
+through `csa_issue` (§7a). That is the only way to get what opcode 401 would have done. *Every
+claim in this file that rests on `_ALL` "parsing and discarding a target" is withdrawn with it: the
+402 path never reads `sta`, so there is no discarded target to reason from.*
 
 **Scope is not what the signatures suggest, and `attack_scope()` is the one place that decides.**
 `CSA` takes no target: the **[V]** reading is the Go handler, `StartDeauthCsa` parses one MAC with a
 28-byte frame against `StartDeauth`'s two and 32 (CLAUDE.md §"2.0.0-stable, analysed"), and hak5cmd's
 help lists `[bssid] [channel]` — the help alone would not settle it, since this repo has caught it
 wrong three times. "Because it rides in a beacon" is the carrier question §13 still lists as not
-proven, so that explanation is **[A]**; the breadth does not depend on it. `BOTH` advertises a `[target]` that its handler parses and
-discards, so it is BSS-wide too; the readings behind that are **[V]** and the "discards it"
-conclusion is **[A]**, falsifiable by firing `BOTH` at one client among several and seeing whether
-the others stay associated (evidence in `CLAUDE.md` §"2.0.0-stable, analysed"). And because
+proven, so that explanation is **[A]**; the breadth does not depend on it. ~~`BOTH` advertises a `[target]` that its handler parses and
+discards, so it is BSS-wide too~~ — **withdrawn 2026-11-09, see the correction above:** `_ALL` is
+not on `BOTH`'s path at all.
+
+**`BOTH` is still `bss`, and this is the reason of record.** Its CSA leg is BSS-wide *by
+construction* — `csa_issue` sends `<bssid> <ch>`, a command with no target argument — and at the
+shipped `SWEEP_TARGETED=1` the targeted sweep follows the deauth to every **subject** of the
+attempt, which on an AP row is every heard member (§7). The honest corner, stated rather than
+smoothed over: with `SWEEP_TARGETED=0` a client-row `BOTH` is one targeted deauth plus a BSS-wide
+CSA leg, so the confirm's "on EVERY client of <bssid>" **over-warns** about the deauth half while
+staying true of the CSA half. Over-warning in one non-default corner is the direction to err in.
+*Falsified by:* a client-row `BOTH` at `SWEEP_TARGETED=0` disconnecting a client other than the
+picked one, which would make the confirm literally true of the deauth half too.
+
+And because
 `resp_target` resolves an **AP row** to a broadcast target, every attack on one is BSS-wide
 regardless of the key. The picker appends ` bss` to a broad option and the pre-transmit confirm
-reads "on EVERY client of <bssid>", because "`CSA` on <one client>" would be a lie. `posture_opts`
-is unchanged and still orders by efficacy, so a BSS-wide attack is preselected on the common
-badges — the marker and the confirm carry that, not a reordering that would demote the attack most
-likely to work.
+reads "on EVERY client of <bssid>", because "`CSA` on <one client>" would be a lie. **`posture_opts`
+no longer orders by efficacy.** It returns `DEAUTH BOTH CSA` on every badge where anything is
+offered at all (empty for `NOINJ` and `NONE`), and `pick_list` preselects element 0, so `DEAUTH` is
+the default everywhere. That is exactly the reordering an earlier revision of this paragraph said
+would "demote the attack most likely to work", and the measurement is why it is now right: `DEAUTH`
+is the only key whose frame this firmware builds, so leading `CSA` under PMF preselected an attack
+that provably transmits nothing.
 
 There is also a
 `_pineap` layer (`DEAUTH`, `DEAUTHCSA`, `DEAUTHALL`) and an HTTP layer (`/api/pineap/deauth`,
@@ -111,12 +147,19 @@ assuming an offset: version (2) + group cipher (4) + pairwise count (2) + 4×N +
 
 | Badge | Meaning | `DEAUTH` | `CSA` |
 |---|---|---|---|
-| `D+C` | no PMF | works | works |
-| `D?+C` | PMF optional (WPA3 transition) | partial | works |
-| `C` | PMF required (WPA3) | blocked | works |
+| `D+C` | no PMF | works | lands **only with an injector**; `fw-broken` without one |
+| `D?+C` | PMF optional (WPA3 transition) | partial | lands **only with an injector**; `fw-broken` without one |
+| `C` | PMF required (WPA3) | blocked | lands **only with an injector**; `fw-broken` without one |
 | `NONE` | PMF + beacon protection | blocked | blocked |
 | `NOINJ` | channel we cannot transmit on | cannot transmit | cannot transmit |
 | `?` | no beacon captured | unknown | unknown |
+
+*The `CSA` column changed on 2026-11-15 and used to read `works` on the first three rows.* It is
+the badge's verdict on the **channel-switch mechanism**, which is not the same question as whether
+this firmware can send one: pineapd's CSA announces **channel 14 with Channel Switch Count 0** (both
+literals with one call site, no setting reaches either) and `_ALL` builds no deauth frame, so with
+no `CSA_INJECTOR` configured and executable the label is `fw-broken` whatever the beacon says.
+`posture_why` carries the same sentence onto the screen in one line.
 
 Two honest limits baked into the model. `D?+C` **cannot be resolved from a beacon at all**, because
 PMF is negotiated per client — a transition-mode BSS can hold protected and unprotected clients
@@ -191,14 +234,30 @@ deliberately **not** cached, so a transient miss does not stick for five minutes
 
 ## 4. The attack contract
 
-The badge **advises; it never decides.** All three attacks are offered, ordered by what the beacon
-predicts and labelled honestly, so a deliberate no-hope attempt stays the operator's call. Where
-nothing is expected to work the operator is asked once and may still proceed.
+The badge **advises; it never decides.** All three attacks are offered with **`DEAUTH` first** — the
+order no longer tracks the badge — and labelled honestly, so a deliberate no-hope attempt stays the
+operator's call. Where nothing is expected to work the operator is asked once and may still proceed;
+that fallback offers `DEAUTH BOTH CSA`, in that order, for the same reason the picker does.
 
-- `response_cmd <key>` → the DuckyScript command name
-- `posture_opts <badge>` → viable keys, best first; empty for `NONE` and `NOINJ`
-- `posture_expect <badge> <key>` → `works` | `partial` | `blocked` | `unknown`
-- `posture_why <badge>` → one line of plain English for the screen
+- `response_cmd <key>` → the DuckyScript command name. **`DEAUTH` and `BOTH` both resolve to
+  `PINEAPPLE_DEAUTH_CLIENT`** (opcode 400); `BOTH`'s second leg is `csa_issue`, not a command name.
+- `posture_opts <badge>` → the offered keys: `DEAUTH BOTH CSA` wherever anything is offered at all,
+  empty for `NONE` and `NOINJ`. `pick_list` preselects element 0, so the string order *is* the
+  default.
+- `posture_expect <badge> <key>` → the picker's label, which follows the **sender** and not the
+  badge alone. The labels of record for the CSA-bearing keys are **`fw-broken`** (the firmware CSA),
+  **`injector`** (CSA routed to `CSA_INJECTOR`), **`deauth+csa`** (`BOTH` with an injector
+  configured) and **`deauth only`** (`BOTH` without one). Beside them the deauth half still carries
+  the badge's own word — `works` with no PMF, `partial` under PMF-optional, `blocked` under
+  PMF-required and at `NONE`/`NOINJ` — and everything at badge `?` is `unknown`.
+  *The flat `works | partial | blocked | unknown` list this line carried until 2026-11-15 is
+  withdrawn as a specification of the set.* It was written when the label depended on the badge
+  alone, and it hid the case that mattered most: with an injector configured — the one configuration
+  the whole CSA hook exists to enable — an injector-blind label told the operator CSA was
+  `fw-broken` while `csa_issue` was routing it to `pagerinj` and the loot row recorded two legs
+  landing. The picker lied in exactly the case it was there for.
+- `posture_why <badge>` → one line of plain English for the screen. Its CSA half says that CSA lands
+  **only with an injector configured**, and is `fw-broken` without one.
 
 ## 5. Target resolution
 
@@ -215,10 +274,36 @@ nothing is expected to work the operator is asked once and may still proceed.
 ## 6. Channel lock
 
 Reuses Watch's `lock_target` / `unlock_target` rather than a second implementation: it issues
-`PINEAPPLE_EXAMINE_BSSID`, reads the channel back three times via `iwinfo`, falls back to
-`PINEAPPLE_EXAMINE_CHANNEL`, and reports failure if the radio is still hopping. Returns 0 locked,
-1 locked-by-channel, 2 failed. On failure the response **does not transmit** and the attempt is
-logged as `LOCK_FAILED`.
+`PINEAPPLE_EXAMINE_BSSID`, reads the channel back three times via `cur_channel` (`iwinfo` first,
+then `iw dev info`), falls back to `PINEAPPLE_EXAMINE_CHANNEL`, and reports failure if the radio is
+still hopping. **It has FOUR return codes and only ONE of them is a refusal** — this line said
+"0 locked, 1 locked-by-channel, 2 failed" until 2026-11-15, which left the one an incautious reader
+is most likely to normalise away undocumented:
+
+| rc | `lock` in the loot | what it means | the response |
+|---|---|---|---|
+| 0 | `ok` | two or more readable samples agree with each other **and** with the target channel — or no target channel was supplied at all (`want 0`), there being nothing to disagree with | transmits |
+| 1 | `by-channel` | the samples agreed but on the wrong channel, and the read after `PINEAPPLE_EXAMINE_CHANNEL` came back equal to the target | transmits |
+| **3** | **`unverified`** | the channel could not be established: no readable sample, exactly **one** readable sample, or an empty read after `EXAMINE_CHANNEL` | **transmits**, and the loot says `unverified` instead of claiming a verification that did not happen |
+| 2 | `failed` | readable samples that **disagree** — the radio is still hopping | refuses: nothing is transmitted and the attempt is looted `LOCK_FAILED` |
+
+**⚠ rc 3 is "unverified, PROCEED". Do not normalise it to 0, and do not fold it into 2.** Refusing
+every response on a device whose channel will not read back is worse than labelling it; and
+reporting `ok` from a single sample would be *more* confidence from *less* evidence than the
+two-sample case beside it, since one reading cannot establish that a radio is parked. `resp_fire`
+maps rc 3 to `lock=unverified`, shows `LOCK_TEXT` to the operator in yellow, and carries on. Four
+separate fixes converged on this shape over two days; CLAUDE.md "Third contact"'s last bullet has
+the sequence.
+
+**Two readable samples are two readable samples, whichever one was missing.** An unreadable sample
+is a *missing reading*, not a different channel — `cur_channel` prints nothing when it cannot parse
+one — so the comparison is backfilled from the last sample outward, and `8/8/_` now reaches the same
+rc 0 as `_/8/8`. Until 2026-11-15 an empty **third** sample short-circuited to rc 3 before the
+backfill ran, so two agreeing reads scored `ok` or `unverified` depending on nothing but which slot
+was blank. The hopping line logs the **raw, pre-backfill** triple (`samples _/6/11`): the 2026-11-09
+bench defect was diagnosable only because the empty slot was visible, and printing the repaired
+values made its own signature unreachable by construction. *Falsified by:* a `lock_target` rc
+changing for any of those sample patterns without `cur_channel` changing.
 
 `lock_target` takes the channel to verify as an optional third argument. It previously verified
 against `WATCH_CH`, which only `watch_prepare` sets — so a response lock was checked against the
@@ -246,9 +331,25 @@ chosen command can actually reach — **not** from which row the operator picked
   itself, which is always a subject even behind a randomised MAC, so an explicit pick is never
   dropped from its own loot.
 - A client row that Recon happens to list as an AP falls back to `recon_stat`.
+- **On an AP row the subject set is widened again — in `resp_fire`, not in `resp_snapshot`.** Every
+  station the membership capture **heard** is appended as a subject with `p0 '-'`, including the
+  randomised MACs and the stations Recon has no row for that the sweep above drops, and each one
+  gets its own `responses.tsv` row. `resp_verdict` scores a subject with no baseline `INCONCLUSIVE`,
+  never `MOVED` — the honest answer for a device we transmitted at and cannot measure.
 
-**Why scope and not row type.** `CSA` takes no target argument at all and `_ALL`'s is parsed and
-discarded, so both transmit BSS-wide even when the operator picked one client. Selecting subjects by
+**The aggregate pays for that honesty, and it is worth knowing before reading a loot file.**
+`resp_aggregate` returns `MOVED` only when some subject moved **and none was inconclusive**, so a
+single heard-but-unmeasurable station **caps the attempt at `INCONCLUSIVE`** however many measured
+subjects fell silent. It can still read `NO_EFFECT`: any subject whose counter kept advancing
+outranks the inconclusive ones, because that is positive evidence the attack missed. The transmit
+set and the measurement set were the same array until 2026-11-09, which is what silenced the rung
+entirely on an AP whose only client carried a randomised MAC — seven consecutive refusals, CLAUDE.md
+"Third contact".
+
+**Why scope and not row type.** `CSA` takes no target argument at all, and `BOTH`'s CSA leg is that
+same `<bssid> <ch>` command, so both put a BSS-wide frame on the air even when the operator picked
+one client. (~~`_ALL`'s target is parsed and discarded~~ — withdrawn 2026-11-09: `_ALL` is not on
+either path, §2.) Selecting subjects by
 row type therefore measured a single camera and wrote a single loot row for a transmit that hit the
 whole BSS: `MOVED: 1/1 quiet` was a claim about one device presented as the outcome of a BSS-wide
 action, and the other devices knocked off left no record. Fixed 2026-11-03; the harness `cliscope`
@@ -334,8 +435,15 @@ subject** with `resp_verdict`:
 | `MOVED` | gone from Recon, or its packet counter stalled with nothing newer seen |
 | `NO_EFFECT` | counter still advancing — it never left |
 | `INCONCLUSIVE` | no baseline, no follow-up reading, or the counter stalled but it was seen again |
-| `LOCK_FAILED` | the radio would not hold the channel; nothing was transmitted |
+| `LOCK_FAILED` | the radio would not hold the channel (`lock_target` rc **2** only); nothing was transmitted |
+| `CMD_REFUSED` | the command refused — a non-zero rc, or **anything on stderr**, which is the only signal `hak5cmd` gives since it exits 0 on every path including its errors. Nothing was transmitted. Written for **every** subject of the attempt, and deliberately outside the `MOVED`/`NO_EFFECT`/`INCONCLUSIVE` vocabulary so that a refusal can never be mistaken for a measurement by a reader of `responses.tsv` |
 | ~~`NO_CLIENTS`~~ | *no longer written (2026-11-10): a broadcast target with no clients fires, and is the one `INCONCLUSIVE` subject* |
+
+**`CMD_REFUSED` and `LOCK_FAILED` are the only two refusal verdicts this rung writes.** The capture
+reasons are not among them — since 2026-11-10 `NO_CAPTURE`, `SNAP_SHORT` and `NO_CLIENTS` are
+`events.log` reasons that accompany a broadcast that **did** fire (table above). And `unverified` is
+a value of the loot's **`lock` column**, not a verdict: a row can read `lock=unverified` beside any
+of `MOVED`, `NO_EFFECT` or `INCONCLUSIVE`.
 
 `resp_aggregate` reduces those to the one verdict shown on screen and written to `events.log`:
 **`MOVED` only when every subject went quiet**, `NO_EFFECT` when any kept transmitting,
@@ -348,6 +456,80 @@ aircrack-ng PR that popularised it (#2724, still unmerged) ships a regression te
 config has no `wpa=`, no `ieee80211w` and no station — it counts bytes leaving an interface and
 skips in CI. This verdict model is what turns an unverifiable attack into a measurable one, and it
 is the most valuable part of the response side.
+
+### 7a. `csa_issue`: what each return code asserts
+
+The CSA leg has two possible senders and they answer "did it work?" **oppositely**, so `csa_issue`
+owns the question instead of leaving it to its callers:
+
+- **`hak5cmd`** (the firmware command `PINEAPPLE_DEAUTH_CLIENT_CSA`) exits **0 on every path,
+  including its error paths**, and writes the error to **stderr** (measured 2026-11-05). Stderr is
+  the only signal; the rc is worthless.
+- **`pagerinj`** (`CSA_INJECTOR`) returns `failed && !sent ? 1 : 0` and prints its `sent=`/`failed=`
+  summary to **stderr even on success**, so the **rc** is the signal and testing stderr would report
+  failure every single time.
+
+One rule for both would file a fabricated result, which is the whole thing this rung exists to
+prevent. There is a third complication on the injector path: `csa_issue` runs it under `timeout`, and `wait`
+returns **`timeout`'s** status rather than the child's — 124 on expiry whatever the injector itself
+exited with — so the wrapper's status is not the injector's verdict either.
+
+| rc | the assertion | the evidence it rests on |
+|---|---|---|
+| 0 | the sender ran clean | injector rc 0; or the firmware command rc 0 **with empty stderr** |
+| **2** | **frames DID leave the radio, and the run was then capped by its own timeout** | `sent=N` with N > 0 on the injector's own stderr. Nothing else is accepted as proof of a send |
+| **3** | **capped with no send evidence** — the wrapper expired (status 124, or ≥ 128 for a signal) and there is no `sent=` line | the *absence* of `sent=`. So rc 3 means "we do not know", never "nothing was sent" |
+| 1 | refusal: nothing was sent | injector rc 1; a missing command; no band from which to pick a new channel; or the firmware command's stderr |
+
+**rc 2 must never collapse to 1.** The refusal path writes `CMD_REFUSED`, which asserts that no
+frame left the radio — writing it for frames whose own stderr says `sent=90` is a false statement in
+the loot, in the one direction this rung is built to avoid. **And rc 3 must never collapse to 2**,
+which is what it did until 2026-11-15: a bare 124 was scored as a send on the strength of the
+wrapper's status alone, so an injector that expired having transmitted *nothing* was recorded as
+having transmitted. The two failures are mirror images and both put a claim in the loot that the
+evidence does not carry.
+
+**How `resp_fire` handles each, at both of its call sites.**
+
+*The `CSA` arm*, where the CSA is the whole attack:
+
+- **rc 0 and rc 2 proceed to the measurement.** rc 2 warns on screen and logs that it was capped
+  after sending: a capped run is a reason to distrust the **dwell**, not a reason to claim nothing
+  went out.
+- **rc 3 also proceeds to the measurement, but its verdict is read down.** A `NO_EFFECT` is
+  **downgraded to `INCONCLUSIVE`**, because "nothing was transmitted" explains a subject that kept
+  transmitting exactly as well as "the CSA did not move it" — and `NO_EFFECT` on a CSA is one of the
+  open firmware questions this rung exists to *answer*, so filing it from an unproven send would
+  file a fabricated answer. A **`MOVED` stands**: the device went quiet, and reading that down would
+  throw away a positive result. The loot records the CSA leg as **unknown** rather than naming a
+  sender that may not have sent — today that is the sender's name with a trailing `?` in the `cmd`
+  column, at both arms.
+- The `csa inject` log line carries **two** numbers and they are not the same thing: `rc=` is the
+  `timeout` wrapper's status and `issue=` is the classification above, so `rc=124 issue=3` is the
+  capped-with-no-evidence case and **`issue=`** is what to grep for.
+- **rc 1 is the refusal**: `CMD_REFUSED` for every subject, and nothing is measured.
+
+*The `BOTH` arm*, where the deauth has **already** left the radio by the time the CSA leg is issued,
+so no CSA result may fail the attempt:
+
+- rc 0 and rc 2 both count as sent and name the sender in the loot's `cmd` column.
+- rc 3 is recorded **unknown** — the leg is neither claimed nor denied.
+- rc 1 warns ("the CSA leg did not send; the deauth was still transmitted") and logs the failure.
+- **None of the four aborts the attempt or changes the deauth's verdict.**
+
+`csa_clamp` bounds `CSA_INJ_SECS` and `CSA_INJ_WAIT` to 1–60 before both the invocation and
+`resp_fire`'s lock budget, because `pagerinj` reads `--secs 0` as "transmit until signalled" and
+`csa_issue` runs it in the **foreground**: a hand-edited 0 would park `resp_fire` forever behind a
+transmitter no teardown could reach. The injector is `child_add`ed as well, so the watchdog and
+`kill_children` can both find it. The three CSA keys (`CSA_INJECTOR`, `CSA_COUNT`, `CSA_CHAN`) are
+deliberately **unstarred**: `cfg()` accepts integers only, so a path cannot arrive through
+`PAYLOAD_SET_CONFIG`, and a star without a `SETTINGS_TABLE` row would be a lie.
+
+**`CSA_INJECTOR` defaults to empty and should stay that way until the bench says otherwise.**
+`dev/injector/README.md` requires pineapd **stopped**, and CamHound cannot stop pineapd — Recon, the
+EXAMINE lock and every deauth command *are* pineapd — so the in-payload path bets that the EXAMINE
+lock holds the channel well enough, and that bet is **unmeasured**. The validated way to run
+`pagerinj` is standalone, `dev/injector/run_17a.sh`.
 
 ## 8. Where the code lives, and why
 
@@ -404,9 +586,15 @@ Five ways to reach Disrupt, all gated on `RESPONSE`, which defaults to 1:
 | `RESP_SETTLE_SECS` | 6 | `*` | wait after transmitting before judging the effect |
 | `BCN_CAP_SECS` / `BCN_CAP_COUNT` | 4 / 5 | | beacon capture window and frame count |
 | `RESP_LOCK_SECS` | 20 | `*` | EXAMINE lock duration held across a response; raised to `RESP_SETTLE_SECS + 5` when set lower |
+| `SWEEP_TARGETED` | 1 | `*` | after a BSS-wide deauth, also send one targeted `PINEAPPLE_DEAUTH_CLIENT` per subject of the attempt |
 | `SCAN_IF` | `wlan0` | | reserved, currently unused |
 
-The six starred keys are also on the device's **Settings → Response settings** page. Switching
+The **seven** starred keys are also on the device's **Settings → Response settings** page — count
+them in `SETTINGS_TABLE`, whose `response` group holds `RESPONSE`, `RESPONSE_CONFIRM`,
+`AUTO_RESPOND`, `SWEEP_TARGETED`, `RESP_LOCK_SECS`, `RESP_SETTLE_SECS` and `POSTURE_TTL`.
+*This said "six" until 2026-11-15 and the table above was missing its `SWEEP_TARGETED` row, so the
+count and the table were wrong together — and a starred key with no row here is the same lie a
+starred key with no `SETTINGS_TABLE` row would be.* Switching
 `RESPONSE_CONFIRM` off asks a second time, and a lock shorter than `RESP_SETTLE_SECS + 5` is raised
 on apply and saved as raised (`settings_apply` re-runs `resp_clamp_lock`), so the menu shows the value
 in force. `Reset defaults` clears these overrides along with the recon ones.
@@ -460,9 +648,14 @@ per-subject loot rows with badge and raw caps, the aggregate verdict, the zero-m
 anyway and looting `INCONCLUSIVE` (`nomem_fired`, since 2026-11-10; before that, the no-clients guard), the
 cached badge appearing on the card afterwards, and EXAMINE being released. Two further scenarios
 reach the confirms the badge logic adds: `blind` (the fake `tcpdump` captures no beacon, so the badge
-is `?`) checks that the "Fire blind?" dialog appears, that accepting it offers CSA first with every
-option labelled `unknown`, fires `PINEAPPLE_DEAUTH_CLIENT_CSA` with bssid and channel only, and
-writes loot rows with badge `?` and caps `-`, and that declining it sends nothing and writes no row;
+is `?`) checks that the "Fire blind?" dialog appears, that accepting it offers
+`DEAUTH bss (unknown)`, `BOTH bss (unknown)` and `CSA bss (fw-broken)` **in that order** — at badge
+`?` the deauth half is genuinely unread, while the firmware CSA is known broken whatever the beacon
+would have said, which is why the third label is not `unknown` too — that a `CSA` picked there fires
+`PINEAPPLE_DEAUTH_CLIENT_CSA` with bssid and channel only and writes loot rows with badge `?` and
+caps `-`, and that declining it sends nothing and writes no row. *This paragraph said "offers CSA
+first with every option labelled `unknown`" until 2026-11-15, which was the pre-reordering picker
+and a label set that predated `posture_expect` following the sender;*
 `noinj` (the Reolink AP moved to DFS channel 52) checks that gate 1 answers `NOINJ` with no capture
 and no lock, and that declining "Try anyway?" sends nothing. An accepted "Try anyway?" is still
 unreached by any test. `cliscope` (2026-11-03) drives both scopes from one client-row menu: `DEAUTH`
@@ -473,6 +666,15 @@ pins `attack_scope` on four cases, `resp_snapshot` on seven (own-BSS sweep, cli 
 row, a target whose row is foreign to the BSSID in both scopes, a randomised pick kept, one Recon read
 for the sweep, and the `recon_stat` fallback adding an out-of-sweep pick for one more read), and
 `resp_verdict - - - - 0` as `INCONCLUSIVE`.
+
+The CSA leg and the lock are pinned at the level the mistakes were actually made at — a return code
+meaning one thing in `csa_issue` and another at the call site, which no end-to-end scenario catches:
+`csa_issue`'s **rc 2** *and* `resp_fire`'s acceptance of rc 2 at **both** arms, the same pair for
+**rc 3**, `csa_clamp`'s bounds, the targeted sweep's **stderr**-refusal detection (an rc of 0 with a
+message on stderr, which is the only shape `hak5cmd` produces), a check that no `-k` reaches the
+injector's argv unless `timeout` was probed to accept it, and `lock_target`'s symmetry cases —
+one-empty, middle-empty, last-empty, one readable sample, an empty fourth read and a genuinely
+hopping radio, each confirmed by a mutation that fails only its own case.
 
 Unit coverage:
 
@@ -509,7 +711,7 @@ firmware version:
 | firmware | what happens | where |
 |---|---|---|
 | **1.1.3** | `_pineap RECON CLIENTS` does not exist (measured 2026-11-03: `Unknown recon command`, rc 255); since that day `recon_lines CLIENTS` reads `RECON DEVICES` instead, whose object carries no association, so a client row has `AP_OF` `-` and `resp_target` refuses it like 2.0.0's. Every AP row has `R_TARGET` broadcast, subjects are 0 → `NO_CLIENTS`. | `resp_snapshot`'s `[ "$a" = "$R_BSSID" ]` sweep iterates the `RECON DEVICES` client rows and matches none, every `AP_OF` being `-` → `resp_fire` refusal; a client row is refused earlier, by `resp_target` |
-| **2.0.0** | client rows arrive, but the device object has no association field, so `JQ_CLI`'s `(.ap_mac // .bssid // "-")` yields `-` for all of them. An **AP row** finds 0 matching clients → `NO_CLIENTS`. A **client row** never reaches the sweep: `AP_OF` is `-`, so `resp_target` returns 1 and `disrupt_menu` aborts with "nothing to attack: no associated BSS". | `payload.sh:2122-2123`; `resp_snapshot`'s `[ "$a" = "$R_BSSID" ]` |
+| **2.0.0** | client rows arrive, but the device object has no association field, so `JQ_CLI`'s `(.ap_mac // .bssid // "-")` yields `-` for all of them. An **AP row** finds 0 matching clients → `NO_CLIENTS`. A **client row** never reaches the sweep: `AP_OF` is `-`, so `resp_target` returns 1 and `disrupt_menu` aborts with "nothing to attack: no associated BSS". | `resp_target`'s client branch, and `disrupt_menu`'s abort beside it; `resp_snapshot`'s `[ "$a" = "$R_BSSID" ]` |
 
 *Corrected 2026-11-03. An earlier revision of this section said the rung was "inert until the device
 is flashed to 2.0.0", which is wrong and was the more consequential half of the claim — it implied a
@@ -553,7 +755,10 @@ than any one of them: `AP_OF[mac] == "-"` disables **Watch on a client** and **S
 (`watchable()`, and `watch_prepare`'s "no BSSID: cannot lock"), **kit detection** — CamHound's
 largest single identity signal — (`kit_eval`), the **AP→client tree** in the report
 (`write_report`), and the **response rung** for client rows (`resp_target`). Cited by name: every
-one of those four line numbers went stale within a commit. Fixing the association is therefore the
+one of those four line numbers went stale within a commit. *(2026-11-15: this file's own five
+`payload.sh:NNNN` citations had gone the same way — they landed in `assoc_learn_members`,
+`assoc_lookup`, `battery_tick`, `kill_children` and `score_device`, not one of them the function
+meant — and are now function names. Grep this file for `payload.sh:` and it should find nothing.)* Fixing the association is therefore the
 highest-value change available to this payload, and worth more than a firmware flash.
 
 **But the response rung does not actually need it, and this reframes the whole problem.** Read what
@@ -610,8 +815,8 @@ recalled; a reader who implements §13a as written will hit all three.
 
 | §13a says | What the artifact says | Consequence |
 |---|---|---|
-| "A client's MAC is `addr2`, six octets at `p + rt + 10`" | True **only for a ToDS frame**. On a FromDS frame `addr2` **is the BSSID** and `addr1` is the client. `addr2` is always the *transmitter* (`PLAN_v2.md:55`, IDEA_27 at `:164`) — and on a downlink frame the transmitter is the AP. | Harvesting `addr2` unconditionally records the AP as its own client. `resp_snapshot`'s stated invariant — "The AP's own counter is never the subject: it keeps beaconing whatever happens to its clients" (`payload.sh:2184`) — breaks, and one AP subject scoring `NO_EFFECT` makes `resp_aggregate` return `NO_EFFECT` for the whole attempt (`:2203`), so successes systematically read as failures. |
-| "whether `-s 32` clears radiotap far enough to reach `addr2`" — framed as a parameter | **Arithmetic settles it: it cannot.** `addr2` occupies frame octets 10-15, so a record must hold `rt + 16` bytes. mac80211's RX radiotap is at minimum FLAGS+CHANNEL+DBM_ANTSIGNAL and normally TSFT, with an MCS/HE block on an ax radio (`phy1`, backports 6.12.61): 18 at the optimistic floor, and `18 + 16 = 34 > 32`. The Watch rung's `-s 32` is **deliberately header-only** — `PCAP_AWK` reads only `hdr[1]`, `hdr[3]`, `hdr[4]` (`payload.sh:1756-1759`) and never touches frame content — so its existence is evidence of nothing about address reachability. | At `-s 32` every record fails the `rt + 16` guard and the walker returns **zero** clients, which is indistinguishable from the `NO_CLIENTS` bug being fixed. |
+| "A client's MAC is `addr2`, six octets at `p + rt + 10`" | True **only for a ToDS frame**. On a FromDS frame `addr2` **is the BSSID** and `addr1` is the client. `addr2` is always the *transmitter* (`PLAN_v2.md:55`, IDEA_27 at `:164`) — and on a downlink frame the transmitter is the AP. | Harvesting `addr2` unconditionally records the AP as its own client. `resp_snapshot`'s stated invariant — "The AP's own counter is never the subject: it keeps beaconing whatever happens to its clients" (`resp_snapshot`'s header comment) — breaks, and one AP subject scoring `NO_EFFECT` makes `resp_aggregate` return `NO_EFFECT` for the whole attempt, so successes systematically read as failures. |
+| "whether `-s 32` clears radiotap far enough to reach `addr2`" — framed as a parameter | **Arithmetic settles it: it cannot.** `addr2` occupies frame octets 10-15, so a record must hold `rt + 16` bytes. mac80211's RX radiotap is at minimum FLAGS+CHANNEL+DBM_ANTSIGNAL and normally TSFT, with an MCS/HE block on an ax radio (`phy1`, backports 6.12.61): 18 at the optimistic floor, and `18 + 16 = 34 > 32`. The Watch rung's `-s 32` is **deliberately header-only** — `PCAP_AWK` reads only `hdr[1]`, `hdr[3]`, `hdr[4]` (in its own program text) and never touches frame content — so its existence is evidence of nothing about address reachability. | At `-s 32` every record fails the `rt + 16` guard and the walker returns **zero** clients, which is indistinguishable from the `NO_CLIENTS` bug being fixed. |
 | the primitives table: `beacon_find` + `hex_octet` / `hex_u16le` are "already in the payload" | The **algorithm** transfers; the **mechanism** does not. Bash `${var:off:len}` costs O(length of the *whole* string), so a `pcap_bytes` + substring walk is O(records x filesize). Measured twice, independently, with a **fixed read count of 2000** against a growing string — that fixed count is the whole proof, since a constant number of reads taking longer on a bigger string means each read is O(length). First run 32 KB 156 ms, 128 KB 969 ms, 512 KB 3331 ms, 2048 KB 13634 ms; re-run 146 / 751 / 3665 / 15938 ms. *Corrected on the re-run:* an earlier revision of this row also claimed head-offset and tail-offset timings were **identical**, offered as ruling out "it is just the offset". They are not — at 2048 KB the tail offset came back at 9539 ms against 15938 ms at the head, about 40% faster. That sub-claim is withdrawn; it was never load-bearing, and the fixed-count scaling above settles the question without it. The Pager is a 580 MHz MIPS 24KEc, 15-40x slower. `beacon_find` escapes this only because `capture_beacon` bounds it with `-c 5` of ~350 B. | A parse that overruns the EXAMINE lock produces the **false `MOVED`** that `resp_clamp_lock` exists to prevent: the post-fire Recon read lands after hopping resumed, the counter looks stalled, and `resp_verdict` scores `MOVED` with a green `RESPOND_HIT`. Reproduce in one line (a session scratchpad will not exist for you): `h=$(head -c 2097152 /dev/zero \| tr '\0' a); time for ((i=0;i<2000;i++)); do b="${h:$((i*2)):2}"; done`. |
 
 **Resolved mechanics, as decisions.** Filter `type data and (wlan addr1 <bssid> or wlan addr2
@@ -680,11 +885,11 @@ testing fiction.
 access_point hook**, which is refused 100% of the time today on both firmwares. It does **not**
 populate `AP_OF`, so the other four chokepoint features stay inert, and a user-payload **client**
 row still aborts in `resp_target`'s client branch — on real firmware such a row is not even
-`watchable` (`:1018`), so the detect→Watch→confirmed→Disrupt funnel reaches `summary_card` only for
+`watchable`, so the detect→Watch→confirmed→Disrupt funnel reaches `summary_card` only for
 AP rows anyway. The inverse lookup that would fix the client row — `type data and wlan addr2 <mac>`,
 BSSID from `addr1` on a ToDS frame, the same walker with the two addresses swapped — is worth more
 than this change, because `AP_OF` gates five features. It is **recon-side** (`AP_OF` is filled by
-`record_seen`/`JQ_DEVCLI` at `:1226` and surfaces in `inventory.tsv`'s `ap_bssid` column and the
+`record_seen`/`JQ_DEVCLI` and surfaces in `inventory.tsv`'s `ap_bssid` column and the
 report tree), so it is handed over with the parser proven rather than written here.
 
 **Bound amended 2026-11-10 — the inverse lookup landed, from the recon side, laptop-verified only.**
@@ -716,12 +921,28 @@ that a camera's uplink is heard within the 6 s window. `dev/pager-day-one.md` 8d
 check. *Falsified by:* a client-row Disrupt whose loot row names a BSSID the client is not
 associated to.
 
-Needs a Pager:
+Needs a Pager — **four of the six below have since been answered; they are struck in place, with the
+pointer, rather than deleted, because what closed them is where the next session should look:**
 
-- whether `tcpdump` beacon capture on `wlan1mon` works while pineapd owns and hops it
-- whether the three `PINEAPPLE_DEAUTH_CLIENT*` commands behave as `hak5cmd`'s help text claims
-- `PINEAPPLE_DEAUTH_CLIENT_ALL`'s target argument — its help says "all clients on an AP" yet it
-  takes a target, which is passed through but whose semantics are unconfirmed
+- ~~whether `tcpdump` beacon capture on `wlan1mon` works while pineapd owns and hops it~~
+  **Answered 2026-11-05 for the locked case, which is the only case this rung uses.** The Disrupt
+  that ran on the 1.1.3 unit looted `…|ch 9|D+C|0c00|…` — a badge and a raw RSN Capabilities field,
+  neither of which can exist without a beacon having been captured and parsed (CLAUDE.md "Second
+  contact"). The capture runs under a short EXAMINE lock, so the *hopping* half of the question is
+  the reason the lock is there and remains unmeasured. **[A]** on the step from "a badge was looted"
+  to "the capture worked". *Falsified by:* a loot row with a real badge produced without a beacon
+  capture.
+- ~~whether the three `PINEAPPLE_DEAUTH_CLIENT*` commands behave as `hak5cmd`'s help text claims~~
+  **Answered 2026-11-09, and they do not** — read from pineapd's own handler rather than from the
+  help, which this binary has now had wrong four times: one function, one numeric opcode, 400/401/402
+  (CLAUDE.md "Third contact", §2 above). Measured alongside it: `_CSA` takes **two** arguments and
+  not three (2026-11-05).
+- ~~`PINEAPPLE_DEAUTH_CLIENT_ALL`'s target argument — its help says "all clients on an AP" yet it
+  takes a target, which is passed through but whose semantics are unconfirmed~~ **Answered
+  2026-11-09: the semantics are that there are none.** `_ALL` sends opcode **402**, and the 402 path
+  never reads `sta`, so the `ff:ff:ff:ff:ff:ff` the Go daemon writes by immediate is dead data and
+  `_ALL` builds no deauth frame at all (§2). The question was well posed and its answer makes the
+  command unusable rather than untargeted.
 - whether `DEAUTHCSA` emits a CSA-bearing beacon or a spectrum-management action frame — **beacon,
   strongly indicated but not proven.** The evidence is `csa_beacon_record`,
   `recon_engine::inject_csa` and the string `"Caught beacon for CSA on {}"`. It is **not** the
@@ -732,9 +953,41 @@ Needs a Pager:
   not follow. (The shipped `.so` exports 113 functions including `libwifi_create_action` and
   `libwifi_create_probe_resp`, all unreferenced. See `dev/pager-csa-primitives.md`.) An earlier
   revision of this file recorded this as settled on the invalid argument; the conclusion survives,
-  the reasoning did not.
-- whether Recon's packet counters move the way `resp_verdict` assumes
-- whether the CSA attack moves a real client **at all** — see §7
+  the reasoning did not. *Strengthened 2026-11-09, still not closed:* `inject_csa` @ `0x4a125c` only
+  **queues** a record, and the CSA element is constructed inside `index_beacon_ns` (at `+0xc0a`) —
+  i.e. the frame is built when a beacon from that BSSID is indexed, which is what a beacon-carried
+  CSA looks like from the inside and is hard to explain for an action frame. A capture is still what
+  would close it (CLAUDE.md "Third contact").
+- whether Recon's packet counters move the way `resp_verdict` assumes — **still open, and it is now
+  the oldest unanswered item in this section**
+- ~~whether the CSA attack moves a real client **at all** — see §7~~ **Answered 2026-11-10, and not
+  through these commands — the question has moved to `pagerinj` for good.** A CSA-bearing cloned
+  beacon from `pagerinj` does reach a live client, and it does two **separable** things: Channel
+  Switch **Mode 1** quiesces the client in place (six arms, zero auth and zero assoc frames in any
+  of their captures), while **mode 0** makes it re-associate (a complete Authentication / ReAssoc
+  Request / ReAssoc Response cycle, twice in one run). CLAUDE.md "Seventh contact" for the
+  separation and "Eighth contact" for the frame-by-frame read. Two cautions carry back here:
+  "mode 0 **moves** it" is **[A]** and was *withdrawn* as a reading — no frame in that capture shows
+  the station change channel or says where it went — and the **count ≥ 1 denial** prediction was
+  tested and **failed**, the client re-associating successfully while count-3 CSAs were in the air,
+  for a reason that is structural: the target AP's own beacons keep refreshing the cached IEs, so
+  17a cannot test the denial path against an AP that is still on the air. None of this is reachable
+  from the firmware commands, whose CSA announces **channel 14 with count 0**.
+
+**🆕 Open, from the recon side (2026-11-15): a member heard only as a DESTINATION may be a member
+that already left.** After a deauth that worked, the AP goes on retrying to the departed station for
+a while — so a station the next capture hears only as `addr1` can still be admitted as a member, and
+a *successful* attack is exactly the condition that produces them. `CLI_AWK` already distinguishes
+the two directions and prints `UP <sta> <n>` for a station heard **transmitting** (and `OWN <sta>
+<n>` for every frame it sent), which `resp_members` could use to tell "present" from "was present";
+it currently reads only the `CLI` lines, which admit either direction. **Recorded as an observation,
+not a change:** `resp_members`' success path belongs to the recon-side session, and nothing about it
+is touched here. Note the trade-off is real in both directions — dropping destination-only stations
+from the *transmit* set would re-introduce the 2026-11-09 defect, where the measurement gate gated
+the frame — so if this is acted on, the place to act is the **measurement** set. *Falsified by:* a
+station that a post-deauth capture hears **only** as the AP's destination turning out to be still
+associated — which would make destination-only no evidence of departure, and the distinction not
+worth drawing.
 
 **A note on running the harness where no hex dumper is present.** `preflight()` sets `HAVE_TCPDUMP`
 when `tcpdump` and either `hexdump` or `od` are present (`capture_ready`). On a machine with neither

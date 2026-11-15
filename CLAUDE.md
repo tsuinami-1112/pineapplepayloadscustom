@@ -348,12 +348,19 @@ captures it ships with — raising any Watch snap to reach addresses breaks it; 
 `capture_ready` (gates `HAVE_TCPDUMP` on tcpdump + *either* hex dumper), `lock_target`/
 `unlock_target` (EXAMINE channel lock), `capture_beacon`, `beacon_find`, `ie_find`, `rsn_caps`.
 **⚠ `lock_target` rc 3 is "unverified, PROCEED" and is not a failure — do not normalise it to 0.**
-It is returned when the channel cannot be read back at all, when only ONE of the three samples was
+It is returned when no sample can be read back at all, when only ONE of the three samples was
 readable (one sample cannot establish that the radio is parked), and when the read after
 `EXAMINE_CHANNEL` comes back empty. All three write `lock=unverified` to the loot and carry on,
 which is the point: refusing every response on a device whose channel will not read back is worse
-than labelling it. rc **2** is the refusal. Four separate fixes converged on this shape over two
-days; see "Third contact"'s last bullet for the whole sequence.
+than labelling it. rc **2** is the refusal, and it belongs to readable samples that *disagree* —
+with each other, or with the target channel — whose log line prints the raw, pre-backfill triple
+(`_/6/11`) rather than the repaired one. **Since 2026-11-15 an unreadable LAST sample is handled
+like any other unreadable sample: `8/8/_` returns rc 0 exactly as `_/8/8` does**, two readable
+samples that agree with each other and with the target being a verified park whichever slot came
+back blank. Until then an empty third sample short-circuited to rc 3 before the comparison ran, so
+the same evidence scored differently by position. Four separate fixes converged on this shape over
+two days and this is the fifth; see "Third contact"'s last bullet for the first four, which is also
+where that asymmetry is recorded.
 
 **Posture** (what will work against a target, read from its beacon) —
 - `posture_read_pcap` → sets `POSTURE_RSN` / `POSTURE_EXT` / `POSTURE_BADGE`
@@ -364,9 +371,19 @@ days; see "Third contact"'s last bullet for the whole sequence.
   per BSSID beside the badge, so a cache hit restores this target's caps and never attributes a previous
   target's to this response's loot row.
 - `posture_opts <badge>` → the offered attacks, **best first**; `pick_list` preselects element 0, so
-  the string order *is* the default. Empty means nothing is offered, and `disrupt_menu` then asks
-  "Nothing is expected to work — try anyway?".
-- `posture_expect`, `posture_why` → the picker label and the one-line explanation.
+  the string order *is* the default. The order is `DEAUTH BOTH CSA` on every badge that offers
+  anything, and the badge no longer changes it, `DEAUTH` being the only key that reaches the air on
+  this firmware. Empty means nothing is offered (`NOINJ` and `NONE`), and `disrupt_menu` then asks
+  "Nothing is expected to work — try anyway?"; **since 2026-11-15 that fallback offers
+  `DEAUTH BOTH CSA` too**, where it used to hand back `BOTH DEAUTH CSA` and so preselect the broad
+  attack in the one case where nothing is expected to work at all.
+- `posture_expect`, `posture_why` → the picker label and the one-line explanation. The labels of
+  record follow the SENDER, not the badge: `fw-broken` for a firmware CSA, `injector` for a CSA
+  routed to `CSA_INJECTOR`, `deauth+csa` for `BOTH` with an injector configured, `deauth only` for
+  `BOTH` without. *The old `works`/`partial`/`blocked`/`unknown` set is gone as of 2026-11-15.*
+  `posture_why`'s CSA clause follows the same rule — a CSA **lands only with an injector
+  configured, and is `fw-broken` without** — in place of the old flat "CSA lands", which promised
+  on every badge the one leg this firmware cannot transmit.
 
 **Injection gates** — `csa_injectable <band> <ch>` models both gates (see below);
 `PINEAPD_DFS_BLOCKED` mirrors the firmware's hardcoded set; `inj_probe` reads the **transmitting
@@ -400,10 +417,25 @@ accepts integers only so a path cannot arrive via `PAYLOAD_SET_CONFIG`, and a st
 `resp_fire`, `resp_snapshot`, `resp_verdict` (MOVED / NO_EFFECT / INCONCLUSIVE from recon packet
 counters), `resp_aggregate`, `resp_write` (→ `responses.tsv`, header `RESP_HDR`), `auto_respond_ok`.
 **⚠ `csa_issue` rc 2 means "it DID transmit and was then capped by its own timeout" — do not
-collapse it to 1.** `wait` returns `timeout`'s status, not the injector's, so a capped run comes
-back 124 whatever the injector exited with; scoring that as a refusal writes `CMD_REFUSED`, which
-asserts no frame left the radio, for frames whose own stderr says `sent=90`. Both call sites in
-`resp_fire` (the `CSA` arm and the `BOTH` arm) handle rc 2 as a send, and the selftest pins it.
+collapse it to 1 — and rc 3 is that same cap with no evidence of a send, which is not a refusal
+either.** `wait` returns `timeout`'s status, not the injector's, so a capped run comes back 124
+whatever the injector exited with; scoring that as a refusal writes `CMD_REFUSED`, which asserts no
+frame left the radio, for frames whose own stderr says `sent=90`. **Since 2026-11-15 the two cases
+are separated by that stderr and not by the wrapper status**: rc **2** requires a `sent=N` with
+N > 0 in the injector's own summary, and a wrapper status of 124 or ≥ 128 with no such line is
+rc **3**, "capped with no send evidence" — before this round every 124 scored 2 unconditionally.
+rc **1** remains the refusal (nothing sent), rc **0** the clean run. Both call sites in `resp_fire`
+take rc 2 as a send. rc 3 proceeds to the measurement as well, but it is carried rather than
+forgotten: on the `CSA` arm a `NO_EFFECT` verdict is **downgraded to `INCONCLUSIVE`**, because
+"nothing transmitted" explains that counter equally well, while a `MOVED` stands, and the loot's
+legs record names the CSA leg **unknown**; on the `BOTH` arm — where the opcode-400 deauth has
+already left the radio — a CSA leg of rc 1 warns, rc 2 counts as sent and rc 3 is recorded unknown,
+and none of the three fails the attempt. The selftest pins `csa_issue`'s rc 2 and rc 3 and
+`resp_fire`'s acceptance of both at both arms.
+`disrupt_menu` leads with `DEAUTH` in both places it offers the three keys — the picker and the
+"Nothing is expected to work — try anyway?" fallback, which since 2026-11-15 hands back
+`DEAUTH BOTH CSA` and not `BOTH DEAUTH CSA` — and `posture_why` says a CSA **lands only with an
+injector configured** and is `fw-broken` without; the labels are in the Posture bullets above.
 Timings: `RESP_LOCK_SECS`, `RESP_SETTLE_SECS` — both starred and wired; the lock must exceed
 fire + settle or it expires mid-measurement.
 `RESPONSE` **defaults to 1** — recon and response are both live out of the box; `RESPONSE=0` is the
@@ -415,17 +447,29 @@ firmware defect, not the station's choice (see "Third contact").* The sweep is k
 that survived the refutation: broadcast reaches members the capture never enumerated, targeted
 reaches a member whose traffic the BSS-wide frame somehow misses, and the two cost n+1 frames
 together. It is guarded on `attack_scope`, not on `R_TARGET`, and never runs for `CSA`. Since
-2026-11-09 it sweeps **heard** members, not only measurable ones — the transmit set and the
-measurement set are no longer the same array, which is what had silenced the rung entirely on an AP
-whose only client carried a randomised MAC. `RECON_FRESH` **defaults to 1** and starts
+2026-11-09 it sweeps **heard** members, not only measurable ones: `subjects` is one array — the
+sweep and the verdict loop both iterate it — and what changed is that a heard-but-unmeasurable
+member is now admitted to it with `p0 '-'`, which scores it `INCONCLUSIVE` instead of keeping it off
+the air. That is what had silenced the rung entirely on an AP whose only client carried a randomised
+MAC. *Reworded 2026-11-15: this said "the transmit set and the measurement set are no longer the
+same array", which no reading of `resp_fire` supports — there is one `subjects` array and always
+was. "Third contact"'s wording is the accurate one.* `RECON_FRESH` **defaults to 1** and starts
 a fresh Recon session at launch, so a run reports what is transmitting now; it wipes the Recon
 session for anything else using it, which is why it is starred. `attack_scope <key>` → `cli`|`bss` is the single place that decides blast radius:
-only `DEAUTH` on a client row is targeted, because `CSA` has no target argument and `_ALL`'s is
-parsed and discarded, and an AP row resolves `R_TARGET` to broadcast so everything is BSS-wide
-there. `disrupt_menu` reads it twice — the picker appends ` bss` to a broad option, and the
-pre-transmit confirm says "on EVERY client of <bssid>" instead of naming one device. `posture_opts`
-still orders by efficacy, so a BSS-wide attack stays preselected on the common badges; the marker
-and the confirm carry the breadth rather than the ordering.
+only `DEAUTH` on a client row is targeted. `CSA` takes `<bssid> <ch>` and has no target argument at
+all, so it is BSS-wide by construction; `BOTH` stays `bss` because its CSA leg is BSS-wide by that
+same construction and because, at the shipped `SWEEP_TARGETED=1`, the targeted sweep follows its
+deauth to every heard member anyway. An AP row resolves `R_TARGET` to broadcast, so everything is
+BSS-wide there. *The old reason — "`_ALL`'s target is parsed and discarded" — is withdrawn
+2026-11-15: `BOTH` is no longer `_ALL`, and `_ALL` was never a deauth. `_ALL` and `_CSA` both send
+opcode 402 and build no deauth frame at all (see "Third contact"), so there is no
+accepted-and-discarded target left to appeal to.* The corner where the label over-warns is
+`SWEEP_TARGETED=0`: a client-row `BOTH` is then one targeted deauth plus a BSS-wide CSA leg, and the
+confirm still says "on EVERY client of <bssid>". `disrupt_menu` reads it twice — the picker appends
+` bss` to a broad option, and the pre-transmit confirm says "on EVERY client of <bssid>" instead of
+naming one device (both verified in `disrupt_menu`). `posture_opts` **no longer orders by efficacy**:
+`DEAUTH` leads on every badge that offers anything, so what `pick_list` preselects on a client row is
+the targeted attack, and the ` bss` marker and the confirm carry the breadth of the other two.
 **`resp_snapshot <scope>` reads it too, and that was a defect until 2026-11-03**: subjects were
 selected by *row type* (`R_TARGET == ff:ff:ff:ff:ff:ff`), so a client-row `CSA`/`BOTH` transmitted
 BSS-wide and then measured and looted exactly one device. Subjects now follow the attack's scope,
@@ -1385,12 +1429,20 @@ while `_All` and `_Csa` are **both exactly 668 bytes** and parse it **once**; an
 **The inference, kept separate and tagged [A] because it is one:** three independent size
 measurements put `_All` with `_Csa` rather than with `_Deauth`, and `_Csa`'s single MAC is
 unambiguously the BSSID — so `_All`'s struct is `{bssid, channel}` and its one `ParseMAC` is the
-BSSID. `resp_fire` (`payload.sh:1871`) still passes three positionals and Go's `json.Unmarshal`
-drops the unknown field silently.
+BSSID. ~~`resp_fire` (`payload.sh:1871`) still passes three positionals and Go's `json.Unmarshal`
+drops the unknown field silently.~~ *Struck 2026-11-15, both halves: the line number no longer lands
+in `resp_fire` (cite the function, the other session is moving the file), and no CamHound call
+reaches `_All` any more. `response_cmd` maps `BOTH` to `PINEAPPLE_DEAUTH_CLIENT` — opcode 400 —
+whose three positionals are `<bssid> <target> <ch>` and are all parsed, so the dropped-field
+reasoning describes a call the payload no longer makes. `_All` survives in this repo only as a
+measured fact about the firmware.*
 
 So **`BOTH` hits every client on the BSSID while `DEAUTH` beside it in the same menu hits one** —
-and `posture_opts` lists `BOTH` first on the common badges while `pick_list` preselects element 0,
-so **the broad attack is the default**. The payload's own comment documented `_ALL` as taking
+~~and `posture_opts` lists `BOTH` first on the common badges while `pick_list` preselects element 0,
+so **the broad attack is the default**~~. *Struck 2026-11-15, as this section's own heading has said
+since 2026-11-09: `posture_opts` returns `DEAUTH BOTH CSA` on every badge that offers anything, so
+element 0 — what `pick_list` preselects — is the targeted key, and `disrupt_menu`'s "try anyway"
+fallback offers that same order.* The payload's own comment documented `_ALL` as taking
 `[target]` because hak5cmd's help says so; that comment is now corrected in place. Third instance
 of help-not-matching-code in this binary, and the first with an operator-visible consequence.
 *Falsified by:* firing `BOTH` at one client among several and seeing whether the others stay
@@ -1439,7 +1491,8 @@ Three consequences for CamHound. All are **pre-existing defects that become visi
 2.0.0 regressions** — they behave identically on both firmwares, and were simply unreachable while
 `RECON CLIENTS` returned nothing. Line numbers are master's and will drift:
 
-1. **`JQ_CLI` (`payload.sh:664`) reads probes as `.probes // .probed_ssids // .probed`** — none of
+1. **`JQ_CLI` (cited by name: `payload.sh:664` no longer lands there) reads probes as
+   `.probes // .probed_ssids // .probed`** — none of
    the three exists. The key is **`probe`, singular**, and it is an **object, not an array**, so
    adding `.probe` to that chain *still* yields nothing: `$p0` becomes the object, the
    `if type == "array"` guard wraps it as `[$p0]`, and `map(.ssid // "")` returns `""` because the
@@ -1580,13 +1633,16 @@ payloads and one matters in a chamber:
 
 So on 1.1.3 `--archive` was a no-op *and* malformed (`__archive_dir` was unset, plus a double
 `shift` that broke the single-file case), and `--remove` echoed. On 2.0.0 both are real.
-`library/user/exfiltration/wigle-toolkit/payload.sh:121` therefore **really deletes loot** on the
-`LEFT` path, and its "Press A if OK" gate at `:102` was decorative on 1.1.3 because nothing
-happened either way. **Identical keystrokes, identical UI, real deletion.**
+`library/user/exfiltration/wigle-toolkit/payload.sh` therefore **really deletes loot** on the
+`LEFT` path — the branch that sets `opt="--remove"` — and the "Press A if OK" gate right below it
+was decorative on 1.1.3 because nothing happened either way. *Cites de-numbered 2026-11-15: they
+read `:121` and `:102`, and neither lands any more (the file gained the warning comment that the
+2.0.0 reading prompted); the `LEFT` branch and its gate are what they meant.* **Identical keystrokes, identical UI, real deletion.**
 
 *(One framing correction: `od` ships in neither image, so CamHound's `od` fallbacks in
 `pcap_words`/`pcap_bytes` never execute on a Pager. That is **by design, not dead code** — the
-comment at `payload.sh:519` says so, and the branch exists for the laptop `--replay`/`--selftest`
+comment above `capture_ready` says so (it was cited as `payload.sh:519`, which no longer lands
+there), and the branch exists for the laptop `--replay`/`--selftest`
 path on hosts that lack `hexdump`. The finding confirms that comment's "a Pager always has busybox
 hexdump" assumption.)*
 
