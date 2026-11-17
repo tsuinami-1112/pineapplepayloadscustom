@@ -465,8 +465,9 @@ band_of() {
 #     MFPR (required) = bit 6 -> 0x40 of the low octet
 #   Extended Capabilities (ID 127): Beacon Protection = bit 84 -> octet 10 (0-based), mask 0x10.
 #     Beacon protection is NOT in the RSNXE (ID 244) -- that element has no such bit.
-# Badges: D+C both work | D?+C deauth is per-client, CSA works | C CSA only
-#         NONE both blocked | NOINJ radio may not transmit here | ? posture unread
+# Badges: D+C deauth lands | D?+C deauth per-client | C deauth ignored -- on all three a CSA needs
+#         an injector | NONE PMF + beacon protection, nothing forged is expected to work
+#         | NOINJ cannot inject here (pineapd on DFS and 6 GHz, the reg table elsewhere) | ? posture unread
 declare -A POSTURE POSTURE_TS POSTURE_RSN_C POSTURE_EXT_C   # badge, read time, and the caps it was read from, per BSSID
 
 hex_octet() {   # hex_octet <hexstring> <index0> -> decimal octet, nonzero rc if short
@@ -646,7 +647,7 @@ posture_from_caps() {   # posture_from_caps <rsncaps_hex|-> <extcap_hex|-> <band
 # with the two BSS-wide keys on the list below it. DEAUTH leads because it is the one key measured
 # to reach the air here, not because the list is ranked -- there is no ranking. The ' bss' marker
 # and the confirm carry the breadth, rather than demoting the attack most likely to work. (Until
-# a9575a2 this led BOTH, so a BSS-wide attack was the default on every badge; this comment opened
+# 82fa566 this led BOTH, so a BSS-wide attack was the default on every badge; this comment opened
 # by claiming an efficacy ordering long after that stopped being true, which is withdrawn, and
 # CLAUDE.md and RESPONSE.md withdraw it too. The phrase is left unquoted on purpose, so grepping
 # for it finds no copy that reads as an assertion.)
@@ -3688,7 +3689,7 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
   if [ -z "$opts" ]; then
     LOG red "$(posture_why "$badge")"
     confirm "Nothing is expected to work ($badge). Try anyway?" || return 0
-    # Same order as posture_opts, which leads DEAUTH on every badge it offers anything for (a9575a2)
+    # Same order as posture_opts, which leads DEAUTH on every badge it offers anything for (82fa566)
     # because it is the one key measured to reach the air on this firmware. pick_list preselects
     # element 0, so this string IS the default attack on a badge where nothing is expected to work;
     # it led BOTH until 2026-11-15, i.e. the blind fallback preselected a different key from every
@@ -3742,8 +3743,16 @@ posture_why() {
     # the frame whoever sends it, and on 5 GHz DFS only gate 1 (pineapd's compiled refusal) fires,
     # which pagerinj bypasses, but no frame has ever been shown to reach the air there.
     # CLAUDE.md "First contact" has the two-gate asymmetry.
-    'NONE')  printf 'PMF + beacon protection: no forged frame works, injector or not' ;;
-    'NOINJ') printf 'DFS or 6 GHz: pineapd refuses here; an injector is unproven on DFS, dropped on 6 GHz' ;;
+    # NOINJ has a THIRD producer the first rewording left out (caught by the fix round's intent
+    # lens): csa_injectable also refuses any channel the live `iw phy channels` table marks
+    # disabled or No IR -- 2.4 GHz 12-14 and 5 GHz 169/173/177 under US -- and, with no probe read,
+    # everything outside 2.4 GHz 1-11 and 5 GHz 36-48. Neither set is DFS or 6 GHz and pineapd
+    # refuses neither, so "DFS or 6 GHz: pineapd refuses here" named the wrong gate and the wrong
+    # sender there. "The reg table the rest" is that producer: a gate-2 verdict no sender gets past.
+    # The NONE line is hedged because beacon protection needs the CLIENT to have installed a BIGTK,
+    # which a beacon cannot show -- the AP's bit 84 is policy, not client behaviour.
+    'NONE')  printf 'PMF + beacon protection: no forged frame is expected to work, injector or not' ;;
+    'NOINJ') printf 'cannot inject here: pineapd refuses DFS and 6 GHz, the reg table the rest; an injector is unproven on DFS, dropped on 6 GHz' ;;
     *)       printf 'posture unread: no beacon captured' ;;
   esac
 }
@@ -4729,6 +4738,11 @@ IWFIX
   st "posture_why covers NOINJ" "$(posture_why NOINJ | grep -c 'pineapd refuses')" "1"
   st "posture_why: NOINJ says what an injector changes and what it does not" \
      "$(posture_why NOINJ | grep -c 'unproven on DFS, dropped on 6 GHz')" "1"
+  # csa_injectable's third producer -- a channel the live table marks disabled or No IR, or anything
+  # outside the always-safe set when no table was read -- is neither DFS nor 6 GHz, and pineapd does
+  # not refuse it; the line must name it rather than blame pineapd for every NOINJ.
+  st "posture_why: NOINJ names the regulatory table, not pineapd, for the rest" \
+     "$(posture_why NOINJ | grep -c 'the reg table the rest')" "1"
   st "posture_why: beacon protection is not an injector problem either" \
      "$(posture_why NONE | grep -c 'injector or not')" "1"
   # posture_why and posture_expect land on the same screen, so they must not disagree about the
@@ -4926,7 +4940,7 @@ IWFIX
   # taken, so a capped-after-sending injector writes CMD_REFUSED for frames that left the radio)
   # and `crc == 0` alone (the same on the BOTH arm, so the loot stops naming a leg that sent).
   local o_lock3 o_unlock3 o_mem3 o_snap3 o_csa3 o_set3="$RESP_SETTLE_SECS" o_swp3="$SWEEP_TARGETED"
-  local ST_SUB=ec:71:db:00:00:21
+  local ST_SUB=ec:71:db:00:00:21 ST_SUB2=ec:71:db:00:00:22   # ST_SUB2 only with ST_TWO=1; iterated after ST_SUB
   o_lock3=$(declare -f lock_target);   o_unlock3=$(declare -f unlock_target)
   o_mem3=$(declare -f resp_members);   o_snap3=$(declare -f resp_snapshot)
   o_csa3=$(declare -f csa_issue)
@@ -4949,8 +4963,10 @@ IWFIX
       else
         RS_PK[$ST_SUB]=20; RS_T[$ST_SUB]=200       # counter advanced -> NO_EFFECT
       fi
+      [ "${ST_TWO:-0}" = 1 ] && { RS_PK[$ST_SUB2]=10; RS_T[$ST_SUB2]=200; }   # packets flat, last-seen moved -> INCONCLUSIVE natively
     else
       printf 'x' >"$tmp/snapn"; RS_PK[$ST_SUB]=10; RS_T[$ST_SUB]=100
+      [ "${ST_TWO:-0}" = 1 ] && { RS_PK[$ST_SUB2]=10; RS_T[$ST_SUB2]=100; }
     fi
     return 0
   }
@@ -4998,6 +5014,16 @@ IWFIX
   st_fire3 CSA 3 >/dev/null
   st "fire CSA: a downgraded verdict keeps the raw word in events.log" \
      "$(grep -c 'INCONCLUSIVE pk 10 -> 10 present=1 raw=MOVED (CSA send unproven)' "$tmp/events.log")" "1"
+  # Two subjects, one read down and one natively INCONCLUSIVE (packets flat, last-seen moved): the
+  # raw word must stay on the subject whose counters said MOVED. `raw` is reset per subject, and
+  # without the reset the second line inherits the first's reading -- the wrong-attribution class
+  # posture_of's cache had. The reset was pinned by nothing until the fix round's impact lens
+  # deleted it and failed zero checks; this is the check that pins it. ST_SUB is iterated first
+  # (bash's hash order for these two keys, measured), which is what gives the mutation teeth.
+  ST_TWO=1; st_fire3 CSA 3 >/dev/null
+  st "fire CSA: with two subjects the raw word stays on the one whose counters stalled" \
+     "$(grep -c "$ST_SUB INCONCLUSIVE pk 10 -> 10 present=1 raw=MOVED (CSA send unproven)" "$tmp/events.log") $(grep -c "$ST_SUB2 INCONCLUSIVE pk 10 -> 10 present=1\$" "$tmp/events.log") $(grep -c "$ST_SUB2 .*raw=" "$tmp/events.log")" "1 1 0"
+  ST_TWO=0
   # The BOTH arm on the SAME counters: the opcode-400 deauth has already left the radio, so its
   # verdicts keep a transmission behind them and MOVED stands. This is the asymmetry that is real.
   st "fire BOTH: rc 3 on the same stalled counters still loots MOVED" \
@@ -5041,7 +5067,7 @@ IWFIX
      "$(sed -n 1p "$tmp/locksecs")/$(sed -n 2p "$tmp/locksecs")" "26/20"
   CSA_INJ_SECS="$o_cs3"; CSA_INJ_WAIT="$o_cw3"; RESP_LOCK_SECS="$o_rl3"; CLI_CAP_SECS="$o_cc3"
   rm -f "$tmp/locksecs"
-  unset ST_CRC ST_GONE ST_STALL; unset -f st_fire3
+  unset ST_CRC ST_GONE ST_STALL ST_TWO; unset -f st_fire3
   rm -f "$tmp/snapn" "$tmp/fired" "$tmp/responses.tsv" "$tmp/events.log"
   eval "$o_lock3"; eval "$o_unlock3"; eval "$o_mem3"; eval "$o_snap3"; eval "$o_csa3"
   RESP_SETTLE_SECS="$o_set3"; SWEEP_TARGETED="$o_swp3"

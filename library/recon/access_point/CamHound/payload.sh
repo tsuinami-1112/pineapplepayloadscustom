@@ -455,8 +455,9 @@ band_of() {
 #     MFPR (required) = bit 6 -> 0x40 of the low octet
 #   Extended Capabilities (ID 127): Beacon Protection = bit 84 -> octet 10 (0-based), mask 0x10.
 #     Beacon protection is NOT in the RSNXE (ID 244) -- that element has no such bit.
-# Badges: D+C both work | D?+C deauth is per-client, CSA works | C CSA only
-#         NONE both blocked | NOINJ radio may not transmit here | ? posture unread
+# Badges: D+C deauth lands | D?+C deauth per-client | C deauth ignored -- on all three a CSA needs
+#         an injector | NONE PMF + beacon protection, nothing forged is expected to work
+#         | NOINJ cannot inject here (pineapd on DFS and 6 GHz, the reg table elsewhere) | ? posture unread
 declare -A POSTURE POSTURE_TS POSTURE_RSN_C POSTURE_EXT_C   # badge, read time, and the caps it was read from, per BSSID
 
 hex_octet() {   # hex_octet <hexstring> <index0> -> decimal octet, nonzero rc if short
@@ -636,7 +637,7 @@ posture_from_caps() {   # posture_from_caps <rsncaps_hex|-> <extcap_hex|-> <band
 # with the two BSS-wide keys on the list below it. DEAUTH leads because it is the one key measured
 # to reach the air here, not because the list is ranked -- there is no ranking. The ' bss' marker
 # and the confirm carry the breadth, rather than demoting the attack most likely to work. (Until
-# a9575a2 this led BOTH, so a BSS-wide attack was the default on every badge; this comment opened
+# 82fa566 this led BOTH, so a BSS-wide attack was the default on every badge; this comment opened
 # by claiming an efficacy ordering long after that stopped being true, which is withdrawn, and
 # CLAUDE.md and RESPONSE.md withdraw it too. The phrase is left unquoted on purpose, so grepping
 # for it finds no copy that reads as an assertion.)
@@ -2594,7 +2595,7 @@ disrupt_menu() {   # the three attacks, ordered and labelled by what the beacon 
   if [ -z "$opts" ]; then
     LOG red "$(posture_why "$badge")"
     confirm "Nothing is expected to work ($badge). Try anyway?" || return 0
-    # Same order as posture_opts, which leads DEAUTH on every badge it offers anything for (a9575a2)
+    # Same order as posture_opts, which leads DEAUTH on every badge it offers anything for (82fa566)
     # because it is the one key measured to reach the air on this firmware. pick_list preselects
     # element 0, so this string IS the default attack on a badge where nothing is expected to work;
     # it led BOTH until 2026-11-15, i.e. the blind fallback preselected a different key from every
@@ -2648,8 +2649,16 @@ posture_why() {
     # the frame whoever sends it, and on 5 GHz DFS only gate 1 (pineapd's compiled refusal) fires,
     # which pagerinj bypasses, but no frame has ever been shown to reach the air there.
     # CLAUDE.md "First contact" has the two-gate asymmetry.
-    'NONE')  printf 'PMF + beacon protection: no forged frame works, injector or not' ;;
-    'NOINJ') printf 'DFS or 6 GHz: pineapd refuses here; an injector is unproven on DFS, dropped on 6 GHz' ;;
+    # NOINJ has a THIRD producer the first rewording left out (caught by the fix round's intent
+    # lens): csa_injectable also refuses any channel the live `iw phy channels` table marks
+    # disabled or No IR -- 2.4 GHz 12-14 and 5 GHz 169/173/177 under US -- and, with no probe read,
+    # everything outside 2.4 GHz 1-11 and 5 GHz 36-48. Neither set is DFS or 6 GHz and pineapd
+    # refuses neither, so "DFS or 6 GHz: pineapd refuses here" named the wrong gate and the wrong
+    # sender there. "The reg table the rest" is that producer: a gate-2 verdict no sender gets past.
+    # The NONE line is hedged because beacon protection needs the CLIENT to have installed a BIGTK,
+    # which a beacon cannot show -- the AP's bit 84 is policy, not client behaviour.
+    'NONE')  printf 'PMF + beacon protection: no forged frame is expected to work, injector or not' ;;
+    'NOINJ') printf 'cannot inject here: pineapd refuses DFS and 6 GHz, the reg table the rest; an injector is unproven on DFS, dropped on 6 GHz' ;;
     *)       printf 'posture unread: no beacon captured' ;;
   esac
 }

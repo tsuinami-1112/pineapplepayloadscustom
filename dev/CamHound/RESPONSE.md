@@ -168,8 +168,9 @@ the `fw-broken` short-circuit is reached, and those two badges are reachable in 
 badges are exceptions. Falsified by: `posture_expect NOINJ CSA` or `posture_expect NONE CSA`
 printing `fw-broken` with `CSA_INJECTOR` empty.* `posture_why` carries the same sentence onto the screen in one line, and on
 those two badges says instead what an injector does and does not buy: `NONE` → "PMF + beacon
-protection: no forged frame works, injector or not", `NOINJ` → "DFS or 6 GHz: pineapd refuses here;
-an injector is unproven on DFS, dropped on 6 GHz" (the gate asymmetry below).
+protection: no forged frame is expected to work, injector or not", `NOINJ` → "cannot inject here:
+pineapd refuses DFS and 6 GHz, the reg table the rest; an injector is unproven on DFS, dropped on
+6 GHz" (the gate asymmetry below).
 
 Two honest limits baked into the model. `D?+C` **cannot be resolved from a beacon at all**, because
 PMF is negotiated per client — a transition-mode BSS can hold protected and unprotected clients
@@ -265,7 +266,8 @@ that fallback offers `DEAUTH BOTH CSA`, in that order, for the same reason the p
   return `blocked` and `?` returns `unknown` earlier. Falsified by: `posture_expect C BOTH` with an
   executable `CSA_INJECTOR` printing anything else.* Beside them the deauth half still carries
   the badge's own word — `works` with no PMF, `partial` under PMF-optional, `blocked` under
-  PMF-required and at `NONE`/`NOINJ` — and everything at badge `?` is `unknown`.
+  PMF-required and at `NONE`/`NOINJ` — and everything at badge `?` is `unknown`, except `CSA` with
+  no injector, which the `fw-broken` short-circuit answers first (§3 above has the branch order).
   *The flat `works | partial | blocked | unknown` list this line carried until 2026-11-15 is
   withdrawn as a specification of the set.* It was written when the label depended on the badge
   alone, and it hid the case that mattered most: with an injector configured — the one configuration
@@ -275,13 +277,20 @@ that fallback offers `DEAUTH BOTH CSA`, in that order, for the same reason the p
 - `posture_why <badge>` → one line of plain English for the screen. Its CSA half says that CSA lands
   **only with an injector configured**, and is `fw-broken` without one. On the two badges that offer
   nothing it names what an injector changes there, because `posture_expect` says only `blocked`:
-  `NONE` → "PMF + beacon protection: no forged frame works, injector or not" (the forgery is what
-  beacon protection defeats, so the sender is beside the point), `NOINJ` → "DFS or 6 GHz: pineapd
-  refuses here; an injector is unproven on DFS, dropped on 6 GHz" (the two gates below: on 5 GHz DFS
-  only gate 1 fires, which `pagerinj` bypasses, and no frame has yet been shown to reach the air
-  there; on 6 GHz gate 2 fires too and cfg80211 drops it silently). *Both lines reworded 2026-11-17;
-  they read "no frame this firmware sends works" and "the radio may not transmit on this channel",
-  neither of which distinguishes the two gates or mentions an injector.*
+  `NONE` → "PMF + beacon protection: no forged frame is expected to work, injector or not" (the
+  forgery is what beacon protection defeats, so the sender is beside the point; "expected" because
+  the client must have installed a BIGTK for that, which a beacon cannot show), `NOINJ` → "cannot
+  inject here: pineapd refuses DFS and 6 GHz, the reg table the rest; an injector is unproven on
+  DFS, dropped on 6 GHz" (the two gates below: on 5 GHz DFS only gate 1 fires, which `pagerinj`
+  bypasses, and no frame has yet been shown to reach the air there; on 6 GHz gate 2 fires too and
+  cfg80211 drops it silently; and "the reg table the rest" is `csa_injectable`'s third producer, a
+  channel the live table marks disabled or No IR — 2.4 GHz 12-14 and 5 GHz 169/173/177 under US —
+  or anything outside 2.4 GHz 1-11 and 5 GHz 36-48 when no table was read, a gate-2 verdict no
+  sender gets past). *Both lines reworded 2026-11-17; they read "no frame this firmware sends
+  works" and "the radio may not transmit on this channel", neither of which distinguishes the two
+  gates or mentions an injector. The `NOINJ` line's first rewording, "DFS or 6 GHz: pineapd refuses
+  here; …", blamed pineapd for the third producer too and was caught by the fix round's intent lens
+  the same day.*
 
 ## 5. Target resolution
 

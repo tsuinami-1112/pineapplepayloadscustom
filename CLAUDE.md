@@ -80,7 +80,7 @@ is also an array; the other half of the protection is running the suite under bo
 laptop that lacks BusyBox is where the next such program will be written.
 
 **The harness argument is a scenario filter, not a mode.** `run_harness.sh live` runs the `live`
-scenario alone - 6 checks of 144 - and still prints `0 failure(s)`, which reads exactly like a full
+scenario alone - 6 checks of 147 - and still prints `0 failure(s)`, which reads exactly like a full
 pass. This gate list said `live` until 2026-11-04 and every session that copied it was running a
 fourteenth of the suite (sixteenth now). No argument (or `all`) runs them all; a scenario name runs one,
 which is what you want while iterating, never for the gate.
@@ -363,7 +363,8 @@ rc 2 to disagreement with the target and promises the triple for every rc 2. Nei
 Agreeing samples on a channel that is not `want` are the ENTRY to the fourth read, which returns
 **1** when the read-back lands on target, **3** when it comes back empty, and only then **2**; and
 that branch's text is the `c4` one above, so an operator meeting `ch 7 != 8, lock failed` in
-`events.log` found no row describing it. Read in `lock_target`, both `return 2` sites.* On the
+`events.log` found no row of `RESPONSE.md` §6's rc table describing it. Read in `lock_target`, both
+`return 2` sites.* On the
 rc **0** path `LOCK_TEXT` now names the agreed channel and the raw triple together —
 `<if> ch N, target ch M (samples a/b/c)` — so the `8/8/_` pattern below reports the channel it
 agreed on rather than `ch ?` beside `lock=ok`. *Falsified by:* `lock_target` returning anything but
@@ -387,7 +388,7 @@ where that asymmetry is recorded.
   target's to this response's loot row.
 - `posture_opts <badge>` → the offered attacks in **one fixed order, `DEAUTH` first**; `pick_list`
   preselects element 0, so the string order *is* the default. (*This read "best first" until
-  2026-11-17; the function stopped ordering by efficacy in `a9575a2` and the two statements in this
+  2026-11-17; the function stopped ordering by efficacy in `82fa566` and the two statements in this
   file disagreed — the `disrupt_menu` paragraph below says "no longer orders by efficacy".*)
   The order is `DEAUTH BOTH CSA` on every badge that offers
   anything, and the badge no longer changes it, `DEAUTH` being the only key that reaches the air on
@@ -406,7 +407,9 @@ where that asymmetry is recorded.
   meets on a WPA3 BSS. Read in `posture_expect`'s `BOTH)` branch.* **The old
   `works`/`partial`/`blocked`/`unknown` set is NOT gone**: those four still label the deauth half
   (`works` with no PMF, `partial` under PMF-optional, `blocked` under PMF-required and at
-  `NONE`/`NOINJ`) and every key at badge `?` reads `unknown`. The four sender labels were **added
+  `NONE`/`NOINJ`) and at badge `?` every key reads `unknown` except `CSA` with no injector, which the
+  `fw-broken` short-circuit catches first, the `?` test following it (measured by the fix round's
+  docs sceptic; this said "every key at badge `?` reads `unknown`"). The four sender labels were **added
   beside them** for the CSA-bearing keys. *This line said "the old set is gone as of 2026-11-15"
   until 2026-11-17 — a claim the function contradicts on most paths and the selftest pins against
   (`posture_expect 'D+C' DEAUTH` prints `works`), and which would have invited the next session to
@@ -416,11 +419,17 @@ where that asymmetry is recorded.
   sender rule too — a CSA **lands only with an injector configured, and is `fw-broken` without** —
   in place of the old flat "CSA lands", which promised on every badge the one leg this firmware
   cannot transmit. On the two badges that offer nothing it now says what an injector does and does
-  not buy: `NONE` reads "PMF + beacon protection: no forged frame works, injector or not" and
-  `NOINJ` "DFS or 6 GHz: pineapd refuses here; an injector is unproven on DFS, dropped on 6 GHz"
-  (the asymmetry is "First contact"'s: on 5 GHz DFS only gate 1 fires, so `pagerinj` bypasses it
-  and nothing has yet been shown to reach the air there, while on 6 GHz all 59 channels carry
-  `NO_IR` and cfg80211 drops the frame silently). **`posture_expect` still returns `blocked` on
+  not buy: `NONE` reads "PMF + beacon protection: no forged frame is expected to work, injector or
+  not" and `NOINJ` "cannot inject here: pineapd refuses DFS and 6 GHz, the reg table the rest; an
+  injector is unproven on DFS, dropped on 6 GHz" (the asymmetry is "First contact"'s: on 5 GHz DFS
+  only gate 1 fires, so `pagerinj` bypasses it and nothing has yet been shown to reach the air
+  there, while on 6 GHz all 59 channels carry `NO_IR` and cfg80211 drops the frame silently). "The
+  reg table the rest" is `csa_injectable`'s third producer — a channel the live `iw phy channels`
+  table marks disabled or No IR, 2.4 GHz 12-14 and 5 GHz 169/173/177 under US, and with no table
+  read everything outside 2.4 GHz 1-11 and 5 GHz 36-48 — which is neither DFS nor 6 GHz and which
+  pineapd does not refuse; the fix round's first wording, "DFS or 6 GHz: pineapd refuses here",
+  blamed the wrong gate there and was caught by its intent lens. The `NONE` line is hedged because
+  beacon protection needs the client to have installed a BIGTK, which a beacon cannot show. **`posture_expect` still returns `blocked` on
   both badges whatever the injector is** — deliberate, and pinned by the selftest.
 
 **Injection gates** — `csa_injectable <band> <ch>` models both gates (see below);

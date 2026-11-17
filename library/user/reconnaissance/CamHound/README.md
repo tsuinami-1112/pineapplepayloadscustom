@@ -378,8 +378,9 @@ not a property of the target: pineapd refuses the 16 DFS channels and 6 GHz outr
 drops frames on channels the live regulatory domain marks disabled or no-IR. pineapd logs its refusal
 and returns an error; cfg80211's drop is silent (the frame is freed and `sendto` reports success), so
 CamHound refuses rather than guesses (`csa_injectable`, two gates; see `dev/pager-csa-primitives.md`).
-The two gates are **not symmetrical**, which is why the screen line for `NOINJ` reads "pineapd
-refuses here; an injector is unproven on DFS, dropped on 6 GHz": on 5 GHz DFS only pineapd refuses,
+The two gates are **not symmetrical**, which is why the screen line for `NOINJ` reads "cannot inject
+here: pineapd refuses DFS and 6 GHz, the reg table the rest; an injector is unproven on DFS, dropped
+on 6 GHz" (the "rest" being the disabled and no-IR channels above): on 5 GHz DFS only pineapd refuses,
 so a configured injector bypasses the gate — but nothing has yet been **shown** to reach the air
 there, and the on-device test cannot tell a transmitted frame from a silently dropped one. On 6 GHz
 cfg80211 refuses as well, so an injector changes nothing.
