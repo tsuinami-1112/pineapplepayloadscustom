@@ -352,9 +352,24 @@ It is returned when no sample can be read back at all, when only ONE of the thre
 readable (one sample cannot establish that the radio is parked), and when the read after
 `EXAMINE_CHANNEL` comes back empty. All three write `lock=unverified` to the loot and carry on,
 which is the point: refusing every response on a device whose channel will not read back is worse
-than labelling it. rc **2** is the refusal, and it belongs to readable samples that *disagree* —
-with each other, or with the target channel — whose log line prints the raw, pre-backfill triple
-(`_/6/11`) rather than the repaired one. **Since 2026-11-15 an unreadable LAST sample is handled
+than labelling it. rc **2** is the refusal, and it has **two producers, not one**. (i) Readable
+samples that *disagree with each other* — the hopping branch, whose log line prints the raw,
+pre-backfill triple rather than the repaired one (`wlan1mon still hopping (samples _/6/11): lock
+failed`). (ii) Samples that agree with each other on the **wrong** channel, where the read after
+`EXAMINE_CHANNEL` then lands elsewhere too — `ch 7 != 8, lock failed`, which names no samples at
+all. *Corrected 2026-11-17: this read "readable samples that disagree — with each other, or with
+the target channel — whose log line prints the raw, pre-backfill triple", which both attributes
+rc 2 to disagreement with the target and promises the triple for every rc 2. Neither holds.
+Agreeing samples on a channel that is not `want` are the ENTRY to the fourth read, which returns
+**1** when the read-back lands on target, **3** when it comes back empty, and only then **2**; and
+that branch's text is the `c4` one above, so an operator meeting `ch 7 != 8, lock failed` in
+`events.log` found no row describing it. Read in `lock_target`, both `return 2` sites.* On the
+rc **0** path `LOCK_TEXT` now names the agreed channel and the raw triple together —
+`<if> ch N, target ch M (samples a/b/c)` — so the `8/8/_` pattern below reports the channel it
+agreed on rather than `ch ?` beside `lock=ok`. *Falsified by:* `lock_target` returning anything but
+2 for three readable agreeing samples whose value differs from a non-zero `want` and whose fourth
+read differs too, or that branch printing the triple.
+**Since 2026-11-15 an unreadable LAST sample is handled
 like any other unreadable sample: `8/8/_` returns rc 0 exactly as `_/8/8` does**, two readable
 samples that agree with each other and with the target being a verified park whichever slot came
 back blank. Until then an empty third sample short-circuited to rc 3 before the comparison ran, so
@@ -370,20 +385,43 @@ where that asymmetry is recorded.
   sets globals in the caller's shell. It resets `POSTURE_RSN`/`POSTURE_EXT` on entry and caches the caps
   per BSSID beside the badge, so a cache hit restores this target's caps and never attributes a previous
   target's to this response's loot row.
-- `posture_opts <badge>` → the offered attacks, **best first**; `pick_list` preselects element 0, so
-  the string order *is* the default. The order is `DEAUTH BOTH CSA` on every badge that offers
+- `posture_opts <badge>` → the offered attacks in **one fixed order, `DEAUTH` first**; `pick_list`
+  preselects element 0, so the string order *is* the default. (*This read "best first" until
+  2026-11-17; the function stopped ordering by efficacy in `a9575a2` and the two statements in this
+  file disagreed — the `disrupt_menu` paragraph below says "no longer orders by efficacy".*)
+  The order is `DEAUTH BOTH CSA` on every badge that offers
   anything, and the badge no longer changes it, `DEAUTH` being the only key that reaches the air on
   this firmware. Empty means nothing is offered (`NOINJ` and `NONE`), and `disrupt_menu` then asks
   "Nothing is expected to work — try anyway?"; **since 2026-11-15 that fallback offers
   `DEAUTH BOTH CSA` too**, where it used to hand back `BOTH DEAUTH CSA` and so preselect the broad
   attack in the one case where nothing is expected to work at all.
-- `posture_expect`, `posture_why` → the picker label and the one-line explanation. The labels of
-  record follow the SENDER, not the badge: `fw-broken` for a firmware CSA, `injector` for a CSA
-  routed to `CSA_INJECTOR`, `deauth+csa` for `BOTH` with an injector configured, `deauth only` for
-  `BOTH` without. *The old `works`/`partial`/`blocked`/`unknown` set is gone as of 2026-11-15.*
-  `posture_why`'s CSA clause follows the same rule — a CSA **lands only with an injector
-  configured, and is `fw-broken` without** — in place of the old flat "CSA lands", which promised
-  on every badge the one leg this firmware cannot transmit.
+- `posture_expect`, `posture_why` → the picker label and the one-line explanation. Four labels
+  follow the SENDER rather than the badge: `fw-broken` for a firmware CSA; `injector` for a CSA
+  routed to `CSA_INJECTOR` **and for `BOTH` on badge `C` with one configured** (the deauth half
+  cannot land under PMF-required, so the label names the leg that does send — `posture_why`'s line
+  beside it still says the deauth is ignored); `deauth+csa` for `BOTH` with an injector on `D+C`;
+  `deauth only` for `BOTH` without one. *Corrected 2026-11-17: this read "`deauth+csa` for `BOTH`
+  with an injector configured" flatly, and `BOTH`'s label under an injector is the badge's business
+  too — `deauth+csa` on `D+C`, `partial` on `D?+C`, `injector` on `C`, which is the arm an operator
+  meets on a WPA3 BSS. Read in `posture_expect`'s `BOTH)` branch.* **The old
+  `works`/`partial`/`blocked`/`unknown` set is NOT gone**: those four still label the deauth half
+  (`works` with no PMF, `partial` under PMF-optional, `blocked` under PMF-required and at
+  `NONE`/`NOINJ`) and every key at badge `?` reads `unknown`. The four sender labels were **added
+  beside them** for the CSA-bearing keys. *This line said "the old set is gone as of 2026-11-15"
+  until 2026-11-17 — a claim the function contradicts on most paths and the selftest pins against
+  (`posture_expect 'D+C' DEAUTH` prints `works`), and which would have invited the next session to
+  delete labels the picker prints. `RESPONSE.md` §4 had the narrow, true form all along: the flat
+  list is withdrawn as a *specification of the set*, not retired. Falsified by: a `posture_expect`
+  that returns none of the four on any (badge, key) pair.* `posture_why`'s CSA clause follows the
+  sender rule too — a CSA **lands only with an injector configured, and is `fw-broken` without** —
+  in place of the old flat "CSA lands", which promised on every badge the one leg this firmware
+  cannot transmit. On the two badges that offer nothing it now says what an injector does and does
+  not buy: `NONE` reads "PMF + beacon protection: no forged frame works, injector or not" and
+  `NOINJ` "DFS or 6 GHz: pineapd refuses here; an injector is unproven on DFS, dropped on 6 GHz"
+  (the asymmetry is "First contact"'s: on 5 GHz DFS only gate 1 fires, so `pagerinj` bypasses it
+  and nothing has yet been shown to reach the air there, while on 6 GHz all 59 channels carry
+  `NO_IR` and cfg80211 drops the frame silently). **`posture_expect` still returns `blocked` on
+  both badges whatever the injector is** — deliberate, and pinned by the selftest.
 
 **Injection gates** — `csa_injectable <band> <ch>` models both gates (see below);
 `PINEAPD_DFS_BLOCKED` mirrors the firmware's hardcoded set; `inj_probe` reads the **transmitting
@@ -426,12 +464,26 @@ N > 0 in the injector's own summary, and a wrapper status of 124 or ≥ 128 with
 rc **3**, "capped with no send evidence" — before this round every 124 scored 2 unconditionally.
 rc **1** remains the refusal (nothing sent), rc **0** the clean run. Both call sites in `resp_fire`
 take rc 2 as a send. rc 3 proceeds to the measurement as well, but it is carried rather than
-forgotten: on the `CSA` arm a `NO_EFFECT` verdict is **downgraded to `INCONCLUSIVE`**, because
-"nothing transmitted" explains that counter equally well, while a `MOVED` stands, and the loot's
-legs record names the CSA leg **unknown**; on the `BOTH` arm — where the opcode-400 deauth has
-already left the radio — a CSA leg of rc 1 warns, rc 2 counts as sent and rc 3 is recorded unknown,
-and none of the three fails the attempt. The selftest pins `csa_issue`'s rc 2 and rc 3 and
-`resp_fire`'s acceptance of both at both arms.
+forgotten: on the `CSA` arm **every** verdict behind it is read down to `INCONCLUSIVE` — `MOVED`
+included — because "nothing transmitted" explains each of them equally well. The word that was
+scored is kept rather than lost: the `subject` line in `events.log` carries it as `raw=MOVED`, the
+aggregate screen line gains `; CSA send unproven`, and the loot's legs record names the CSA leg
+**unknown** (`cmd` gains a trailing `?`). *Corrected 2026-11-17: this said "a `MOVED` stands", and
+the reason the code and three docs gave for that asymmetry — an absent frame does not explain a
+subject going quiet — is false. `resp_verdict` has two producers for `MOVED` and both are what an
+idle or wandering device does unprovoked: it dropped out of the Recon list (`present=0`), or its
+packet counter did not advance (`t1 = t0`). The payload's own `attack_scope` comment says so in as
+many words — "an idle camera reads MOVED whether or not anything was transmitted ... MOVED on a
+quiet device is weak" — so two answers sat in one file, one of them justifying a behaviour.
+Measured by the round-2 review: with the selftest stub's post-read set equal to its pre-read, the
+rc-3 case looted `pagerinj:ch1:n3? MOVED 0` and lit `RESPOND_HIT` — green LED and a 300 ms vibrate
+— one screen after the same arm had printed "nothing is claimed". Keeping `MOVED` was defensible
+policy; the stated reason was not, and the doubt never reached the verdict line.* On the `BOTH` arm
+— where the opcode-400 deauth has already left the radio — a CSA leg of rc 1 warns, rc 2 counts as
+sent and rc 3 is recorded unknown, **no verdict is read down** (a `NO_EFFECT` there still has a
+transmission behind it), and none of the three fails the attempt. *Falsified by:* a `MOVED` row in
+`responses.tsv` from a `CSA` attempt whose `cmd` column ends in `?`. The selftest pins
+`csa_issue`'s rc 2 and rc 3 and `resp_fire`'s acceptance of both at both arms.
 `disrupt_menu` leads with `DEAUTH` in both places it offers the three keys — the picker and the
 "Nothing is expected to work — try anyway?" fallback, which since 2026-11-15 hands back
 `DEAUTH BOTH CSA` and not `BOTH DEAUTH CSA` — and `posture_why` says a CSA **lands only with an
@@ -1437,10 +1489,19 @@ whose three positionals are `<bssid> <target> <ch>` and are all parsed, so the d
 reasoning describes a call the payload no longer makes. `_All` survives in this repo only as a
 measured fact about the firmware.*
 
-So **`BOTH` hits every client on the BSSID while `DEAUTH` beside it in the same menu hits one** —
+So ~~**`BOTH` hits every client on the BSSID while `DEAUTH` beside it in the same menu hits one**~~ —
 ~~and `posture_opts` lists `BOTH` first on the common badges while `pick_list` preselects element 0,
-so **the broad attack is the default**~~. *Struck 2026-11-15, as this section's own heading has said
-since 2026-11-09: `posture_opts` returns `DEAUTH BOTH CSA` on every badge that offers anything, so
+so **the broad attack is the default**~~. *First clause struck 2026-11-17: its "So" chained it to
+the `_All` struct inference above, and the call that inference describes is withdrawn in the
+sentence immediately before it. `response_cmd` maps `BOTH` to `PINEAPPLE_DEAUTH_CLIENT` — opcode
+400 — and `resp_fire` fires it at `$R_TARGET`, which on a client row is the picked client, so
+`BOTH`'s deauth leg aims exactly where `DEAUTH`'s does. What makes a client-row `BOTH` BSS-wide at
+the shipped default is the targeted sweep (`SWEEP_TARGETED=1`, guarded on `attack_scope`) together
+with a CSA leg whose signature carries no target at all; at `SWEEP_TARGETED=0` the deauth leg hits
+one client while the confirm still says "on EVERY client of <bssid>" — which the `attack_scope`
+paragraph of the code map above already recorded, so this was the second answer in one file. Read
+in `response_cmd`, `attack_scope` and `resp_fire`'s fire line.* *Struck 2026-11-15, as this
+section's own heading has said since 2026-11-09: `posture_opts` returns `DEAUTH BOTH CSA` on every badge that offers anything, so
 element 0 — what `pick_list` preselects — is the targeted key, and `disrupt_menu`'s "try anyway"
 fallback offers that same order.* The payload's own comment documented `_ALL` as taking
 `[target]` because hak5cmd's help says so; that comment is now corrected in place. Third instance

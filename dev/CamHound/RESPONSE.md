@@ -158,8 +158,18 @@ assuming an offset: version (2) + group cipher (4) + pairwise count (2) + 4×N +
 the badge's verdict on the **channel-switch mechanism**, which is not the same question as whether
 this firmware can send one: pineapd's CSA announces **channel 14 with Channel Switch Count 0** (both
 literals with one call site, no setting reaches either) and `_ALL` builds no deauth frame, so with
-no `CSA_INJECTOR` configured and executable the label is `fw-broken` whatever the beacon says.
-`posture_why` carries the same sentence onto the screen in one line.
+no `CSA_INJECTOR` configured and executable the label is `fw-broken` on every badge the picker
+still speaks for. *Qualified 2026-11-17: this read "whatever the beacon says", which the table's own
+`NONE` and `NOINJ` rows contradict. `posture_expect` returns `blocked` for both **before**
+the `fw-broken` short-circuit is reached, and those two badges are reachable in the picker — the
+"Nothing is expected to work — try anyway?" fallback offers all three keys there. Read in
+`posture_expect`: the `NOINJ` and `NONE` returns precede the `[ "$inj" = 0 ]` CSA case, while the
+`?` test FOLLOWS it — so badge `?` does label CSA `fw-broken` with no injector, and only these two
+badges are exceptions. Falsified by: `posture_expect NOINJ CSA` or `posture_expect NONE CSA`
+printing `fw-broken` with `CSA_INJECTOR` empty.* `posture_why` carries the same sentence onto the screen in one line, and on
+those two badges says instead what an injector does and does not buy: `NONE` → "PMF + beacon
+protection: no forged frame works, injector or not", `NOINJ` → "DFS or 6 GHz: pineapd refuses here;
+an injector is unproven on DFS, dropped on 6 GHz" (the gate asymmetry below).
 
 Two honest limits baked into the model. `D?+C` **cannot be resolved from a beacon at all**, because
 PMF is negotiated per client — a transition-mode BSS can hold protected and unprotected clients
@@ -246,8 +256,14 @@ that fallback offers `DEAUTH BOTH CSA`, in that order, for the same reason the p
   default.
 - `posture_expect <badge> <key>` → the picker's label, which follows the **sender** and not the
   badge alone. The labels of record for the CSA-bearing keys are **`fw-broken`** (the firmware CSA),
-  **`injector`** (CSA routed to `CSA_INJECTOR`), **`deauth+csa`** (`BOTH` with an injector
-  configured) and **`deauth only`** (`BOTH` without one). Beside them the deauth half still carries
+  **`injector`** (a CSA routed to `CSA_INJECTOR`, **and `BOTH` on badge `C` with one configured** —
+  under PMF-required the deauth half cannot land, so the label names the leg that does send),
+  **`deauth+csa`** (`BOTH` with an injector on `D+C`) and **`deauth only`** (`BOTH` without one).
+  *The `injector`-on-`BOTH` arm was added to this bullet 2026-11-17; `posture_expect`'s `BOTH)`
+  branch under an injector reads `deauth+csa` on `D+C`, `partial` on `D?+C` and `injector`
+  otherwise, and `C` is the badge that reaches "otherwise" on shipped firmware — `NONE`/`NOINJ`
+  return `blocked` and `?` returns `unknown` earlier. Falsified by: `posture_expect C BOTH` with an
+  executable `CSA_INJECTOR` printing anything else.* Beside them the deauth half still carries
   the badge's own word — `works` with no PMF, `partial` under PMF-optional, `blocked` under
   PMF-required and at `NONE`/`NOINJ` — and everything at badge `?` is `unknown`.
   *The flat `works | partial | blocked | unknown` list this line carried until 2026-11-15 is
@@ -257,7 +273,15 @@ that fallback offers `DEAUTH BOTH CSA`, in that order, for the same reason the p
   `fw-broken` while `csa_issue` was routing it to `pagerinj` and the loot row recorded two legs
   landing. The picker lied in exactly the case it was there for.
 - `posture_why <badge>` → one line of plain English for the screen. Its CSA half says that CSA lands
-  **only with an injector configured**, and is `fw-broken` without one.
+  **only with an injector configured**, and is `fw-broken` without one. On the two badges that offer
+  nothing it names what an injector changes there, because `posture_expect` says only `blocked`:
+  `NONE` → "PMF + beacon protection: no forged frame works, injector or not" (the forgery is what
+  beacon protection defeats, so the sender is beside the point), `NOINJ` → "DFS or 6 GHz: pineapd
+  refuses here; an injector is unproven on DFS, dropped on 6 GHz" (the two gates below: on 5 GHz DFS
+  only gate 1 fires, which `pagerinj` bypasses, and no frame has yet been shown to reach the air
+  there; on 6 GHz gate 2 fires too and cfg80211 drops it silently). *Both lines reworded 2026-11-17;
+  they read "no frame this firmware sends works" and "the radio may not transmit on this channel",
+  neither of which distinguishes the two gates or mentions an injector.*
 
 ## 5. Target resolution
 
@@ -285,7 +309,7 @@ is most likely to normalise away undocumented:
 | 0 | `ok` | two or more readable samples agree with each other **and** with the target channel — or no target channel was supplied at all (`want 0`), there being nothing to disagree with | transmits |
 | 1 | `by-channel` | the samples agreed but on the wrong channel, and the read after `PINEAPPLE_EXAMINE_CHANNEL` came back equal to the target | transmits |
 | **3** | **`unverified`** | the channel could not be established: no readable sample, exactly **one** readable sample, or an empty read after `EXAMINE_CHANNEL` | **transmits**, and the loot says `unverified` instead of claiming a verification that did not happen |
-| 2 | `failed` | readable samples that **disagree** — the radio is still hopping | refuses: nothing is transmitted and the attempt is looted `LOCK_FAILED` |
+| 2 | `failed` | **either** readable samples that **disagree with each other** — the radio is still hopping — **or** samples that agree on the **wrong** channel where the read after `EXAMINE_CHANNEL` also lands elsewhere (`ch 7 != 8, lock failed`) | refuses: nothing is transmitted and the attempt is looted `LOCK_FAILED` |
 
 **⚠ rc 3 is "unverified, PROCEED". Do not normalise it to 0, and do not fold it into 2.** Refusing
 every response on a device whose channel will not read back is worse than labelling it; and
@@ -294,6 +318,26 @@ two-sample case beside it, since one reading cannot establish that a radio is pa
 maps rc 3 to `lock=unverified`, shows `LOCK_TEXT` to the operator in yellow, and carries on. Four
 separate fixes converged on this shape over two days; CLAUDE.md "Third contact"'s last bullet has
 the sequence.
+
+**rc 2 has two producers and the round-2 review found all three docs describing one.** The row
+above now carries both. They are told apart by the line in `events.log`: the hopping branch prints
+`<if> still hopping (samples _/6/11): lock failed` — the **raw, pre-backfill** triple — while the
+other prints `ch <c4> != <want>, lock failed` and names no samples at all, because by then the
+three samples agreed and the disagreement is between the read-back and the target. Note that
+samples agreeing on a channel that is not `want` do **not** give rc 2 by themselves: they are the
+entry to the fourth read, which returns 1 when it lands on target, 3 when it comes back empty and
+2 only when it lands somewhere else. Read in `lock_target`, at both of its `return 2` sites.
+*Falsified by:* that `c4` branch being unreachable — e.g. an earlier guard making `c4` equal to
+`want` whenever it is readable.
+
+**On rc 0 `LOCK_TEXT` names the channel it agreed on and the raw triple together**, in the form
+`<if> ch N, target ch M (samples a/b/c)`. It is set before the backfill as well as after, and until
+2026-11-17 only the pre-backfill assignment survived on the rc-0 path — so the `8/8/_` pattern,
+which has returned rc 0 since 2026-11-15, told the operator `ch ?` beside `lock=ok` — and `ch ?`
+is not a cosmetic slip there, because Watch's INCONCLUSIVE card and Stimulus's both print
+`LOCK_TEXT` whatever rc the lock returned (rc 2 aborts before the card), so the one screen where
+the operator asks whether the radio was parked pointed at the lock as the cause of the missing
+frames. *Falsified by:* an `8/8/_` lock at `want 1` whose text contains `ch ?`.
 
 **Two readable samples are two readable samples, whichever one was missing.** An unreadable sample
 is a *missing reading*, not a different channel — `cur_channel` prints nothing when it cannot parse
@@ -478,8 +522,19 @@ exited with — so the wrapper's status is not the injector's verdict either.
 |---|---|---|
 | 0 | the sender ran clean | injector rc 0; or the firmware command rc 0 **with empty stderr** |
 | **2** | **frames DID leave the radio, and the run was then capped by its own timeout** | `sent=N` with N > 0 on the injector's own stderr. Nothing else is accepted as proof of a send |
-| **3** | **capped with no send evidence** — the wrapper expired (status 124, or ≥ 128 for a signal) and there is no `sent=` line | the *absence* of `sent=`. So rc 3 means "we do not know", never "nothing was sent" |
-| 1 | refusal: nothing was sent | injector rc 1; a missing command; no band from which to pick a new channel; or the firmware command's stderr |
+| **3** | **capped with no send evidence** — the wrapper expired (status 124, or ≥ 128 for a signal) and there is no `sent=N` line with N > 0 | the *absence* of a `sent=N`, N > 0. The test is `sent=[1-9]`, so a `sent=0` is a `sent=` line and is still **not** evidence. So rc 3 means "we do not know", never "nothing was sent" |
+| 1 | refusal: nothing was sent | injector rc 1; a missing command; or the firmware command's stderr |
+
+**The no-band case is a fall-through, not a return code.** When `csa_newchan` can offer no honest
+new channel — `CSA_CHAN` 0 and `R_BAND` outside 2/5/6 — `csa_issue` logs
+`csa injector skipped: no band for <bssid>, cannot pick a new channel` and drops out of the
+injector block into the **firmware** sender, which is then classified by the firmware rule, 0 or 1.
+The row above listed it as an rc-1 producer until 2026-11-17; there is no `return` on that arm (read
+in `csa_issue`, the `[ -z "$nc" ]` branch, and `csa_newchan`'s own comment: "band unknown: refuse to
+guess, the caller falls back to the firmware"). The only thing it guarantees is that the loot's
+`cmd` column will name `PINEAPPLE_DEAUTH_CLIENT_CSA` rather than the injector. *Falsified by:* a
+`csa_issue` returning 1 with `R_BAND` unset while `PINEAPPLE_DEAUTH_CLIENT_CSA` exists and exits 0
+with empty stderr.
 
 **rc 2 must never collapse to 1.** The refusal path writes `CMD_REFUSED`, which asserts that no
 frame left the radio — writing it for frames whose own stderr says `sent=90` is a false statement in
@@ -496,14 +551,28 @@ evidence does not carry.
 - **rc 0 and rc 2 proceed to the measurement.** rc 2 warns on screen and logs that it was capped
   after sending: a capped run is a reason to distrust the **dwell**, not a reason to claim nothing
   went out.
-- **rc 3 also proceeds to the measurement, but its verdict is read down.** A `NO_EFFECT` is
-  **downgraded to `INCONCLUSIVE`**, because "nothing was transmitted" explains a subject that kept
-  transmitting exactly as well as "the CSA did not move it" — and `NO_EFFECT` on a CSA is one of the
-  open firmware questions this rung exists to *answer*, so filing it from an unproven send would
-  file a fabricated answer. A **`MOVED` stands**: the device went quiet, and reading that down would
-  throw away a positive result. The loot records the CSA leg as **unknown** rather than naming a
-  sender that may not have sent — today that is the sender's name with a trailing `?` in the `cmd`
-  column, at both arms.
+- **rc 3 also proceeds to the measurement, but EVERY verdict behind it is read down.** Each
+  subject that would have scored `NO_EFFECT`, `MOVED` or anything else becomes `INCONCLUSIVE`,
+  because "nothing was transmitted" explains all of them equally well — and `NO_EFFECT` on a CSA is
+  one of the open firmware questions this rung exists to *answer*, so filing any of them from an
+  unproven send would file a fabricated answer. The word that was scored is **kept, not lost**: the
+  `subject` line in `events.log` carries it as `raw=MOVED`, and the aggregate screen line gains
+  `; CSA send unproven`. The loot records the CSA leg as **unknown** rather than naming a sender
+  that may not have sent — the sender's name with a trailing `?` in the `cmd` column, at both arms.
+  *Corrected 2026-11-17. This read "A **`MOVED` stands**: the device went quiet, and reading that
+  down would throw away a positive result", and the reason — an absent frame cannot explain a quiet
+  subject — is false. `resp_verdict` produces `MOVED` from two states and both are what an idle or
+  wandering device does unprovoked: the subject dropped out of the Recon list (`present=0`), or its
+  cumulative packet counter did not advance (`t1 = t0`). The payload says so itself in
+  `attack_scope`'s comment — "an idle camera reads MOVED whether or not anything was transmitted
+  ... MOVED on a quiet device is weak" — and the harness has been driving exactly that producer on
+  every run, its counters being frozen by default. Measured by the round-2 review: with the
+  selftest stub's post-read made equal to its pre-read, the rc-3 case looted
+  `pagerinj:ch1:n3? MOVED 0`, which `resp_aggregate` turned into `RESPOND_HIT` — green LED, 300 ms
+  vibrate — one screen after this arm had printed "nothing is claimed". Keeping `MOVED` was a
+  defensible policy; the reason given for it was not, and the doubt reached no column but `cmd`.
+  Falsified by: `resp_verdict` returning `INCONCLUSIVE` for `p0=10 t0=100 p1=10 t1=100 present=1`,
+  which would make `MOVED` require positive evidence of a change.*
 - The `csa inject` log line carries **two** numbers and they are not the same thing: `rc=` is the
   `timeout` wrapper's status and `issue=` is the classification above, so `rc=124 issue=3` is the
   capped-with-no-evidence case and **`issue=`** is what to grep for.
@@ -513,7 +582,10 @@ evidence does not carry.
 so no CSA result may fail the attempt:
 
 - rc 0 and rc 2 both count as sent and name the sender in the loot's `cmd` column.
-- rc 3 is recorded **unknown** — the leg is neither claimed nor denied.
+- rc 3 is recorded **unknown** — the leg is neither claimed nor denied — and **no verdict is read
+  down here**, unlike the `CSA` arm: the deauth has already left the radio, so a `NO_EFFECT` still
+  has a transmission behind it and remains a reading. `csa_unknown` is set only inside the `CSA`
+  branch (read in `resp_fire`).
 - rc 1 warns ("the CSA leg did not send; the deauth was still transmitted") and logs the failure.
 - **None of the four aborts the attempt or changes the deauth's verdict.**
 

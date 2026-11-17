@@ -364,8 +364,13 @@ captured under a short channel lock when no Watch lock is held, since Recon hops
 the channel-switch **mechanism**, which is a different question from whether this firmware can send
 one: the firmware's CSA announces **channel 14** (Japan-only, not in the US table) with a switch
 count of **0**, both fixed in the daemon with no setting that reaches them. So unless `CSA_INJECTOR`
-is set to an executable injector, the picker labels CSA `fw-broken` whatever the beacon says, and
-the one-line explanation on screen says the same.
+is set to an executable injector, the picker labels CSA `fw-broken` on every badge it still speaks
+for, and the one-line explanation on screen says the same — except on `NONE` and `NOINJ`, whose
+lines name what an injector does and does not buy instead (two paragraphs down). *Qualified
+2026-11-17: this read "whatever the beacon says", which the table's own `NONE` and `NOINJ` rows
+contradict: there the label is `blocked`, both badges being decided before the CSA clause is
+reached. On `?` the old wording was right — with no injector `CSA` reads `fw-broken` there, because
+the `?` test comes after.*
 
 `D?+C` cannot be resolved from a beacon alone, because PMF is negotiated per client — a transition
 -mode BSS can hold both protected and unprotected clients at once. `NOINJ` is a gate verdict,
@@ -373,6 +378,11 @@ not a property of the target: pineapd refuses the 16 DFS channels and 6 GHz outr
 drops frames on channels the live regulatory domain marks disabled or no-IR. pineapd logs its refusal
 and returns an error; cfg80211's drop is silent (the frame is freed and `sendto` reports success), so
 CamHound refuses rather than guesses (`csa_injectable`, two gates; see `dev/pager-csa-primitives.md`).
+The two gates are **not symmetrical**, which is why the screen line for `NOINJ` reads "pineapd
+refuses here; an injector is unproven on DFS, dropped on 6 GHz": on 5 GHz DFS only pineapd refuses,
+so a configured injector bypasses the gate — but nothing has yet been **shown** to reach the air
+there, and the on-device test cannot tell a transmitted frame from a silently dropped one. On 6 GHz
+cfg80211 refuses as well, so an injector changes nothing.
 
 **2 · Attack.** All three are always offered, **`DEAUTH` first on every badge**, and each is
 labelled with what will actually be **sent**. The first in the list is preselected, so the ordering
@@ -382,9 +392,9 @@ is the recommendation. The labels:
 |---|---|---|
 | `works` | `DEAUTH` | no PMF: the deauth lands |
 | `partial` | `DEAUTH`, `BOTH` | PMF optional: it lands on the clients that did not negotiate PMF |
-| `blocked` | any | PMF required, or `NONE`/`NOINJ`: this one cannot work |
+| `blocked` | any | PMF required, or `NONE`/`NOINJ`: this one cannot work. On `NOINJ` that is deliberately the conservative word even with an injector configured — pineapd refuses here, and a frame from an injector has never been **shown** to reach the air on DFS, so the label stays `blocked` and the explanation line says what is and is not known |
 | `fw-broken` | `CSA` | the firmware's CSA, which announces channel 14 with count 0 and moves nothing |
-| `injector` | `CSA` | `CSA_INJECTOR` is configured, so the CSA is a real one |
+| `injector` | `CSA`, `BOTH` | `CSA_INJECTOR` is configured, so the CSA is a real one. On `BOTH` it appears under PMF-required (`C`), where it names the only leg that can send — the line above the picker still tells you the deauth is ignored there |
 | `deauth only` | `BOTH` | the deauth will be sent; the CSA leg is the firmware's and is along for the ride |
 | `deauth+csa` | `BOTH` | both legs will be sent for real, the CSA through the injector |
 | `unknown` | `DEAUTH`, `BOTH`, and `CSA` with an injector | the beacon was not read, so nothing is predicted |
@@ -412,7 +422,8 @@ because it rides in a beacon.
 
 **3 · Verdict.** Every kernel-side drop path reports success, so "we sent it" proves nothing. The
 channel is locked with the same `lock_target` Watch uses (verified read-back, falling back to a
-channel lock, aborting **only** if the readings it got disagree with each other), and after
+channel lock, aborting if the readings disagree with each other **or** if the radio is still on
+another channel after the channel command), and after
 `RESP_SETTLE_SECS` the target is re-read from Recon:
 
 | Verdict | Means |
@@ -420,8 +431,17 @@ channel lock, aborting **only** if the readings it got disagree with each other)
 | `MOVED` | gone from Recon, or its packet counter stalled with nothing newer seen |
 | `NO_EFFECT` | packet counter still advancing — it never left |
 | `INCONCLUSIVE` | no baseline, no follow-up reading, or the counter stalled but it was seen again |
-| `LOCK_FAILED` | the radio would not hold the target channel — the samples disagreed, so it was still hopping; nothing was transmitted |
+| `LOCK_FAILED` | the radio would not hold the target channel; nothing was transmitted. Two ways to get here: the three channel readings disagreed with each other (still hopping), or they agreed but on the wrong channel and the radio was still elsewhere after the channel command. `events.log` tells them apart — `still hopping (samples …)` against `ch 7 != 8, lock failed` |
 | `CMD_REFUSED` | the firmware refused the command, so nothing was transmitted. Every subject of that attempt gets this instead of a verdict, because a refusal is not a measurement |
+
+**When the `cmd` column ends in `?`, the CSA injector could not prove it sent anything** — its
+window expired with no `sent=N` line to show — so on a `CSA` attempt the verdict is `INCONCLUSIVE`
+whatever the counters did, `MOVED` included; "nothing was transmitted" explains a quiet device as
+well as a successful switch does. The word the counters actually scored is kept in `events.log`, on
+the `subject` line as `raw=MOVED`, and the verdict line on screen ends `; CSA send unproven`. On a
+`BOTH` attempt the `?` marks the CSA leg only: the deauth did leave the radio, so that verdict
+stands as it would on any other fire. *New 2026-11-17 — until then a `MOVED` behind an unproven
+send was looted as `MOVED` and lit the green "hit" screen.*
 
 Those last two are the only refusals written to `responses.tsv`. Separately, the **`lock`** column
 can read `unverified`: the radio's channel could not be read back (or only one of the three reads
