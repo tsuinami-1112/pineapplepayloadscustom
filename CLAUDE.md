@@ -420,23 +420,27 @@ where that asymmetry is recorded.
   in place of the old flat "CSA lands", which promised on every badge the one leg this firmware
   cannot transmit. On the two badges that offer nothing it now says what an injector does and does
   not buy: `NONE` reads "PMF + beacon protection: no forged frame is expected to work, injector or
-  not" and `NOINJ` "cannot inject here: pineapd refuses DFS and 6 GHz, the channel table the rest
+  not" and `NOINJ` "will not inject here: pineapd refuses DFS and 6 GHz, the channel table the rest
   (or none was read); an injector is unproven on DFS, dropped on 6 GHz" (the asymmetry is "First
   contact"'s: on 5 GHz DFS only gate 1 fires, so `pagerinj` bypasses it and nothing has yet been
   shown to reach the air there, while on 6 GHz all 59 channels carry `NO_IR` and cfg80211 drops the
   frame silently). "The channel table the rest" is `csa_injectable`'s third producer — a channel
   the live `iw phy channels` table marks disabled or No IR, or never lists at all: under US 5 GHz
   169/173/177 carry No IR and 2.4 GHz 12-14 are absent from the eleven-line table measured there —
-  which is neither DFS nor 6 GHz and which pineapd does not refuse; a gate-2 verdict no sender gets
-  past. "(or none was read)" is the other half: with no table read (`INJ_PROBED` not 1)
+  which is neither DFS nor 6 GHz and which pineapd does not refuse — gate 2 for a channel the table
+  flags, and for one it never lists a channel the radio does not offer at all; neither is something
+  a sender gets past. "(or none was read)" is the other half: with no table read (`INJ_PROBED` not 1)
   `csa_injectable` passes only 2.4 GHz 1-11 and 5 GHz 36-48, the set injectable under both the US
   and the world domain, which is CamHound's own conservatism and no gate verdict — it refuses 5 GHz
   149-165, which gate 2 permits under US ("Channel 149 is clear of both", below). The fix round's
   first wording, "DFS or 6 GHz: pineapd refuses here", blamed pineapd for the third producer and
   was caught by its intent lens; the second, "the reg table the rest" for both halves, blamed
-  cfg80211 for the fallback and was caught by its code and docs sceptics, the same day. The `NONE`
-  line is hedged because beacon protection needs the client to have installed a BIGTK, which a
-  beacon cannot show. **`posture_expect` still returns `blocked` on
+  cfg80211 for the fallback and was caught by its code and docs sceptics, the same day; the gloss
+  on the third then filed a never-listed channel under gate 2 and was caught by the next sceptic,
+  who also raised the prefix — it is "will not", not "cannot", because on the no-table half nothing
+  has established that the channel refuses a frame; CamHound does. The `NONE` line is hedged
+  because beacon protection needs the client to have installed a BIGTK, which a beacon cannot
+  show. **`posture_expect` still returns `blocked` on
   both badges whatever the injector is** — deliberate, and pinned by the selftest.
 
 **Injection gates** — `csa_injectable <band> <ch>` models both gates (see below);

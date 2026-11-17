@@ -457,7 +457,7 @@ band_of() {
 #     Beacon protection is NOT in the RSNXE (ID 244) -- that element has no such bit.
 # Badges: D+C deauth lands | D?+C deauth per-client | C deauth ignored -- on all three a CSA needs
 #         an injector | NONE PMF + beacon protection, nothing forged is expected to work
-#         | NOINJ cannot inject here (pineapd on DFS and 6 GHz; elsewhere the channel table refused, or
+#         | NOINJ will not inject here (pineapd on DFS and 6 GHz; elsewhere the channel table refused, or
 #         none could be read and only the US-and-00 safe set passes) | ? posture unread
 declare -A POSTURE POSTURE_TS POSTURE_RSN_C POSTURE_EXT_C   # badge, read time, and the caps it was read from, per BSSID
 
@@ -2658,15 +2658,19 @@ posture_why() {
     # could be read (INJ_PROBED != 1), everything outside 2.4 GHz 1-11 and 5 GHz 36-48. None of
     # that is DFS or 6 GHz and pineapd refuses none of it, so "DFS or 6 GHz: pineapd refuses here"
     # named the wrong gate and the wrong sender there. "The channel table the rest" is the read
-    # half of that producer, a gate-2 verdict no sender gets past; "(or none was read)" is the
-    # other half, CamHound's own conservatism and no gate verdict at all -- the fallback also
-    # refuses 5 GHz 149-165, which gate 2 permits under US (CLAUDE.md "First contact": channel 149
-    # is clear of both). The second rewording said "the reg table the rest" for both halves and
-    # was caught by the fix round's code and docs sceptics the same day.
+    # half of that producer: gate 2 for a channel the table flags (DISABLED or NO_IR), and for one
+    # it never lists, a channel the radio does not offer at all -- neither is something a sender
+    # gets past; "(or none was read)" is the other half, CamHound's own conservatism and no gate
+    # verdict at all -- the fallback also refuses 5 GHz 149-165, which gate 2 permits under US
+    # (CLAUDE.md "First contact": channel 149 is clear of both). The second rewording said "the
+    # reg table the rest" for both halves and was caught by the fix round's code and docs sceptics
+    # the same day; its gloss then filed the never-listed channel under gate 2 and was caught by
+    # the next. The prefix is "will not", not "cannot": on the no-table half nothing has
+    # established that the channel refuses a frame -- CamHound does.
     # The NONE line is hedged because beacon protection needs the CLIENT to have installed a BIGTK,
     # which a beacon cannot show -- the AP's bit 84 is policy, not client behaviour.
     'NONE')  printf 'PMF + beacon protection: no forged frame is expected to work, injector or not' ;;
-    'NOINJ') printf 'cannot inject here: pineapd refuses DFS and 6 GHz, the channel table the rest (or none was read); an injector is unproven on DFS, dropped on 6 GHz' ;;
+    'NOINJ') printf 'will not inject here: pineapd refuses DFS and 6 GHz, the channel table the rest (or none was read); an injector is unproven on DFS, dropped on 6 GHz' ;;
     *)       printf 'posture unread: no beacon captured' ;;
   esac
 }
