@@ -357,7 +357,7 @@ captured under a short channel lock when no Watch lock is held, since Recon hops
 | `D?+C` | PMF optional (transition mode) | per-client | only with an injector configured |
 | `C` | PMF required (WPA3) | ignored | only with an injector configured |
 | `NONE` | PMF + beacon protection | blocked | blocked |
-| `NOINJ` | channel we cannot transmit on: DFS 5 GHz, 6 GHz, or disabled/no-IR under the live domain | cannot transmit | cannot transmit |
+| `NOINJ` | channel we cannot transmit on: DFS 5 GHz, 6 GHz, disabled/no-IR or unlisted under the live domain — or, when the live table could not be read at all, anything outside 2.4 GHz 1-11 and 5 GHz 36-48 | cannot transmit | cannot transmit |
 | `?` | no beacon captured | unknown | unknown |
 
 *The CSA column read `works` on the first three rows until 2026-11-15.* It is the badge's verdict on
@@ -379,8 +379,10 @@ drops frames on channels the live regulatory domain marks disabled or no-IR. pin
 and returns an error; cfg80211's drop is silent (the frame is freed and `sendto` reports success), so
 CamHound refuses rather than guesses (`csa_injectable`, two gates; see `dev/pager-csa-primitives.md`).
 The two gates are **not symmetrical**, which is why the screen line for `NOINJ` reads "cannot inject
-here: pineapd refuses DFS and 6 GHz, the reg table the rest; an injector is unproven on DFS, dropped
-on 6 GHz" (the "rest" being the disabled and no-IR channels above): on 5 GHz DFS only pineapd refuses,
+here: pineapd refuses DFS and 6 GHz, the channel table the rest (or none was read); an injector is
+unproven on DFS, dropped on 6 GHz" (the "rest" being the disabled, no-IR or unlisted channels above,
+and "none was read" the case where CamHound could not read the table at all and passes only 2.4 GHz
+1-11 and 5 GHz 36-48, its own caution rather than either gate's verdict): on 5 GHz DFS only pineapd refuses,
 so a configured injector bypasses the gate — but nothing has yet been **shown** to reach the air
 there, and the on-device test cannot tell a transmitted frame from a silently dropped one. On 6 GHz
 cfg80211 refuses as well, so an injector changes nothing.
@@ -393,7 +395,7 @@ is the recommendation. The labels:
 |---|---|---|
 | `works` | `DEAUTH` | no PMF: the deauth lands |
 | `partial` | `DEAUTH`, `BOTH` | PMF optional: it lands on the clients that did not negotiate PMF |
-| `blocked` | any | PMF required, or `NONE`/`NOINJ`: this one cannot work. On `NOINJ` that is deliberately the conservative word even with an injector configured — pineapd refuses here, and a frame from an injector has never been **shown** to reach the air on DFS, so the label stays `blocked` and the explanation line says what is and is not known |
+| `blocked` | any | PMF required, or `NONE`/`NOINJ`: this one cannot work. On `NOINJ` that is deliberately the conservative word even with an injector configured — whichever gate refused, an injector only bypasses pineapd's DFS refusal, a frame from one has never been **shown** to reach the air on DFS, and on 6 GHz or a no-IR channel cfg80211 drops it whoever sends it — so the label stays `blocked` and the explanation line says what is and is not known |
 | `fw-broken` | `CSA` | the firmware's CSA, which announces channel 14 with count 0 and moves nothing |
 | `injector` | `CSA`, `BOTH` | `CSA_INJECTOR` is configured, so the CSA is a real one. On `BOTH` it appears under PMF-required (`C`), where it names the only leg that can send — the line above the picker still tells you the deauth is ignored there |
 | `deauth only` | `BOTH` | the deauth will be sent; the CSA leg is the firmware's and is along for the ride |

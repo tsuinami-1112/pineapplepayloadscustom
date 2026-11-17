@@ -467,7 +467,8 @@ band_of() {
 #     Beacon protection is NOT in the RSNXE (ID 244) -- that element has no such bit.
 # Badges: D+C deauth lands | D?+C deauth per-client | C deauth ignored -- on all three a CSA needs
 #         an injector | NONE PMF + beacon protection, nothing forged is expected to work
-#         | NOINJ cannot inject here (pineapd on DFS and 6 GHz, the reg table elsewhere) | ? posture unread
+#         | NOINJ cannot inject here (pineapd on DFS and 6 GHz; elsewhere the channel table refused, or
+#         none could be read and only the US-and-00 safe set passes) | ? posture unread
 declare -A POSTURE POSTURE_TS POSTURE_RSN_C POSTURE_EXT_C   # badge, read time, and the caps it was read from, per BSSID
 
 hex_octet() {   # hex_octet <hexstring> <index0> -> decimal octet, nonzero rc if short
@@ -647,7 +648,8 @@ posture_from_caps() {   # posture_from_caps <rsncaps_hex|-> <extcap_hex|-> <band
 # with the two BSS-wide keys on the list below it. DEAUTH leads because it is the one key measured
 # to reach the air here, not because the list is ranked -- there is no ranking. The ' bss' marker
 # and the confirm carry the breadth, rather than demoting the attack most likely to work. (Until
-# 82fa566 this led BOTH, so a BSS-wide attack was the default on every badge; this comment opened
+# 82fa566 this led BOTH, or CSA under PMF-required and at '?', so a BSS-wide attack was the
+# default on every badge; this comment opened
 # by claiming an efficacy ordering long after that stopped being true, which is withdrawn, and
 # CLAUDE.md and RESPONSE.md withdraw it too. The phrase is left unquoted on purpose, so grepping
 # for it finds no copy that reads as an assertion.)
@@ -3745,14 +3747,20 @@ posture_why() {
     # CLAUDE.md "First contact" has the two-gate asymmetry.
     # NOINJ has a THIRD producer the first rewording left out (caught by the fix round's intent
     # lens): csa_injectable also refuses any channel the live `iw phy channels` table marks
-    # disabled or No IR -- 2.4 GHz 12-14 and 5 GHz 169/173/177 under US -- and, with no probe read,
-    # everything outside 2.4 GHz 1-11 and 5 GHz 36-48. Neither set is DFS or 6 GHz and pineapd
-    # refuses neither, so "DFS or 6 GHz: pineapd refuses here" named the wrong gate and the wrong
-    # sender there. "The reg table the rest" is that producer: a gate-2 verdict no sender gets past.
+    # disabled or No IR, or never lists at all -- under US 5 GHz 169/173/177 carry No IR and
+    # 2.4 GHz 12-14 are absent from the eleven-line table measured there -- and, when no table
+    # could be read (INJ_PROBED != 1), everything outside 2.4 GHz 1-11 and 5 GHz 36-48. None of
+    # that is DFS or 6 GHz and pineapd refuses none of it, so "DFS or 6 GHz: pineapd refuses here"
+    # named the wrong gate and the wrong sender there. "The channel table the rest" is the read
+    # half of that producer, a gate-2 verdict no sender gets past; "(or none was read)" is the
+    # other half, CamHound's own conservatism and no gate verdict at all -- the fallback also
+    # refuses 5 GHz 149-165, which gate 2 permits under US (CLAUDE.md "First contact": channel 149
+    # is clear of both). The second rewording said "the reg table the rest" for both halves and
+    # was caught by the fix round's code and docs sceptics the same day.
     # The NONE line is hedged because beacon protection needs the CLIENT to have installed a BIGTK,
     # which a beacon cannot show -- the AP's bit 84 is policy, not client behaviour.
     'NONE')  printf 'PMF + beacon protection: no forged frame is expected to work, injector or not' ;;
-    'NOINJ') printf 'cannot inject here: pineapd refuses DFS and 6 GHz, the reg table the rest; an injector is unproven on DFS, dropped on 6 GHz' ;;
+    'NOINJ') printf 'cannot inject here: pineapd refuses DFS and 6 GHz, the channel table the rest (or none was read); an injector is unproven on DFS, dropped on 6 GHz' ;;
     *)       printf 'posture unread: no beacon captured' ;;
   esac
 }
@@ -4738,11 +4746,16 @@ IWFIX
   st "posture_why covers NOINJ" "$(posture_why NOINJ | grep -c 'pineapd refuses')" "1"
   st "posture_why: NOINJ says what an injector changes and what it does not" \
      "$(posture_why NOINJ | grep -c 'unproven on DFS, dropped on 6 GHz')" "1"
-  # csa_injectable's third producer -- a channel the live table marks disabled or No IR, or anything
-  # outside the always-safe set when no table was read -- is neither DFS nor 6 GHz, and pineapd does
-  # not refuse it; the line must name it rather than blame pineapd for every NOINJ.
-  st "posture_why: NOINJ names the regulatory table, not pineapd, for the rest" \
-     "$(posture_why NOINJ | grep -c 'the reg table the rest')" "1"
+  # csa_injectable's third producer -- a channel the live table marks disabled or No IR or never
+  # lists, or anything outside the always-safe set when no table was read -- is neither DFS nor
+  # 6 GHz, and pineapd does not refuse it; the line must name it rather than blame pineapd for every
+  # NOINJ. And the no-table half is CamHound's own caution, not a gate's verdict (the fallback
+  # refuses 5 GHz 149-165, which gate 2 permits under US), so the line must own it rather than
+  # blame cfg80211 -- "the reg table the rest" did, and the fix round's sceptics caught it.
+  st "posture_why: NOINJ names the channel table, not pineapd, for the rest" \
+     "$(posture_why NOINJ | grep -c 'the channel table the rest')" "1"
+  st "posture_why: and NOINJ owns the no-table fallback instead of blaming a gate" \
+     "$(posture_why NOINJ | grep -c '(or none was read)')" "1"
   st "posture_why: beacon protection is not an injector problem either" \
      "$(posture_why NONE | grep -c 'injector or not')" "1"
   # posture_why and posture_expect land on the same screen, so they must not disagree about the

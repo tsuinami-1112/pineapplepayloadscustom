@@ -151,7 +151,7 @@ assuming an offset: version (2) + group cipher (4) + pairwise count (2) + 4×N +
 | `D?+C` | PMF optional (WPA3 transition) | partial | lands **only with an injector**; `fw-broken` without one |
 | `C` | PMF required (WPA3) | blocked | lands **only with an injector**; `fw-broken` without one |
 | `NONE` | PMF + beacon protection | blocked | blocked |
-| `NOINJ` | channel we cannot transmit on | cannot transmit | cannot transmit |
+| `NOINJ` | channel we cannot transmit on (or, with no live table read, one outside the always-safe set) | cannot transmit | cannot transmit |
 | `?` | no beacon captured | unknown | unknown |
 
 *The `CSA` column changed on 2026-11-15 and used to read `works` on the first three rows.* It is
@@ -169,8 +169,8 @@ badges are exceptions. Falsified by: `posture_expect NOINJ CSA` or `posture_expe
 printing `fw-broken` with `CSA_INJECTOR` empty.* `posture_why` carries the same sentence onto the screen in one line, and on
 those two badges says instead what an injector does and does not buy: `NONE` → "PMF + beacon
 protection: no forged frame is expected to work, injector or not", `NOINJ` → "cannot inject here:
-pineapd refuses DFS and 6 GHz, the reg table the rest; an injector is unproven on DFS, dropped on
-6 GHz" (the gate asymmetry below).
+pineapd refuses DFS and 6 GHz, the channel table the rest (or none was read); an injector is unproven
+on DFS, dropped on 6 GHz" (the gate asymmetry below).
 
 Two honest limits baked into the model. `D?+C` **cannot be resolved from a beacon at all**, because
 PMF is negotiated per client — a transition-mode BSS can hold protected and unprotected clients
@@ -280,17 +280,22 @@ that fallback offers `DEAUTH BOTH CSA`, in that order, for the same reason the p
   `NONE` → "PMF + beacon protection: no forged frame is expected to work, injector or not" (the
   forgery is what beacon protection defeats, so the sender is beside the point; "expected" because
   the client must have installed a BIGTK for that, which a beacon cannot show), `NOINJ` → "cannot
-  inject here: pineapd refuses DFS and 6 GHz, the reg table the rest; an injector is unproven on
-  DFS, dropped on 6 GHz" (the two gates below: on 5 GHz DFS only gate 1 fires, which `pagerinj`
-  bypasses, and no frame has yet been shown to reach the air there; on 6 GHz gate 2 fires too and
-  cfg80211 drops it silently; and "the reg table the rest" is `csa_injectable`'s third producer, a
-  channel the live table marks disabled or No IR — 2.4 GHz 12-14 and 5 GHz 169/173/177 under US —
-  or anything outside 2.4 GHz 1-11 and 5 GHz 36-48 when no table was read, a gate-2 verdict no
-  sender gets past). *Both lines reworded 2026-11-17; they read "no frame this firmware sends
-  works" and "the radio may not transmit on this channel", neither of which distinguishes the two
-  gates or mentions an injector. The `NOINJ` line's first rewording, "DFS or 6 GHz: pineapd refuses
-  here; …", blamed pineapd for the third producer too and was caught by the fix round's intent lens
-  the same day.*
+  inject here: pineapd refuses DFS and 6 GHz, the channel table the rest (or none was read); an
+  injector is unproven on DFS, dropped on 6 GHz" (the two gates below: on 5 GHz DFS only gate 1
+  fires, which `pagerinj` bypasses, and no frame has yet been shown to reach the air there; on
+  6 GHz gate 2 fires too and cfg80211 drops it silently; "the channel table the rest" is
+  `csa_injectable`'s third producer, a channel the live table marks disabled or No IR or never
+  lists at all — 5 GHz 169/173/177 carry No IR under US, and 2.4 GHz 12-14 are simply absent from
+  the eleven-line 2.4 GHz table measured there — a gate-2 verdict no sender gets past; and "(or
+  none was read)" is that producer's other half, CamHound's own conservatism when no table could be
+  read and no gate verdict at all, since the fallback passes only 2.4 GHz 1-11 and 5 GHz 36-48 and
+  so refuses 5 GHz 149-165, which gate 2 permits under US — §3 above, and CLAUDE.md "First
+  contact": "Channel 149 is clear of both"). *Both lines reworded 2026-11-17; they read "no frame
+  this firmware sends works" and "the radio may not transmit on this channel", neither of which
+  distinguishes the two gates or mentions an injector. The `NOINJ` line's first rewording, "DFS or
+  6 GHz: pineapd refuses here; …", blamed pineapd for the third producer and was caught by the fix
+  round's intent lens; its second, "the reg table the rest" for both halves, blamed cfg80211 for the
+  no-table fallback and was caught by the round's code and docs sceptics, all the same day.*
 
 ## 5. Target resolution
 
