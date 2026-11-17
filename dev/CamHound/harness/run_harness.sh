@@ -178,10 +178,13 @@ s_csainj() {   # the optional CSA injector: pagerinj in place of the firmware CS
   #
   # Run as a PAIR under HARNESS_PK_ADVANCE so the two arms differ in exactly ONE variable -- whether
   # the injector could prove a send -- and the INCONCLUSIVE is a RESULT, not an artifact of whatever
-  # the fixture's counters happen to do. That advance had to be added to the _pineap stub: with the
-  # counters frozen, as every scenario before 2026-11-15 ran them, every measured subject reads
-  # MOVED ("counter stalled") and MOVED is deliberately NOT downgraded, so the pair would have
-  # agreed and the check would have asserted nothing. NO_EFFECT had never been produced here at all.
+  # the fixture's counters happen to do. The advance had to be added to the _pineap stub because
+  # with the counters frozen, as every scenario before 2026-11-15 ran them, every measured subject
+  # reads MOVED ("counter stalled") and NO_EFFECT had never been produced here at all, so the pair
+  # could not have been built from the frozen shape. The pair is what carries the NO_EFFECT result;
+  # the frozen-counter arm added after it covers MOVED's OTHER producer, because since 2026-11-17
+  # an rc-3 MOVED is read down to INCONCLUSIVE too, so "MOVED is deliberately NOT downgraded" --
+  # which this comment used to say, and which was the weakest half of the old rule -- is false.
   reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
   rules csainj3 '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '3' ' ch ' '1' "${COMMON[@]}"
   answers t t B; HARNESS_PK_ADVANCE=500 PATH="$PATHX" timeout 300 bash "$T/payload_csa.sh" >/dev/null 2>"$T/stderr"
@@ -196,6 +199,27 @@ s_csainj() {   # the optional CSA injector: pagerinj in place of the firmware CS
     "grep -q '|CSA|pagerinj:ch40:n3?|ok|' $LOOT/responses.tsv && grep -qE '\|INCONCLUSIVE\$' $LOOT/responses.tsv && ! grep -qE '\|(NO_EFFECT|MOVED|CMD_REFUSED)\$' $LOOT/responses.tsv"
   check "csainj: rc 3 says on screen that nothing is claimed, and the deauth was never sent" \
     "grep -q 'LOG yellow CSA injector was capped with no send evidence; measuring, but nothing is claimed' $T/log && ! grep -q '^PINEAPPLE_DEAUTH_CLIENT ' $T/log"
+  # MOVED's OTHER producer, which no scenario drove against rc 3 until 2026-11-17: the counters
+  # FROZEN (no HARNESS_PK_ADVANCE), so the post-read equals the pre-read and resp_verdict scores
+  # "counter stalled, nothing newer seen" -- MOVED. That is exactly what an idle or wandering
+  # camera reads as with nothing transmitted at all, so with no send proven it cannot be looted as
+  # a hit: it used to write MOVED, aggregate MOVED and light RESPOND_HIT (green LED, vibrate) right
+  # after the screen said nothing is claimed. The word the counters produced is not lost -- it is
+  # carried into the events.log subject line as raw=MOVED, where it is a reading about the device
+  # rather than a verdict about the attack. reset() already clears /tmp/cs_harness_pkn.
+  reset; printf 'CYCLE_SECS=5\nRESPONSE=1\n' >"$HARNESS_CFG"
+  rules csainj5 '^CamHound' 'Scan,Exit' 'Review hits' '4,Exit' '^[0-9]+ REO' 'Disrupt,Back' '^Disrupt \[' '3' ' ch ' '1' "${COMMON[@]}"
+  answers t t B; HARNESS_INJ_CAP=1 PATH="$PATHX" timeout 300 bash "$T/payload_csa.sh" >/dev/null 2>"$T/stderr"
+  check "csainj: rc 3 reads a STALLED counter's MOVED down to INCONCLUSIVE as well" \
+    "grep -q '|CSA|pagerinj:ch40:n3?|ok|' $LOOT/responses.tsv && grep -qE '\|INCONCLUSIVE\$' $LOOT/responses.tsv && ! grep -qE '\|(MOVED|NO_EFFECT|CMD_REFUSED)\$' $LOOT/responses.tsv"
+  check "csainj: and the counters' own word survives in events.log as raw=MOVED" \
+    "grep -qE 'subject [^ ]+ INCONCLUSIVE .* raw=MOVED \(CSA send unproven\)' $LOOT/events.log"
+  # The doubt has to reach the SCREEN as well, not just the cmd column's `?`: the verdict line was
+  # where a green RESPOND_HIT used to be printed behind an unproven send, so the aggregate names
+  # the reason it is unsettled. INCONCLUSIVE is the only aggregate reachable with csa_unknown set
+  # (every subject is read down to it), which is why only that branch carries the suffix.
+  check "csainj: and the verdict line on screen says the send was never proven" \
+    "grep -qE '^LOG yellow INCONCLUSIVE: [0-9]+/[0-9]+ unsettled, 0 quiet; CSA send unproven\$' $T/log"
 }
 
 s_disrupt() {   # shipped default (RESPONSE=1 from the config block, nothing written to the saved config): Disrupt on the Reolink AP against log-only stubs; posture, lock, loot row

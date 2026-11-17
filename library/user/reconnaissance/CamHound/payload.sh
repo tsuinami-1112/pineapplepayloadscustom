@@ -639,13 +639,17 @@ posture_from_caps() {   # posture_from_caps <rsncaps_hex|-> <extcap_hex|-> <band
 #   DEAUTH parses two addresses and is the only key that can aim, which it does on a client row.
 #   BOTH is scope bss by decision, not by signature -- its deauth leg can aim but its CSA leg
 #        cannot. See attack_scope.
-# posture_opts orders by efficacy (best first) and pick_list preselects element 0, so the DEFAULT
-# attack is whatever posture_opts leads with -- DEAUTH on every badge it offers anything for, since
-# a9575a2, that being the one key measured to reach the air here. So the default is targeted on a
-# client row and BSS-wide on an AP row (where DEAUTH's target resolves to ff:ff:ff:ff:ff:ff), and
-# the two BSS-wide keys stay on the list below it. The ' bss' marker and the confirm carry the
-# breadth, rather than demoting the attack most likely to work. (Until a9575a2 this led BOTH, so a
-# BSS-wide attack was the default on every badge; that is what the sentence here used to say.)
+# posture_opts returns ONE fixed order -- `DEAUTH BOTH CSA` -- on every badge that offers anything
+# at all, and nothing on the two that offer nothing; it does not rank, and the badge does not
+# change the order. pick_list preselects element 0, so DEAUTH is the default everywhere: targeted
+# on a client row and BSS-wide on an AP row (where DEAUTH's target resolves to ff:ff:ff:ff:ff:ff),
+# with the two BSS-wide keys on the list below it. DEAUTH leads because it is the one key measured
+# to reach the air here, not because the list is ranked -- there is no ranking. The ' bss' marker
+# and the confirm carry the breadth, rather than demoting the attack most likely to work. (Until
+# a9575a2 this led BOTH, so a BSS-wide attack was the default on every badge; this comment opened
+# by claiming an efficacy ordering long after that stopped being true, which is withdrawn, and
+# CLAUDE.md and RESPONSE.md withdraw it too. The phrase is left unquoted on purpose, so grepping
+# for it finds no copy that reads as an assertion.)
 response_cmd() {
   case "$1" in
     DEAUTH) printf 'PINEAPPLE_DEAUTH_CLIENT' ;;
@@ -689,7 +693,8 @@ attack_scope() {
   esac
 }
 
-# posture_opts <badge> -> viable attack keys, best first; empty when nothing can reach the air
+# posture_opts <badge> -> viable attack keys in the offered order, DEAUTH first; empty when nothing
+# can reach the air. The order is the same on every badge that offers anything -- see response_cmd.
 posture_opts() {
   case "$1" in
     'NOINJ'|'NONE') printf '' ;;                 # regulatory wall, or beacon protection: nothing works
@@ -702,7 +707,11 @@ posture_opts() {
   esac
 }
 
-# posture_expect <badge> <attack key> -> works | partial | blocked | unknown
+# posture_expect <badge> <attack key> -> the badge's word for the deauth half
+# (works | partial | blocked | unknown), or a sender label for a CSA-bearing key
+# (fw-broken | injector | deauth only | deauth+csa). Eight strings in all: the four sender labels
+# were ADDED beside the original four, not substituted for them, and this line listed only the
+# first four until 2026-11-17.
 # Labels each option honestly in the picker so a deliberate no-hope attempt is still the operator's call.
 posture_expect() {
   local b="$1" k="$2" inj=0
@@ -2638,7 +2647,7 @@ bucket_stats() {
 WATCH_MAC=""; WATCH_BSSID=""; WATCH_CH=0; WATCH_ROLE=""; CAP_PIDS=""; CUR=A
 declare -a RUNS
 
-# lock_target bssid secs [channel] -> 0 locked, 1 locked by channel, 2 lock failed
+# lock_target bssid secs [channel] -> 0 locked, 1 locked by channel, 2 lock failed, 3 unverified (PROCEED)
 LOCK_TEXT=""
 lock_target() {   # lock_target <bssid> <secs> [channel]; the channel defaults to the current Watch target's
   local bssid="$1" secs="$2" c1 c2 c3 c4 raw ngood want="${3:-${WATCH_CH:-0}}"
@@ -2702,6 +2711,19 @@ lock_target() {   # lock_target <bssid> <secs> [channel]; the channel defaults t
     LOCK_TEXT="$RECON_IF ch $c3 from ONE readable sample ($raw): lock unverified"
     return 3
   fi
+  # The rc-0 return below is the ONE exit that never rewrote LOCK_TEXT, so the pre-backfill default
+  # set above from the RAW c3 reached the operator: samples 8/8/_ are a VERIFIED park -- two
+  # readable samples, agreeing, on the target channel -- and the text read "ch ?, target ch 8".
+  # Until 2026-11-15 that pairing did not exist, because an empty last sample short-circuited to
+  # rc 3 before the comparison ran; the symmetry fix made rc 0 reachable with c3 raw-empty and left
+  # the text behind. Watch's INCONCLUSIVE card and Stimulus both print LOCK_TEXT on ANY rc, and
+  # that card is exactly where the operator asks whether the radio was parked, so "ch ?" pointed at
+  # the lock as the cause of the missing frames when the lock is the one thing that was verified.
+  # Both halves are printed now: the channel the readable samples agreed on, AND the raw triple,
+  # which is the pattern information the 2026-11-09 defect was diagnosed from. Must sit AFTER the
+  # backfill -- above it c3 is still empty and the text would name no channel at all. The rc 1/2/3
+  # branches below all overwrite it, so this is the rc-0 text and nothing else.
+  LOCK_TEXT="$RECON_IF ch $c3, target ch $want (samples $raw)"
   if [ "$c1" = "$c2" ] && [ "$c2" = "$c3" ]; then
     [ "$c3" = "$want" ] || [ "$want" = 0 ] && return 0
     # The FOURTH read, which both the 2026-11-09 and 2026-11-10 repairs stopped short of: they
@@ -3352,7 +3374,7 @@ csa_issue() {
 }
 
 resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was reached
-  local mac="$1" k="$2" badge="$3" cmd lock rc m p0 t0 p1 t1 present verdict nmv=0 nne=0 ninc=0 n
+  local mac="$1" k="$2" badge="$3" cmd lock rc m p0 t0 p1 t1 present verdict raw nmv=0 nne=0 ninc=0 n
   local scope tgt_verdict=- cap_secs lock_secs csa_secs=0 t_cap frc ferr nmeas=0 nomem='' csa_unknown=0
   local -a subjects=(); local -A P0=() T0=()
   RESP_MEMBERS=(); RESP_MEMBERS_BSS=''      # never inherit a previous target's set
@@ -3488,13 +3510,19 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
     elif (( frc == 3 )); then
       # rc 3 is "capped or killed with NO send evidence": neither a refusal nor a send. Proceeding
       # is right -- the measurement is the only thing that could still show an effect -- but the
-      # OPEN question is what it may then be read as saying. A subject that keeps transmitting is
-      # NO_EFFECT, which in responses.tsv reads as the firmware fact "a CSA does not move this
-      # camera"; with nothing known to have been transmitted, "nothing was sent" explains the same
-      # counters exactly as well, so that reading is not available and the verdict is downgraded to
-      # INCONCLUSIVE below. MOVED is left alone: it is not explained by an absent frame, so it
-      # stands on the counters as it would on any other fire. The loot's cmd column marks the leg
-      # `?`, the same "which legs went out" slot BOTH uses.
+      # OPEN question is what it may then be read as saying, and the answer is NOTHING. Every
+      # verdict resp_verdict can return is explained by "no frame left the radio" just as well as
+      # by the attack, so on this arm EVERY one of them is read down to INCONCLUSIVE below, MOVED
+      # included. Until 2026-11-17 only NO_EFFECT was, on the stated ground that "an absent frame
+      # does not explain a subject going quiet" -- which is false for both of MOVED's producers:
+      # resp_verdict returns MOVED for a subject that dropped out of recon AND for one whose
+      # last-seen stamp did not advance, and attack_scope's own comment says so in as many words
+      # ("an idle camera reads MOVED whether or not anything was transmitted"). So an rc-3 MOVED
+      # used to loot a positive result, aggregate to MOVED and light RESPOND_HIT -- green LED and a
+      # vibrate -- immediately after this screen said nothing is claimed. The word the counters
+      # produced is not thrown away: it is carried into the events.log subject line as raw=<word>,
+      # where it is evidence about the device rather than a verdict about the attack. The loot's cmd
+      # column marks the leg `?`, the same "which legs went out" slot BOTH uses.
       LOG yellow "CSA injector was capped with no send evidence; measuring, but nothing is claimed"
       log resp "csa capped-no-send ${ferr:0:160}"
       csa_unknown=1; cmd="$CSA_CMD?"; frc=0; ferr=''
@@ -3521,8 +3549,9 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
     # 0 sent cleanly, 2 sent then capped. Both put frames on the air, so both name the sender in
     # the loot; only a real failure takes the warning branch. 3 is neither: the leg was capped or
     # killed with no send evidence, so it is recorded as UNKNOWN rather than counted as a send or
-    # reported as a failure. No downgrade of the verdict here, unlike the CSA arm: the deauth leg
-    # has already left the radio, so NO_EFFECT still has a frame behind it and remains a reading.
+    # reported as a failure. No downgrade of any verdict here, unlike the CSA arm, where rc 3 reads
+    # every one of them down: the opcode-400 deauth has already left the radio, so each verdict
+    # keeps a transmission behind it and stays a reading of what the subject did about it.
     if (( crc == 0 )) || (( crc == 2 )); then
       (( crc == 2 )) && log resp "csa leg capped after sending ${CSA_ERR:0:160}"
       # Keep the firmware spelling stable for readers and for the gates; name the injector when it
@@ -3573,27 +3602,33 @@ resp_fire() {   # resp_fire <mac> <attack key> <badge> -> 0 when a verdict was r
   resp_snapshot "$scope"
   unlock_target
   for m in "${subjects[@]}"; do
-    p0="${P0[$m]}"; t0="${T0[$m]}"; present=1; p1=-; t1=-
+    p0="${P0[$m]}"; t0="${T0[$m]}"; present=1; p1=-; t1=-; raw=''
     if [ -n "${RS_PK[$m]+x}" ]; then p1="${RS_PK[$m]}"; t1="${RS_T[$m]}"; else present=0; fi
     verdict=$(resp_verdict "$p0" "$t0" "$p1" "$t1" "$present")
-    # A CSA leg that cannot prove it transmitted cannot support NO_EFFECT: "the frame landed and
-    # the camera ignored it" and "no frame left the radio" predict the same unchanged counters, and
-    # the first of those is a firmware answer this rung exists to produce honestly. Only set on the
-    # CSA arm (k = CSA), where the unproven leg is the ONLY leg; on BOTH the deauth went out, so
-    # NO_EFFECT keeps a transmission behind it. MOVED is not downgraded either way -- an absent
-    # frame does not explain a subject going quiet.
-    (( csa_unknown )) && [ "$verdict" = NO_EFFECT ] && verdict=INCONCLUSIVE
+    # A CSA leg that cannot prove it transmitted supports NO verdict at all, so every one of them
+    # is read down to INCONCLUSIVE here. "The frame landed and the camera ignored it" and "no frame
+    # left the radio" predict the same unchanged counters; so do "the CSA moved it" and "it was
+    # idle anyway", because resp_verdict scores MOVED both for a subject that vanished from recon
+    # and for one whose last-seen stamp did not advance, and an unprovoked device does both. There
+    # is no asymmetry to draw: the only word that survives is the one that already says "we do not
+    # know". Only set on the CSA arm (k = CSA), where the unproven leg is the ONLY leg; on BOTH the
+    # opcode-400 deauth went out, so its verdicts keep a transmission behind them and stand.
+    # The counters' own word is kept as `raw` for the events.log line below -- a reading about the
+    # subject, not a claim about the attack -- so nothing measured is discarded.
+    if (( csa_unknown )) && [ "$verdict" != INCONCLUSIVE ]; then raw="$verdict"; verdict=INCONCLUSIVE; fi
     case "$verdict" in MOVED) nmv=$((nmv + 1)) ;; NO_EFFECT) nne=$((nne + 1)) ;; *) ninc=$((ninc + 1)) ;; esac
     [ "$m" = "$R_TARGET" ] && tgt_verdict="$verdict"
     resp_write "$mac" "$badge" "$k" "$cmd" "$lock" "$p0" "$p1" "$verdict" "$m"
-    log resp "subject $m $verdict pk $p0 -> $p1 present=$present"
+    log resp "subject $m $verdict pk $p0 -> $p1 present=$present${raw:+ raw=$raw (CSA send unproven)}"
   done
   verdict=$(resp_aggregate "$nmv" "$nne" "$ninc")
   log resp "verdict $verdict $R_TARGET scope=$scope moved=$nmv no_effect=$nne inconclusive=$ninc of $n"
   case "$verdict" in
     MOVED)     set_state RESPOND_HIT; LOG green "$verdict: $nmv/$n quiet" ;;
     NO_EFFECT) set_state RESPOND_NIL; LOG yellow "$verdict: $nne/$n still transmitting" ;;
-    *)         set_state INCONCLUSIVE; LOG yellow "$verdict: $ninc/$n unsettled, $nmv quiet" ;;
+    # csa_unknown is 0 or 1, never empty, so ${csa_unknown:+} would fire on both -- hence the test.
+    *)         set_state INCONCLUSIVE
+               LOG yellow "$verdict: $ninc/$n unsettled, $nmv quiet$( (( csa_unknown )) && printf '; CSA send unproven' )" ;;
   esac
   # The aggregate word covers the whole blast radius, which is the honest summary of a BSS-wide
   # transmit. The operator still picked one device, so name that device's own verdict too, or a
@@ -3698,8 +3733,17 @@ posture_why() {
     'D+C')   printf 'no PMF: deauth lands; CSA only with an injector' ;;
     'D?+C')  printf 'PMF optional: deauth works per-client; CSA only with an injector' ;;
     'C')     printf 'PMF required: deauth is ignored; CSA only with an injector' ;;
-    'NONE')  printf 'PMF + beacon protection: no frame this firmware sends works' ;;
-    'NOINJ') printf 'DFS or 6 GHz: the radio may not transmit on this channel' ;;
+    # These two said "no frame this firmware sends works" and "the radio may not transmit on this
+    # channel", both of which are about the FIRMWARE sender only and so under-stated what the
+    # payload will attempt with an injector configured: posture_opts returns empty on these badges,
+    # so disrupt_menu's "try anyway" fallback offers CSA regardless and csa_issue routes it to
+    # CSA_INJECTOR with no badge test. The wording now covers both senders. posture_expect still
+    # answers `blocked` here and that is deliberate and pinned -- on 6 GHz cfg80211's NO_IR drops
+    # the frame whoever sends it, and on 5 GHz DFS only gate 1 (pineapd's compiled refusal) fires,
+    # which pagerinj bypasses, but no frame has ever been shown to reach the air there.
+    # CLAUDE.md "First contact" has the two-gate asymmetry.
+    'NONE')  printf 'PMF + beacon protection: no forged frame works, injector or not' ;;
+    'NOINJ') printf 'DFS or 6 GHz: pineapd refuses here; an injector is unproven on DFS, dropped on 6 GHz' ;;
     *)       printf 'posture unread: no beacon captured' ;;
   esac
 }
@@ -4386,10 +4430,15 @@ IWFIX
   # rc 3, added 2026-11-15. rc 124 / >= 128 used to return 2 on its own -- "injector capped after
   # transmitting" -- for a run with NO sent= line anywhere on stderr, which asserted a transmission
   # nobody observed and let resp_fire read the counters as a firmware answer. pagerinj's summary is
-  # printed after its transmit loop (pagerinj.c:1604) and its SIGTERM handler is installed only
-  # once that loop is reached (:1531), so a run signalled INSIDE the loop comes back 124 WITH
-  # `interrupted: sent=N` and a run signalled before it comes back 124 with nothing. rc 3 is
-  # UNKNOWN, between the send (2) and the refusal (1).
+  # printed after its transmit loop (pagerinj.c:1604) and its SIGINT/SIGTERM handler is installed
+  # at :1531-1532, after the beacon capture (whose failure exits `return 1` with no summary, :1468)
+  # and before the loop (:1564) -- so a run signalled once the handler exists comes back 124 WITH
+  # `interrupted: sent=N` and a run signalled during the capture comes back 124 with nothing. rc 3
+  # is UNKNOWN, between the send (2) and the refusal (1). (This read "installed only once that loop
+  # is reached (:1531)", which the line it cites contradicts -- the two are 33 lines apart and in
+  # the other order. The rc-3 shape rests on the handler being installed AFTER the capture, so the
+  # conclusion is unaffected; but a signal landing between :1532 and :1564 reaches the summary with
+  # sent=0, which that wording left unexplainable and which `sent=[1-9]` exists to catch.)
   # Falsified by: a pagerinj run that transmitted and printed no sent= line.
   printf '#!/bin/sh\nprintf "no beacon captured on wlan1mon\\n" >&2\nexit 124\n' >"$tmp/inj_cap_nosend"
   printf '#!/bin/sh\nexit 137\n' >"$tmp/inj_killed"
@@ -4609,14 +4658,35 @@ IWFIX
   # decided only by which slot cur_channel happened to fail in. Both patterns are driven here and
   # compared to EACH OTHER, so what is pinned is the symmetry rather than two constants that could
   # drift apart. 8/_/8 is the third one-empty pattern and is the "MIDDLE empty sample" case above.
-  local _lk_first _lk_last
+  local _lk_first _lk_last _lk_first_t _lk_last_t
   : >"$tmp/chseq"
   iwinfo() { printf 'x' >>"$tmp/chseq"; [ "$(wc -c <"$tmp/chseq" | tr -d ' ')" -gt 1 ] && printf '          Channel: 1 (2.412 GHz)\n'; return 0; }
-  lock_target aa:00:00:00:00:10 5 1 >/dev/null; _lk_first=$?
+  lock_target aa:00:00:00:00:10 5 1 >/dev/null; _lk_first=$?; _lk_first_t="$LOCK_TEXT"
   : >"$tmp/chseq"
   iwinfo() { printf 'x' >>"$tmp/chseq"; [ "$(wc -c <"$tmp/chseq" | tr -d ' ')" -lt 3 ] && printf '          Channel: 1 (2.412 GHz)\n'; return 0; }
-  lock_target aa:00:00:00:00:10 5 1 >/dev/null; _lk_last=$?
+  lock_target aa:00:00:00:00:10 5 1 >/dev/null; _lk_last=$?; _lk_last_t="$LOCK_TEXT"
   st "lock_target: an empty LAST sample scores the same as an empty FIRST one" "$_lk_last/$_lk_first" "0/0"
+  # ... and so does its TEXT, which is the half the symmetry fix left behind. LOCK_TEXT was set
+  # once from the RAW c3, before the backfill, and the rc-0 return never rewrote it -- so 1/1/_
+  # scored a verified park whose message said the channel was never read, on the one card where
+  # the operator asks whether the radio was parked. Pinned as the pair, not as one constant: the
+  # agreed channel AND the raw triple, with "ch ?" asserted absent so the old default cannot come
+  # back. Falsified by: the two patterns' texts naming different channels.
+  st "lock_target: a verified park names the channel the readable samples agreed on" \
+    "$(printf '%s' "$_lk_last_t" | grep -c 'ch 1, target ch 1 (samples 1/1/_)')" "1"
+  st "lock_target: a verified park never reports its channel as unread" \
+    "$(printf '%s' "$_lk_last_t" | grep -c 'ch ?')" "0"
+  st "lock_target: and an empty FIRST sample reports the same channel" \
+    "$(printf '%s' "$_lk_first_t" | grep -c 'ch 1, target ch 1 (samples _/1/1)')" "1"
+  # want 0 is "any channel will do" -- lock_target's third argument omitted with no Watch target,
+  # which is how watchable() and the funnel call it. Three agreeing samples are a park whatever
+  # channel they name, so this must not take the c3 != want road into EXAMINE_CHANNEL.
+  local _lk_wch="$WATCH_CH"
+  : >"$tmp/chseq"
+  iwinfo() { printf '          Channel: 6 (2.437 GHz)\n'; return 0; }
+  WATCH_CH=0; lock_target aa:00:00:00:00:10 5 >/dev/null
+  st "lock_target: with no channel asked for, an agreed channel is still a park" "$?" 0
+  WATCH_CH="$_lk_wch"
   # ONE readable sample, in the FIRST slot this time: the mirror of the "_/_/1" case above, and the
   # only pattern that needs c3 to be backfilled from c1 rather than from c2. If that fallback is
   # dropped the rc is still 3 (the ngood rule decides it) but LOCK_TEXT reports an empty channel,
@@ -4652,7 +4722,15 @@ IWFIX
   st "response header written"           "$(head -1 "$tmp/responses.tsv")" "$RESP_HDR"
   st "response row field count = header" "$(sed -n 2p "$tmp/responses.tsv" | awk -F'|' '{print NF}')" \
                                          "$(printf '%s\n' "$RESP_HDR" | awk -F'|' '{print NF}')"
-  st "posture_why covers NOINJ" "$(posture_why NOINJ | grep -c 'may not transmit')" "1"
+  # NOINJ and NONE used to describe the firmware sender alone ("the radio may not transmit on this
+  # channel" / "no frame this firmware sends works"), which under-states the attempt on the one
+  # badge pair where disrupt_menu's blind fallback still offers a CSA and csa_issue still routes it
+  # to the injector. Both lines must now name what an injector does and does not change.
+  st "posture_why covers NOINJ" "$(posture_why NOINJ | grep -c 'pineapd refuses')" "1"
+  st "posture_why: NOINJ says what an injector changes and what it does not" \
+     "$(posture_why NOINJ | grep -c 'unproven on DFS, dropped on 6 GHz')" "1"
+  st "posture_why: beacon protection is not an injector problem either" \
+     "$(posture_why NONE | grep -c 'injector or not')" "1"
   # posture_why and posture_expect land on the same screen, so they must not disagree about the
   # same key. These lines used to read "CSA lands" / "CSA still lands" from the badge alone while
   # posture_expect labelled CSA 'fw-broken' with no injector configured. The three badges that
@@ -4663,10 +4741,17 @@ IWFIX
      "$(posture_why 'D?+C' | grep -c 'CSA only with an injector')" "1"
   st "posture_why: PMF-required too" \
      "$(posture_why C | grep -c 'CSA only with an injector')" "1"
-  # The invariant rather than the three strings: no badge line may promise that a CSA lands on its
-  # own. Catches a reworded line that drifts back to the old claim in new words.
+  # Two invariants rather than the three strings, because what must be forbidden is the CLAIM and
+  # not the two strings that carried it. The first catches "CSA lands" anywhere in a badge line,
+  # reworded or not -- it was anchored with `$` until 2026-11-17, which killed exactly the two old
+  # strings while "CSA lands too" and "a CSA will land" passed. The `$` is gone, so any number of
+  # lowercase words may sit between CSA and `lands`. The second is the positive form and is the
+  # stronger half: a badge line that mentions a CSA at all must say what sends it, so a drift that
+  # adds a bare promise BESIDE the pinned phrase is caught as well.
   st "posture_why: no badge line claims a bare CSA lands" \
-     "$(for _b in 'D+C' 'D?+C' C NONE NOINJ '?'; do posture_why "$_b"; printf '\n'; done | grep -cE 'CSA ([a-z]+ )*lands$')" "0"
+     "$(for _b in 'D+C' 'D?+C' C NONE NOINJ '?'; do posture_why "$_b"; printf '\n'; done | grep -cE 'CSA ([a-z]+ )*lands')" "0"
+  st "posture_why: a line that mentions a CSA always names the injector" \
+     "$(for _b in 'D+C' 'D?+C' C NONE NOINJ '?'; do posture_why "$_b"; printf '\n'; done | grep CSA | grep -vc injector)" "0"
   # disrupt_menu's blind "try anyway" fallback is a literal and the menu cannot be driven from here
   # (it needs a picker, a confirm and a posture read), so it is pinned the way the "Other devices"
   # wiring is above: read out of the file and compared with posture_opts' OWN output. That is the
@@ -4850,17 +4935,33 @@ IWFIX
   resp_members() { RESP_MEMBERS=(); RESP_MEMBERS_BSS=''; MEMBERS_WHY=NO_CLIENTS; MEMBERS_TEXT=stub; return 1; }
   # Two reads per attempt, the pre- and the post-. The counter lives in a file because resp_fire
   # calls this in the parent shell but the selftest's own checks run inside $( ) around it.
+  # MOVED has TWO producers and the rc-3 rule has to be pinned against both: ST_GONE is the
+  # present=0 one ("gone from recon"), ST_STALL the stalled-counter one (a post-read identical to
+  # the pre-read), which is the one an idle device produces unprovoked and the one the old
+  # "an absent frame does not explain a quiet subject" wording was weakest about. Before
+  # 2026-11-17 only ST_GONE was driven here, so the untested producer was also the common one.
   resp_snapshot() {
     RS_PK=(); RS_T=()
     if [ -s "$tmp/snapn" ]; then
       [ "${ST_GONE:-0}" = 1 ] && return 0          # subject dropped out of recon -> MOVED
-      RS_PK[$ST_SUB]=20; RS_T[$ST_SUB]=200         # counter advanced -> NO_EFFECT
+      if [ "${ST_STALL:-0}" = 1 ]; then
+        RS_PK[$ST_SUB]=10; RS_T[$ST_SUB]=100       # counter did not move -> MOVED, the other way
+      else
+        RS_PK[$ST_SUB]=20; RS_T[$ST_SUB]=200       # counter advanced -> NO_EFFECT
+      fi
     else
       printf 'x' >"$tmp/snapn"; RS_PK[$ST_SUB]=10; RS_T[$ST_SUB]=100
     fi
     return 0
   }
-  csa_issue() { CSA_CMD=pagerinj:ch1:n3; CSA_ERR='stub reason'; return "${ST_CRC:-0}"; }
+  # CSA_ERR only for a NON-ZERO rc, because that is the only state the real function can produce:
+  # csa_issue clears both globals on entry and its firmware tail returns 0 only via
+  # `(( rc == 0 )) && [ -z "$err" ]`. Setting it unconditionally made rc 0 an unreachable shape --
+  # resp_fire's refusal gate is `(( frc != 0 )) || [ -n "$ferr" ]`, so `st_fire3 CSA 0` scored
+  # CMD_REFUSED and the two lock-budget cases below asserted the lock argument of an attempt that
+  # never fired. A fixture that can return what the function cannot is authored from the test's
+  # convenience rather than from the artifact, which is the one thing CLAUDE.md forbids outright.
+  csa_issue() { CSA_CMD=pagerinj:ch1:n3; CSA_ERR=''; (( ${ST_CRC:-0} != 0 )) && CSA_ERR='stub reason'; return "${ST_CRC:-0}"; }
   PINEAPPLE_DEAUTH_CLIENT() { printf '%s\n' "$*" >>"$tmp/fired"; }
   PINEAPPLE_DEAUTH_CLIENT_CSA() { :; }
   SWEEP_TARGETED=0; RESP_SETTLE_SECS=0
@@ -4870,16 +4971,38 @@ IWFIX
     resp_fire aa:00:00:00:00:10 "$1" 'D+C' >/dev/null 2>&1; rc=$?
     printf '%s %s' "$(awk -F'|' 'NR == 2 { print $12, $16 }' "$tmp/responses.tsv" 2>/dev/null)" "$rc"
   }
+  # rc 0 first: the clean fire, which nothing in this block drove until 2026-11-17 because the
+  # stub's unconditional CSA_ERR sent it down resp_fire's refusal gate instead. It is the control
+  # the three answers below are differences from.
+  st "fire CSA: rc 0 is a clean fire, measured on the counters" "$(st_fire3 CSA 0)" "pagerinj:ch1:n3 NO_EFFECT 0"
   st "fire CSA: rc 2 proceeds to the measurement as a send"   "$(st_fire3 CSA 2)" "pagerinj:ch1:n3 NO_EFFECT 0"
-  # rc 3 reaches the SAME counters and must not report them as NO_EFFECT: "the CSA landed and the
-  # camera ignored it" and "no frame left the radio" explain an unchanged counter equally well, and
-  # the first is a firmware answer. The leg is marked ? in the cmd column.
-  st "fire CSA: rc 3 proceeds but downgrades NO_EFFECT to INCONCLUSIVE" "$(st_fire3 CSA 3)" "pagerinj:ch1:n3? INCONCLUSIVE 0"
+  # rc 3 reaches the SAME counters and may report NO verdict from them: "the CSA landed and the
+  # camera ignored it", "the CSA moved it" and "no frame left the radio" all explain what the
+  # counters did, and only the last is known to be available. So every verdict is read down, both
+  # of MOVED's producers included, and the leg is marked ? in the cmd column. The three cases below
+  # are the same single variable each time -- rc 3 against rc 2 on identical counters.
+  st "fire CSA: rc 3 proceeds but reads NO_EFFECT down to INCONCLUSIVE" "$(st_fire3 CSA 3)" "pagerinj:ch1:n3? INCONCLUSIVE 0"
   ST_GONE=1
-  st "fire CSA: rc 3 leaves MOVED standing -- an absent frame does not explain a quiet subject" \
-     "$(st_fire3 CSA 3)" "pagerinj:ch1:n3? MOVED 0"
+  st "fire CSA: rc 3 reads a VANISHED subject's MOVED down too" \
+     "$(st_fire3 CSA 3)" "pagerinj:ch1:n3? INCONCLUSIVE 0"
   st "fire CSA: and rc 2 still reads MOVED the same way" "$(st_fire3 CSA 2)" "pagerinj:ch1:n3 MOVED 0"
-  ST_GONE=0
+  ST_GONE=0; ST_STALL=1
+  # The stalled-counter MOVED, which is what an idle or wandering device reads as with nothing
+  # transmitted at all -- attack_scope's own comment says so -- and so the producer the downgrade
+  # matters most for. rc 2 beside it proves the downgrade is rc-3-only and not a blanket rule.
+  st "fire CSA: rc 3 reads a STALLED counter's MOVED down as well" \
+     "$(st_fire3 CSA 3)" "pagerinj:ch1:n3? INCONCLUSIVE 0"
+  st "fire CSA: and rc 2 on those same counters still reads MOVED" "$(st_fire3 CSA 2)" "pagerinj:ch1:n3 MOVED 0"
+  # Nothing measured is thrown away: the counters' own word survives in the subject line, where it
+  # is a reading about the device rather than a verdict about the attack.
+  st_fire3 CSA 3 >/dev/null
+  st "fire CSA: a downgraded verdict keeps the raw word in events.log" \
+     "$(grep -c 'INCONCLUSIVE pk 10 -> 10 present=1 raw=MOVED (CSA send unproven)' "$tmp/events.log")" "1"
+  # The BOTH arm on the SAME counters: the opcode-400 deauth has already left the radio, so its
+  # verdicts keep a transmission behind them and MOVED stands. This is the asymmetry that is real.
+  st "fire BOTH: rc 3 on the same stalled counters still loots MOVED" \
+     "$(st_fire3 BOTH 3)" "PINEAPPLE_DEAUTH_CLIENT+pagerinj:ch1:n3? MOVED 0"
+  ST_STALL=0
   st "fire CSA: rc 1 is still CMD_REFUSED, rc 1, nothing measured" "$(st_fire3 CSA 1)" "pagerinj:ch1:n3 CMD_REFUSED 1"
   # The BOTH arm. The deauth is already on the air by the time csa_issue runs, so no CSA rc fails
   # the attempt and none downgrades the verdict; what changes is which legs the loot names.
@@ -4918,7 +5041,7 @@ IWFIX
      "$(sed -n 1p "$tmp/locksecs")/$(sed -n 2p "$tmp/locksecs")" "26/20"
   CSA_INJ_SECS="$o_cs3"; CSA_INJ_WAIT="$o_cw3"; RESP_LOCK_SECS="$o_rl3"; CLI_CAP_SECS="$o_cc3"
   rm -f "$tmp/locksecs"
-  unset ST_CRC ST_GONE; unset -f st_fire3
+  unset ST_CRC ST_GONE ST_STALL; unset -f st_fire3
   rm -f "$tmp/snapn" "$tmp/fired" "$tmp/responses.tsv" "$tmp/events.log"
   eval "$o_lock3"; eval "$o_unlock3"; eval "$o_mem3"; eval "$o_snap3"; eval "$o_csa3"
   RESP_SETTLE_SECS="$o_set3"; SWEEP_TARGETED="$o_swp3"

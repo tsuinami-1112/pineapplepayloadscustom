@@ -4,9 +4,14 @@
 # HARNESS_INJ_CAP=1: capped or killed with NO send evidence -- exits 124 (what csa_issue's `timeout`
 #   wrapper reports on expiry, and what `wait` hands back whatever the injector itself exited with)
 #   and prints NO sent= line. Faithful to the real binary: pagerinj's sent=/failed= summary is
-#   printed only after its transmit loop (pagerinj.c:1604) and its SIGTERM handler is installed only
-#   once that loop is reached (:1531), so a run signalled while still waiting for a beacon to clone
-#   comes back with nothing to claim. csa_issue scores that rc 3 (unknown), not rc 2 (sent).
+#   printed only after its transmit loop (pagerinj.c:1604) and its SIGINT/SIGTERM handler is
+#   installed at :1531-1532, after the beacon capture (whose failure exits `return 1` with no
+#   summary, :1468) and before the loop (:1564) -- so a run signalled while still waiting for a
+#   beacon to clone comes back with nothing to claim, which is the window this stub models (see its
+#   stderr below). csa_issue scores that rc 3 (unknown), not rc 2 (sent).
+#   This said the handler was "installed only once that loop is reached (:1531)"; the line it cites
+#   is a sigaction 33 lines ABOVE the loop, so a signal landing between :1532 and :1564 still
+#   reaches the summary with sent=0 -- which is why csa_issue greps `sent=[1-9]` and not `sent=`.
 # NOTE it writes to stderr on SUCCESS too (the real binary prints its sent=/failed= summary there,
 # pagerinj.c's final fprintf). That is exactly why csa_issue must judge pagerinj by rc and hak5cmd
 # by stderr: one rule for both would file a fabricated result for one of them.
