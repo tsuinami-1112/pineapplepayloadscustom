@@ -381,7 +381,7 @@ where that asymmetry is recorded.
 **Posture** (what will work against a target, read from its beacon) —
 - `posture_read_pcap` → sets `POSTURE_RSN` / `POSTURE_EXT` / `POSTURE_BADGE`
 - `posture_from_caps <rsn> <ext> <band> <ch>` → the badge: `D+C` (no PMF), `D?+C` (PMF capable),
-  `C` (PMF required), `NONE` (PMF + beacon protection), `NOINJ` (cannot transmit here), `?` (unread)
+  `C` (PMF required), `NONE` (PMF + beacon protection), `NOINJ` (we will not transmit here), `?` (unread)
 - `posture_of` → cached per BSSID, `POSTURE_TTL`. **Call it directly, never inside `$( )`** — it
   sets globals in the caller's shell. It resets `POSTURE_RSN`/`POSTURE_EXT` on entry and caches the caps
   per BSSID beside the badge, so a cache hit restores this target's caps and never attributes a previous

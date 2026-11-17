@@ -373,8 +373,9 @@ reached. On `?` the old wording was right — with no injector `CSA` reads `fw-b
 the `?` test comes after.*
 
 `D?+C` cannot be resolved from a beacon alone, because PMF is negotiated per client — a transition
--mode BSS can hold both protected and unprotected clients at once. `NOINJ` is a
-property of the channel, not of the target, and it has three producers rather than two: pineapd
+-mode BSS can hold both protected and unprotected clients at once. `NOINJ` says
+nothing about the target: it is decided before any beacon is read, from the channel and from what
+CamHound could learn about it, and it has three producers rather than two: pineapd
 refuses the 16 DFS channels and 6 GHz outright; cfg80211 drops frames on channels the live table
 marks disabled or no-IR, and the radio cannot reach one the table never lists; and when no table
 could be read at all CamHound refuses everything outside 2.4 GHz 1-11 and 5 GHz 36-48 — its own

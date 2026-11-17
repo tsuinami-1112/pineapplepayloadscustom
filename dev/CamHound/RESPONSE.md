@@ -174,9 +174,9 @@ on DFS, dropped on 6 GHz" (the gate asymmetry below).
 
 Two honest limits baked into the model. `D?+C` **cannot be resolved from a beacon at all**, because
 PMF is negotiated per client — a transition-mode BSS can hold protected and unprotected clients
-simultaneously, so the badge says `partial` and means it. And `NOINJ` is a property of the
-*channel*, not the target, so `csa_injectable()` short-circuits the whole read: a channel we cannot
-transmit on needs no capture.
+simultaneously, so the badge says `partial` and means it. And `NOINJ` says nothing about the *target* — it is decided
+from the channel and from what `inj_probe()` could read about it — so `csa_injectable()`
+short-circuits the whole read: a channel we will not transmit on needs no capture.
 
 `NOINJ` is decided by **two independent gates in series**, which are easy to conflate:
 
