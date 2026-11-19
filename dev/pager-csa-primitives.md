@@ -232,9 +232,26 @@ section used to list it as a second unconfirmed item, advising `ff:ff:ff:ff:ff:f
 That advice is moot: the request struct behind `/api/pineap/deauth_all` carries **no `target`
 field**, its handler parses one MAC where the targeted handler parses two, and Go's
 `json.Unmarshal` drops the extra positional silently. So `_ALL` is **untargeted whatever you pass**
-— it hits every client on the BSSID. Full evidence, and the operator-visible consequence for
-CamHound's menu, is in `CLAUDE.md` §"2.0.0-stable, analysed" (one copy, kept there). Method for
-re-deriving it is the next section.
+— ~~it hits every client on the BSSID~~.
+
+**⚠ Struck 2026-11-17: `_ALL` hits NOBODY.** "Untargeted whatever you pass" survives and is
+strengthened; the clause about who it hits is wrong by a measured fact this file was never updated
+for. `StartDeauthAll` emits `li a0,402` at `0x0086c62c` — the **same** command id as
+`StartDeauthCsa` — and pineapd's single deauth handler dispatches on that id: 400 deauth, 401
+deauth+CSA, 402 CSA only. 402 fails the first dispatch test and reaches `inject_csa(bssid, ch, 14)`
+without ever reaching `inject_deauth` at `0x47364e`, so `_ALL` **builds no deauth frame at all**;
+the `ff:ff:ff:ff:ff:ff` it writes into `sta` by immediate is dead data the 402 path never reads.
+Confirmed on the bench the same day, one address and one channel minutes apart:
+`PINEAPPLE_DEAUTH_CLIENT <bssid> ff:ff:ff:ff:ff:ff 8` dropped the client, `..._ALL` with that same
+address did nothing. The evidence lives in `CLAUDE.md` §"Third contact", **not** in
+§"2.0.0-stable, analysed", which this paragraph used to point at as the one copy — that section
+carries the Go struct-size readings and defers its mechanism to Third contact. *Falsified by:*
+`_ALL` disconnecting any client on any firmware, or a `li`/`ori a0,401` anywhere in
+`/pineapple/pineapple`, either of which would overturn Third contact instead of this strike.
+
+Full evidence is therefore in `CLAUDE.md` §"Third contact" (one copy, kept there); the
+operator-visible consequence for CamHound's menu is in §"2.0.0-stable, analysed" beside it. Method
+for re-deriving the Go half is the next section.
 
 ### Recovering Go symbols from `/pineapple/pineapple` — and the two traps that cost a session
 

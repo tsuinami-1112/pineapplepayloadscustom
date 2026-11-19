@@ -325,13 +325,24 @@ On by default. `PAYLOAD_SET_CONFIG camhound RESPONSE 0`, or Settings → Respons
 
 **Scope: only `DEAUTH` on a client row hits one device.** `PINEAPPLE_DEAUTH_CLIENT_CSA` takes
 `[bssid] [channel]` and has no target argument, so `CSA` is BSS-wide by its own signature;
-`PINEAPPLE_DEAUTH_CLIENT_ALL` advertises a `[target]` that its handler parses and discards, so
-`BOTH` is BSS-wide too. An AP row resolves the target to broadcast, so on one of those all three
+`BOTH` is BSS-wide because its **CSA leg** is that same targetless command, issued as a second
+command after the deauth. An AP row resolves the target to broadcast, so on one of those all three
 options are BSS-wide. `attack_scope()` is the single place that decides; the picker appends ` bss`
 to a broad option and the pre-transmit confirm reads *"on EVERY client of <bssid>"* rather than
-naming one device. `posture_opts` still orders by expected efficacy, so a BSS-wide attack is
-preselected on the common badges — deliberately, since demoting the attack most likely to work
-would make the advice worse; the marker and the confirm carry the breadth instead.
+naming one device. One corner where that confirm over-warns, stated so it is not a surprise: with
+`SWEEP_TARGETED=0` (not the default), `BOTH` from a client row is one *targeted* deauth plus a
+BSS-wide CSA, so the breadth is real of the CSA half only. At the shipped `SWEEP_TARGETED=1` the
+targeted sweep follows the deauth to every station the attempt covers, and the confirm is exact.
+
+*Corrected 2026-11-09: `BOTH` is **not** `PINEAPPLE_DEAUTH_CLIENT_ALL`, and this paragraph used to
+say `_ALL`'s `[target]` was "parsed and discarded".* `_ALL` and `_CSA` send the **same** command id
+to the firmware daemon, which builds a CSA and **no deauth frame at all** — measured on the bench,
+where the plain `PINEAPPLE_DEAUTH_CLIENT` with a broadcast target dropped a client on demand and
+`_ALL` with that same address, same channel, same BSSID, minutes later, did nothing. So `BOTH` now
+sends `PINEAPPLE_DEAUTH_CLIENT` and then a CSA of its own, and **`DEAUTH` is preselected on every
+badge**: it is the only option whose frame this firmware actually builds. `posture_opts` no longer
+orders by expected efficacy — ordering by a prediction put a provable no-op at the top of the list.
+The developer write-up is `dev/CamHound/RESPONSE.md` §2.
 
 **1 · Posture.** The badge comes from the target's own beacon, captured on `RECON_IF` — the only
 source that covers every band, since `radio0` is 2.4 GHz-only and `radio1` carries no managed
@@ -342,35 +353,73 @@ captured under a short channel lock when no Watch lock is held, since Recon hops
 
 | Badge | Meaning | deauth+disassoc | CSA |
 |---|---|---|---|
-| `D+C` | no PMF | works | works |
-| `D?+C` | PMF optional (transition mode) | per-client | works |
-| `C` | PMF required (WPA3) | ignored | works |
+| `D+C` | no PMF | works | only with an injector configured |
+| `D?+C` | PMF optional (transition mode) | per-client | only with an injector configured |
+| `C` | PMF required (WPA3) | ignored | only with an injector configured |
 | `NONE` | PMF + beacon protection | blocked | blocked |
-| `NOINJ` | channel we cannot transmit on: DFS 5 GHz, 6 GHz, or disabled/no-IR under the live domain | cannot transmit | cannot transmit |
+| `NOINJ` | channel we will not transmit on: DFS 5 GHz, 6 GHz, disabled/no-IR or unlisted under the live domain — or, when the live table could not be read at all, anything outside 2.4 GHz 1-11 and 5 GHz 36-48 | cannot transmit | cannot transmit |
 | `?` | no beacon captured | unknown | unknown |
 
+*The CSA column read `works` on the first three rows until 2026-11-15.* It is the badge's verdict on
+the channel-switch **mechanism**, which is a different question from whether this firmware can send
+one: the firmware's CSA announces **channel 14** (Japan-only, not in the US table) with a switch
+count of **0**, both fixed in the daemon with no setting that reaches them. So unless `CSA_INJECTOR`
+is set to an executable injector, the picker labels CSA `fw-broken` on every badge it still speaks
+for, and the one-line explanation on screen says the same — except on `NONE` and `NOINJ`, whose
+lines name what an injector does and does not buy instead (two paragraphs down). *Qualified
+2026-11-17: this read "whatever the beacon says", which the table's own `NONE` and `NOINJ` rows
+contradict: there the label is `blocked`, both badges being decided before the CSA clause is
+reached. On `?` the old wording was right — with no injector `CSA` reads `fw-broken` there, because
+the `?` test comes after.*
+
 `D?+C` cannot be resolved from a beacon alone, because PMF is negotiated per client — a transition
--mode BSS can hold both protected and unprotected clients at once. `NOINJ` is a gate verdict,
-not a property of the target: pineapd refuses the 16 DFS channels and 6 GHz outright, and cfg80211
-drops frames on channels the live regulatory domain marks disabled or no-IR. pineapd logs its refusal
+-mode BSS can hold both protected and unprotected clients at once. `NOINJ` says
+nothing about the target: it is decided before any beacon is read, from the channel and from what
+CamHound could learn about it, and it has three producers rather than two: pineapd
+refuses the 16 DFS channels and 6 GHz outright; cfg80211 drops frames on channels the live table
+marks disabled or no-IR, and the radio cannot reach one the table never lists; and when no table
+could be read at all CamHound refuses everything outside 2.4 GHz 1-11 and 5 GHz 36-48 — its own
+caution, not a gate's verdict. pineapd logs its refusal
 and returns an error; cfg80211's drop is silent (the frame is freed and `sendto` reports success), so
 CamHound refuses rather than guesses (`csa_injectable`, two gates; see `dev/pager-csa-primitives.md`).
+The two gates are **not symmetrical**, which is why the screen line for `NOINJ` reads "will not inject
+here: pineapd refuses DFS and 6 GHz, the channel table the rest (or none was read); an injector is
+unproven on DFS, dropped on 6 GHz" (the "rest" being the disabled, no-IR or unlisted channels above,
+and "none was read" the case where CamHound could not read the table at all and passes only 2.4 GHz
+1-11 and 5 GHz 36-48, its own caution rather than either gate's verdict): on 5 GHz DFS only pineapd refuses,
+so a configured injector bypasses the gate — but nothing has yet been **shown** to reach the air
+there, and the on-device test cannot tell a transmitted frame from a silently dropped one. On 6 GHz
+cfg80211 refuses as well, so an injector changes nothing.
 
-**2 · Attack.** All three are always offered, ordered by what the beacon says will work and
-labelled `works` / `partial` / `blocked` / `unknown`. The first in the list is preselected, so the
-ordering is the recommendation. The badge advises; you decide — there are two gates, and both can be
-overridden:
+**2 · Attack.** All three are always offered, **`DEAUTH` first on every badge**, and each is
+labelled with what will actually be **sent**. The first in the list is preselected, so the ordering
+is the recommendation. The labels:
+
+| label | on | means |
+|---|---|---|
+| `works` | `DEAUTH` | no PMF: the deauth lands |
+| `partial` | `DEAUTH`, `BOTH` | PMF optional: it lands on the clients that did not negotiate PMF |
+| `blocked` | any | PMF required, or `NONE`/`NOINJ`: this one cannot work. On `NOINJ` that is deliberately the conservative word even with an injector configured — whichever rule refused, an injector only bypasses pineapd's DFS refusal, a frame from one has never been **shown** to reach the air on DFS, and on 6 GHz or a no-IR channel cfg80211 drops it whoever sends it — so the label stays `blocked` and the explanation line says what is and is not known |
+| `fw-broken` | `CSA` | the firmware's CSA, which announces channel 14 with count 0 and moves nothing |
+| `injector` | `CSA`, `BOTH` | `CSA_INJECTOR` is configured, so the CSA is a real one. On `BOTH` it appears under PMF-required (`C`), where it names the only leg that can send — the line above the picker still tells you the deauth is ignored there |
+| `deauth only` | `BOTH` | the deauth will be sent; the CSA leg is the firmware's and is along for the ride |
+| `deauth+csa` | `BOTH` | both legs will be sent for real, the CSA through the injector |
+| `unknown` | `DEAUTH`, `BOTH`, and `CSA` with an injector | the beacon was not read, so nothing is predicted |
+
+The badge advises; you decide — there are two gates, and both can be overridden:
 
 - **`NONE` or `NOINJ`** — nothing is offered. You are asked once ("Nothing is expected to work"),
-  and may proceed anyway.
-- **`?`** — the beacon could not be read, so none of the labels mean anything. CSA leads, because it
-  works on every badge but `NONE`, and you are asked once ("Fire blind?") before the picker.
+  and may proceed anyway; the fallback list is `DEAUTH`, `BOTH`, `CSA`, in that order.
+- **`?`** — the beacon could not be read, so none of the deauth labels mean anything. You are asked
+  once ("Fire blind?") before the picker, and there `DEAUTH` and `BOTH` read `unknown` while `CSA`
+  still reads `fw-broken` — that one does not depend on the beacon. *`CSA` used to lead this list,
+  "because it works on every badge but `NONE`"; it does not, and that is why `DEAUTH` leads now.*
 
 | Option | Command | Frames | Scope |
 |---|---|---|---|
 | `DEAUTH` | `PINEAPPLE_DEAUTH_CLIENT [bssid] [target] [channel]` | deauth + disassociation | one client (from a client row); whole BSS from an AP row |
 | `CSA` | `PINEAPPLE_DEAUTH_CLIENT_CSA [bssid] [channel]` | channel-switch announcements | whole BSS |
-| `BOTH` | `PINEAPPLE_DEAUTH_CLIENT_ALL [bssid] [target] [channel]` | all three | whole BSS |
+| `BOTH` | `PINEAPPLE_DEAUTH_CLIENT [bssid] [target] [channel]`, then a CSA as a second command | deauth + disassociation, then a channel-switch announcement | whole BSS |
 
 An AP target is attacked broadcast (`ff:ff:ff:ff:ff:ff`); a client target is attacked through its
 own AP's BSSID on that AP's channel. A client with no AP known has no BSS to announce from and is
@@ -380,15 +429,32 @@ because it rides in a beacon.
 
 **3 · Verdict.** Every kernel-side drop path reports success, so "we sent it" proves nothing. The
 channel is locked with the same `lock_target` Watch uses (verified read-back, falling back to a
-channel lock, aborting if the radio is still hopping), and after `RESP_SETTLE_SECS` the target is
-re-read from Recon:
+channel lock, aborting if the readings disagree with each other **or** if the radio is still on
+another channel after the channel command), and after
+`RESP_SETTLE_SECS` the target is re-read from Recon:
 
 | Verdict | Means |
 |---|---|
 | `MOVED` | gone from Recon, or its packet counter stalled with nothing newer seen |
 | `NO_EFFECT` | packet counter still advancing — it never left |
 | `INCONCLUSIVE` | no baseline, no follow-up reading, or the counter stalled but it was seen again |
-| `LOCK_FAILED` | the radio would not hold the target channel; nothing was transmitted |
+| `LOCK_FAILED` | the radio would not hold the target channel; nothing was transmitted. Two ways to get here: the three channel readings disagreed with each other (still hopping), or they agreed but on the wrong channel and the radio was still elsewhere after the channel command. `events.log` tells them apart — `still hopping (samples …)` against `ch 7 != 8, lock failed` |
+| `CMD_REFUSED` | the firmware refused the command, so nothing was transmitted. Every subject of that attempt gets this instead of a verdict, because a refusal is not a measurement |
+
+**When the `cmd` column ends in `?`, the CSA injector could not prove it sent anything** — its
+window expired with no `sent=N` line to show — so on a `CSA` attempt the verdict is `INCONCLUSIVE`
+whatever the counters did, `MOVED` included; "nothing was transmitted" explains a quiet device as
+well as a successful switch does. The word the counters actually scored is kept in `events.log`, on
+the `subject` line as `raw=MOVED`, and the verdict line on screen ends `; CSA send unproven`. On a
+`BOTH` attempt the `?` marks the CSA leg only: the deauth did leave the radio, so that verdict
+stands as it would on any other fire. *New 2026-11-17 — until then a `MOVED` behind an unproven
+send was looted as `MOVED` and lit the green "hit" screen.*
+
+Those last two are the only refusals written to `responses.tsv`. Separately, the **`lock`** column
+can read `unverified`: the radio's channel could not be read back (or only one of the three reads
+succeeded), so the lock was not confirmed. **That is not a failure and the attempt still fires** —
+refusing every response on a device whose channel will not read back would be worse than labelling
+it — but treat the verdict beside an `unverified` lock as weaker evidence than one beside `ok`.
 
 An AP-row Disrupt whose client capture recovered **nobody** — no station heard twice, a capture cut
 before the client address (raise `CLI_CAP_SNAP`), or no usable `tcpdump` — **still fires its
@@ -403,7 +469,14 @@ What is measured follows the attack's **scope**, not the row you picked. A `cli`
 (`DEAUTH` from a client row) measures that one device. A `bss`-scope attempt (`CSA` or `BOTH` from any
 row, or anything from an AP row) is measured on the BSSID's visible, non-randomised clients, since the
 AP itself keeps beaconing whatever happens; the device you picked is always among them, even behind a
-randomised MAC. `responses.tsv` gets one row per subject (each measured client, or the broadcast
+randomised MAC. **From an AP row, every station heard in the listen window is a subject too** —
+including the randomised MACs and the ones Recon has no row for, which the sweep above skips. Those
+cannot be measured (there is no baseline to compare against), so each gets its own loot row reading
+`INCONCLUSIVE`, and **one of them is enough to stop the whole attempt reading `MOVED`**: the
+aggregate is `MOVED` only when every subject went quiet and none was unsettled. It can still read
+`NO_EFFECT`, since a station that kept transmitting is positive evidence the attack missed. That is
+deliberate — the alternative is to leave devices you transmitted at out of the loot, which is how
+this rung once went silent on an AP whose only client carried a randomised MAC. `responses.tsv` gets one row per subject (each measured client, or the broadcast
 placeholder when nobody was heard), and the verdict shown is the
 aggregate (`MOVED` only when every subject went quiet, `NO_EFFECT` when any kept transmitting,
 `INCONCLUSIVE` otherwise). When you picked one device and more than one was measured, a second line

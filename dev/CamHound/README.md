@@ -12,7 +12,7 @@ facts that are settled so they do not get re-derived.
 | File | Purpose |
 |---|---|
 | `PLAN_v2.md` | the full recon design: user answers, adopted ideas, confidence model, feature list, phases, the Phase 0 spike table (section 7.1) |
-| `RESPONSE.md` | the response side (the Disrupt rung): why CSA works where deauth cannot, the undocumented firmware primitives, the posture model and its element/bit references, target resolution, the channel lock, the verdict model, block placement, and what is still unverified |
+| `RESPONSE.md` | the response side (the Disrupt rung): why CSA works where deauth cannot, the undocumented firmware primitives, the posture model and its element/bit references, target resolution, the channel lock and its four return codes, the verdict model, the CSA leg's return-code contract (§7a), block placement, and what is still unverified |
 | `gen_hooks.sh` | regenerates `library/recon/{client,access_point}/CamHound/` from the user payload (header + config + lib block + watch-core block + `hook_main.sh`) |
 | `check_sync.sh` | fails when the shared blocks differ between the user payload and the hooks |
 | `hook_header.sh`, `hook_main.sh` | the hook-only parts |
@@ -186,14 +186,17 @@ and `RESPONSE_CONFIRM`). For a recon-only first run:
 `--selftest` is safe to run on the device — every device-changing command is stubbed, and since
 2026-11-04 so is every display and dialog command, so it no longer paints the Pager's screen nor can
 it block on a button press. The cheapest first step is `bash payload.sh --selftest` on the Pager
-itself. Expect `== 489 checks, 0 failed ==` (the count as of 2026-11-15; it grows with every case added) and
-the two block hashes; a lower count means the copy
-on the device is older than the repo's.
+itself. Expect `0 failed` beside **the count printed at the end** — deliberately not restated here,
+because it grows with every case added and a stale number in this file reads as a target — and the
+two block hashes. A count *lower than the repo's own* means the copy on the device is older than the
+repo's, so compare it against a `--selftest` run on this checkout rather than against a figure
+written down here.
 
 *Corrected 2026-11-04. An earlier version of this paragraph called the device run "the only way to
 exercise the `od` fallback in `pcap_stream`/`pcap_words`, since a laptop with `hexdump` never takes
 that branch and `od` is what the Pager actually has". **Both halves are backwards.** All three
-dumpers are `if hexdump; then hexdump; else od; fi` (`payload.sh:636`, `:694`, `:1894`); `hexdump`
+dumpers are `if hexdump; then hexdump; else od; fi` (`pcap_bytes`, `pcap_stream`, `pcap_words` —
+those three line numbers had gone stale and are function names since 2026-11-15); `hexdump`
 is in the measured device inventory and `od` ships in neither firmware image, so a Pager always
 takes the **hexdump** branch and a device run exercises the fallback less, not more. The `od` branch
 is for a host that lacks hexdump — which is what the cloud container running the gates is, so the
@@ -219,6 +222,7 @@ table has never had one. The probe's answer is the `jq=1` of its first row.)*
 | `assoc <mac> -> <bssid> n=N up=U recs=R itmax=I ch=C lock=ok dwell=Ns` | a client's AP was read off the air: N frames between the two out of R records, U of them the client's own (at least one is required), radiotap I bytes, parked on channel C. **`lock=` is the first-run answer to whether `EXAMINE_CHANNEL` alone parks:** `ok` it did, `unverified` the channel could not be read back, `hop` it did not and the capture ran across the hop |
 | `assoc <mac> none why=NO_FRAMES\|NO_PAIR\|NO_UPLINK\|AMBIGUOUS\|SNAP_SHORT\|NO_CAPTURE … ch=C lock=…` | the lookup found no AP and the card is unchanged. `NO_FRAMES` means not heard on channel C in the window — the client may be idle, or its AP may be on another channel than the one it was last heard on; it is not evidence that the client is unassociated. Every failure line ends `own=N`, the number of frames the client itself sent in the capture: 0 is `NO_UPLINK`, more than 0 with no AP seen twice is `NO_PAIR`; an `AMBIGUOUS` line adds `cand=<bssid>/<n>,<bssid>/<n>`, both candidates whole with their own-frame counts. `NO_UPLINK … down=<bssid>/K` means that AP was heard sending K frames to the client and the client itself was not heard: nothing is named, because an AP goes on sending to a client that has left it |
 | `assoc members of <bssid>: N heard, M client row(s) now carry this AP[, K more only sent to (not taught)]` | an AP-row Disrupt's membership capture heard N stations transmitting to that AP; M of them have a client row that now carries it, and those cards offer Watch and Disrupt outright. The other N − M have no Recon row yet (remembered, applied when one appears) or an AP the firmware supplied. K further members were heard only as the destination of the AP's frames: they are in the attack and its measurement, and are not taught this AP |
+| the `csa inject` line with **`issue=3`** | the CSA injector was **capped with no send evidence**: its wrapper expired and it printed no `sent=N` line with N > 0, so whether a frame left the radio is *unknown* (the test is `sent=[1-9]`: a `sent=0` is a `sent=` line and is not send evidence, which `issue=2` requires). **Read `issue=`, not `rc=`** — the two numbers on that line are different things: `rc=` is the `timeout` wrapper's status (124 on expiry, ≥ 128 when it was signalled) and `issue=` is `csa_issue`'s own classification, `0` clean, `2` sent then capped (`sent=N` on stderr), `3` capped with nothing to show, `1` a refusal. So an `issue=3` line normally reads `rc=124 issue=3`, and `issue=3` is the marker to grep for. It is neither a refusal (`issue=1`, which loots `CMD_REFUSED`) nor a proven send. On a `CSA` attempt **every** verdict behind it is read down to `INCONCLUSIVE`, because "nothing was transmitted" explains each of them equally well — and so is a `MOVED`; the `subject` line keeps the raw word as `raw=MOVED`, and the verdict line on screen ends `; CSA send unproven`. *This row said "while a `MOVED` stands" until 2026-11-17: `resp_verdict` scores `MOVED` for a subject that left the Recon list or whose packet counter did not advance, which is what an idle device does unprovoked, so an absent frame explains it as well as it explains a `NO_EFFECT` — `attack_scope`'s own comment in `payload.sh` says so, and the harness's frozen counters produce that very case on every run.* On a `BOTH` attempt the CSA leg is recorded unknown (`cmd` gains a `?`, and `csa leg unknown` is logged) and the deauth's verdict is untouched, the deauth having already left the radio. `RESPONSE.md` §7a is the contract |
 | `no-members <bssid> why=NO_CAPTURE\|SNAP_SHORT\|NO_CLIENTS` then `fired … broadcast with no members recovered` | an AP-row Disrupt recovered nobody and **fired the broadcast anyway** (operator-decided 2026-11-10, "nuclear blast"); `responses.tsv` has one `INCONCLUSIVE` row for `ff:ff:ff:ff:ff:ff`. These tokens are no longer loot verdicts — `SNAP_SHORT` still names `CLI_CAP_SNAP` as the knob |
 
 Known-inert on 1.1.3, so do not read these as faults: client association **until a client is
