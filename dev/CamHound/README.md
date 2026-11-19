@@ -121,11 +121,13 @@ scp dev/injector/pagerinj root@172.16.52.1:/root/pagerinj
 ssh root@172.16.52.1 'chmod +x /root/pagerinj; /root/pagerinj --selftest | tail -2'
 ```
 
-**Leave `CSA_INJECTOR` empty until the bench says otherwise.** `dev/injector/README.md` requires
-pineapd STOPPED — it hops the interface and its own CSA flood is a clone source `pagerinj` skips —
-and CamHound cannot stop pineapd, because Recon, the EXAMINE lock and every deauth command *are*
-pineapd. Turning the hook on bets that CamHound's EXAMINE lock holds the channel well enough, and
-nothing has measured that. Measure it standalone first with `dev/injector/run_17a.sh`. That script
+**`CSA_INJECTOR` is off by default; the EXAMINE-lock half of that caution is now measured.**
+`dev/injector/README.md` §Use still says to stop pineapd, but `run_17a.sh` has parked with EXAMINE
+and left pineapd running since 2026-11-09, and eight arms transmitted that way on `wlan1mon` with
+`park confirmed` and `sent=84..97` (CLAUDE.md Fourth to Sixth contact). What turning the hook on
+still bets is the rest of the envelope: the injector starts late in CamHound's 36 s lock, gets
+`CSA_INJ_WAIT` = 5 s for its beacon where `run_17a` allows 10, and cannot clear a pineapd CSA queued
+on the BSSID in the previous ~10 s, whose clones `pagerinj` refuses as a clone source. `run_17a.sh`
 parks the radio with EXAMINE by default and leaves pineapd running; pass `--stop-pineapd` only if
 you want it stopped, because stopping it takes the monitor interfaces down with it (measured on the
 bench) and the script has to bring them back up. It restores whatever it changed on `EXIT`, `INT`,

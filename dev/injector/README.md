@@ -371,13 +371,24 @@ the docs — derived from `ieee80211_mgd_csa_present()`, not measured.
 ## Use
 
 ```sh
-# FIRST, every time, before any transmit: stop pineapd.  Plan §B0 rig control 1: "If the hopper
-# moves wlan1mon before dequeue, the frame goes out on another channel and the parked receiver sees
-# nothing — which would be scored as a kernel gate."  §B4 opens with exactly this line.  (Control 1's
-# own command, `uci set pineapd.wlan1mon.hop=0; uci commit pineapd; /etc/init.d/pineapd restart`,
-# only stops the hopping and leaves pineapd — and its CSA flood, a CSA-bearing clone source the
-# 17a capture would have to skip — running; for pagerinj the stop is the right one.)
-/etc/init.d/pineapd stop; sleep 2; ip link set wlan1mon up
+# pineapd and the radio. Two cases, and the default is NOT to stop pineapd -- measured 2026-11-09,
+# four runs: pineapd OWNS the monitor interfaces, so stopping it takes wlan1mon away and pagerinj
+# transmits nothing (`recv: Network is down`, rc=1). See run_17a.sh's header, lines 15-29. (This
+# block said "FIRST, every time, before any transmit: stop pineapd" until 2026-11-19, five days
+# after the script it describes stopped doing so.)
+#   * Normal case: leave pineapd running and let EXAMINE pin the radio -- pineapd is measured to
+#     transmit under a held lock (CLAUDE.md "Third contact"), and eight 17a arms cloned and flooded
+#     under one. An EXAMINE park on a DFS channel has not yet been issued on a Pager; if it is
+#     refused, that is the second case.
+#       PINEAPPLE_EXAMINE_BSSID AA:BB:CC:DD:EE:FF 30; PINEAPPLE_EXAMINE_CHANNEL 52 30
+#       ip link set wlan1mon up        # it can be administratively DOWN while pineapd runs
+#   * Stop pineapd ONLY when it has recently been asked for a firmware CSA on this BSSID: its own
+#     count-0 clones are then in the air and pagerinj refuses them as clone sources. Bring the
+#     interfaces back yourself afterwards.
+#       /etc/init.d/pineapd stop; sleep 2; ip link set wlan1mon up
+# Plan §B0 rig control 1 ("If the hopper moves wlan1mon before dequeue, the frame goes out on
+# another channel and the parked receiver sees nothing") is met by the EXAMINE pin; its own
+# `uci set pineapd.wlan1mon.hop=0` is the alternative that keeps pineapd up.
 
 # B4 / step 13 — prove transmission on a DFS channel.  Set the channel FIRST.  Here --chan is the
 # nonce beacon's own DS Parameter Set, so it names the channel you parked on.

@@ -464,11 +464,22 @@ teardown could reach; the injector is now `child_add`ed and `timeout`-capped as 
 executable, else the firmware command, and owns the rc-vs-stderr question the two senders answer
 **oppositely** — `hak5cmd` exits 0 on every error path so stderr is its only signal, while
 `pagerinj` prints its `sent=/failed=` summary to stderr even on success so rc is its only signal;
-one rule for both would file a fabricated result). **`CSA_INJECTOR` defaults to empty and should
-stay that way until the bench says otherwise**: `dev/injector/README.md` requires pineapd STOPPED,
-and CamHound cannot stop pineapd — Recon, the EXAMINE lock and every deauth command *are* pineapd —
-so the in-payload path bets that the EXAMINE lock holds the channel well enough, and that bet is
-unmeasured. The validated way to run `pagerinj` is standalone: `dev/injector/run_17a.sh`. The three
+one rule for both would file a fabricated result). **`CSA_INJECTOR` defaults to empty, and what is left unmeasured is narrower than this line said
+until 2026-11-19.** `dev/injector/README.md` §Use still opens "stop pineapd", but `run_17a.sh` has
+parked with EXAMINE and left pineapd **running** since 2026-11-09 (its header, lines 15-29: stopping
+it "removes the very interfaces pagerinj needs", and cost three bench runs of four), issuing
+`EXAMINE_BSSID` then `EXAMINE_CHANNEL` (`:233-236`) — the same pair `lock_target` issues — on
+`wlan1mon`, which is `RECON_IF`. Eight arms transmitted that way, `sent=84..97` (Fourth to Sixth
+contact), the six of Fifth and Sixth contact each printing `park confirmed: wlan1mon reads ch 8
+twice`. So the EXAMINE lock holding the channel well enough for `pagerinj` is **measured**, and
+"standalone with pineapd stopped" — what this line used to call the validated way — names the
+configuration that failed. What is still unmeasured is CamHound's envelope: the injector starts far
+later into the lock (after `RESP_LOCK_SECS` and a `CLI_CAP_SECS` membership capture plus a re-arm,
+a 36 s budget against `run_17a`'s 30), its beacon capture gets `CSA_INJ_WAIT` = 5 s where `run_17a`
+takes pagerinj's default 10, no 17a run read Recon's counters, and when pineapd was asked for its own
+CSA on the BSSID within the previous ~10 s (its record's TTL) its count-0 clones are on the air and
+`pagerinj` skips a CSA-bearing clone source and exits rc 1, which only `--stop-pineapd` clears and
+CamHound cannot. The standalone runner is `dev/injector/run_17a.sh`. The three
 CSA keys (`CSA_INJECTOR`, `CSA_COUNT`, `CSA_CHAN`) are deliberately **unstarred**, because `cfg()`
 accepts integers only so a path cannot arrive via `PAYLOAD_SET_CONFIG`, and a star without a
 `SETTINGS_TABLE` row is a lie.

@@ -124,12 +124,18 @@ FIRE_ERR="/tmp/cs_fire_$$.err"   # the attack command's stderr: a refusal must n
 # Number of 14 (li a3,14 at 0x473634 -- 2484 MHz, Japan-only, 11b-only, absent from the US table).
 # Both are literals with a single call site. dev/injector/pagerinj builds the element properly, so
 # pointing CSA_INJECTOR at it routes the CSA leg there instead of at the firmware command.
-# DEFAULT OFF, and read dev/injector/README.md before turning it on. pagerinj's own docs say to
-# STOP PINEAPD first, because it hops the interface and its CSA flood is itself a CSA-bearing clone
-# source. CamHound cannot stop pineapd -- Recon, the EXAMINE lock and every deauth command ARE
-# pineapd -- so the in-payload path is betting that the EXAMINE lock holds the channel well enough,
-# and that bet is UNMEASURED. The validated way to run pagerinj is standalone, with pineapd stopped;
-# dev/injector/run_17a.sh does that. Turn this on only once the bench says the two can coexist.
+# DEFAULT OFF, and read dev/injector/README.md before turning it on -- but note its §Use still
+# opens "stop pineapd" and run_17a.sh's header no longer agrees: since 2026-11-09 that script parks
+# with EXAMINE and leaves pineapd RUNNING, because stopping it removes the very interfaces pagerinj
+# needs (it cost three bench runs of four). Eight arms transmitted under that park, on wlan1mon, which
+# is this RECON_IF, with the same two EXAMINE commands lock_target issues -- park confirmed,
+# sent=84..97 (CLAUDE.md Fourth to Sixth contact). So the lock holding the channel is MEASURED.
+# What is not is this payload's envelope: csa_issue starts the injector only after RESP_LOCK_SECS
+# and the membership capture, gives it CSA_INJ_WAIT=5s to find a beacon where run_17a allows 10, and
+# if pineapd was asked for its own CSA on this BSSID in the previous ~10 s its count-0 clones are on
+# the air -- pagerinj SKIPS a CSA-bearing clone source and exits rc 1 (csa_issue scores that
+# icls=1), and only --stop-pineapd clears it, which CamHound cannot do. Turn it on with that in mind
+# and read the `csa inject` line.
 # Not starred: cfg() accepts integers only, so a path cannot arrive via PAYLOAD_SET_CONFIG, and a
 # star with no SETTINGS_TABLE row is a lie (CLAUDE.md). Edit these here.
 CSA_INJECTOR=""         # absolute path to pagerinj; empty = use the firmware command

@@ -322,12 +322,20 @@ control (ch 5180, same shell, no interface state change in between: plan B0 cont
 means nothing.
 
 ```sh
-# FIRST, every time, before any pagerinj transmit: stop pineapd (plan B0 rig control 1; this is B4's
-# exact line). It hops wlan1mon — "If the hopper moves wlan1mon before dequeue, the frame goes out on
-# another channel and the parked receiver sees nothing — which would be scored as a kernel gate."
-# Control 1's own `uci set pineapd.wlan1mon.hop=0; uci commit pineapd; /etc/init.d/pineapd restart`
-# only stops the hopping and leaves pineapd (and any CSA flood it is running) alive; use the stop.
-/etc/init.d/pineapd stop; sleep 2; ip link set wlan1mon up
+# pineapd and the radio -- two cases, and the stop is the FALLBACK, not the first move (run_17a.sh's
+# header, lines 15-29, measured 2026-11-09): stopping pineapd takes the monitor interfaces with it,
+# and after the first stop/start cycle pagerinj transmitted NOTHING (`recv: Network is down`, rc=1)
+# on three runs of four. The measured way to hold wlan1mon on a channel is an EXAMINE park with
+# pineapd RUNNING (eight 17a arms, CLAUDE.md Fourth to Sixth contact) -- but no Pager has yet been
+# asked to park on a DFS channel, and this step needs the 5180 control on the same interface state.
+# So try the park first: for each F below, PINEAPPLE_EXAMINE_CHANNEL <36 or 52> 60 in place of the
+# `iw dev wlan1mon set freq` line, and read `iw dev wlan1mon info` back twice. Only if the ch 52
+# park is refused, stop pineapd as below -- once, and expect the interfaces not to survive a second
+# cycle. (Plan B0 rig control 1's reason -- "If the hopper moves wlan1mon before dequeue, the frame
+# goes out on another channel and the parked receiver sees nothing" -- is met by either; its own
+# `uci set pineapd.wlan1mon.hop=0` leaves pineapd, and any CSA flood it is running, alive.) This
+# block said "FIRST, every time: stop pineapd" until 2026-11-19.
+/etc/init.d/pineapd stop; sleep 2; ip link set wlan1mon up     # the fallback case only; see above
 for F in 5180 5260; do                    # 5180 control first, then the test, nothing between them
   iw dev wlan1mon set freq $F 20          # set the channel yourself; pagerinj will not
   # nonce via busybox hexdump, not od: `od` ships in neither firmware image (CLAUDE.md §"2.0.0-stable, analysed"), so
